@@ -1,0 +1,148 @@
+name: Release
+
+# Cross-build release binaries when a version tag is pushed, and attach them
+# to the GitHub Release.
+#
+# WrongTrace is NOT CGO-free: smacker/go-tree-sitter compiles the C parser
+# runtime and per-language grammars via cgo. With CGO_ENABLED=0 the grammar
+# packages fail with "build constraints exclude all Go files" and the root
+# package breaks on "undefined: Node". (modernc.org/sqlite is the CGO-free
+# dependency; tree-sitter is not.) Platform strategy therefore avoids CGO
+# cross-toolchains wherever a native runner exists:
+#   linux/amd64   -> native on ubuntu-latest
+#   windows/amd64 -> cross from ubuntu with mingw-w64 (apt gcc-mingw-w64-x86_64)
+#   darwin/arm64  -> native on macos-latest (Apple Silicon)
+#   darwin/amd64  -> cross from the arm64 Mac with `clang -arch x86_64`
+#
+# The dashboard is built on every leg BEFORE the Go build so //go:embed picks
+# up the real bundle instead of the committed web/dist placeholder. Binaries
+# funnel through artifacts into one release job that creates the GitHub
+# Release with the annotated tag message as notes.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+          - goos: windows
+            goarch: amd64
+            runner: ubuntu-latest
+          - goos: darwin
+            goarch: amd64
+            runner: macos-latest
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # mingw cross-compiler for the windows leg (built on ubuntu).
+      - name: Install mingw-w64 (windows cross-build)
+        if: matrix.goos == 'windows'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-mingw-w64-x86_64
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Real dashboard bundle before the Go build (embed target).
+      - name: Build dashboard
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build wrongtrace (${{ matrix.goos }}-${{ matrix.goarch }})
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '1'
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXT=""
+          if [ "${GOOS}" = "windows" ]; then EXT=".exe"; fi
+          case "${GOOS}-${GOARCH}" in
+            windows-*) export CC=x86_64-w64-mingw32-gcc ;;
+            darwin-amd64) export CC="clang -arch x86_64" ;;
+          esac
+          mkdir -p release
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${TAG}" \
+            -o "release/wrongtrace-${TAG}-${GOOS}-${GOARCH}${EXT}" \
+            ./cmd/wrongtrace
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrongtrace-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    name: Create release and attach binaries
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Full history so the annotated tag object (and its message) is
+      # available for release notes.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download all platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          NOTES="$(git tag -l --format='%(contents)' "${TAG}")"
+
+          # Annotated tag message as notes; generated notes for a
+          # lightweight tag (empty message).
+          if [ -n "${NOTES}" ]; then
+            if gh release create "${TAG}" release/* \
+              --title "WrongTrace ${TAG}" \
+              --notes "${NOTES}" \
+              --verify-tag; then
+              exit 0
+            fi
+          else
+            if gh release create "${TAG}" release/* \
+              --title "WrongTrace ${TAG}" \
+              --generate-notes \
+              --verify-tag; then
+              exit 0
+            fi
+          fi
+
+          # Release already exists (e.g. re-run): attach/overwrite assets.
+          gh release upload "${TAG}" release/* --clobber
