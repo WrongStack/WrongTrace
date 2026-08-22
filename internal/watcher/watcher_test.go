@@ -352,23 +352,22 @@ func TestDebounce_CoalescesBurstIntoSingleCall(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool { return h.countFor("hot.go") >= 1 },
 		"coalesced event never fired")
 
-	// Bounded assertion (floor + ceiling): the core contract is that one
-	// burst coalesces rather than splattering — floor 1 proves coalescing
-	// happened at all. On a loaded runner under -race, fsnotify delivery can
-	// lag past the debounce window and split the burst into two coalesced
-	// calls (the same failure mode observed on CI for the two-burst test,
-	// fixed in 3ba8166), so the ceiling tolerates one split. 3+ calls would
-	// indicate a genuine coalescing regression. The EXACT single-call
-	// contract is enforced deterministically by
-	// TestDebounce_SyntheticBurstFiresExactlyOnce, which injects events
-	// directly and involves no fsnotify delivery.
+	// Real-filesystem burst counts are SOFT: under -race on a loaded runner,
+	// fsnotify delivery can lag past the debounce window and split one burst
+	// more than once — CI observed 3 calls for a 5-write burst on a commit
+	// that touched no Go code (c02d712, fifth flake of this family). The
+	// floor proves delivery happened; the ceiling is the number of writes,
+	// since worst-case delivery (every event lands after the previous window
+	// expired) is one call per write, and MORE calls than writes means
+	// duplicate handling — a genuine bug. Coalescing QUALITY is enforced
+	// deterministically by TestDebounce_SyntheticBurstFiresExactlyOnce.
 	time.Sleep(2*120*time.Millisecond + 100*time.Millisecond)
-	if n := h.countFor("hot.go"); n < 1 || n > 2 {
-		t.Errorf("burst coalesced into %d calls, want 1-2 (floor: coalescing happened; ceiling: no splatter): %v", n, h.snapshot())
+	if n := h.countFor("hot.go"); n < 1 || n > 5 {
+		t.Errorf("burst produced %d calls, want 1-5 (floor: delivered; ceiling: one per write — more means duplicate handling): %v", n, h.snapshot())
 	}
 	// Single-lock multi-count: every handler call must belong to hot.go.
-	if total, per := h.counts("hot.go"); total != per["hot.go"] || total > 2 {
-		t.Errorf("total handler calls = %d (%d for hot.go), want them equal and at most 2: %v",
+	if total, per := h.counts("hot.go"); total != per["hot.go"] || total > 5 {
+		t.Errorf("total handler calls = %d (%d for hot.go), want them equal and at most 5: %v",
 			total, per["hot.go"], h.snapshot())
 	}
 }
@@ -449,16 +448,16 @@ func TestDebounce_SeparateBurstsProduceSeparateCalls(t *testing.T) {
 		"second burst never registered after the first")
 
 	// Floor + ceiling: the window-boundary contract is that each
-	// debounce-separated burst registers its own call, and that a burst does
-	// not splatter. On a loaded runner fsnotify delivery can lag past the
-	// debounce window and split one burst into two coalesced calls (observed
-	// on CI: 3 calls for 2 bursts), so the ceiling allows one extra call per
-	// burst (4); 5+ indicates a genuine fragmentation regression. Exact
-	// single-call-per-burst coalescing stays covered by
-	// TestDebounce_CoalescesBurstIntoSingleCall.
+	// debounce-separated burst registers its own call. On a loaded runner
+	// fsnotify delivery can lag past the debounce window and split a burst
+	// more than once (CI observed 3 calls for a 5-write burst — c02d712), so
+	// the ceiling is the total write count (worst case: one call per write);
+	// MORE calls than writes means duplicate handling, a genuine bug. Exact
+	// single-call-per-burst coalescing stays covered deterministically by
+	// TestDebounce_SyntheticBurstFiresExactlyOnce.
 	time.Sleep(2*100*time.Millisecond + 100*time.Millisecond)
-	if n := h.countFor("twice.go"); n < 2 || n > 4 {
-		t.Errorf("separate bursts produced %d calls, want 2-4 (floor: each window registers; ceiling: no splatter): %v", n, h.snapshot())
+	if n := h.countFor("twice.go"); n < 2 || n > 6 {
+		t.Errorf("separate bursts produced %d calls, want 2-6 (floor: each window registers; ceiling: one per write — more means duplicate handling): %v", n, h.snapshot())
 	}
 }
 
