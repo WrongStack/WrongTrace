@@ -26,6 +26,11 @@ CREATE TABLE IF NOT EXISTS code_node_events (
     action           VARCHAR NOT NULL,
     ast_content_hash VARCHAR(64),
     lines_of_code    INTEGER,
+    start_line       INTEGER DEFAULT 0,
+    end_line         INTEGER DEFAULT 0,
+    diff_snippet     TEXT DEFAULT '',
+    added_lines      INTEGER DEFAULT 0,
+    deleted_lines    INTEGER DEFAULT 0,
     event_time       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

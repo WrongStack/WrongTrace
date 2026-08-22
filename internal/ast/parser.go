@@ -154,6 +154,20 @@ func (e *Engine) Snapshot(path string) (*FileSnapshot, bool) {
 	return s, ok
 }
 
+// AllSnapshots returns a shallow copy of all cached snapshots.
+func (e *Engine) AllSnapshots() map[string]*FileSnapshot {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.snapshots == nil {
+		return nil
+	}
+	out := make(map[string]*FileSnapshot, len(e.snapshots))
+	for k, v := range e.snapshots {
+		out[k] = v
+	}
+	return out
+}
+
 // SetSnapshot stores a freshly-parsed snapshot for diffing on the next
 // event. A no-op after Close: the map is dropped then, and assigning into a
 // nil map would panic.
@@ -195,7 +209,7 @@ func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out
 	if ok {
 		sig := buildSignature(lang, file, kind, node, src)
 		body := sliceText(node, src)
-		body = normalizeForHash(body)
+		body = normalizeForHash(body, lang)
 		hash := sha256.Sum256([]byte(body))
 		out.Nodes[sig] = Node{
 			Signature: sig,
@@ -387,9 +401,11 @@ func sliceText(n *sitter.Node, src []byte) string {
 
 // normalizeForHash strips comments and collapses whitespace so cosmetic-only
 // edits (formatting, comment tweaks) do not register as semantic changes.
-// It is intentionally language-agnostic and conservative: it never rewrites
-// identifiers, strings, or numeric literals.
-func normalizeForHash(s string) string {
+// It is intentionally conservative: it never rewrites identifiers, strings,
+// or numeric literals. '#' is treated as a line-comment ONLY for Python:
+// in JS/TS '#' is the private-field prefix (class A { #x = 1 }) and must be
+// preserved verbatim.
+func normalizeForHash(s string, lang Language) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	prevSpace := false
@@ -428,6 +444,13 @@ func normalizeForHash(s string) string {
 			if i+1 < len(s) && s[i+1] == '*' {
 				inBlockComment = true
 				i++
+				continue
+			}
+		case '#':
+			// Python-only line comment. In JS/TS '#' starts a private field
+			// (this.#x) — stripping it there corrupts the hash.
+			if lang == LangPython {
+				inLineComment = true
 				continue
 			}
 		case '"', '\'', '`':

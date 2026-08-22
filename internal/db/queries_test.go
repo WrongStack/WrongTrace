@@ -176,3 +176,68 @@ func TestModelComparison_EmptyStore(t *testing.T) {
 		t.Fatalf("want 0 rows on empty store, got %+v", rows)
 	}
 }
+
+func TestAllNodeStats_And_Thrashing(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+
+	seedRun(t, s, RunRecord{
+		RunID:     "run-1",
+		TaskID:    "task-1",
+		AgentName: "TestAgent",
+		ModelName: "gpt-4o",
+		Provider:  "openai",
+		CostUSD:   0.05,
+		CreatedAt: now,
+	})
+
+	seedEvent(t, s, "ev-1", "run-1", "func:foo", "ADDED", now.Add(-5*time.Minute))
+	seedEvent(t, s, "ev-2", "run-1", "func:foo", "MODIFIED", now.Add(-3*time.Minute))
+	seedEvent(t, s, "ev-3", "run-1", "func:foo", "MODIFIED", now.Add(-1*time.Minute))
+
+	// Test AllNodeStats
+	stats, err := s.AllNodeStats()
+	if err != nil {
+		t.Fatalf("AllNodeStats failed: %v", err)
+	}
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 node stat, got %d", len(stats))
+	}
+	stat := stats["func:foo"]
+	if stat.EditCount != 3 {
+		t.Errorf("expected 3 edits, got %d", stat.EditCount)
+	}
+	if stat.LastModel != "gpt-4o" {
+		t.Errorf("expected last model gpt-4o, got %s", stat.LastModel)
+	}
+
+	// Test Thrashing
+	thrashing, err := s.Thrashing(2, 7)
+	if err != nil {
+		t.Fatalf("Thrashing query failed: %v", err)
+	}
+	if len(thrashing) != 1 {
+		t.Fatalf("expected 1 thrashing row, got %d", len(thrashing))
+	}
+	if thrashing[0].Signature != "func:foo" {
+		t.Errorf("thrashing signature = %s, want func:foo", thrashing[0].Signature)
+	}
+
+	// Test Overview
+	ov, err := s.Overview()
+	if err != nil {
+		t.Fatalf("Overview failed: %v", err)
+	}
+	if ov.TotalRuns != 1 || ov.TotalEvents != 3 {
+		t.Errorf("Overview mismatch: runs=%d events=%d", ov.TotalRuns, ov.TotalEvents)
+	}
+}
+
+func TestHelpers(t *testing.T) {
+	if toInt(int64(42)) != 42 || toInt(int(42)) != 42 || toInt(float64(42.0)) != 42 || toInt("invalid") != 0 {
+		t.Error("toInt helper failed")
+	}
+	if toFloat(float64(3.14)) != 3.14 || toFloat(int64(3)) != 3.0 || toFloat(int(3)) != 3.0 || toFloat("invalid") != 0 {
+		t.Error("toFloat helper failed")
+	}
+}

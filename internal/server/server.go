@@ -17,13 +17,18 @@ import (
 	"github.com/go-chi/cors"
 
 	"github.com/wrongstack/wrongtrace/internal/core"
+	"github.com/wrongstack/wrongtrace/internal/models"
 )
 
 // EngineAPI is the slice of *core.Engine the HTTP layer needs. Declared as an
 // interface so handlers can be exercised with a fake in tests.
 type EngineAPI interface {
 	Metrics() (core.MetricsSnapshot, error)
+	Atlas() (core.AtlasSnapshot, error)
 	FileHealth(path string) (core.IPCHealth, error)
+	ModelCatalog() []models.ModelInfo
+	UpsertModel(m models.ModelInfo)
+	CalculateCost(model string, promptTokens, completionTokens int64) float64
 	Hub() *core.Hub
 	Repo() string
 }
@@ -32,6 +37,10 @@ type EngineAPI interface {
 type Config struct {
 	Port   int
 	Engine *core.Engine
+	// SocketPath is the IPC endpoint (UDS / named pipe) the daemon bound, if
+	// any. Reported via /api/health so the dashboard can show agents the real
+	// connect path instead of guessing platform defaults.
+	SocketPath string
 }
 
 // Server bundles the HTTP listener and chi router.
@@ -90,14 +99,18 @@ func (s *Server) buildRouter() chi.Router {
 		MaxAge:           300,
 	}))
 
-	h := &Handlers{Engine: s.cfg.Engine} // *core.Engine satisfies EngineAPI
+	h := &Handlers{Engine: s.cfg.Engine, SocketPath: s.cfg.SocketPath} // *core.Engine satisfies EngineAPI
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", h.Health)
 		r.Get("/metrics/overview", h.Overview)
 		r.Get("/metrics/thrashing", h.Thrashing)
 		r.Get("/metrics/models", h.Models)
 		r.Get("/metrics/recent", h.RecentEvents)
+		r.Get("/atlas", h.Atlas)
 		r.Get("/file/health", h.FileHealth)
+		r.Get("/models/catalog", h.ModelCatalog)
+		r.Post("/models/catalog", h.UpsertModel)
+		r.Post("/models/calculate-cost", h.CalculateCost)
 		r.Get("/ws", h.WebSocket)
 	})
 

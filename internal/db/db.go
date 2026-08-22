@@ -76,6 +76,16 @@ func (s *Store) Migrate() error {
 	if err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	// Add new columns to existing databases safely
+	for _, col := range []string{
+		"ALTER TABLE code_node_events ADD COLUMN start_line INTEGER DEFAULT 0",
+		"ALTER TABLE code_node_events ADD COLUMN end_line INTEGER DEFAULT 0",
+		"ALTER TABLE code_node_events ADD COLUMN diff_snippet TEXT DEFAULT ''",
+		"ALTER TABLE code_node_events ADD COLUMN added_lines INTEGER DEFAULT 0",
+		"ALTER TABLE code_node_events ADD COLUMN deleted_lines INTEGER DEFAULT 0",
+	} {
+		_, _ = s.db.ExecContext(context.Background(), col)
+	}
 	return nil
 }
 

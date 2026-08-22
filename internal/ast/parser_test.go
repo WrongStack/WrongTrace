@@ -185,24 +185,29 @@ func TestDiff_StringLiteralChangeIsSemantic(t *testing.T) {
 func TestNormalizeForHash(t *testing.T) {
 	cases := []struct {
 		name string
+		lang Language
 		in   string
 		want string
 	}{
-		{"line comment stripped", "a // tail\nb", "a b"},
-		{"block comment stripped", "a /* mid */ b", "a b"},
-		{"whitespace collapsed", "a\n\t b   c", "a b c"},
-		{"string kept verbatim", `x := "a  b // c"`, `x := "a  b // c"`},
-		{"raw string kept", "s := `a /* b */`", "s := `a /* b */`"},
-		{"empty", "   \n\t ", ""},
+		{"line comment stripped", LangGo, "a // tail\nb", "a b"},
+		{"python comment stripped", LangPython, "a # tail\nb", "a b"},
+		{"python private-name marker preserved (JS not Python)", LangJavaScript, "class A { #x = 1 }", "class A { #x = 1 }"},
+		{"python private-dunder preserved", LangPython, "self.__x = 1", "self.__x = 1"},
+		{"block comment stripped", LangGo, "a /* mid */ b", "a b"},
+		{"whitespace collapsed", LangGo, "a\n\t b   c", "a b c"},
+		{"string kept verbatim", LangGo, `x := "a  b // c"`, `x := "a  b // c"`},
+		{"python string kept verbatim", LangPython, `x := "a # not a comment"`, `x := "a # not a comment"`},
+		{"raw string kept", LangGo, "s := `a /* b */`", "s := `a /* b */`"},
+		{"empty", LangGo, "   \n\t ", ""},
 	}
 	for _, c := range cases {
-		if got := normalizeForHash(c.in); got != c.want {
-			t.Errorf("%s: normalizeForHash(%q) = %q, want %q", c.name, c.in, got, c.want)
+		if got := normalizeForHash(c.in, c.lang); got != c.want {
+			t.Errorf("%s: normalizeForHash(%q, %v) = %q, want %q", c.name, c.in, c.lang, got, c.want)
 		}
 	}
 
 	// Equivalent inputs must hash identically (through the public path).
-	if normalizeForHash("a // x\nb") != normalizeForHash("a /* y */ b") {
+	if normalizeForHash("a // x\nb", LangGo) != normalizeForHash("a /* y */ b", LangGo) {
 		t.Error("different comment styles with same code normalized differently")
 	}
 }

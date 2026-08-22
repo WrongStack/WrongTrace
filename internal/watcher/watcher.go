@@ -141,6 +141,11 @@ func (w *Watcher) Run(ctx context.Context) {
 			if w.pathIgnored(ev.Name) {
 				continue
 			}
+			if ev.Op&fsnotify.Create == fsnotify.Create {
+				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
+					_ = w.addRecursive(ev.Name)
+				}
+			}
 			if !isRelevant(ev.Op) {
 				continue
 			}

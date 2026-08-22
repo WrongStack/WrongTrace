@@ -529,3 +529,37 @@ func TestRun_WithoutEngineParksQuietly(t *testing.T) {
 		t.Fatal("Run did not exit after cancellation")
 	}
 }
+
+func TestWatcher_PathIgnoredAndClose(t *testing.T) {
+	root := t.TempDir()
+	w, err := New(Config{
+		Dir: root,
+		IgnoreDirs: []string{".git", "node_modules", "custom_ignored"},
+	})
+	if err != nil {
+		t.Fatalf("New watcher: %v", err)
+	}
+
+	if !w.pathIgnored(filepath.Join(root, ".git", "HEAD")) {
+		t.Error("expected .git to be ignored")
+	}
+	if !w.pathIgnored(filepath.Join(root, "node_modules", "pkg", "index.js")) {
+		t.Error("expected node_modules to be ignored")
+	}
+	if !w.pathIgnored(filepath.Join(root, "custom_ignored", "file.go")) {
+		t.Error("expected custom_ignored to be ignored")
+	}
+	if w.pathIgnored(filepath.Join(root, "src", "main.go")) {
+		t.Error("expected src/main.go to NOT be ignored")
+	}
+
+	// Test Close
+	if err := w.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+	// Nil receiver Close
+	var nilWatcher *Watcher
+	if err := nilWatcher.Close(); err != nil {
+		t.Errorf("nil Watcher.Close returned error: %v", err)
+	}
+}

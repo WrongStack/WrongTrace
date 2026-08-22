@@ -426,3 +426,75 @@ func TestWebSocket_PlainHTTPRequestDoesNotUpgrade(t *testing.T) {
 		t.Fatalf("status = %d, want 400 (no Upgrade header)", resp.StatusCode)
 	}
 }
+
+func TestAtlasEndpoint(t *testing.T) {
+	_, _, ts := newTestServer(t)
+	var atlas map[string]interface{}
+	resp := getJSON(t, ts.URL+"/api/atlas", &atlas)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if atlas["repo"] != "srv-test" {
+		t.Errorf("expected repo srv-test, got %v", atlas["repo"])
+	}
+	if _, ok := atlas["packages"]; !ok {
+		t.Error("expected packages array in atlas response")
+	}
+}
+
+func TestServerLifecycle(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "lifecycle.db"))
+	if err != nil {
+		t.Fatalf("db open: %v", err)
+	}
+	defer store.Close()
+	_ = store.Migrate()
+
+	engine := core.NewEngine(core.Config{RepoName: "lifecycle-test", Store: store})
+	srv := New(Config{Port: 0, Engine: engine})
+
+	if err := srv.Shutdown(nil); err != nil {
+		t.Errorf("Shutdown on unstarted server returned error: %v", err)
+	}
+}
+
+func TestModelCatalogEndpoints(t *testing.T) {
+	_, _, ts := newTestServer(t)
+
+	// 1. GET /api/models/catalog
+	var catalog []map[string]interface{}
+	resp := getJSON(t, ts.URL+"/api/models/catalog", &catalog)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(catalog) == 0 {
+		t.Fatal("expected non-empty model catalog")
+	}
+
+	// 2. POST /api/models/catalog (Add custom model)
+	customBody := `{"id":"custom-deepseek-coder","name":"Custom DeepSeek Coder","provider":"Internal","input_price_per_m":0.1,"output_price_per_m":0.2,"context_window":64000}`
+	postResp, err := http.Post(ts.URL+"/api/models/catalog", "application/json", strings.NewReader(customBody))
+	if err != nil {
+		t.Fatalf("POST /api/models/catalog: %v", err)
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST status = %d, want 200", postResp.StatusCode)
+	}
+
+	// 3. POST /api/models/calculate-cost
+	calcBody := `{"model":"custom-deepseek-coder","prompt_tokens":1000000,"completion_tokens":1000000}`
+	calcResp, err := http.Post(ts.URL+"/api/models/calculate-cost", "application/json", strings.NewReader(calcBody))
+	if err != nil {
+		t.Fatalf("POST /api/models/calculate-cost: %v", err)
+	}
+	defer calcResp.Body.Close()
+	var calcResult map[string]interface{}
+	if err := json.NewDecoder(calcResp.Body).Decode(&calcResult); err != nil {
+		t.Fatalf("decode calculate cost: %v", err)
+	}
+	costVal, ok := calcResult["total_cost_usd"].(float64)
+	if !ok || costVal < 0.299 || costVal > 0.301 {
+		t.Errorf("expected ~$0.30 total cost, got %v", calcResult["total_cost_usd"])
+	}
+}

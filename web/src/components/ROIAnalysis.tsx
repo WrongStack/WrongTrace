@@ -9,7 +9,12 @@ interface ROIAnalysisProps {
 // days. A higher value means the model is expensive relative to durable
 // output; a lower value is the goal.
 export function ROIAnalysis({ models }: ROIAnalysisProps) {
-  const sorted = [...models].sort((a, b) => a.cost_per_surviving_node - b.cost_per_surviving_node);
+  const sorted = [...models].sort((a, b) => {
+    if (a.total_survived_nodes === 0 && b.total_survived_nodes === 0) return 0;
+    if (a.total_survived_nodes === 0) return 1;
+    if (b.total_survived_nodes === 0) return -1;
+    return a.cost_per_surviving_node - b.cost_per_surviving_node;
+  });
   const totalCost = models.reduce((acc, m) => acc + m.total_cost_usd, 0);
   const totalSurvived = models.reduce((acc, m) => acc + m.total_survived_nodes, 0);
   const blended = totalSurvived > 0 ? totalCost / totalSurvived : 0;
@@ -52,17 +57,21 @@ export function ROIAnalysis({ models }: ROIAnalysisProps) {
                 <tr key={m.model} className="border-t border-white/5">
                   <td className="py-1.5 text-slate-200">{m.model}</td>
                   <td className="py-1.5 text-right">
-                    <span
-                      className={
-                        m.cost_per_surviving_node < blended * 0.8
-                          ? 'text-signal-added'
-                          : m.cost_per_surviving_node > blended * 1.5
-                          ? 'text-signal-deleted'
-                          : 'text-slate-300'
-                      }
-                    >
-                      ${m.cost_per_surviving_node.toFixed(4)}
-                    </span>
+                    {m.total_survived_nodes === 0 ? (
+                      <span className="text-slate-500">—</span>
+                    ) : (
+                      <span
+                        className={
+                          m.cost_per_surviving_node < blended * 0.8
+                            ? 'text-signal-added'
+                            : m.cost_per_surviving_node > blended * 1.5
+                            ? 'text-signal-deleted'
+                            : 'text-slate-300'
+                        }
+                      >
+                        ${m.cost_per_surviving_node.toFixed(4)}
+                      </span>
+                    )}
                   </td>
                   <td className="py-1.5 text-right text-slate-300">{m.total_survived_nodes}</td>
                   <td className="py-1.5 text-right text-slate-400">

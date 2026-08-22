@@ -2,6 +2,7 @@ package ast
 
 import (
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -18,15 +19,20 @@ const (
 // when the change could not be correlated to an active agent run; the engine
 // backfills it during the correlation window.
 type Event struct {
-	RunID      string
-	RepoName   string
-	FilePath   string
-	Signature  string
-	NodeType   NodeKind
-	Action     Action
-	BodyHash   string
-	LOC        int
-	OccurredAt time.Time
+	RunID        string    `json:"run_id"`
+	RepoName     string    `json:"repo_name"`
+	FilePath     string    `json:"file_path"`
+	Signature    string    `json:"node_signature"`
+	NodeType     NodeKind  `json:"node_type"`
+	Action       Action    `json:"action"`
+	BodyHash     string    `json:"ast_content_hash"`
+	LOC          int       `json:"lines_of_code"`
+	StartLine    uint32    `json:"start_line"`
+	EndLine      uint32    `json:"end_line"`
+	DiffSnippet  string    `json:"diff_snippet"`
+	AddedLines   int       `json:"added_lines"`
+	DeletedLines int       `json:"deleted_lines"`
+	OccurredAt   time.Time `json:"event_time"`
 }
 
 // DiffResult is the ordered set of Events emitted for one file transition.
@@ -51,15 +57,21 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	if prev == nil {
 		for _, sig := range next.SortedSignatures() {
 			n := next.Nodes[sig]
+			diff, added, deleted := formatAddedDiff(n.Body)
 			res.Events = append(res.Events, Event{
-				RepoName:   repoName,
-				FilePath:   next.Path,
-				Signature:  sig,
-				NodeType:   n.Kind,
-				Action:     ActionAdded,
-				BodyHash:   n.Hash,
-				LOC:        n.LOC,
-				OccurredAt: now,
+				RepoName:     repoName,
+				FilePath:     next.Path,
+				Signature:    sig,
+				NodeType:     n.Kind,
+				Action:       ActionAdded,
+				BodyHash:     n.Hash,
+				LOC:          n.LOC,
+				StartLine:    n.StartLine,
+				EndLine:      n.EndLine,
+				DiffSnippet:  diff,
+				AddedLines:   added,
+				DeletedLines: deleted,
+				OccurredAt:   now,
 			})
 		}
 		res.NewSnap = next
@@ -68,15 +80,21 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	if next == nil {
 		for _, sig := range prev.SortedSignatures() {
 			n := prev.Nodes[sig]
+			diff, added, deleted := formatDeletedDiff(n.Body)
 			res.Events = append(res.Events, Event{
-				RepoName:   repoName,
-				FilePath:   prev.Path,
-				Signature:  sig,
-				NodeType:   n.Kind,
-				Action:     ActionDeleted,
-				BodyHash:   n.Hash,
-				LOC:        n.LOC,
-				OccurredAt: now,
+				RepoName:     repoName,
+				FilePath:     prev.Path,
+				Signature:    sig,
+				NodeType:     n.Kind,
+				Action:       ActionDeleted,
+				BodyHash:     n.Hash,
+				LOC:          n.LOC,
+				StartLine:    n.StartLine,
+				EndLine:      n.EndLine,
+				DiffSnippet:  diff,
+				AddedLines:   added,
+				DeletedLines: deleted,
+				OccurredAt:   now,
 			})
 		}
 		return res
@@ -91,15 +109,21 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	for _, sig := range prevSigs {
 		if _, ok := nextSet[sig]; !ok {
 			n := prev.Nodes[sig]
+			diff, added, deleted := formatDeletedDiff(n.Body)
 			res.Events = append(res.Events, Event{
-				RepoName:   repoName,
-				FilePath:   prev.Path,
-				Signature:  sig,
-				NodeType:   n.Kind,
-				Action:     ActionDeleted,
-				BodyHash:   n.Hash,
-				LOC:        n.LOC,
-				OccurredAt: now,
+				RepoName:     repoName,
+				FilePath:     prev.Path,
+				Signature:    sig,
+				NodeType:     n.Kind,
+				Action:       ActionDeleted,
+				BodyHash:     n.Hash,
+				LOC:          n.LOC,
+				StartLine:    n.StartLine,
+				EndLine:      n.EndLine,
+				DiffSnippet:  diff,
+				AddedLines:   added,
+				DeletedLines: deleted,
+				OccurredAt:   now,
 			})
 		}
 	}
@@ -109,29 +133,41 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	for _, sig := range nextSigs {
 		newNode := next.Nodes[sig]
 		if _, existed := prevSet[sig]; !existed {
+			diff, added, deleted := formatAddedDiff(newNode.Body)
 			res.Events = append(res.Events, Event{
-				RepoName:   repoName,
-				FilePath:   next.Path,
-				Signature:  sig,
-				NodeType:   newNode.Kind,
-				Action:     ActionAdded,
-				BodyHash:   newNode.Hash,
-				LOC:        newNode.LOC,
-				OccurredAt: now,
+				RepoName:     repoName,
+				FilePath:     next.Path,
+				Signature:    sig,
+				NodeType:     newNode.Kind,
+				Action:       ActionAdded,
+				BodyHash:     newNode.Hash,
+				LOC:          newNode.LOC,
+				StartLine:    newNode.StartLine,
+				EndLine:      newNode.EndLine,
+				DiffSnippet:  diff,
+				AddedLines:   added,
+				DeletedLines: deleted,
+				OccurredAt:   now,
 			})
 			continue
 		}
 		oldNode := prev.Nodes[sig]
 		if oldNode.Hash != newNode.Hash {
+			diff, added, deleted := generateLineDiff(oldNode.Body, newNode.Body)
 			res.Events = append(res.Events, Event{
-				RepoName:   repoName,
-				FilePath:   next.Path,
-				Signature:  sig,
-				NodeType:   newNode.Kind,
-				Action:     ActionModified,
-				BodyHash:   newNode.Hash,
-				LOC:        newNode.LOC,
-				OccurredAt: now,
+				RepoName:     repoName,
+				FilePath:     next.Path,
+				Signature:    sig,
+				NodeType:     newNode.Kind,
+				Action:       ActionModified,
+				BodyHash:     newNode.Hash,
+				LOC:          newNode.LOC,
+				StartLine:    newNode.StartLine,
+				EndLine:      newNode.EndLine,
+				DiffSnippet:  diff,
+				AddedLines:   added,
+				DeletedLines: deleted,
+				OccurredAt:   now,
 			})
 		}
 	}
@@ -174,3 +210,124 @@ func safePath(a, b *FileSnapshot) string {
 	}
 	return ""
 }
+
+func formatAddedDiff(body string) (string, int, int) {
+	if body == "" {
+		return "", 0, 0
+	}
+	lines := strings.Split(body, "\n")
+	var b strings.Builder
+	for i, l := range lines {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("+ ")
+		b.WriteString(l)
+	}
+	return b.String(), len(lines), 0
+}
+
+func formatDeletedDiff(body string) (string, int, int) {
+	if body == "" {
+		return "", 0, 0
+	}
+	lines := strings.Split(body, "\n")
+	var b strings.Builder
+	for i, l := range lines {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("- ")
+		b.WriteString(l)
+	}
+	return b.String(), 0, len(lines)
+}
+
+func generateLineDiff(oldText, newText string) (string, int, int) {
+	oldLines := strings.Split(oldText, "\n")
+	newLines := strings.Split(newText, "\n")
+
+	var b strings.Builder
+	added := 0
+	deleted := 0
+
+	type match struct {
+		oldIdx, newIdx int
+	}
+
+	// Fast line LCS
+	m, n := len(oldLines), len(newLines)
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			if oldLines[i-1] == newLines[j-1] {
+				dp[i][j] = dp[i-1][j-1] + 1
+			} else if dp[i-1][j] >= dp[i][j-1] {
+				dp[i][j] = dp[i-1][j]
+			} else {
+				dp[i][j] = dp[i][j-1]
+			}
+		}
+	}
+
+	// Backtrack matches
+	var matches []match
+	i, j := m, n
+	for i > 0 && j > 0 {
+		if oldLines[i-1] == newLines[j-1] {
+			matches = append(matches, match{oldIdx: i - 1, newIdx: j - 1})
+			i--
+			j--
+		} else if dp[i-1][j] >= dp[i][j-1] {
+			i--
+		} else {
+			j--
+		}
+	}
+	for l, r := 0, len(matches)-1; l < r; l, r = l+1, r-1 {
+		matches[l], matches[r] = matches[r], matches[l]
+	}
+
+	currOld, currNew := 0, 0
+	first := true
+	emit := func(prefix, line string) {
+		if !first {
+			b.WriteByte('\n')
+		}
+		first = false
+		b.WriteString(prefix)
+		b.WriteString(line)
+	}
+
+	for _, mat := range matches {
+		for currOld < mat.oldIdx {
+			emit("- ", oldLines[currOld])
+			deleted++
+			currOld++
+		}
+		for currNew < mat.newIdx {
+			emit("+ ", newLines[currNew])
+			added++
+			currNew++
+		}
+		emit("  ", oldLines[currOld])
+		currOld++
+		currNew++
+	}
+	for currOld < len(oldLines) {
+		emit("- ", oldLines[currOld])
+		deleted++
+		currOld++
+	}
+	for currNew < len(newLines) {
+		emit("+ ", newLines[currNew])
+		added++
+		currNew++
+	}
+
+	return b.String(), added, deleted
+}
+

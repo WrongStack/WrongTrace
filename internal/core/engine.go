@@ -17,6 +17,7 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/ast"
 	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
+	"github.com/wrongstack/wrongtrace/internal/models"
 )
 
 // IPCHealth is exported as an alias so the server package can reference the
@@ -145,16 +146,21 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 			ev.RunID = runID
 		}
 		rec := db.EventRecord{
-			EventID:    newID(),
-			RunID:      ev.RunID,
-			RepoName:   ev.RepoName,
-			FilePath:   ev.FilePath,
-			Signature:  ev.Signature,
-			NodeType:   string(ev.NodeType),
-			Action:     string(ev.Action),
-			BodyHash:   ev.BodyHash,
-			LOC:        ev.LOC,
-			OccurredAt: ev.OccurredAt,
+			EventID:      newID(),
+			RunID:        ev.RunID,
+			RepoName:     ev.RepoName,
+			FilePath:     ev.FilePath,
+			Signature:    ev.Signature,
+			NodeType:     string(ev.NodeType),
+			Action:       string(ev.Action),
+			BodyHash:     ev.BodyHash,
+			LOC:          ev.LOC,
+			StartLine:    ev.StartLine,
+			EndLine:      ev.EndLine,
+			DiffSnippet:  ev.DiffSnippet,
+			AddedLines:   ev.AddedLines,
+			DeletedLines: ev.DeletedLines,
+			OccurredAt:   ev.OccurredAt,
 		}
 		if err := e.cfg.Store.InsertEvent(rec); err != nil {
 			log.Printf("engine: insert event %s: %v", rec.EventID, err)
@@ -192,6 +198,12 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 	if p.RunID == "" {
 		return errors.New("run_id is required")
 	}
+
+	// Auto-compute cost if not explicitly passed by agent but tokens are provided
+	if p.CostUSD <= 0 && (p.PromptTokens > 0 || p.CompletionTokens > 0) {
+		p.CostUSD = models.Global.CalculateCost(p.ModelName, p.PromptTokens, p.CompletionTokens)
+	}
+
 	rec := db.RunRecord{
 		RunID:            p.RunID,
 		TaskID:           p.TaskID,
@@ -218,6 +230,21 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 	e.runMu.Unlock()
 	e.hub.Broadcast(WSEvent{Type: "run_reported", Payload: rec})
 	return nil
+}
+
+// ModelCatalog returns all available AI models and their token pricing specs.
+func (e *Engine) ModelCatalog() []models.ModelInfo {
+	return models.Global.AllModels()
+}
+
+// UpsertModel updates or adds a custom model into the catalog.
+func (e *Engine) UpsertModel(m models.ModelInfo) {
+	models.Global.Upsert(m)
+}
+
+// CalculateCost computes total dollar spend from tokens for a specific model.
+func (e *Engine) CalculateCost(model string, promptTokens, completionTokens int64) float64 {
+	return models.Global.CalculateCost(model, promptTokens, completionTokens)
 }
 
 // ReportRunMCP adapts the MCP tool's flat arguments into a full run record,

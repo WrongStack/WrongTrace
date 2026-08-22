@@ -10,16 +10,17 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.51.0",
+    "@xyflow/react": "^12.11.3",
     "lucide-react": "^1.33.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "recharts": "^3.10.1"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.1.0",
-    "@tailwindcss/postcss": "^4.3.3",
     "postcss": "^8.4.45",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",

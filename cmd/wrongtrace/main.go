@@ -16,6 +16,7 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/ast"
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
+	"github.com/wrongstack/wrongtrace/internal/ingest"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 	"github.com/wrongstack/wrongtrace/internal/mcp"
 	"github.com/wrongstack/wrongtrace/internal/server"
@@ -113,6 +114,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		Store:    store,
 		AST:      astEngine,
 	})
+	engine.PrimeDirectory(abs)
 
 	// Filesystem watcher with debouncing + ignore rules.
 	w, err := watcher.New(watcher.Config{
@@ -140,12 +142,30 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	// Embedded HTTP server + WebSocket hub.
 	httpServer := server.New(server.Config{
-		Port:   port,
-		Engine: engine,
+		Port:       port,
+		Engine:     engine,
+		SocketPath: socketPath,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Automatic Session Log & Tool Call Ingestor.
+	sessionWatcher := ingest.NewSessionWatcher(func(ev ingest.ToolCallEvent) {
+		_ = engine.ReportRun(ipc.TelemetryReport{
+			RunID:            ev.SessionID,
+			TaskID:           ev.ToolName,
+			AgentName:        ev.AgentName,
+			ModelName:        ev.ModelName,
+			Provider:         ev.Provider,
+			PromptTokens:     ev.PromptTokens,
+			CompletionTokens: ev.CompletionTokens,
+			CostUSD:          ev.CostUSD,
+			Intent:           ev.Intent,
+		})
+	})
+	sessionWatcher.DiscoverAgentDirs(abs)
+	sessionWatcher.StartPolling(ctx, 3*time.Second)
 
 	go func() {
 		if err := httpServer.Start(); err != nil {
@@ -168,7 +188,9 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
-	_ = shutdownCtx
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
 	log.Printf("wrongtrace stopped")
 	return nil
 }

@@ -62,16 +62,21 @@ type RunRecord struct {
 // types (no sql.Null*) keep JSON serialization clean; NULL handling happens
 // locally inside the scan/insert helpers.
 type EventRecord struct {
-	EventID    string    `json:"event_id"`
-	RunID      string    `json:"run_id"`
-	RepoName   string    `json:"repo_name"`
-	FilePath   string    `json:"file_path"`
-	Signature  string    `json:"node_signature"`
-	NodeType   string    `json:"node_type"`
-	Action     string    `json:"action"`
-	BodyHash   string    `json:"ast_content_hash"`
-	LOC        int       `json:"lines_of_code"`
-	OccurredAt time.Time `json:"event_time"`
+	EventID      string    `json:"event_id"`
+	RunID        string    `json:"run_id"`
+	RepoName     string    `json:"repo_name"`
+	FilePath     string    `json:"file_path"`
+	Signature    string    `json:"node_signature"`
+	NodeType     string    `json:"node_type"`
+	Action       string    `json:"action"`
+	BodyHash     string    `json:"ast_content_hash"`
+	LOC          int       `json:"lines_of_code"`
+	StartLine    uint32    `json:"start_line"`
+	EndLine      uint32    `json:"end_line"`
+	DiffSnippet  string    `json:"diff_snippet"`
+	AddedLines   int       `json:"added_lines"`
+	DeletedLines int       `json:"deleted_lines"`
+	OccurredAt   time.Time `json:"event_time"`
 }
 
 // UpsertRun inserts an agent_run, replacing any existing row with the same
@@ -119,8 +124,10 @@ func (s *Store) InsertEvent(e EventRecord) error {
 
 	const q = `
 		INSERT INTO code_node_events
-			(event_id, run_id, repo_name, file_path, node_signature, node_type, action, ast_content_hash, lines_of_code, event_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+			(event_id, run_id, repo_name, file_path, node_signature, node_type, action,
+			 ast_content_hash, lines_of_code, start_line, end_line, diff_snippet,
+			 added_lines, deleted_lines, event_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
 	`
 	var runID any
 	if e.RunID != "" {
@@ -132,7 +139,8 @@ func (s *Store) InsertEvent(e EventRecord) error {
 	}
 	_, err := s.db.ExecContext(ctx, q,
 		e.EventID, runID, e.RepoName, e.FilePath, e.Signature, e.NodeType,
-		e.Action, bodyHash, e.LOC, fmtDBTime(e.OccurredAt),
+		e.Action, bodyHash, e.LOC, e.StartLine, e.EndLine, e.DiffSnippet,
+		e.AddedLines, e.DeletedLines, fmtDBTime(e.OccurredAt),
 	)
 	if err != nil {
 		return fmt.Errorf("insert event %s: %w", e.EventID, err)
@@ -147,7 +155,9 @@ func (s *Store) RecentEvents(limit int) ([]EventRecord, error) {
 	}
 	rows, err := s.db.QueryContext(context.Background(), `
 		SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
-		       action, ast_content_hash, lines_of_code, event_time
+		       action, ast_content_hash, lines_of_code,
+		       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
+		       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
 		FROM code_node_events
 		ORDER BY event_time DESC
 		LIMIT ?
@@ -160,13 +170,14 @@ func (s *Store) RecentEvents(limit int) ([]EventRecord, error) {
 	out := make([]EventRecord, 0, limit)
 	for rows.Next() {
 		var (
-			e       EventRecord
-			ts      string
-			runID   = nullable(&e.RunID)
+			e        EventRecord
+			ts       string
+			runID    = nullable(&e.RunID)
 			bodyHash = nullable(&e.BodyHash)
 		)
 		if err := rows.Scan(&e.EventID, runID, &e.RepoName, &e.FilePath,
-			&e.Signature, &e.NodeType, &e.Action, bodyHash, &e.LOC, &ts); err != nil {
+			&e.Signature, &e.NodeType, &e.Action, bodyHash, &e.LOC,
+			&e.StartLine, &e.EndLine, &e.DiffSnippet, &e.AddedLines, &e.DeletedLines, &ts); err != nil {
 			return nil, fmt.Errorf("scan recent event: %w", err)
 		}
 		e.OccurredAt = parseDBTime(ts)
@@ -378,6 +389,44 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 		out.Warning = fmt.Sprintf("%d edits in the last 24h across %d signatures", edits, sigs)
 	}
 	return out, nil
+}
+
+// NodeStat captures aggregate historical stats for a single node signature.
+type NodeStat struct {
+	Signature   string    `json:"node_signature"`
+	FilePath    string    `json:"file_path"`
+	EditCount   int       `json:"edit_count"`
+	LastAction  string    `json:"last_action"`
+	LastModel   string    `json:"last_model"`
+	LastEventAt time.Time `json:"last_event_time"`
+}
+
+// AllNodeStats queries aggregate metrics for every known AST node signature.
+func (s *Store) AllNodeStats() (map[string]NodeStat, error) {
+	rows, err := s.db.QueryContext(context.Background(), `
+		SELECT e.node_signature, e.file_path, COUNT(*) as edit_count,
+		       COALESCE((SELECT action FROM code_node_events WHERE node_signature = e.node_signature ORDER BY event_time DESC LIMIT 1), 'ACTIVE') as last_action,
+		       COALESCE((SELECT r.model_name FROM code_node_events c LEFT JOIN agent_runs r ON c.run_id = r.run_id WHERE c.node_signature = e.node_signature AND r.model_name IS NOT NULL ORDER BY c.event_time DESC LIMIT 1), 'unknown') as last_model,
+		       MAX(e.event_time) as last_event_time
+		FROM code_node_events e
+		GROUP BY e.node_signature, e.file_path
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("node stats query: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]NodeStat)
+	for rows.Next() {
+		var ns NodeStat
+		var ts string
+		if err := rows.Scan(&ns.Signature, &ns.FilePath, &ns.EditCount, &ns.LastAction, &ns.LastModel, &ts); err != nil {
+			return nil, fmt.Errorf("scan node stat: %w", err)
+		}
+		ns.LastEventAt = parseDBTime(ts)
+		out[ns.Signature] = ns
+	}
+	return out, rows.Err()
 }
 
 // nullable returns a sql.Scanner that writes through to s when the column is

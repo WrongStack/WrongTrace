@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import type { FileHealth, MetricsSnapshot, ModelRow, ThrashingRow, EventRecord } from '../types';
+import type { FileHealth, HealthResponse, MetricsSnapshot, ModelRow, ThrashingRow, EventRecord, AtlasSnapshot } from '../types';
 
 const base = '/api';
 
@@ -43,11 +43,38 @@ export function useRecentEvents() {
   });
 }
 
+export function useHealth() {
+  return useQuery<HealthResponse>({
+    queryKey: ['health'],
+    queryFn: () => jget<HealthResponse>(`${base}/health`),
+    // The socket path never changes during a daemon's lifetime; the refetch
+    // interval only re-syncs the navbar after a daemon restart.
+    staleTime: 60_000,
+    refetchInterval: 30_000,
+  });
+}
+
 export function useFileHealth(path: string | null) {
   return useQuery<FileHealth>({
     queryKey: ['file_health', path],
     queryFn: () => jget<FileHealth>(`${base}/file/health?path=${encodeURIComponent(path ?? '')}`),
     enabled: !!path,
     staleTime: 30_000,
+  });
+}
+
+export function useAtlas() {
+  return useQuery<AtlasSnapshot>({
+    queryKey: ['atlas'],
+    queryFn: () => jget<AtlasSnapshot>(`${base}/atlas`),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useModelCatalog() {
+  return useQuery<import('../types').ModelInfo[]>({
+    queryKey: ['model_catalog'],
+    queryFn: () => jget<import('../types').ModelInfo[]>(`${base}/models/catalog`),
+    staleTime: 60_000,
   });
 }
