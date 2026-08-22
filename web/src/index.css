@@ -1,6 +1,25 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+/*
+ * Tailwind v4 CSS-first configuration (replaces tailwind.config.js).
+ * Custom tokens are declared as @theme custom properties — the --color-*
+ * namespace generates utilities like bg-bg-base / text-signal-added,
+ * and --font-* drives font-sans / font-mono.
+ */
+@theme {
+  /* WrongTrace brand palette: dark-first, single accent (indigo). */
+  --color-bg-base: #0b0d12;
+  --color-bg-panel: #11141b;
+  --color-bg-raised: #161a23;
+  --color-accent: #6366f1;
+  --color-accent-soft: #818cf8;
+  --color-signal-added: #22c55e;
+  --color-signal-modified: #eab308;
+  --color-signal-deleted: #ef4444;
+
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+}
 
 :root {
   color-scheme: dark;
