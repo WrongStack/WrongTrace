@@ -671,11 +671,40 @@ func ScanAgentSessions(root string) map[string]int {
 	return counts
 }
 
+// ignorePatterns returns the effective directory ignore patterns from the
+// daemon settings. Falls back to the same defaults UpdateSettings seeds, so
+// the language scan stays bounded even before any settings write.
+func ignorePatterns() []string {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	if len(globalSettings.IgnorePatterns) > 0 {
+		return globalSettings.IgnorePatterns
+	}
+	return []string{".git", "node_modules", "vendor", "dist", "build", ".cache", "target", ".next"}
+}
+
 // DetectPrimaryLanguage infers the predominant language by counting source file extensions.
+// Directories whose base name matches an ignore_patterns setting entry are pruned with
+// filepath.SkipDir (never descended) — without this, a fat node_modules tree dominated the
+// count and made every web project classify as TypeScript while the full walk made
+// batch-import pathologically slow.
 func DetectPrimaryLanguage(root string) string {
 	extCounts := make(map[string]int)
+	ignored := ignorePatterns()
 	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
+		if err != nil || info == nil {
+			return nil
+		}
+		if info.IsDir() {
+			if p == root {
+				return nil
+			}
+			base := filepath.Base(p)
+			for _, ig := range ignored {
+				if base == ig {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(p))
