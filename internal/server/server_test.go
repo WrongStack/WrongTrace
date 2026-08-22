@@ -255,11 +255,20 @@ func TestAPIUnknownRouteIsJSON404NotSPA(t *testing.T) {
 func TestSPAFallback(t *testing.T) {
 	_, _, ts := newTestServer(t)
 
-	// Discover a real asset from the embedded dist so the test does not
-	// depend on a specific content hash.
+	// The SPA contract is CONSISTENCY, not "the React shell": root and
+	// unknown client routes must serve the SAME embedded index.html, and
+	// real assets must be served verbatim. A fresh checkout embeds the
+	// committed placeholder index (no <div id="root">) until `make
+	// build-ui` runs, while a dev working tree may hold the placeholder
+	// index alongside built assets — asserting React markers would fail in
+	// exactly that mixed state.
 	dist, err := WebDistFS()
 	if err != nil {
 		t.Fatalf("embedded dist unavailable: %v", err)
+	}
+	wantIndex, err := fs.ReadFile(dist, "index.html")
+	if err != nil {
+		t.Fatalf("read embedded index.html: %v", err)
 	}
 	entries, err := fs.ReadDir(dist, "assets")
 	if err != nil || len(entries) == 0 {
@@ -281,8 +290,8 @@ func TestSPAFallback(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d", resp.StatusCode)
 		}
-		if !strings.Contains(body, `<div id="root">`) {
-			t.Errorf("root document is not the React index.html: %.120s", body)
+		if body != string(wantIndex) {
+			t.Errorf("root document differs from the embedded index.html (%d vs %d bytes)", len(body), len(wantIndex))
 		}
 	})
 
@@ -291,7 +300,7 @@ func TestSPAFallback(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("asset %s: status = %d", asset, resp.StatusCode)
 		}
-		if strings.Contains(body, `<div id="root">`) {
+		if body == string(wantIndex) {
 			t.Errorf("asset request returned index.html instead of the asset")
 		}
 		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "javascript") {
@@ -306,8 +315,8 @@ func TestSPAFallback(t *testing.T) {
 				t.Errorf("%s: status = %d, want 200 (SPA fallback)", route, resp.StatusCode)
 				continue
 			}
-			if !strings.Contains(body, `<div id="root">`) {
-				t.Errorf("%s: fallback did not serve index.html", route)
+			if body != string(wantIndex) {
+				t.Errorf("%s: fallback did not serve the embedded index.html", route)
 			}
 		}
 	})
