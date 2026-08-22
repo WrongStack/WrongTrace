@@ -17,7 +17,8 @@ all: build
 
 build: build-ui build-go
 
-# Build the React frontend into web/dist/. Requires Node.js 18+.
+# Build the React frontend into web/dist. Requires Node.js 20.19+/22.12+
+# (vite 8 engines floor; Rolldown requires the newer V8/Node API surface).
 build-ui:
 	cd web && npm install && npm run build
 
