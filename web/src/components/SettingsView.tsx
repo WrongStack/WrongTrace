@@ -169,7 +169,7 @@ export function SettingsView() {
   const handleVacuum = async () => {
     setIsVacuuming(true);
     try {
-      await fetch('/api/db/vacuum', { method: 'POST' });
+      await fetch('/api/settings/vacuum', { method: 'POST' });
       setVacuumMsg('Database optimized and pages reclaimed!');
       setTimeout(() => setVacuumMsg(null), 4000);
     } catch (err) {
@@ -182,7 +182,7 @@ export function SettingsView() {
   const handlePrune = async () => {
     setIsPruning(true);
     try {
-      const res = await fetch('/api/db/clear-stale', {
+      const res = await fetch('/api/settings/clear-stale', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ days: 30 }),

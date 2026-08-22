@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,10 @@ import (
 
 	"github.com/wrongstack/wrongtrace/internal/db"
 )
+
+// ErrProjectNotFound is returned by project operations that reference an
+// unknown project ID. HTTP callers map it to 404 (see server handlers).
+var ErrProjectNotFound = errors.New("project not found")
 
 // ProjectProfile represents a monitored workspace/repository with its dedicated SQLite DB,
 // agent session log paths, and auto-discovered agent statistics.
@@ -90,10 +95,9 @@ func (e *Engine) GetActiveProject() *ProjectProfile {
 // SwitchActiveProject marks a project as active and switches the active database context.
 func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 	e.lockMu.Lock()
-	defer e.lockMu.Unlock()
-
 	target, ok := e.projects[id]
 	if !ok {
+		e.lockMu.Unlock()
 		return nil, fmt.Errorf("project not found: %s", id)
 	}
 
@@ -105,6 +109,29 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 	target.IsActive = true
 	e.projects[id] = target
 	e.cfg.RepoName = target.Name
+	SaveProjectsIndex(e.projects)
+	watcher := e.watcher
+	e.lockMu.Unlock()
+
+	// Hot-swap database to target project's dedicated SQLite store
+	if target.DBPath != "" {
+		if newStore, err := db.Open(target.DBPath); err == nil {
+			_ = newStore.Migrate()
+			e.lockMu.Lock()
+			e.cfg.Store = newStore
+			e.lockMu.Unlock()
+		}
+	}
+
+	// Re-prime AST and watcher for target workspace directory
+	if target.Path != "" {
+		go e.PrimeDirectory(target.Path)
+		if watcher != nil {
+			_ = watcher.AddWatchDir(target.Path)
+		}
+	}
+
+	e.hub.Broadcast(WSEvent{Type: "project_switched", Payload: target})
 
 	return &target, nil
 }
@@ -213,9 +240,12 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	_ = os.MkdirAll(storageDir, 0o755)
 	dbPath := filepath.Join(storageDir, "wrongtrace.db")
 
-	// Ensure dedicated per-project SQLite database is initialized with migrations
+	// Ensure dedicated per-project SQLite database is initialized with migrations.
+	// The handle is opened only to apply the schema; keeping it open would leak
+	// a connection (and on Windows, lock the file) for every project ever added.
 	if projStore, err := db.Open(dbPath); err == nil {
 		_ = projStore.Migrate()
+		_ = projStore.Close()
 	}
 
 	// Auto-discover agent session paths and language
@@ -292,7 +322,7 @@ func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 
 	existing, ok := e.projects[p.ID]
 	if !ok {
-		return ProjectProfile{}, fmt.Errorf("project not found: %s", p.ID)
+		return ProjectProfile{}, fmt.Errorf("%w: %s", ErrProjectNotFound, p.ID)
 	}
 
 	if p.Name != "" {

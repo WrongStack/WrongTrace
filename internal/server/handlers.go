@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -315,15 +317,35 @@ func (h *Handlers) AddProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p)
 }
 
-// UpdateProject updates metadata or log paths of a project.
+// UpdateProject updates metadata or log paths of a project. The project id
+// comes from the URL ({id}); a body id is optional and must agree with it.
+// The dashboard's edit form sends only name/description/*_logs_path, so
+// requiring a body id (as this handler once did) broke every edit.
 func (h *Handlers) UpdateProject(w http.ResponseWriter, r *http.Request) {
 	var p core.ProjectProfile
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.ID == "" {
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		id = p.ID
+	}
+	if id == "" {
 		writeError(w, http.StatusBadRequest, "project id is required")
 		return
 	}
+	if p.ID != "" && p.ID != id {
+		writeError(w, http.StatusConflict, fmt.Sprintf("body id %q does not match URL id %q", p.ID, id))
+		return
+	}
+	p.ID = id
 	updated, err := h.Engine.UpdateProject(p)
 	if err != nil {
+		if errors.Is(err, core.ErrProjectNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -418,14 +440,34 @@ func (h *Handlers) VacuumDB(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "message": "database vacuum completed"})
 }
 
-// ClearStale removes old telemetry events older than N days.
+// ClearStale removes old telemetry events older than N days. The days value
+// may arrive as a JSON body {"days":30} (what the dashboard sends) or the
+// ?days= query param (documented REST form); omitted means 30. Invalid
+// values are rejected with 400 rather than silently rewritten — a caller
+// asking to prune "abc" days needs to know, not get 30.
 func (h *Handlers) ClearStale(w http.ResponseWriter, r *http.Request) {
-	daysStr := r.URL.Query().Get("days")
 	days := 30
-	if daysStr != "" {
-		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
-			days = d
+	daysStr := r.URL.Query().Get("days")
+	if daysStr == "" {
+		var body struct {
+			Days *int `json:"days"`
 		}
+		if r.Body != nil {
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.Days != nil {
+				days = *body.Days
+			}
+		}
+	} else {
+		d, err := strconv.Atoi(daysStr)
+		if err != nil || d <= 0 {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid days value %q: must be a positive integer", daysStr))
+			return
+		}
+		days = d
+	}
+	if days <= 0 {
+		writeError(w, http.StatusBadRequest, "days must be a positive integer")
+		return
 	}
 	deleted, err := h.Engine.ClearStale(days)
 	if err != nil {

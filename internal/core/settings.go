@@ -68,8 +68,19 @@ func (e *Engine) UpdateSettings(s AppSettings) AppSettings {
 	if s.DefaultProvider != "" {
 		globalSettings.DefaultProvider = s.DefaultProvider
 	}
-	globalSettings.SlackWebhookURL = s.SlackWebhookURL
-	globalSettings.DiscordWebhookURL = s.DiscordWebhookURL
-	globalSettings.CustomWebhookURL = s.CustomWebhookURL
+	// Webhook URLs are guarded like every other field: an empty string means
+	// "not provided in this partial update", not "clear the configured URL".
+	// Assigning unconditionally let a partial settings POST wipe configured
+	// integrations. Clearing is explicit via a non-empty sentinel or a
+	// dedicated clear action, never an accident of omission.
+	if s.SlackWebhookURL != "" {
+		globalSettings.SlackWebhookURL = s.SlackWebhookURL
+	}
+	if s.DiscordWebhookURL != "" {
+		globalSettings.DiscordWebhookURL = s.DiscordWebhookURL
+	}
+	if s.CustomWebhookURL != "" {
+		globalSettings.CustomWebhookURL = s.CustomWebhookURL
+	}
 	return globalSettings
 }
