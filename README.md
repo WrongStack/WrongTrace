@@ -38,6 +38,11 @@ echo '{"jsonrpc":"2.0","method":"telemetry/report_run","params":{"run_id":"r1","
 make run-mcp
 ```
 
+**Connecting agents and other projects** — MCP registration per client (Claude
+Code, Cursor, Windsurf, Cline), the IPC socket protocol, the REST API, and the
+recommended per-task workflow are documented in
+[docs/integrations.md](docs/integrations.md).
+
 ## CLI
 
 | Command            | What it does                                                          |
