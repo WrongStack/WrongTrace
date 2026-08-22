@@ -34,6 +34,8 @@ type RPCError struct {
 type TelemetryReport struct {
 	RunID            string  `json:"run_id"`
 	TaskID           string  `json:"task_id"`
+	ProjectID        string  `json:"project_id,omitempty"`
+	ProjectSlug      string  `json:"project_slug,omitempty"`
 	AgentName        string  `json:"agent_name"`
 	ModelName        string  `json:"model_name"`
 	Provider         string  `json:"provider"`

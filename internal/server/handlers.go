@@ -3,18 +3,20 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/models"
+	"github.com/wrongstack/wrongtrace/internal/proxy"
 )
 
 // Handlers holds the dependencies the route handlers need.
 type Handlers struct {
-	Engine EngineAPI
-	// SocketPath is the daemon's IPC endpoint as configured at startup;
-	// empty when IPC is disabled. Surfaced by /api/health.
+	Engine     EngineAPI
+	Proxy      *proxy.GatewayProxy
 	SocketPath string
 }
 
@@ -193,3 +195,247 @@ func reqToModelInfo(id, name, provider, desc string, inPrice, outPrice, cachePri
 		IsCustom:           true,
 	}
 }
+
+// CheckGuardrail assesses file safety before an AI agent modifies it.
+func (h *Handlers) CheckGuardrail(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeError(w, http.StatusBadRequest, "path query parameter is required")
+		return
+	}
+	res, err := h.Engine.CheckGuardrail(path)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// LockFile locks a file against agent modification.
+func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path   string `json:"path"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
+		writeError(w, http.StatusBadRequest, "path is required in body")
+		return
+	}
+	h.Engine.LockFile(req.Path, req.Reason)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "locked",
+		"path":   req.Path,
+		"reason": req.Reason,
+	})
+}
+
+// UnlockFile removes a lock on a file.
+func (h *Handlers) UnlockFile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
+		writeError(w, http.StatusBadRequest, "path is required in body")
+		return
+	}
+	h.Engine.UnlockFile(req.Path)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "unlocked",
+		"path":   req.Path,
+	})
+}
+
+// ListProxyRoutes returns all configured dynamic gateway routes.
+func (h *Handlers) ListProxyRoutes(w http.ResponseWriter, _ *http.Request) {
+	if h.Proxy == nil || h.Proxy.Routes == nil {
+		writeJSON(w, http.StatusOK, []proxy.ProxyRoute{})
+		return
+	}
+	writeJSON(w, http.StatusOK, h.Proxy.Routes.AllRoutes())
+}
+
+// UpsertProxyRoute creates or updates a dynamic gateway route.
+func (h *Handlers) UpsertProxyRoute(w http.ResponseWriter, r *http.Request) {
+	if h.Proxy == nil || h.Proxy.Routes == nil {
+		writeError(w, http.StatusServiceUnavailable, "proxy service not initialized")
+		return
+	}
+	var route proxy.ProxyRoute
+	if err := json.NewDecoder(r.Body).Decode(&route); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if route.Name == "" || route.PathPrefix == "" || route.TargetUpstream == "" {
+		writeError(w, http.StatusBadRequest, "name, path_prefix, and target_upstream are required")
+		return
+	}
+	saved := h.Proxy.Routes.UpsertRoute(route)
+	writeJSON(w, http.StatusOK, saved)
+}
+
+// DeleteProxyRoute removes a dynamic gateway route.
+func (h *Handlers) DeleteProxyRoute(w http.ResponseWriter, r *http.Request) {
+	if h.Proxy == nil || h.Proxy.Routes == nil {
+		writeError(w, http.StatusServiceUnavailable, "proxy service not initialized")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "route id is required")
+		return
+	}
+	deleted := h.Proxy.Routes.DeleteRoute(id)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"deleted": deleted,
+		"id":      id,
+	})
+}
+
+// ListProjects returns all registered project profiles.
+func (h *Handlers) ListProjects(w http.ResponseWriter, _ *http.Request) {
+	projects := h.Engine.ListProjects()
+	writeJSON(w, http.StatusOK, projects)
+}
+
+// AddProject registers a workspace directory to observe.
+func (h *Handlers) AddProject(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
+		writeError(w, http.StatusBadRequest, "path is required")
+		return
+	}
+	p, err := h.Engine.AddProject(req.Name, req.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// UpdateProject updates metadata or log paths of a project.
+func (h *Handlers) UpdateProject(w http.ResponseWriter, r *http.Request) {
+	var p core.ProjectProfile
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.ID == "" {
+		writeError(w, http.StatusBadRequest, "project id is required")
+		return
+	}
+	updated, err := h.Engine.UpdateProject(p)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// GetProject returns a single project profile by ID.
+func (h *Handlers) GetProject(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "project id is required")
+		return
+	}
+	p, err := h.Engine.GetProject(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// SwitchActiveProject marks a project as the primary active workspace.
+func (h *Handlers) SwitchActiveProject(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "project id is required")
+		return
+	}
+	p, err := h.Engine.SwitchActiveProject(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// ActivateProject is an alias for SwitchActiveProject.
+func (h *Handlers) ActivateProject(w http.ResponseWriter, r *http.Request) {
+	h.SwitchActiveProject(w, r)
+}
+
+// RemoveProject stops monitoring a workspace.
+func (h *Handlers) RemoveProject(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "project id is required")
+		return
+	}
+	if err := h.Engine.RemoveProject(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "removed", "id": id})
+}
+
+// GetSettings returns current application settings.
+func (h *Handlers) GetSettings(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, h.Engine.GetSettings())
+}
+
+// UpdateSettings updates application settings.
+func (h *Handlers) UpdateSettings(w http.ResponseWriter, r *http.Request) {
+	var s core.AppSettings
+	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	updated := h.Engine.UpdateSettings(s)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// SyncModels syncs model definitions and live pricing from models.dev/api.json.
+func (h *Handlers) SyncModels(w http.ResponseWriter, _ *http.Request) {
+	count, err := h.Engine.SyncModelsDev()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to sync models from models.dev: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":  "ok",
+		"synced":  count,
+		"message": "Model catalog synchronized successfully from models.dev",
+	})
+}
+
+// VacuumDB optimizes and defragments the SQLite database.
+func (h *Handlers) VacuumDB(w http.ResponseWriter, _ *http.Request) {
+	if err := h.Engine.VacuumDB(); err != nil {
+		writeError(w, http.StatusInternalServerError, "vacuum failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "message": "database vacuum completed"})
+}
+
+// ClearStale removes old telemetry events older than N days.
+func (h *Handlers) ClearStale(w http.ResponseWriter, r *http.Request) {
+	daysStr := r.URL.Query().Get("days")
+	days := 30
+	if daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
+			days = d
+		}
+	}
+	deleted, err := h.Engine.ClearStale(days)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "clear stale failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":  "ok",
+		"deleted": deleted,
+		"days":    days,
+	})
+}
+

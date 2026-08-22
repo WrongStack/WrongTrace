@@ -9,7 +9,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -48,9 +50,15 @@ type Engine struct {
 	cfg Config
 	hub *Hub
 
-	runMu     sync.Mutex
+	runMu      sync.Mutex
 	activeRuns map[string]runMeta
 	correlate  time.Duration
+
+	lockMu          sync.RWMutex
+	lockedFiles     map[string]bool
+	projects        map[string]ProjectProfile
+	activeProjectID string
+	watcher         WatcherAPI
 }
 
 // runMeta is the metadata kept for an active (or recently-seen) agent run —
@@ -69,11 +77,14 @@ func NewEngine(cfg Config) *Engine {
 	if cfg.RepoName == "" {
 		cfg.RepoName = "default"
 	}
+	loadedProjects := LoadProjectsIndex()
 	return &Engine{
-		cfg:        cfg,
-		hub:        NewHub(),
-		activeRuns: make(map[string]runMeta),
-		correlate:  10 * time.Minute,
+		cfg:         cfg,
+		hub:         NewHub(),
+		activeRuns:  make(map[string]runMeta),
+		correlate:   10 * time.Minute,
+		lockedFiles: make(map[string]bool),
+		projects:    loadedProjects,
 	}
 }
 
@@ -199,6 +210,14 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 		return errors.New("run_id is required")
 	}
 
+	if p.AgentName == "" {
+		if p.ProjectSlug != "" || p.ProjectID != "" {
+			p.AgentName = "WrongStack"
+		} else {
+			p.AgentName = "Agent"
+		}
+	}
+
 	// Auto-compute cost if not explicitly passed by agent but tokens are provided
 	if p.CostUSD <= 0 && (p.PromptTokens > 0 || p.CompletionTokens > 0) {
 		p.CostUSD = models.Global.CalculateCost(p.ModelName, p.PromptTokens, p.CompletionTokens)
@@ -245,6 +264,27 @@ func (e *Engine) UpsertModel(m models.ModelInfo) {
 // CalculateCost computes total dollar spend from tokens for a specific model.
 func (e *Engine) CalculateCost(model string, promptTokens, completionTokens int64) float64 {
 	return models.Global.CalculateCost(model, promptTokens, completionTokens)
+}
+
+// SyncModelsDev fetches live model pricing from models.dev/api.json and merges it into the registry.
+func (e *Engine) SyncModelsDev() (int, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get("https://models.dev/api.json")
+	if err != nil {
+		return 0, fmt.Errorf("fetch models.dev: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("models.dev returned status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("read response body: %w", err)
+	}
+
+	return models.Global.ImportModelsDevJSON(data)
 }
 
 // ReportRunMCP adapts the MCP tool's flat arguments into a full run record,

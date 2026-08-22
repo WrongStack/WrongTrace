@@ -78,3 +78,27 @@ export function useModelCatalog() {
     staleTime: 60_000,
   });
 }
+
+export function useProxyRoutes() {
+  return useQuery<import('../types').ProxyRoute[]>({
+    queryKey: ['proxy_routes'],
+    queryFn: () => jget<import('../types').ProxyRoute[]>(`${base}/proxy/routes`),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useProjects() {
+  return useQuery<import('../types').Project[]>({
+    queryKey: ['projects'],
+    queryFn: () => jget<import('../types').Project[]>(`${base}/projects`),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useSettings() {
+  return useQuery<import('../types').AppSettings>({
+    queryKey: ['app_settings'],
+    queryFn: () => jget<import('../types').AppSettings>(`${base}/settings`),
+    staleTime: 60_000,
+  });
+}

@@ -136,6 +136,7 @@ export interface AtlasFile {
 export interface AtlasPackage {
   path: string;
   name: string;
+  workspace?: string;
   files: AtlasFile[];
   total_loc: number;
   is_fragile: boolean;
@@ -144,6 +145,8 @@ export interface AtlasPackage {
 export interface AtlasSnapshot {
   repo: string;
   generated_at: string;
+  is_monorepo?: boolean;
+  workspaces?: string[];
   packages: AtlasPackage[];
   total_files: number;
   total_loc: number;
@@ -168,3 +171,59 @@ export interface CalculateCostResponse {
   completion_tokens: number;
   total_cost_usd: number;
 }
+
+export interface ProxyRoute {
+  id: string;
+  name: string;
+  path_prefix: string;
+  target_upstream: string;
+  protocol_type: 'openai' | 'openai-compatible' | 'anthropic' | 'gemini' | 'custom';
+  default_model?: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  path: string;
+  description?: string;
+  is_active: boolean;
+  created_at: string;
+  db_path?: string;
+  primary_language?: string;
+  discovered_sessions?: {
+    wrongstack?: number;
+    claude_code?: number;
+    cline?: number;
+    cursor?: number;
+    aider?: number;
+    antigravity?: number;
+  };
+  custom_logs_path?: string;
+  claude_logs_path?: string;
+  cursor_logs_path?: string;
+  cline_logs_path?: string;
+  aider_logs_path?: string;
+  wrongstack_logs_path?: string;
+}
+
+export interface AppSettings {
+  auto_vacuum_enabled?: boolean;
+  retention_days?: number;
+  enable_webhook_alerts?: boolean;
+  webhook_url?: string;
+  webhook_type?: 'slack' | 'discord' | 'custom';
+  debounce_ms?: number;
+  thrashing_threshold?: number;
+  fragility_cutoff?: number;
+  cost_alert_usd?: number;
+  auto_prune_days?: number;
+  default_provider?: string;
+  slack_webhook_url?: string;
+  discord_webhook_url?: string;
+  custom_webhook_url?: string;
+  ignore_patterns?: string[];
+  db_path?: string;
+}
+

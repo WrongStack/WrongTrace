@@ -8,6 +8,8 @@ import { ROIAnalysis } from '../components/ROIAnalysis';
 import { CodeAtlas } from '../components/CodeAtlas';
 import { DiffInspectorView } from '../components/DiffInspectorView';
 import { AgentSessionsView } from '../components/AgentSessionsView';
+import { ProxyRoutingView } from '../components/ProxyRoutingView';
+import { SettingsView } from '../components/SettingsView';
 import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas } from '../hooks/useMetrics';
 import { useWebSocket } from '../hooks/useWebSocket';
 
@@ -16,7 +18,7 @@ import { useWebSocket } from '../hooks/useWebSocket';
 // WebSocket subscription. The WebSocket hook supplies incremental updates;
 // React Query handles full snapshot refetch on focus / interval.
 export function Dashboard() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'atlas' | 'diffs' | 'sessions'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'gateway' | 'settings'>('dashboard');
 
   const overview = useOverview();
   const thrashing = useThrashing();
@@ -104,8 +106,17 @@ export function Dashboard() {
             activeRuns={overview.data?.active_runs ?? []}
             models={models.data ?? []}
             overview={overview.data?.overview}
+            recentEvents={recent.data ?? []}
             loading={overview.isLoading}
           />
+        )}
+
+        {activeTab === 'gateway' && (
+          <ProxyRoutingView />
+        )}
+
+        {activeTab === 'settings' && (
+          <SettingsView />
         )}
 
         <footer className="text-xs text-slate-500 pt-4 pb-8">

@@ -18,18 +18,21 @@ import {
   Calculator,
   Sliders,
   Check,
+  Code2,
 } from 'lucide-react';
-import type { ActiveRun, ModelRow, Overview, ModelInfo } from '../types';
+import { RichDiffViewer } from './RichDiffViewer';
+import type { ActiveRun, ModelRow, Overview, ModelInfo, EventRecord } from '../types';
 import { useModelCatalog } from '../hooks/useMetrics';
 
 interface AgentSessionsViewProps {
   activeRuns: ActiveRun[];
   models: ModelRow[];
   overview?: Overview;
+  recentEvents?: EventRecord[];
   loading: boolean;
 }
 
-export function AgentSessionsView({ activeRuns, models, overview, loading }: AgentSessionsViewProps) {
+export function AgentSessionsView({ activeRuns, models, overview, recentEvents = [], loading }: AgentSessionsViewProps) {
   const [search, setSearch] = useState('');
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [activeSubTab, setActiveSubTab] = useState<'sessions' | 'catalog' | 'calculator'>('sessions');
@@ -318,6 +321,42 @@ export function AgentSessionsView({ activeRuns, models, overview, loading }: Age
                       </div>
                     </div>
                   </div>
+
+                  {/* Session Code Mutations & Diffs */}
+                  {(() => {
+                    const sessionDiffs = recentEvents.filter(
+                      (e) => (e.run_id === selectedRun.run_id || selectedRun.agent_name === 'WrongStack') && !!e.diff_snippet
+                    );
+                    if (sessionDiffs.length === 0) return null;
+                    return (
+                      <div className="space-y-2 pt-2 border-t border-white/5">
+                        <div className="flex items-center justify-between text-xs text-slate-400">
+                          <span className="font-semibold flex items-center gap-1.5 text-slate-300">
+                            <Code2 className="h-3.5 w-3.5 text-accent" />
+                            Code Changes Produced in this Session ({sessionDiffs.length})
+                          </span>
+                        </div>
+                        <div className="space-y-2">
+                          {sessionDiffs.slice(0, 5).map((diffEv) => (
+                            <div key={diffEv.event_id} className="space-y-1">
+                              <div className="text-[11px] font-mono text-cyan-300 truncate">
+                                {diffEv.file_path} :: {diffEv.node_signature}
+                              </div>
+                              <RichDiffViewer
+                                diff={diffEv.diff_snippet}
+                                filePath={diffEv.file_path}
+                                signature={diffEv.node_signature}
+                                action={diffEv.action}
+                                startLine={diffEv.start_line}
+                                endLine={diffEv.end_line}
+                                maxHeight="180px"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   <div className="p-3 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-200 text-[11px] space-y-1">
                     <div className="font-semibold flex items-center gap-1.5">

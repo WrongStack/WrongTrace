@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"sync"
@@ -302,4 +303,82 @@ func normalizeModelID(id string) string {
 	}
 	s = strings.ReplaceAll(s, ".", "-")
 	return s
+}
+
+// ImportModelsDevJSON parses raw JSON from models.dev/api.json and merges all models into the registry.
+func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var arrayFormat []struct {
+		ID                 string  `json:"id"`
+		Name               string  `json:"name"`
+		Provider           string  `json:"provider"`
+		InputPrice         float64 `json:"input_price"`
+		OutputPrice        float64 `json:"output_price"`
+		InputPricePerM     float64 `json:"input_price_per_m"`
+		OutputPricePerM    float64 `json:"output_price_per_m"`
+		CacheReadPricePerM float64 `json:"cache_read_price_per_m"`
+		ContextWindow      int     `json:"context_window"`
+		Description        string  `json:"description"`
+	}
+
+	count := 0
+	if err := json.Unmarshal(data, &arrayFormat); err == nil && len(arrayFormat) > 0 {
+		for _, item := range arrayFormat {
+			if item.ID == "" {
+				continue
+			}
+			inPrice := item.InputPricePerM
+			if inPrice == 0 && item.InputPrice > 0 {
+				inPrice = item.InputPrice * 1e6
+			}
+			outPrice := item.OutputPricePerM
+			if outPrice == 0 && item.OutputPrice > 0 {
+				outPrice = item.OutputPrice * 1e6
+			}
+			norm := normalizeModelID(item.ID)
+			r.models[norm] = ModelInfo{
+				ID:                 norm,
+				Name:               item.Name,
+				Provider:           item.Provider,
+				InputPricePerM:     inPrice,
+				OutputPricePerM:    outPrice,
+				CacheReadPricePerM: item.CacheReadPricePerM,
+				ContextWindow:      item.ContextWindow,
+				Description:        item.Description,
+				IsCustom:           false,
+			}
+			count++
+		}
+		return count, nil
+	}
+
+	var mapFormat map[string]interface{}
+	if err := json.Unmarshal(data, &mapFormat); err != nil {
+		return 0, err
+	}
+
+	for k, v := range mapFormat {
+		if subMap, ok := v.(map[string]interface{}); ok {
+			norm := normalizeModelID(k)
+			info := ModelInfo{ID: norm, Name: k, Provider: "Custom"}
+			if name, ok := subMap["name"].(string); ok {
+				info.Name = name
+			}
+			if prov, ok := subMap["provider"].(string); ok {
+				info.Provider = prov
+			}
+			if inP, ok := subMap["input_price_per_m"].(float64); ok {
+				info.InputPricePerM = inP
+			}
+			if outP, ok := subMap["output_price_per_m"].(float64); ok {
+				info.OutputPricePerM = outP
+			}
+			r.models[norm] = info
+			count++
+		}
+	}
+
+	return count, nil
 }

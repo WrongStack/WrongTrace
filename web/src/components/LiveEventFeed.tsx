@@ -12,6 +12,7 @@ import {
   Copy,
   Check,
 } from 'lucide-react';
+import { RichDiffViewer } from './RichDiffViewer';
 import type { EventRecord } from '../types';
 
 interface LiveEventFeedProps {
@@ -199,57 +200,17 @@ export function LiveEventFeed({ events, loading }: LiveEventFeedProps) {
               {isExpanded && (
                 <div
                   onClick={(evt) => evt.stopPropagation()}
-                  className="mt-2 ml-6 rounded-lg bg-[#0a0e14] border border-white/10 overflow-hidden text-xs"
+                  className="mt-2.5 ml-6"
                 >
-                  <div className="px-3 py-1.5 bg-slate-900/90 border-b border-white/5 flex items-center justify-between">
-                    <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono">
-                      <Code2 className="h-3.5 w-3.5 text-accent" />
-                      <span>Code Diff ({e.action})</span>
-                      {startLine > 0 && <span>· Lines {startLine} - {endLine}</span>}
-                    </div>
-                    {hasDiff && (
-                      <button
-                        onClick={(evt) => handleCopy(e.event_id, e.diff_snippet ?? '', evt)}
-                        className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-white px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 border border-white/5"
-                      >
-                        {copiedId === e.event_id ? (
-                          <>
-                            <Check className="h-3 w-3 text-emerald-400" />
-                            <span>Copied</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="h-3 w-3" />
-                            <span>Copy Diff</span>
-                          </>
-                        )}
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="p-3 max-h-64 overflow-y-auto font-mono text-[11px] leading-relaxed space-y-0.5 select-text">
-                    {hasDiff ? (
-                      e.diff_snippet?.split('\n').map((line, idx) => {
-                        const isAdd = line.startsWith('+ ');
-                        const isDel = line.startsWith('- ');
-                        const lineClass = isAdd
-                          ? 'text-emerald-400 bg-emerald-500/10 -mx-3 px-3 py-0.5 border-l-2 border-emerald-500'
-                          : isDel
-                          ? 'text-red-400 bg-red-500/10 -mx-3 px-3 py-0.5 border-l-2 border-red-500'
-                          : 'text-slate-300 px-1 py-0.5';
-
-                        return (
-                          <div key={idx} className={lineClass}>
-                            {line}
-                          </div>
-                        );
-                      })
-                    ) : (
-                      <div className="text-slate-500 italic">
-                        No inline code snippet available for this event.
-                      </div>
-                    )}
-                  </div>
+                  <RichDiffViewer
+                    diff={e.diff_snippet}
+                    filePath={e.file_path}
+                    signature={e.node_signature}
+                    action={e.action}
+                    startLine={startLine}
+                    endLine={endLine}
+                    maxHeight="260px"
+                  />
                 </div>
               )}
             </li>

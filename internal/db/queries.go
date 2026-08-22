@@ -391,6 +391,47 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 	return out, nil
 }
 
+// AllFilesHealth queries health scores for all churned files in a single fast query.
+func (s *Store) AllFilesHealth() (map[string]FileHealth, error) {
+	out := make(map[string]FileHealth)
+	rows, err := s.db.QueryContext(context.Background(), `
+		SELECT file_path, COUNT(*), COUNT(DISTINCT node_signature)
+		FROM code_node_events
+		WHERE event_time >= datetime('now', '-1 day')
+		GROUP BY file_path
+	`)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var path string
+		var edits, sigs int
+		if err := rows.Scan(&path, &edits, &sigs); err != nil {
+			continue
+		}
+		penalty := edits * 8
+		if sigs >= 3 {
+			penalty += 5
+		}
+		if penalty > 100 {
+			penalty = 100
+		}
+		fh := FileHealth{
+			FilePath:             path,
+			HealthScore:          100 - penalty,
+			RecentThrashingCount: edits,
+		}
+		if edits >= 5 {
+			fh.IsFragile = true
+			fh.Warning = fmt.Sprintf("%d edits in the last 24h across %d signatures", edits, sigs)
+		}
+		out[path] = fh
+	}
+	return out, nil
+}
+
 // NodeStat captures aggregate historical stats for a single node signature.
 type NodeStat struct {
 	Signature   string    `json:"node_signature"`

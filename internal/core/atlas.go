@@ -16,6 +16,8 @@ import (
 type AtlasSnapshot struct {
 	Repo        string         `json:"repo"`
 	GeneratedAt time.Time      `json:"generated_at"`
+	IsMonorepo  bool           `json:"is_monorepo"`
+	Workspaces  []string       `json:"workspaces,omitempty"`
 	Packages    []AtlasPackage `json:"packages"`
 	TotalFiles  int            `json:"total_files"`
 	TotalLOC    int            `json:"total_loc"`
@@ -26,6 +28,7 @@ type AtlasSnapshot struct {
 type AtlasPackage struct {
 	Path      string      `json:"path"` // e.g. "internal/ast", "web/src/components", "."
 	Name      string      `json:"name"` // e.g. "ast", "components", "root"
+	Workspace string      `json:"workspace,omitempty"` // Monorepo scope e.g. "apps/web", "packages/core", "internal"
 	Files     []AtlasFile `json:"files"`
 	TotalLOC  int         `json:"total_loc"`
 	IsFragile bool        `json:"is_fragile"`
@@ -99,11 +102,16 @@ func (e *Engine) Atlas() (AtlasSnapshot, error) {
 	}
 
 	var nodeStats map[string]db.NodeStat
+	var allHealth map[string]db.FileHealth
 	if e.cfg.Store != nil {
 		nodeStats, _ = e.cfg.Store.AllNodeStats()
+		allHealth, _ = e.cfg.Store.AllFilesHealth()
 	}
 	if nodeStats == nil {
 		nodeStats = make(map[string]db.NodeStat)
+	}
+	if allHealth == nil {
+		allHealth = make(map[string]db.FileHealth)
 	}
 
 	var snapshots map[string]*ast.FileSnapshot
@@ -131,10 +139,11 @@ func (e *Engine) Atlas() (AtlasSnapshot, error) {
 		pkg, exists := pkgMap[dir]
 		if !exists {
 			pkg = &AtlasPackage{
-				Path:     dir,
-				Name:     pkgName,
-				Files:    []AtlasFile{},
-				TotalLOC: 0,
+				Path:      dir,
+				Name:      pkgName,
+				Workspace: resolveWorkspace(dir),
+				Files:     []AtlasFile{},
+				TotalLOC:  0,
 			}
 			pkgMap[dir] = pkg
 		}
@@ -148,15 +157,13 @@ func (e *Engine) Atlas() (AtlasSnapshot, error) {
 			Symbols:     []AtlasSymbol{},
 		}
 
-		// Calculate file health from store if available
-		if e.cfg.Store != nil {
-			if h, err := e.cfg.Store.FileHealth(relPath); err == nil {
-				af.HealthScore = h.HealthScore
-				af.IsFragile = h.IsFragile
-				af.RecentThrashingCount = h.RecentThrashingCount
-				if h.IsFragile {
-					pkg.IsFragile = true
-				}
+		// Fast in-memory health lookup from batch query
+		if h, ok := allHealth[relPath]; ok {
+			af.HealthScore = h.HealthScore
+			af.IsFragile = h.IsFragile
+			af.RecentThrashingCount = h.RecentThrashingCount
+			if h.IsFragile {
+				pkg.IsFragile = true
 			}
 		}
 
@@ -204,15 +211,43 @@ func (e *Engine) Atlas() (AtlasSnapshot, error) {
 	}
 	sort.Strings(pkgPaths)
 
+	workspaceSet := make(map[string]struct{})
 	for _, p := range pkgPaths {
 		pkg := pkgMap[p]
 		sort.Slice(pkg.Files, func(i, j int) bool {
 			return pkg.Files[i].Name < pkg.Files[j].Name
 		})
+		if pkg.Workspace != "" && pkg.Workspace != "root" {
+			workspaceSet[pkg.Workspace] = struct{}{}
+		}
 		snap.Packages = append(snap.Packages, *pkg)
 	}
 
+	if len(workspaceSet) >= 2 {
+		snap.IsMonorepo = true
+		snap.Workspaces = make([]string, 0, len(workspaceSet))
+		for ws := range workspaceSet {
+			snap.Workspaces = append(snap.Workspaces, ws)
+		}
+		sort.Strings(snap.Workspaces)
+	}
+
 	return snap, nil
+}
+
+func resolveWorkspace(dir string) string {
+	clean := filepath.ToSlash(filepath.Clean(dir))
+	parts := strings.Split(clean, "/")
+	if len(parts) == 0 || parts[0] == "." || parts[0] == "root" {
+		return "root"
+	}
+	if len(parts) >= 2 {
+		first := parts[0]
+		if first == "packages" || first == "apps" || first == "services" || first == "libs" || first == "modules" {
+			return parts[0] + "/" + parts[1]
+		}
+	}
+	return parts[0]
 }
 
 func symbolShortName(sig string) string {

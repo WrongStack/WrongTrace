@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useDeferredValue } from 'react';
 import {
   ReactFlow,
   Controls,
@@ -32,7 +32,15 @@ import {
   Activity,
   Maximize2,
   RefreshCw,
+  ChevronRight,
+  ChevronDown,
+  FolderOpen,
+  ArrowLeft,
+  Compass,
+  Circle,
+  GitFork,
 } from 'lucide-react';
+import { RichDiffViewer } from './RichDiffViewer';
 import type { AtlasSnapshot, AtlasPackage, AtlasFile, AtlasSymbol, EventRecord } from '../types';
 
 interface CodeAtlasProps {
@@ -45,6 +53,49 @@ interface CodeAtlasProps {
 // ----------------------------------------------------
 // Custom React Flow Nodes
 // ----------------------------------------------------
+
+interface RootProjectNodeData extends Record<string, unknown> {
+  repo: string;
+  isMonorepo?: boolean;
+  workspacesCount?: number;
+  totalPackages: number;
+  totalFiles: number;
+  totalLOC: number;
+}
+
+function RootProjectNode({ data }: NodeProps<Node<RootProjectNodeData>>) {
+  const { repo, isMonorepo, workspacesCount, totalPackages, totalFiles, totalLOC } = data;
+  return (
+    <div className="px-5 py-4 rounded-2xl border border-accent/40 bg-gradient-to-br from-slate-900/95 via-indigo-950/40 to-slate-900/95 shadow-2xl backdrop-blur-xl min-w-[270px]">
+      <div className="flex items-center justify-between gap-2.5">
+        <div className="flex items-center gap-2.5">
+          <div className="p-2 rounded-xl bg-accent/20 text-accent shadow-inner border border-accent/30">
+            <Boxes className="h-5 w-5" />
+          </div>
+          <div>
+            <div className="text-[10px] uppercase font-mono tracking-wider text-accent font-semibold flex items-center gap-1.5">
+              {isMonorepo ? 'Monorepo Root' : 'Project Root'}
+            </div>
+            <div className="font-bold text-sm tracking-tight text-white">{repo || 'Workspace'}</div>
+          </div>
+        </div>
+        {isMonorepo && (
+          <span className="chip bg-purple-500/15 text-purple-300 border border-purple-500/30 text-[10px] font-mono font-semibold">
+            {workspacesCount} Workspaces
+          </span>
+        )}
+      </div>
+      <div className="mt-3 pt-2.5 border-t border-white/10 flex items-center justify-between text-xs text-slate-300 font-mono">
+        <span>{totalPackages} packages</span>
+        <span>·</span>
+        <span>{totalFiles} files</span>
+        <span>·</span>
+        <span className="text-accent font-semibold">{totalLOC.toLocaleString()} LOC</span>
+      </div>
+      <Handle type="source" position={Position.Right} className="!bg-accent !w-2.5 !h-2.5" />
+    </div>
+  );
+}
 
 interface PackageNodeData extends Record<string, unknown> {
   pkg: AtlasPackage;
@@ -69,7 +120,14 @@ function PackageNode({ data }: NodeProps<Node<PackageNodeData>>) {
             <Folder className="h-4 w-4" />
           </div>
           <div>
-            <div className="font-semibold text-xs tracking-tight text-white">{pkg.name}</div>
+            <div className="flex items-center gap-1.5">
+              <span className="font-semibold text-xs tracking-tight text-white">{pkg.name}</span>
+              {pkg.workspace && pkg.workspace !== 'root' && (
+                <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-mono">
+                  {pkg.workspace}
+                </span>
+              )}
+            </div>
             <div className="text-[10px] text-slate-400 font-mono truncate max-w-[140px]" title={pkg.path}>
               {pkg.path}
             </div>
@@ -212,6 +270,7 @@ function SymbolNode({ data }: NodeProps<Node<SymbolNodeData>>) {
 }
 
 const nodeTypes = {
+  rootProjectNode: RootProjectNode,
   packageNode: PackageNode,
   fileNode: FileNode,
   symbolNode: SymbolNode,
@@ -224,8 +283,11 @@ const nodeTypes = {
 export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlasProps) {
   const [viewMode, setViewMode] = useState<'graph' | 'tree'>('graph');
   const [searchQuery, setSearchQuery] = useState('');
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string>('all');
   const [selectedKind, setSelectedKind] = useState<string>('all');
   const [selectedFilter, setSelectedFilter] = useState<'all' | 'fragile' | 'modified'>('all');
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['.']));
+  const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
   const [selectedItem, setSelectedItem] = useState<{
     type: 'package' | 'file' | 'symbol';
     pkg?: AtlasPackage;
@@ -233,12 +295,57 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
     symbol?: AtlasSymbol;
   } | null>(null);
 
+  const toggleFolder = (path: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const toggleFile = (path: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setExpandedFiles((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const expandAll = () => {
+    if (!atlas?.packages) return;
+    const folders = new Set<string>();
+    const files = new Set<string>();
+    atlas.packages.forEach((p) => {
+      folders.add(p.path);
+      p.files.forEach((f) => files.add(f.path));
+    });
+    setExpandedFolders(folders);
+    setExpandedFiles(files);
+  };
+
+  const collapseAll = () => {
+    setExpandedFolders(new Set());
+    setExpandedFiles(new Set());
+  };
+
+  const deferredQuery = useDeferredValue(searchQuery);
+
   // Filtered packages, files, symbols
   const filteredPackages = useMemo(() => {
     if (!atlas?.packages) return [];
-    const q = searchQuery.toLowerCase().trim();
+    const q = deferredQuery.toLowerCase().trim();
 
     return atlas.packages
+      .filter((pkg) => {
+        if (selectedWorkspace !== 'all' && pkg.workspace !== selectedWorkspace) {
+          return false;
+        }
+        return true;
+      })
       .map((pkg) => {
         const filteredFiles = pkg.files
           .map((file) => {
@@ -276,41 +383,247 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
         return { ...pkg, files: filteredFiles };
       })
       .filter((p): p is AtlasPackage => p !== null);
-  }, [atlas, searchQuery, selectedKind, selectedFilter]);
+  }, [atlas, deferredQuery, selectedWorkspace, selectedKind, selectedFilter]);
 
-  // Layout React Flow Nodes & Edges
+  const [focusedScope, setFocusedScope] = useState<
+    | { level: 'all' }
+    | { level: 'package'; pkg: AtlasPackage }
+    | { level: 'file'; pkg: AtlasPackage; file: AtlasFile }
+  >({ level: 'all' });
+
+  const [graphLayout, setGraphLayout] = useState<'radial' | 'tree' | 'grid'>('radial');
+
+  // Layout React Flow Nodes & Edges (Supporting Radial / Orbit, Hierarchical Tree, and Grid)
   const { nodes, edges } = useMemo(() => {
     const nList: Node[] = [];
     const eList: Edge[] = [];
 
-    let currentY = 50;
-    const PKG_X = 50;
-    const FILE_X = 380;
-    const SYM_X = 700;
+    const handleSelectPkg = (pkg: AtlasPackage) => {
+      setSelectedItem({ type: 'package', pkg });
+      setFocusedScope({ level: 'package', pkg });
+    };
 
-    const handleSelectPkg = (pkg: AtlasPackage) => setSelectedItem({ type: 'package', pkg });
-    const handleSelectFile = (file: AtlasFile) => setSelectedItem({ type: 'file', file });
-    const handleSelectSymbol = (symbol: AtlasSymbol, file: AtlasFile) =>
+    const handleSelectFile = (file: AtlasFile, pkg?: AtlasPackage) => {
+      setSelectedItem({ type: 'file', file });
+      const parentPkg = pkg || (focusedScope.level !== 'all' ? focusedScope.pkg : filteredPackages.find((p) => p.files.some((f) => f.path === file.path)));
+      if (parentPkg) {
+        setFocusedScope({ level: 'file', pkg: parentPkg, file });
+      }
+    };
+
+    const handleSelectSymbol = (symbol: AtlasSymbol, file: AtlasFile) => {
       setSelectedItem({ type: 'symbol', symbol, file });
+    };
 
-    filteredPackages.forEach((pkg, pIdx) => {
-      const pkgNodeId = `pkg-${pIdx}-${pkg.path}`;
-      const pkgStartY = currentY;
+    if (focusedScope.level === 'all') {
+      const rootNodeId = 'root-project-node';
 
-      let fileY = currentY;
+      if (graphLayout === 'radial') {
+        // RADIAL / ORBIT MODE: Solar System Orbit around Project / Monorepo Root
+        const CENTER_X = 450;
+        const CENTER_Y = 340;
+        const total = Math.max(1, filteredPackages.length);
+        const R = Math.max(340, total * 38);
 
-      pkg.files.forEach((file, fIdx) => {
-        const fileNodeId = `file-${pIdx}-${fIdx}-${file.path}`;
-        const fileStartY = fileY;
+        nList.push({
+          id: rootNodeId,
+          type: 'rootProjectNode',
+          position: { x: CENTER_X - 135, y: CENTER_Y - 50 },
+          data: {
+            repo: atlas?.repo || 'Workspace',
+            isMonorepo: atlas?.is_monorepo,
+            workspacesCount: atlas?.workspaces?.length || 0,
+            totalPackages: atlas?.packages?.length || filteredPackages.length,
+            totalFiles: atlas?.total_files || 0,
+            totalLOC: atlas?.total_loc || 0,
+          },
+        });
 
-        let symY = fileY;
+        filteredPackages.forEach((pkg, pIdx) => {
+          const theta = (2 * Math.PI * pIdx) / total - Math.PI / 2;
+          const px = CENTER_X + R * Math.cos(theta) - 120;
+          const py = CENTER_Y + R * Math.sin(theta) - 40;
+          const pkgNodeId = `pkg-${pIdx}-${pkg.path}`;
 
-        file.symbols.slice(0, 10).forEach((sym, sIdx) => {
-          const symNodeId = `sym-${pIdx}-${fIdx}-${sIdx}-${sym.node_signature}`;
+          nList.push({
+            id: pkgNodeId,
+            type: 'packageNode',
+            position: { x: px, y: py },
+            data: { pkg, onSelect: handleSelectPkg },
+          });
+
+          eList.push({
+            id: `edge-${rootNodeId}-${pkgNodeId}`,
+            source: rootNodeId,
+            target: pkgNodeId,
+            animated: pkg.is_fragile,
+            style: {
+              stroke: pkg.is_fragile ? '#ef4444' : 'rgba(99, 102, 241, 0.45)',
+              strokeWidth: 1.5,
+            },
+            markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#818cf8' },
+          });
+        });
+      } else if (graphLayout === 'tree') {
+        // HIERARCHICAL TREE MODE: Left-to-Right Branch Tree
+        const rootY = Math.max(80, (filteredPackages.length * 110) / 2 - 40);
+
+        nList.push({
+          id: rootNodeId,
+          type: 'rootProjectNode',
+          position: { x: 40, y: rootY },
+          data: {
+            repo: atlas?.repo || 'Workspace',
+            isMonorepo: atlas?.is_monorepo,
+            workspacesCount: atlas?.workspaces?.length || 0,
+            totalPackages: atlas?.packages?.length || filteredPackages.length,
+            totalFiles: atlas?.total_files || 0,
+            totalLOC: atlas?.total_loc || 0,
+          },
+        });
+
+        const PKG_COLS = filteredPackages.length > 8 ? 2 : 1;
+        const PKG_COL_WIDTH = 290;
+        const PKG_ROW_HEIGHT = 115;
+
+        filteredPackages.forEach((pkg, pIdx) => {
+          const pCol = pIdx % PKG_COLS;
+          const pRow = Math.floor(pIdx / PKG_COLS);
+          const pkgNodeId = `pkg-${pIdx}-${pkg.path}`;
+
+          nList.push({
+            id: pkgNodeId,
+            type: 'packageNode',
+            position: { x: 380 + pCol * PKG_COL_WIDTH, y: 40 + pRow * PKG_ROW_HEIGHT },
+            data: { pkg, onSelect: handleSelectPkg },
+          });
+
+          eList.push({
+            id: `edge-${rootNodeId}-${pkgNodeId}`,
+            source: rootNodeId,
+            target: pkgNodeId,
+            style: { stroke: 'rgba(99, 102, 241, 0.45)', strokeWidth: 1.5 },
+            markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#818cf8' },
+          });
+        });
+      } else {
+        // GRID MODU: Clean Matrix
+        const COLS = 3;
+        const COL_WIDTH = 300;
+        const ROW_HEIGHT = 140;
+
+        filteredPackages.forEach((pkg, pIdx) => {
+          const col = pIdx % COLS;
+          const row = Math.floor(pIdx / COLS);
+          const pkgNodeId = `pkg-${pIdx}-${pkg.path}`;
+
+          nList.push({
+            id: pkgNodeId,
+            type: 'packageNode',
+            position: { x: 50 + col * COL_WIDTH, y: 50 + row * ROW_HEIGHT },
+            data: { pkg, onSelect: handleSelectPkg },
+          });
+        });
+      }
+    } else if (focusedScope.level === 'package') {
+      const { pkg } = focusedScope;
+      const pkgNodeId = `pkg-focus-${pkg.path}`;
+
+      if (graphLayout === 'radial') {
+        const CENTER_X = 400;
+        const CENTER_Y = 300;
+        const total = Math.max(1, pkg.files.length);
+        const R = Math.max(260, total * 30);
+
+        nList.push({
+          id: pkgNodeId,
+          type: 'packageNode',
+          position: { x: CENTER_X - 120, y: CENTER_Y - 40 },
+          data: { pkg, onSelect: handleSelectPkg },
+        });
+
+        pkg.files.forEach((file, fIdx) => {
+          const theta = (2 * Math.PI * fIdx) / total - Math.PI / 2;
+          const fx = CENTER_X + R * Math.cos(theta) - 110;
+          const fy = CENTER_Y + R * Math.sin(theta) - 35;
+          const fileNodeId = `file-focus-${fIdx}-${file.path}`;
+
+          nList.push({
+            id: fileNodeId,
+            type: 'fileNode',
+            position: { x: fx, y: fy },
+            data: { file, onSelect: (f: AtlasFile) => handleSelectFile(f, pkg) },
+          });
+
+          eList.push({
+            id: `edge-${pkgNodeId}-${fileNodeId}`,
+            source: pkgNodeId,
+            target: fileNodeId,
+            style: { stroke: 'rgba(99, 102, 241, 0.5)', strokeWidth: 1.5 },
+            markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#818cf8' },
+          });
+        });
+      } else {
+        // Tree / Linear mode for package
+        nList.push({
+          id: pkgNodeId,
+          type: 'packageNode',
+          position: { x: 50, y: 160 },
+          data: { pkg, onSelect: handleSelectPkg },
+        });
+
+        const FILE_COLS = 2;
+        const FILE_COL_WIDTH = 280;
+        const FILE_ROW_HEIGHT = 110;
+
+        pkg.files.forEach((file, fIdx) => {
+          const fileNodeId = `file-focus-${fIdx}-${file.path}`;
+          const fCol = fIdx % FILE_COLS;
+          const fRow = Math.floor(fIdx / FILE_COLS);
+
+          nList.push({
+            id: fileNodeId,
+            type: 'fileNode',
+            position: { x: 380 + fCol * FILE_COL_WIDTH, y: 50 + fRow * FILE_ROW_HEIGHT },
+            data: { file, onSelect: (f: AtlasFile) => handleSelectFile(f, pkg) },
+          });
+
+          eList.push({
+            id: `edge-${pkgNodeId}-${fileNodeId}`,
+            source: pkgNodeId,
+            target: fileNodeId,
+            style: { stroke: 'rgba(99, 102, 241, 0.5)', strokeWidth: 1.5 },
+            markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#818cf8' },
+          });
+        });
+      }
+    } else if (focusedScope.level === 'file') {
+      const { pkg, file } = focusedScope;
+      const fileNodeId = `file-focus-${file.path}`;
+
+      if (graphLayout === 'radial') {
+        const CENTER_X = 380;
+        const CENTER_Y = 280;
+        const total = Math.max(1, file.symbols.length);
+        const R = Math.max(220, total * 24);
+
+        nList.push({
+          id: fileNodeId,
+          type: 'fileNode',
+          position: { x: CENTER_X - 110, y: CENTER_Y - 35 },
+          data: { file, onSelect: (f: AtlasFile) => handleSelectFile(f, pkg) },
+        });
+
+        file.symbols.forEach((sym, sIdx) => {
+          const theta = (2 * Math.PI * sIdx) / total - Math.PI / 2;
+          const sx = CENTER_X + R * Math.cos(theta) - 100;
+          const sy = CENTER_Y + R * Math.sin(theta) - 25;
+          const symNodeId = `sym-focus-${sIdx}-${sym.node_signature}`;
+
           nList.push({
             id: symNodeId,
             type: 'symbolNode',
-            position: { x: SYM_X, y: symY },
+            position: { x: sx, y: sy },
             data: { symbol: sym, file, onSelect: handleSelectSymbol },
           });
 
@@ -320,47 +633,54 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
             target: symNodeId,
             animated: sym.status === 'MODIFIED',
             style: {
-              stroke: sym.status === 'MODIFIED' ? '#f59e0b' : 'rgba(148, 163, 184, 0.25)',
+              stroke: sym.status === 'MODIFIED' ? '#f59e0b' : 'rgba(148, 163, 184, 0.3)',
               strokeWidth: 1.5,
             },
             markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#64748b' },
           });
-
-          symY += 60;
         });
-
-        const fileSpan = Math.max(75, file.symbols.length * 60);
+      } else {
+        // Tree mode for symbols
         nList.push({
           id: fileNodeId,
           type: 'fileNode',
-          position: { x: FILE_X, y: fileStartY },
-          data: { file, onSelect: handleSelectFile },
+          position: { x: 50, y: 160 },
+          data: { file, onSelect: (f: AtlasFile) => handleSelectFile(f, pkg) },
         });
 
-        eList.push({
-          id: `edge-${pkgNodeId}-${fileNodeId}`,
-          source: pkgNodeId,
-          target: fileNodeId,
-          style: { stroke: 'rgba(99, 102, 241, 0.4)', strokeWidth: 1.5 },
-          markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#818cf8' },
+        const SYM_COLS = 2;
+        const SYM_COL_WIDTH = 260;
+        const SYM_ROW_HEIGHT = 65;
+
+        file.symbols.forEach((sym, sIdx) => {
+          const symNodeId = `sym-focus-${sIdx}-${sym.node_signature}`;
+          const sCol = sIdx % SYM_COLS;
+          const sRow = Math.floor(sIdx / SYM_COLS);
+
+          nList.push({
+            id: symNodeId,
+            type: 'symbolNode',
+            position: { x: 380 + sCol * SYM_COL_WIDTH, y: 50 + sRow * SYM_ROW_HEIGHT },
+            data: { symbol: sym, file, onSelect: handleSelectSymbol },
+          });
+
+          eList.push({
+            id: `edge-${fileNodeId}-${symNodeId}`,
+            source: fileNodeId,
+            target: symNodeId,
+            animated: sym.status === 'MODIFIED',
+            style: {
+              stroke: sym.status === 'MODIFIED' ? '#f59e0b' : 'rgba(148, 163, 184, 0.3)',
+              strokeWidth: 1.5,
+            },
+            markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#64748b' },
+          });
         });
-
-        fileY += fileSpan + 25;
-      });
-
-      const pkgSpan = Math.max(80, fileY - pkgStartY);
-      nList.push({
-        id: pkgNodeId,
-        type: 'packageNode',
-        position: { x: PKG_X, y: pkgStartY },
-        data: { pkg, onSelect: handleSelectPkg },
-      });
-
-      currentY += pkgSpan + 50;
-    });
+      }
+    }
 
     return { nodes: nList, edges: eList };
-  }, [filteredPackages]);
+  }, [filteredPackages, focusedScope, graphLayout]);
 
   return (
     <div className="space-y-4">
@@ -396,6 +716,22 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
               className="pl-8 pr-3 py-1.5 text-xs bg-slate-900/90 border border-white/10 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-accent w-48 sm:w-64"
             />
           </div>
+
+          {/* Monorepo Workspace Filter */}
+          {atlas?.is_monorepo && (
+            <select
+              value={selectedWorkspace}
+              onChange={(e) => setSelectedWorkspace(e.target.value)}
+              className="text-xs bg-slate-900 border border-purple-500/30 rounded-lg px-2.5 py-1.5 text-purple-300 font-mono focus:outline-none focus:border-purple-400"
+            >
+              <option value="all">All Workspaces ({atlas.workspaces?.length || 0})</option>
+              {atlas.workspaces?.map((ws) => (
+                <option key={ws} value={ws}>
+                  📦 {ws}
+                </option>
+              ))}
+            </select>
+          )}
 
           {/* Kind Filter */}
           <select
@@ -493,6 +829,89 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                     maskColor="rgba(15, 23, 42, 0.7)"
                     className="!bg-slate-950 !border-white/10 !rounded-lg"
                   />
+                  <Panel position="top-left" className="bg-slate-900/90 backdrop-blur-md px-2.5 py-1.5 rounded-lg border border-white/10 text-xs shadow-lg flex items-center gap-2">
+                    {/* Drill-down Breadcrumb */}
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setFocusedScope({ level: 'all' })}
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                          focusedScope.level === 'all'
+                            ? 'bg-indigo-500/20 text-indigo-300 font-semibold'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <Boxes className="h-3.5 w-3.5 text-indigo-400" />
+                        All Packages
+                      </button>
+                      {focusedScope.level !== 'all' && (
+                        <>
+                          <ChevronRight className="h-3 w-3 text-slate-600" />
+                          <button
+                            type="button"
+                            onClick={() => setFocusedScope({ level: 'package', pkg: focusedScope.pkg })}
+                            className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                              focusedScope.level === 'package'
+                                ? 'bg-indigo-500/20 text-indigo-300 font-semibold'
+                                : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            <Folder className="h-3.5 w-3.5 text-indigo-400" />
+                            {focusedScope.pkg.name}
+                          </button>
+                        </>
+                      )}
+                      {focusedScope.level === 'file' && (
+                        <>
+                          <ChevronRight className="h-3 w-3 text-slate-600" />
+                          <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-semibold">
+                            <FileCode className="h-3.5 w-3.5 text-cyan-400" />
+                            {focusedScope.file.name}
+                          </span>
+                        </>
+                      )}
+                    </div>
+
+                    <div className="h-3.5 w-px bg-white/10" />
+
+                    {/* Layout Switcher (Radial / Tree / Grid) */}
+                    <div className="flex items-center bg-slate-950/80 border border-white/10 rounded-md p-0.5 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setGraphLayout('radial')}
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                          graphLayout === 'radial' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
+                        }`}
+                        title="Radial / Orbit (Orbital Graph Layout)"
+                      >
+                        <Circle className="h-3 w-3" />
+                        Orbit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setGraphLayout('tree')}
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                          graphLayout === 'tree' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
+                        }`}
+                        title="Hierarchical Tree Layout"
+                      >
+                        <GitFork className="h-3 w-3" />
+                        Tree
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setGraphLayout('grid')}
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                          graphLayout === 'grid' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
+                        }`}
+                        title="Grid Matrix Layout"
+                      >
+                        <LayoutGrid className="h-3 w-3" />
+                        Grid
+                      </button>
+                    </div>
+                  </Panel>
+
                   <Panel position="top-right" className="bg-slate-900/80 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 text-[11px] text-slate-400 flex items-center gap-3">
                     <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-indigo-500" /> Package</span>
                     <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-cyan-500" /> File</span>
@@ -502,59 +921,173 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
               )}
             </div>
           ) : (
-            /* Tree Explorer View */
+            /* Interactive Hierarchical Tree Explorer View */
             <div className="panel max-h-[650px] overflow-y-auto space-y-3">
-              {filteredPackages.map((pkg) => (
-                <div key={pkg.path} className="border border-white/5 rounded-xl bg-slate-900/50 overflow-hidden">
-                  <div
-                    onClick={() => setSelectedItem({ type: 'package', pkg })}
-                    className="px-4 py-2.5 bg-white/5 flex items-center justify-between cursor-pointer hover:bg-white/10"
-                  >
-                    <div className="flex items-center gap-2">
-                      <Folder className="h-4 w-4 text-indigo-400" />
-                      <span className="font-semibold text-xs text-white">{pkg.name}</span>
-                      <span className="text-[11px] text-slate-500 font-mono">({pkg.path})</span>
-                    </div>
-                    <span className="text-xs font-mono text-slate-400">{pkg.total_loc} LOC</span>
-                  </div>
-
-                  <div className="p-3 space-y-3">
-                    {pkg.files.map((file) => (
-                      <div key={file.path} className="pl-3 border-l-2 border-slate-700/50 space-y-2">
-                        <div
-                          onClick={() => setSelectedItem({ type: 'file', file })}
-                          className="flex items-center justify-between cursor-pointer hover:text-cyan-300"
-                        >
-                          <div className="flex items-center gap-2">
-                            <FileCode className="h-3.5 w-3.5 text-cyan-400" />
-                            <span className="text-xs font-medium text-slate-200">{file.name}</span>
-                            <span className="text-[10px] text-slate-500 uppercase font-mono">{file.language}</span>
-                          </div>
-                          <span className="text-[11px] font-mono text-emerald-400">{file.health_score}% health</span>
-                        </div>
-
-                        <div className="pl-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-1.5">
-                          {file.symbols.map((sym) => (
-                            <div
-                              key={sym.node_signature}
-                              onClick={() => setSelectedItem({ type: 'symbol', symbol: sym, file })}
-                              className="px-2 py-1 rounded bg-slate-950/60 border border-white/5 flex items-center justify-between text-xs cursor-pointer hover:border-purple-500/50"
-                            >
-                              <div className="flex items-center gap-1.5 truncate">
-                                {symbolKindIcon(sym.kind)}
-                                <span className="font-mono text-slate-300 truncate" title={sym.node_signature}>
-                                  {sym.name}
-                                </span>
-                              </div>
-                              <span className="text-[10px] font-mono text-slate-500 shrink-0">{sym.lines_of_code}L</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+              {/* Tree Quick Actions & Active Breadcrumb */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-white/5 text-xs">
+                <div className="flex items-center gap-1.5 font-mono text-[11px] text-slate-400 truncate max-w-[65%]">
+                  <span className="text-slate-500">Path:</span>
+                  <span className="text-indigo-400 font-semibold">{atlas?.repo || 'root'}</span>
+                  {selectedItem?.pkg && (
+                    <>
+                      <span className="text-slate-600">/</span>
+                      <span className="text-indigo-300">{selectedItem.pkg.name}</span>
+                    </>
+                  )}
+                  {selectedItem?.file && (
+                    <>
+                      <span className="text-slate-600">/</span>
+                      <span className="text-cyan-300 font-medium">{selectedItem.file.name}</span>
+                    </>
+                  )}
+                  {selectedItem?.symbol && (
+                    <>
+                      <span className="text-slate-600">/</span>
+                      <span className="text-purple-300 font-bold">{selectedItem.symbol.name}</span>
+                    </>
+                  )}
                 </div>
-              ))}
+
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={expandAll}
+                    className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 border border-white/5 transition-colors"
+                  >
+                    Expand All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={collapseAll}
+                    className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 border border-white/5 transition-colors"
+                  >
+                    Collapse All
+                  </button>
+                </div>
+              </div>
+
+              {filteredPackages.map((pkg) => {
+                const isFolderOpen = expandedFolders.has(pkg.path);
+                const isPkgSelected = selectedItem?.type === 'package' && selectedItem.pkg?.path === pkg.path;
+
+                return (
+                  <div
+                    key={pkg.path}
+                    className={`border rounded-xl bg-slate-900/50 overflow-hidden transition-all ${
+                      isPkgSelected ? 'border-indigo-500/80 shadow-md shadow-indigo-500/10' : 'border-white/5'
+                    }`}
+                  >
+                    <div
+                      onClick={() => {
+                        setSelectedItem({ type: 'package', pkg });
+                        toggleFolder(pkg.path);
+                      }}
+                      className={`px-3 py-2 flex items-center justify-between cursor-pointer transition-colors ${
+                        isPkgSelected ? 'bg-indigo-500/15' : 'bg-white/5 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span onClick={(e) => toggleFolder(pkg.path, e)} className="p-0.5 hover:bg-white/10 rounded">
+                          {isFolderOpen ? (
+                            <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+                          ) : (
+                            <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+                          )}
+                        </span>
+                        {isFolderOpen ? (
+                          <FolderOpen className="h-4 w-4 text-indigo-400" />
+                        ) : (
+                          <Folder className="h-4 w-4 text-indigo-400" />
+                        )}
+                        <span className="font-semibold text-xs text-white">{pkg.name}</span>
+                        <span className="text-[11px] text-slate-500 font-mono">({pkg.path})</span>
+                      </div>
+                      <div className="flex items-center gap-2 text-xs font-mono text-slate-400">
+                        <span>{pkg.files.length} files</span>
+                        <span>·</span>
+                        <span>{pkg.total_loc.toLocaleString()} LOC</span>
+                      </div>
+                    </div>
+
+                    {isFolderOpen && (
+                      <div className="p-2 space-y-2">
+                        {pkg.files.map((file) => {
+                          const isFileOpen = expandedFiles.has(file.path);
+                          const isFileSelected = selectedItem?.type === 'file' && selectedItem.file?.path === file.path;
+
+                          return (
+                            <div
+                              key={file.path}
+                              className={`pl-2 border-l-2 space-y-2 transition-all rounded-r-lg ${
+                                isFileSelected
+                                  ? 'border-cyan-400 bg-cyan-500/10'
+                                  : 'border-slate-800 hover:border-slate-700'
+                              }`}
+                            >
+                              <div
+                                onClick={() => {
+                                  setSelectedItem({ type: 'file', file });
+                                  toggleFile(file.path);
+                                }}
+                                className="flex items-center justify-between py-1 px-1.5 rounded cursor-pointer hover:text-cyan-300"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <span onClick={(e) => toggleFile(file.path, e)} className="p-0.5 hover:bg-white/10 rounded">
+                                    {isFileOpen ? (
+                                      <ChevronDown className="h-3 w-3 text-slate-400" />
+                                    ) : (
+                                      <ChevronRight className="h-3 w-3 text-slate-400" />
+                                    )}
+                                  </span>
+                                  <FileCode className="h-3.5 w-3.5 text-cyan-400" />
+                                  <span className={`text-xs font-medium ${isFileSelected ? 'text-cyan-300 font-bold' : 'text-slate-200'}`}>
+                                    {file.name}
+                                  </span>
+                                  <span className="text-[10px] text-slate-500 uppercase font-mono">{file.language}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[10px] font-mono text-slate-400">{file.symbols.length} symbols</span>
+                                  <span className="text-[11px] font-mono text-emerald-400">{file.health_score}% health</span>
+                                </div>
+                              </div>
+
+                              {isFileOpen && (
+                                <div className="pl-6 pb-2 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-1.5">
+                                  {file.symbols.map((sym) => {
+                                    const isSymSelected =
+                                      selectedItem?.type === 'symbol' &&
+                                      selectedItem.symbol?.node_signature === sym.node_signature;
+
+                                    return (
+                                      <div
+                                        key={sym.node_signature}
+                                        onClick={() => setSelectedItem({ type: 'symbol', symbol: sym, file })}
+                                        className={`px-2 py-1 rounded text-xs cursor-pointer flex items-center justify-between transition-all ${
+                                          isSymSelected
+                                            ? 'bg-purple-950/80 border border-purple-400 shadow-sm shadow-purple-500/20 text-white'
+                                            : 'bg-slate-950/60 border border-white/5 hover:border-purple-500/40 text-slate-300'
+                                        }`}
+                                      >
+                                        <div className="flex items-center gap-1.5 truncate">
+                                          {symbolKindIcon(sym.kind)}
+                                          <span className="font-mono truncate" title={sym.node_signature}>
+                                            {sym.name}
+                                          </span>
+                                        </div>
+                                        <span className="text-[10px] font-mono text-slate-500 shrink-0">{sym.lines_of_code}L</span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -638,35 +1171,18 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                   if (!ev) return null;
                   return (
                     <div>
-                      <div className="text-slate-400 mb-1 flex items-center justify-between">
+                      <div className="text-slate-400 mb-1.5 flex items-center justify-between text-xs">
                         <span>Latest Code Change Diff ({ev.action})</span>
-                        {(ev.added_lines || ev.deleted_lines) && (
-                          <span className="font-mono text-[10px]">
-                            {ev.added_lines ? <span className="text-emerald-400">+{ev.added_lines} </span> : null}
-                            {ev.deleted_lines ? <span className="text-red-400">-{ev.deleted_lines}</span> : null}
-                          </span>
-                        )}
                       </div>
-                      <div className="p-2.5 max-h-48 overflow-y-auto rounded-lg bg-[#0a0e14] border border-white/10 font-mono text-[10px] leading-relaxed space-y-0.5 select-text">
-                        {ev.diff_snippet?.split('\n').map((line, idx) => {
-                          const isAdd = line.startsWith('+ ');
-                          const isDel = line.startsWith('- ');
-                          return (
-                            <div
-                              key={idx}
-                              className={
-                                isAdd
-                                  ? 'text-emerald-400 bg-emerald-500/10 -mx-2 px-2 py-0.2 border-l-2 border-emerald-500'
-                                  : isDel
-                                  ? 'text-red-400 bg-red-500/10 -mx-2 px-2 py-0.2 border-l-2 border-red-500'
-                                  : 'text-slate-300'
-                              }
-                            >
-                              {line}
-                            </div>
-                          );
-                        })}
-                      </div>
+                      <RichDiffViewer
+                        diff={ev.diff_snippet}
+                        filePath={ev.file_path}
+                        signature={ev.node_signature}
+                        action={ev.action}
+                        startLine={ev.start_line}
+                        endLine={ev.end_line}
+                        maxHeight="220px"
+                      />
                     </div>
                   );
                 })()}

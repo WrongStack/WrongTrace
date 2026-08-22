@@ -19,6 +19,7 @@ import (
 
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/models"
+	"github.com/wrongstack/wrongtrace/internal/proxy"
 )
 
 // EngineAPI is the slice of *core.Engine the HTTP layer needs. Declared as an
@@ -27,9 +28,24 @@ type EngineAPI interface {
 	Metrics() (core.MetricsSnapshot, error)
 	Atlas() (core.AtlasSnapshot, error)
 	FileHealth(path string) (core.IPCHealth, error)
+	CheckGuardrail(path string) (core.GuardrailResult, error)
+	LockFile(path, reason string)
+	UnlockFile(path string)
+	IsFileLocked(path string) (bool, string)
 	ModelCatalog() []models.ModelInfo
 	UpsertModel(m models.ModelInfo)
 	CalculateCost(model string, promptTokens, completionTokens int64) float64
+	SyncModelsDev() (int, error)
+	ListProjects() []core.Project
+	GetProject(id string) (core.ProjectProfile, error)
+	AddProject(name, path string) (core.Project, error)
+	UpdateProject(p core.ProjectProfile) (core.ProjectProfile, error)
+	SwitchActiveProject(id string) (*core.ProjectProfile, error)
+	RemoveProject(id string) error
+	GetSettings() core.AppSettings
+	UpdateSettings(s core.AppSettings) core.AppSettings
+	VacuumDB() error
+	ClearStale(days int) (int64, error)
 	Hub() *core.Hub
 	Repo() string
 }
@@ -122,7 +138,11 @@ func (s *Server) buildRouter() chi.Router {
 		MaxAge:           300,
 	}))
 
-	h := &Handlers{Engine: s.cfg.Engine, SocketPath: s.cfg.SocketPath} // *core.Engine satisfies EngineAPI
+	h := &Handlers{
+		Engine:     s.cfg.Engine,
+		SocketPath: s.cfg.SocketPath,
+		Proxy:      proxy.NewGatewayProxy(proxy.Config{Reporter: s.cfg.Engine}),
+	}
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", h.Health)
 		r.Get("/metrics/overview", h.Overview)
@@ -131,8 +151,29 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/metrics/recent", h.RecentEvents)
 		r.Get("/atlas", h.Atlas)
 		r.Get("/file/health", h.FileHealth)
+		r.Get("/guardrail/check", h.CheckGuardrail)
+		r.Post("/guardrail/lock", h.LockFile)
+		r.Post("/guardrail/unlock", h.UnlockFile)
+
+		r.Get("/proxy/routes", h.ListProxyRoutes)
+		r.Post("/proxy/routes", h.UpsertProxyRoute)
+		r.Delete("/proxy/routes/{id}", h.DeleteProxyRoute)
+
+		r.Get("/projects", h.ListProjects)
+		r.Post("/projects", h.AddProject)
+		r.Get("/projects/{id}", h.GetProject)
+		r.Put("/projects/{id}", h.UpdateProject)
+		r.Post("/projects/{id}/activate", h.SwitchActiveProject)
+		r.Delete("/projects/{id}", h.RemoveProject)
+
+		r.Get("/settings", h.GetSettings)
+		r.Post("/settings", h.UpdateSettings)
+		r.Post("/settings/vacuum", h.VacuumDB)
+		r.Post("/settings/clear-stale", h.ClearStale)
+
 		r.Get("/models/catalog", h.ModelCatalog)
 		r.Post("/models/catalog", h.UpsertModel)
+		r.Post("/models/sync", h.SyncModels)
 		r.Post("/models/calculate-cost", h.CalculateCost)
 		r.Get("/ws", h.WebSocket)
 	})

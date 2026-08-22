@@ -14,7 +14,9 @@ import {
   Sparkles,
   Download,
   Calendar,
+  Bot,
 } from 'lucide-react';
+import { RichDiffViewer } from './RichDiffViewer';
 import type { EventRecord } from '../types';
 
 interface DiffInspectorViewProps {
@@ -248,7 +250,7 @@ export function DiffInspectorView({ events, loading }: DiffInspectorViewProps) {
                     </h3>
                   </div>
 
-                  <div className="flex items-center gap-3 text-xs text-slate-400 font-mono">
+                  <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400 font-mono">
                     <span className="flex items-center gap-1 text-slate-300">
                       <FileCode className="h-3.5 w-3.5 text-cyan-400" />
                       {currentEvent.file_path}
@@ -256,75 +258,27 @@ export function DiffInspectorView({ events, loading }: DiffInspectorViewProps) {
                     {currentEvent.start_line ? (
                       <span>· Lines {currentEvent.start_line} - {currentEvent.end_line}</span>
                     ) : null}
-                  </div>
-                </div>
-
-                {/* Toolbar */}
-                <div className="flex items-center gap-2">
-                  <div className="flex items-center bg-slate-950 border border-white/10 rounded-lg p-0.5 text-xs">
-                    <button
-                      onClick={() => setViewFormat('unified')}
-                      className={`px-2.5 py-1 rounded text-[11px] font-medium transition-all ${
-                        viewFormat === 'unified' ? 'bg-accent text-white shadow-sm' : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      Unified
-                    </button>
-                    <button
-                      onClick={() => setViewFormat('raw')}
-                      className={`px-2.5 py-1 rounded text-[11px] font-medium transition-all ${
-                        viewFormat === 'raw' ? 'bg-accent text-white shadow-sm' : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      Raw Text
-                    </button>
-                  </div>
-
-                  <button
-                    onClick={() => handleCopy(currentEvent.event_id, currentEvent.diff_snippet ?? '')}
-                    className="flex items-center gap-1.5 px-3 py-1 text-xs bg-slate-900 hover:bg-slate-800 border border-white/10 rounded-lg text-slate-300 transition-all"
-                  >
-                    {copiedId === currentEvent.event_id ? (
-                      <>
-                        <Check className="h-3.5 w-3.5 text-emerald-400" />
-                        <span className="text-emerald-400">Copied</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="h-3.5 w-3.5" />
-                        <span>Copy</span>
-                      </>
+                    {currentEvent.run_id && (
+                      <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 font-mono">
+                        <Bot className="h-3 w-3 text-indigo-400" />
+                        Run: {currentEvent.run_id}
+                      </span>
                     )}
-                  </button>
+                  </div>
                 </div>
               </div>
 
-              {/* Diff Body Content */}
-              <div className="p-4 overflow-y-auto flex-1 font-mono text-xs leading-relaxed select-text space-y-0.5">
-                {currentEvent.diff_snippet ? (
-                  currentEvent.diff_snippet.split('\n').map((line, idx) => {
-                    const isAdd = line.startsWith('+ ');
-                    const isDel = line.startsWith('- ');
-                    const lineClass = isAdd
-                      ? 'text-emerald-300 bg-emerald-500/10 -mx-4 px-4 py-0.5 border-l-2 border-emerald-500 font-medium'
-                      : isDel
-                      ? 'text-red-300 bg-red-500/10 -mx-4 px-4 py-0.5 border-l-2 border-red-500 font-medium'
-                      : 'text-slate-300 px-2 py-0.5';
-
-                    return (
-                      <div key={idx} className={lineClass}>
-                        <span className="inline-block w-8 text-slate-600 select-none mr-2 text-right">
-                          {idx + 1}
-                        </span>
-                        {line}
-                      </div>
-                    );
-                  })
-                ) : (
-                  <div className="text-slate-500 italic p-6 text-center">
-                    No diff snippet available for this transition.
-                  </div>
-                )}
+              {/* Rich Diff Body Content */}
+              <div className="p-3 flex-1 overflow-auto">
+                <RichDiffViewer
+                  diff={currentEvent.diff_snippet}
+                  filePath={currentEvent.file_path}
+                  signature={currentEvent.node_signature}
+                  action={currentEvent.action}
+                  startLine={currentEvent.start_line}
+                  endLine={currentEvent.end_line}
+                  maxHeight="520px"
+                />
               </div>
 
               {/* Metadata Footer */}

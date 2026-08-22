@@ -49,13 +49,40 @@ func (f *failingEngine) Atlas() (core.AtlasSnapshot, error) {
 func (f *failingEngine) FileHealth(string) (core.IPCHealth, error) {
 	return core.IPCHealth{}, errForced
 }
-func (f *failingEngine) ModelCatalog() []models.ModelInfo { return nil }
-func (f *failingEngine) UpsertModel(models.ModelInfo)      {}
+func (f *failingEngine) CheckGuardrail(string) (core.GuardrailResult, error) {
+	return core.GuardrailResult{}, errForced
+}
+func (f *failingEngine) LockFile(string, string)              {}
+func (f *failingEngine) UnlockFile(string)                    {}
+func (f *failingEngine) IsFileLocked(string) (bool, string)   { return false, "" }
+func (f *failingEngine) ModelCatalog() []models.ModelInfo     { return nil }
+func (f *failingEngine) UpsertModel(models.ModelInfo)         {}
 func (f *failingEngine) CalculateCost(string, int64, int64) float64 {
 	return 0
 }
-func (f *failingEngine) Hub() *core.Hub { return f.hub }
-func (f *failingEngine) Repo() string   { return "failing" }
+func (f *failingEngine) SyncModelsDev() (int, error)          { return 0, errForced }
+func (f *failingEngine) ListProjects() []core.Project         { return nil }
+func (f *failingEngine) GetProject(string) (core.ProjectProfile, error) {
+	return core.ProjectProfile{}, errForced
+}
+func (f *failingEngine) AddProject(string, string) (core.Project, error) {
+	return core.Project{}, errForced
+}
+func (f *failingEngine) UpdateProject(core.ProjectProfile) (core.ProjectProfile, error) {
+	return core.ProjectProfile{}, errForced
+}
+func (f *failingEngine) SwitchActiveProject(string) (*core.ProjectProfile, error) {
+	return nil, errForced
+}
+func (f *failingEngine) RemoveProject(string) error            { return errForced }
+func (f *failingEngine) GetSettings() core.AppSettings         { return core.AppSettings{} }
+func (f *failingEngine) UpdateSettings(s core.AppSettings) core.AppSettings {
+	return s
+}
+func (f *failingEngine) VacuumDB() error                       { return errForced }
+func (f *failingEngine) ClearStale(int) (int64, error)         { return 0, errForced }
+func (f *failingEngine) Hub() *core.Hub                        { return f.hub }
+func (f *failingEngine) Repo() string                          { return "failing" }
 
 // callHandler invokes an http.HandlerFunc directly and returns the recorded
 // response, decoded as a JSON map when a body is present.
