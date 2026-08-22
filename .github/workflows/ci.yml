@@ -1,0 +1,64 @@
+name: CI
+
+# Validate every commit: backend static analysis + race-detector test suite,
+# and the dashboard production build. Backend and frontend are independent
+# jobs so a Node failure never masks a Go failure (and vice versa).
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# Superseded runs on the same ref are cancelled so force-pushes and rapid
+# PR updates do not queue stale work.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Go vet + build + test (race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # Guards the fresh-clone invariant: the committed web/dist placeholder
+      # must satisfy //go:embed all:web/dist with no frontend tooling present.
+      - name: go build (embed check)
+        run: go build ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  frontend:
+    name: Dashboard build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # npm ci fails loudly if package-lock.json drifts from package.json —
+      # exactly what CI should catch.
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+
+      - name: npm run build (tsc + vite)
+        working-directory: web
+        run: npm run build
