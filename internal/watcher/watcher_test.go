@@ -60,6 +60,25 @@ func (h *recordingHandler) snapshot() []string {
 	return out
 }
 
+// counts returns the total call count and per-name counts computed under a
+// SINGLE lock hold. Multi-count assertions must use this rather than
+// separate count()/countFor() calls: timer goroutines can append between
+// independent acquisitions, making total exceed the per-name snapshot and
+// producing false-positive failures under -race.
+func (h *recordingHandler) counts(names ...string) (int, map[string]int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	per := make(map[string]int, len(names))
+	for _, p := range h.calls {
+		for _, n := range names {
+			if strings.HasSuffix(filepath.ToSlash(p), "/"+n) || filepath.Base(p) == n {
+				per[n]++
+			}
+		}
+	}
+	return len(h.calls), per
+}
+
 // waitFor polls cond until it holds or the timeout expires.
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
 	t.Helper()
@@ -306,9 +325,12 @@ func TestIgnoredDirs_NeverDeliverEvents(t *testing.T) {
 	if got := h.countFor("keep.go"); got < 1 {
 		t.Errorf("control file never reached the handler: %v", h.snapshot())
 	}
-	if n := h.count(); n != h.countFor("keep.go") {
+	// Single-lock multi-count: separate count()/countFor() calls can be
+	// interleaved by timer goroutines, making total exceed the per-name
+	// snapshot under -race.
+	if total, per := h.counts("keep.go"); total != per["keep.go"] {
 		t.Errorf("handler saw %d calls but only %d were for the control file — an ignored dir leaked: %v",
-			n, h.countFor("keep.go"), h.snapshot())
+			total, per["keep.go"], h.snapshot())
 	}
 }
 
@@ -357,15 +379,17 @@ func TestDebounce_SeparateBurstsProduceSeparateCalls(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool { return h.countFor("twice.go") >= 2 },
 		"second burst never registered after the first")
 
-	// Floor assertion: on a loaded runner fsnotify delivery can lag past the
+	// Floor + ceiling: the window-boundary contract is that each
+	// debounce-separated burst registers its own call, and that a burst does
+	// not splatter. On a loaded runner fsnotify delivery can lag past the
 	// debounce window and split one burst into two coalesced calls (observed
-	// on CI: 3 calls for 2 bursts). The contract is that each
-	// debounce-separated window registers its own call. Exact
+	// on CI: 3 calls for 2 bursts), so the ceiling allows one extra call per
+	// burst (4); 5+ indicates a genuine fragmentation regression. Exact
 	// single-call-per-burst coalescing stays covered by
 	// TestDebounce_CoalescesBurstIntoSingleCall.
 	time.Sleep(2*100*time.Millisecond + 100*time.Millisecond)
-	if n := h.countFor("twice.go"); n < 2 {
-		t.Errorf("separate bursts produced %d calls, want at least 2: %v", n, h.snapshot())
+	if n := h.countFor("twice.go"); n < 2 || n > 4 {
+		t.Errorf("separate bursts produced %d calls, want 2-4 (floor: each window registers; ceiling: no splatter): %v", n, h.snapshot())
 	}
 }
 
@@ -404,8 +428,8 @@ func TestDebounce_IndependentPaths(t *testing.T) {
 	if got := h.countFor("b.go"); got < 1 {
 		t.Errorf("b.go saw %d calls, want at least 1: %v", got, h.snapshot())
 	}
-	if n := h.count(); n != h.countFor("a.go")+h.countFor("b.go") {
-		t.Errorf("total calls = %d, want only a.go+b.go: %v", n, h.snapshot())
+	if total, per := h.counts("a.go", "b.go"); total != per["a.go"]+per["b.go"] {
+		t.Errorf("total calls = %d, want only a.go+b.go (%d): %v", total, per["a.go"]+per["b.go"], h.snapshot())
 	}
 }
 
