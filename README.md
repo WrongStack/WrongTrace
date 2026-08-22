@@ -21,6 +21,13 @@ make build          # build the React UI + Go binary
 make run            # start daemon on :4318 watching the current directory
 ```
 
+Development with hot reload (dashboard HMR + API proxy, one command):
+
+```bash
+./dev.sh            # WSL / macOS / Linux
+./dev.ps1           # Windows (PowerShell 7) — also: ./dev.ps1 -Port 4400 -NoUI
+```
+
 Open <http://localhost:4318> for the dashboard. In another shell:
 
 ```bash

@@ -1,6 +1,10 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
+// Daemon port the dev server proxies to; dev.sh / dev.ps1 export this so a
+// custom -Port keeps the dev proxy coherent.
+const daemonPort = process.env.WRONGTRACE_PORT ?? '4318';
+
 // WrongTrace's Go daemon embeds web/dist at build time, so the dev server
 // proxies API + WS calls to the local daemon (default :4318). In production
 // the dashboard is served by the Go binary itself, but the build artifact is
@@ -11,7 +15,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:4318',
+        target: `http://localhost:${daemonPort}`,
         changeOrigin: true,
         ws: true,
       },
