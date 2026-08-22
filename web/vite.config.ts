@@ -21,22 +21,30 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     sourcemap: false,
-    rollupOptions: {
+    // Vite 8 bundles with Rolldown, where the function-form manualChunks is
+    // gone. The replacement is rolldownOptions.output.codeSplitting (the
+    // initial advancedChunks option was renamed to codeSplitting in rolldown;
+    // advancedChunks still works but warns). Groups are matched in order
+    // (first match wins), preserving the exact segment boundaries of the
+    // previous manualChunks split so @tanstack/react-query still lands in the
+    // plain vendor chunk, not the react chunk.
+    rolldownOptions: {
       output: {
-        // Split the vendor graph so no chunk trips the 500 kB warning:
-        // recharts (+d3) dominates the bundle, react is a stable long-term
-        // cache candidate, and the rest of node_modules is small enough to
-        // share. Segment boundaries are exact so @tanstack/react-query does
-        // not match the react chunk.
-        manualChunks(id: string): string | undefined {
-          if (!id.includes('node_modules')) return undefined;
-          if (/[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/.test(id)) {
-            return 'vendor-react';
-          }
-          if (/[\\/]node_modules[\\/](recharts|d3|d3-[a-z0-9-]+|victory-vendor|react-smooth|internmap)[\\/]/.test(id)) {
-            return 'vendor-charts';
-          }
-          return 'vendor';
+        codeSplitting: {
+          groups: [
+            {
+              name: 'vendor-react',
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+            },
+            {
+              name: 'vendor-charts',
+              test: /[\\/]node_modules[\\/](recharts|d3|d3-[a-z0-9-]+|victory-vendor|react-smooth|internmap)[\\/]/,
+            },
+            {
+              name: 'vendor',
+              test: /[\\/]node_modules[\\/]/,
+            },
+          ],
         },
       },
     },
