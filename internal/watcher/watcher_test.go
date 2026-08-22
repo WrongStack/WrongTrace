@@ -50,6 +50,16 @@ func (h *recordingHandler) countFor(base string) int {
 	return n
 }
 
+// snapshot returns a copy of the recorded calls under lock, safe to print
+// from a failing assertion while timer goroutines may still append.
+func (h *recordingHandler) snapshot() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, len(h.calls))
+	copy(out, h.calls)
+	return out
+}
+
 // waitFor polls cond until it holds or the timeout expires.
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
 	t.Helper()
@@ -287,8 +297,18 @@ func TestIgnoredDirs_NeverDeliverEvents(t *testing.T) {
 			t.Errorf("sanity: %s missing: %v", p, err)
 		}
 	}
-	if n := h.count(); n != 1 {
-		t.Errorf("handler saw %d total calls, want 1 (control only): %v", n, h.calls)
+	// The contract under test is that ONLY the control file is delivered:
+	// node_modules and .git are excluded at registration time, so fsnotify
+	// cannot even generate their events. The control file's exact call count
+	// is timing-dependent — on a loaded CI runner under -race, event delivery
+	// can lag past the debounce window and split the burst into two coalesced
+	// calls — so assert it fired, not how often.
+	if got := h.countFor("keep.go"); got < 1 {
+		t.Errorf("control file never reached the handler: %v", h.snapshot())
+	}
+	if n := h.count(); n != h.countFor("keep.go") {
+		t.Errorf("handler saw %d calls but only %d were for the control file — an ignored dir leaked: %v",
+			n, h.countFor("keep.go"), h.snapshot())
 	}
 }
 
