@@ -317,7 +317,13 @@ func TestParse_Concurrent(t *testing.T) {
 						errs <- fmt.Errorf("w%d r%d parse %s: %d nodes, want 1", w, round, s.path, len(snap.Nodes))
 					}
 					eng.SetSnapshot(snap)
-					if _, ok := eng.Snapshot(s.path); !ok {
+					// Concurrent-read coverage: always read back, but only
+					// REQUIRE presence for paths other workers never Forget.
+					// d.js is forgotten by every worker's iteration, so
+					// another goroutine may legitimately remove it between
+					// this worker's SetSnapshot and Snapshot.
+					_, ok := eng.Snapshot(s.path)
+					if !ok && i != len(srcs)-1 {
 						errs <- fmt.Errorf("w%d r%d snapshot %s missing after SetSnapshot", w, round, s.path)
 					}
 					// Forget on a subset to interleave deletes with reads.
