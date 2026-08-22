@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -48,6 +49,7 @@ type Server struct {
 	cfg    Config
 	router chi.Router
 	hs     *http.Server
+	hsMu   sync.Mutex
 }
 
 // New constructs a Server with all routes wired.
@@ -69,7 +71,7 @@ func (s *Server) Start() error {
 		Handler:           s.router,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	s.hs = hs
+	s.setHS(hs)
 	log.Printf("http: listening on http://localhost%s", addr)
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -77,12 +79,33 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Shutdown gracefully drains in-flight requests.
+// Shutdown gracefully drains in-flight requests. Safe to call before Start
+// (returns nil) or concurrently with it.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.hs == nil {
+	hs := s.currentHS()
+	if hs == nil {
 		return nil
 	}
-	return s.hs.Shutdown(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return hs.Shutdown(ctx)
+}
+
+// setHS/currentHS guard the *http.Server handoff between Start (writer) and
+// Shutdown (reader). The unsynchronized field access was a genuine data race
+// surfaced by -race on the CI runner (Start writing s.hs at the same moment
+// Shutdown read it).
+func (s *Server) setHS(hs *http.Server) {
+	s.hsMu.Lock()
+	s.hs = hs
+	s.hsMu.Unlock()
+}
+
+func (s *Server) currentHS() *http.Server {
+	s.hsMu.Lock()
+	defer s.hsMu.Unlock()
+	return s.hs
 }
 
 func (s *Server) buildRouter() chi.Router {
