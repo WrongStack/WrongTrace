@@ -1,0 +1,31 @@
+# WrongTrace build artifacts and local state.
+bin/
+web/dist/*
+!web/dist/index.html
+web/node_modules/
+web/tsconfig.tsbuildinfo
+.temp_files/
+*.test
+*.out
+coverage.txt
+
+# WrongTrace runtime state (defaults to $HOME/.wrongtrace but kept here for
+# local single-machine runs where the project root is also the repo).
+.wrongtrace/
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Go module cache hygiene.
+vendor/
+
+.wrongstack/
+!/.wrongstack/
+/.wrongstack/*
+!/.wrongstack/project.json

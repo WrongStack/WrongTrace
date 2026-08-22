@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+/* Subtle scrollbar — keeps the dashboard feeling calm without dominating. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(99, 102, 241, 0.25);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(99, 102, 241, 0.45);
+}
+
+/* Reusable shell primitives (kept tiny — no premature component library). */
+@layer components {
+  .panel {
+    @apply bg-bg-panel border border-white/5 rounded-xl p-5;
+  }
+  .panel-raised {
+    @apply bg-bg-raised border border-white/5 rounded-xl p-4;
+  }
+  .stat-num {
+    @apply text-3xl font-semibold tracking-tight;
+  }
+  .stat-label {
+    @apply text-xs uppercase tracking-wider text-slate-400;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium;
+  }
+}

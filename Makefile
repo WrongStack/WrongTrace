@@ -1,0 +1,61 @@
+.PHONY: all build build-ui build-go run run-mcp status clean test fmt vet tidy
+
+# --- Configuration ---------------------------------------------------------
+BIN_DIR       ?= bin
+BINARY        ?= $(BIN_DIR)/wrongtrace
+PKG           ?= ./cmd/wrongtrace
+LDFLAGS       ?= -s -w -X main.version=dev
+PORT          ?= 4318
+WATCH_DIR     ?= .
+REPO_NAME     ?= $(notdir $(CURDIR))
+WRONGTRACE_HOME ?= $(HOME)/.wrongtrace
+DB_PATH       ?= $(WRONGTRACE_HOME)/wrongtrace.db
+SOCKET_PATH   ?= $(WRONGTRACE_HOME)/wrongtrace.sock
+
+# --- Targets ---------------------------------------------------------------
+all: build
+
+build: build-ui build-go
+
+# Build the React frontend into web/dist/. Requires Node.js 18+.
+build-ui:
+	cd web && npm install && npm run build
+
+# Compile the Go binary with the React assets embedded via //go:embed.
+build-go:
+	mkdir -p $(BIN_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BINARY) $(PKG)
+
+# Run the observer daemon with sensible defaults.
+run: build
+	$(BINARY) start \
+		--watch $(WATCH_DIR) \
+		--port $(PORT) \
+		--db $(DB_PATH) \
+		--socket $(SOCKET_PATH) \
+		--repo $(REPO_NAME)
+
+# Spawn the MCP server over stdio (used by Claude Code, Cursor, etc.).
+run-mcp: build
+	$(BINARY) mcp
+
+# Print a short status summary.
+status: build
+	$(BINARY) status
+
+# --- Housekeeping -----------------------------------------------------------
+test:
+	go test ./...
+
+fmt:
+	go fmt ./...
+	cd web && npx --yes prettier --write src
+
+vet:
+	go vet ./...
+
+tidy:
+	go mod tidy
+
+clean:
+	rm -rf $(BIN_DIR) web/dist web/node_modules

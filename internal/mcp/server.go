@@ -1,0 +1,263 @@
+// Package mcp implements the Model Context Protocol server for WrongTrace.
+// When invoked as `wrongtrace mcp`, the binary reads JSON-RPC requests from
+// stdin and writes responses to stdout, following the MCP conventions used
+// by Claude Code, Cursor, Devin, Windsurf, and Cline.
+package mcp
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"time"
+
+	"github.com/wrongstack/wrongtrace/internal/ipc"
+)
+
+// EngineSink is the subset of the core Engine used by the MCP server.
+type EngineSink interface {
+	ReportRunMCP(model, provider, taskID, intent string, promptTokens, completionTokens int64, cost float64) (string, error)
+	FileHealth(path string) (ipc.FileHealthReply, error)
+}
+
+// jsonRPCRequest is the MCP wire format. Notifications (no id) are valid.
+type jsonRPCRequest struct {
+	JSONRPC string                 `json:"jsonrpc"`
+	Method  string                 `json:"method"`
+	Params  map[string]interface{} `json:"params,omitempty"`
+	ID      interface{}            `json:"id,omitempty"`
+}
+
+type jsonRPCResponse struct {
+	JSONRPC string      `json:"jsonrpc"`
+	ID      interface{} `json:"id"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   *rpcError   `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// ServeStdio runs the MCP server on os.Stdin/os.Stdout until stdin closes.
+func ServeStdio(sink EngineSink) error {
+	if sink == nil {
+		return fmt.Errorf("mcp: engine sink is required")
+	}
+	in := bufio.NewReaderSize(os.Stdin, 64*1024)
+	out := bufio.NewWriterSize(os.Stdout, 64*1024)
+	defer func() { _ = out.Flush() }()
+
+	for {
+		line, err := readMessage(in)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		req := jsonRPCRequest{}
+		if err := json.Unmarshal(line, &req); err != nil {
+			_ = writeMessage(out, jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      nil,
+				Error:   &rpcError{Code: -32700, Message: "parse error: " + err.Error()},
+			})
+			continue
+		}
+		// Notifications carry no id: handle state changes, write no response.
+		if req.ID == nil {
+			continue
+		}
+		resp := dispatch(sink, &req)
+		if err := writeMessage(out, resp); err != nil {
+			return err
+		}
+	}
+}
+
+func readMessage(r *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, isPrefix, err := r.ReadLine()
+		if err != nil {
+			return nil, err
+		}
+		line = append(line, chunk...)
+		if !isPrefix {
+			break
+		}
+	}
+	if len(line) == 0 {
+		return nil, io.EOF
+	}
+	return line, nil
+}
+
+func writeMessage(w *bufio.Writer, v interface{}) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(b); err != nil {
+		return err
+	}
+	if err := w.WriteByte('\n'); err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
+// dispatch routes an MCP method to its handler.
+func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
+	resp := jsonRPCResponse{JSONRPC: "2.0", ID: req.ID}
+	switch req.Method {
+	case "initialize":
+		resp.Result = map[string]interface{}{
+			"protocolVersion": "2024-11-05",
+			"serverInfo": map[string]string{
+				"name":    "wrongtrace",
+				"version": "dev",
+			},
+			"capabilities": map[string]interface{}{
+				"tools": map[string]interface{}{},
+			},
+		}
+	case "tools/list":
+		resp.Result = map[string]interface{}{
+			"tools": []map[string]interface{}{
+				{
+					"name":        "report_telemetry",
+					"description": "Record an agent run's intent, model, token usage, and cost so WrongTrace can correlate it to subsequent AST churn.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"model":       map[string]string{"type": "string"},
+							"provider":    map[string]string{"type": "string"},
+							"task_id":     map[string]string{"type": "string"},
+							"intent":      map[string]string{"type": "string"},
+							"tokens_used": map[string]string{"type": "integer"},
+							"cost":        map[string]string{"type": "number"},
+						},
+						"required": []string{"model", "provider", "task_id", "intent"},
+					},
+				},
+				{
+					"name":        "get_file_health_score",
+					"description": "Inspect a file's recent churn. Returns a 0-100 health score and a fragile flag so the agent can avoid files currently being thrashed.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"file_path": map[string]string{"type": "string"},
+						},
+						"required": []string{"file_path"},
+					},
+				},
+			},
+		}
+	case "tools/call":
+		return callTool(sink, req)
+	case "notifications/initialized", "notifications/cancelled":
+		resp.Result = map[string]interface{}{}
+	default:
+		resp.Error = &rpcError{Code: -32601, Message: "method not found: " + req.Method}
+	}
+	return resp
+}
+
+func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
+	resp := jsonRPCResponse{JSONRPC: "2.0", ID: req.ID}
+	name, _ := req.Params["name"].(string)
+	args, _ := req.Params["arguments"].(map[string]interface{})
+	if args == nil {
+		args = map[string]interface{}{}
+	}
+
+	switch name {
+	case "report_telemetry":
+		model, _ := args["model"].(string)
+		provider, _ := args["provider"].(string)
+		taskID, _ := args["task_id"].(string)
+		intent, _ := args["intent"].(string)
+		var tokens int64
+		if v, ok := args["tokens_used"]; ok && v != nil {
+			tokens = toInt64(v)
+		}
+		var cost float64
+		if v, ok := args["cost"]; ok && v != nil {
+			cost = toFloat(v)
+		}
+		if model == "" || provider == "" || taskID == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "model, provider, and task_id are required"}
+			return resp
+		}
+		runID, err := sink.ReportRunMCP(model, provider, taskID, intent, tokens, 0, cost)
+		if err != nil {
+			resp.Error = &rpcError{Code: -32010, Message: err.Error()}
+			return resp
+		}
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": "Telemetry recorded successfully. run_id=" + runID},
+			},
+		}
+	case "get_file_health_score":
+		path, _ := args["file_path"].(string)
+		if path == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
+			return resp
+		}
+		h, err := sink.FileHealth(path)
+		if err != nil {
+			resp.Error = &rpcError{Code: -32011, Message: err.Error()}
+			return resp
+		}
+		text := fmt.Sprintf("health_score=%d fragile=%v recent_thrashing_count=%d warning=%q",
+			h.HealthScore, h.IsFragile, h.RecentThrashingCount, h.Warning)
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": text},
+			},
+			"data": h,
+		}
+	default:
+		resp.Error = &rpcError{Code: -32601, Message: "unknown tool: " + name}
+	}
+	return resp
+}
+
+func toInt64(v interface{}) int64 {
+	switch t := v.(type) {
+	case float64:
+		return int64(t)
+	case int:
+		return int64(t)
+	case int64:
+		return t
+	case json.Number:
+		i, _ := t.Int64()
+		return i
+	}
+	return 0
+}
+
+func toFloat(v interface{}) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case int:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case json.Number:
+		f, _ := t.Float64()
+		return f
+	}
+	return 0
+}
+
+// deadlineGuard documents that tool handlers are expected to be fast; the
+// sink's own store timeouts bound worst-case latency.
+var _ = time.Second
