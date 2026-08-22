@@ -195,30 +195,39 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 	}
 }
 
+// ignoredPathSegment reports whether any segment of the path names an
+// ignored directory (case-insensitive, via the shared isIgnoredDir
+// predicate). Used for watcher-delivered absolute paths as defense in depth.
+func ignoredPathSegment(path string) bool {
+	norm := filepath.ToSlash(path)
+	for _, seg := range strings.Split(norm, "/") {
+		if isIgnoredDir(seg) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseEligible reports whether a file should be parsed into the AST cache:
+// supported language and not a pathological bundle. Directory-ignore
+// filtering is deliberately NOT part of this — PrimeDirectory's walk already
+// prunes ignored subtrees with filepath.SkipDir, and re-checking segments
+// here would false-positive on workspaces whose own root (or an ancestor)
+// happens to be named like an ignore entry (e.g. a workspace named "bin").
+func (e *Engine) parseEligible(path string) bool {
+	if ast.DetectLanguage(path) == ast.LangUnknown {
+		return false
+	}
+	if info, err := os.Stat(path); err == nil && info.Size() > 4*1024*1024 {
+		return false
+	}
+	return true
+}
+
 // shouldSkip filters files we never want to watch: temporary files, ignored directories,
 // unsupported languages, and pathologies like very large generated bundles.
 func (e *Engine) shouldSkip(path string) bool {
-	norm := filepath.ToSlash(path)
-	segs := strings.Split(norm, "/")
-	for _, seg := range segs {
-		for _, ig := range []string{
-			".git", ".temp_files", "temp_files", ".tmp", "tmp",
-			"node_modules", "vendor", "dist", "build", "target",
-			".next", ".nuxt", ".turbo", ".cache", ".wrongtrace",
-			"coverage", "out", ".out", "bin",
-		} {
-			if strings.EqualFold(seg, ig) {
-				return true
-			}
-		}
-	}
-	if ast.DetectLanguage(path) == ast.LangUnknown {
-		return true
-	}
-	if info, err := os.Stat(path); err == nil && info.Size() > 4*1024*1024 {
-		return true
-	}
-	return false
+	return ignoredPathSegment(path) || !e.parseEligible(path)
 }
 
 // Run parks until ctx is done. Reserved for future background work.

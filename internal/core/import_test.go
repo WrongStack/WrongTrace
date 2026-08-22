@@ -277,6 +277,76 @@ func TestPreviewFromWrongStack_AnnotatesEntries(t *testing.T) {
 	}
 }
 
+// TestIsIgnoredDir_CombinesSettingsAndAlwaysList proves the single predicate
+// honors both sources: a settings pattern, an always-ignored tooling dir, and
+// case-insensitivity — and that normal source dirs pass.
+func TestIsIgnoredDir_CombinesSettingsAndAlwaysList(t *testing.T) {
+	setIgnorePatterns(t, []string{"node_modules", ".gen"})
+
+	cases := []struct {
+		base string
+		want bool
+	}{
+		{"node_modules", true}, // settings list
+		{".gen", true},         // settings list
+		{"NODE_MODULES", true}, // case-insensitive
+		{".wrongtrace", true},  // always-list (own data dir)
+		{"Bin", true},          // always-list, mixed case
+		{".temp_files", true},  // always-list (agent scratch)
+		{"pkg", false},         // normal source dir
+		{"internal", false},    // normal source dir
+		{"src", false},         // normal source dir
+	}
+	for _, tc := range cases {
+		if got := isIgnoredDir(tc.base); got != tc.want {
+			t.Errorf("isIgnoredDir(%q) = %v, want %v", tc.base, got, tc.want)
+		}
+	}
+}
+
+// TestPrimeDirectory_UsesSharedIgnorePredicate proves priming skips ignored
+// trees via the same isIgnoredDir predicate DetectPrimaryLanguage uses: files
+// under node_modules and .wrongtrace never reach the AST cache, while real
+// sources do. It also covers the root guard: priming a directory whose own
+// base name matches an ignore entry (e.g. a workspace literally named "bin")
+// must not skip its entire contents.
+func TestPrimeDirectory_UsesSharedIgnorePredicate(t *testing.T) {
+	e, _, parser := newAtlasTestEngine(t)
+
+	// 1. Ignored trees are pruned, real sources are parsed.
+	dir := t.TempDir()
+	real := writeFixture(t, dir, "svc/service.go", "package svc\n\nfunc Hello() string { return \"hi\" }\n")
+	_ = writeFixture(t, dir, "node_modules/dep/index.go", "package dep\n\nfunc Hidden() {}\n")
+	_ = writeFixture(t, dir, ".wrongtrace/self/service.go", "package self\n\nfunc AlsoHidden() {}\n")
+
+	e.PrimeDirectory(dir)
+
+	if _, ok := parser.Snapshot(real); !ok {
+		t.Errorf("real source %s was not primed into the AST cache", real)
+	}
+	for _, hidden := range []string{
+		filepath.Join(dir, "node_modules", "dep", "index.go"),
+		filepath.Join(dir, ".wrongtrace", "self", "service.go"),
+	} {
+		if _, ok := parser.Snapshot(hidden); ok {
+			t.Errorf("ignored-tree file %s leaked into the AST cache", hidden)
+		}
+	}
+
+	// 2. Root guard: a workspace dir literally named "bin" still primes.
+	src := t.TempDir()
+	target := filepath.Join(filepath.Dir(src), "bin")
+	if err := os.Rename(src, target); err != nil {
+		t.Skipf("cannot rename temp dir: %v", err)
+	}
+	tool := writeFixture(t, target, "inner/tool.go", "package inner\n\nfunc Tool() {}\n")
+
+	e.PrimeDirectory(target)
+	if _, ok := parser.Snapshot(tool); !ok {
+		t.Errorf("root-named-ignored workspace: %s was not primed (root guard missing)", tool)
+	}
+}
+
 func TestPreviewFromWrongStack_MissingSourceFile(t *testing.T) {
 	withFakeHome(t)
 	e := newImportEngine(t)

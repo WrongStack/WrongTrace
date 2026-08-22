@@ -72,20 +72,15 @@ func (e *Engine) PrimeDirectory(dir string) {
 			return nil
 		}
 		if info.IsDir() {
-			base := filepath.Base(path)
-			for _, ig := range []string{
-				".git", ".temp_files", "temp_files", ".tmp", "tmp",
-				"node_modules", "vendor", "dist", "build", "target",
-				".next", ".nuxt", ".turbo", ".cache", ".wrongtrace",
-				"coverage", "out", ".out", "bin",
-			} {
-				if strings.EqualFold(base, ig) {
-					return filepath.SkipDir
-				}
+			if path == dir {
+				return nil
+			}
+			if isIgnoredDir(filepath.Base(path)) {
+				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !e.shouldSkip(path) {
+		if e.parseEligible(path) {
 			src, rerr := os.ReadFile(path)
 			if rerr == nil {
 				snap, perr := e.cfg.AST.Parse(path, src)

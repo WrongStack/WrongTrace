@@ -591,6 +591,9 @@ func (e *Engine) RemoveProject(id string) error {
 }
 
 // ScanAgentSessions inspects workspace and global application directories for coding agent artifacts and logs.
+// It deliberately issues only bounded os.ReadDir calls against well-known global
+// directories (never a recursive filepath.Walk of the workspace), so it needs
+// no ignore-pattern filtering and its cost is independent of tree size.
 func ScanAgentSessions(root string) map[string]int {
 	counts := make(map[string]int)
 	homeDir, _ := os.UserHomeDir()
@@ -802,6 +805,37 @@ func ignorePatterns() []string {
 	return []string{".git", "node_modules", "vendor", "dist", "build", ".cache", "target", ".next"}
 }
 
+// alwaysIgnoredDirs are pruned from every recursive walk regardless of
+// settings: tooling caches, build outputs, and the data directories of
+// WrongTrace/WrongStack themselves must never be scanned (scanning our own
+// session store is both slow and meaningless).
+var alwaysIgnoredDirs = []string{
+	".git", ".temp_files", "temp_files", ".tmp", "tmp",
+	"node_modules", "vendor", "dist", "build", "target",
+	".next", ".nuxt", ".turbo", ".cache", ".wrongtrace",
+	"coverage", "out", ".out", "bin",
+}
+
+// isIgnoredDir reports whether a directory base name is excluded from all
+// recursive walks: the ignore_patterns setting plus alwaysIgnoredDirs.
+// Case-insensitive (EqualFold) because Windows roots arrive with mixed
+// case from both WrongStack and users. This is the single ignore predicate
+// shared by DetectPrimaryLanguage, PrimeDirectory, and any future walk —
+// do not inline pattern lists in walkers.
+func isIgnoredDir(base string) bool {
+	for _, ig := range ignorePatterns() {
+		if strings.EqualFold(base, ig) {
+			return true
+		}
+	}
+	for _, ig := range alwaysIgnoredDirs {
+		if strings.EqualFold(base, ig) {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectPrimaryLanguage infers the predominant language by counting source file extensions.
 // Directories whose base name matches an ignore_patterns setting entry are pruned with
 // filepath.SkipDir (never descended) — without this, a fat node_modules tree dominated the
@@ -809,7 +843,6 @@ func ignorePatterns() []string {
 // batch-import pathologically slow.
 func DetectPrimaryLanguage(root string) string {
 	extCounts := make(map[string]int)
-	ignored := ignorePatterns()
 	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil || info == nil {
 			return nil
@@ -818,11 +851,8 @@ func DetectPrimaryLanguage(root string) string {
 			if p == root {
 				return nil
 			}
-			base := filepath.Base(p)
-			for _, ig := range ignored {
-				if base == ig {
-					return filepath.SkipDir
-				}
+			if isIgnoredDir(filepath.Base(p)) {
+				return filepath.SkipDir
 			}
 			return nil
 		}
