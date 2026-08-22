@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "wrongtrace": {
+      "command": "wrongtrace",
+      "args": ["mcp"]
+    }
+  }
+}

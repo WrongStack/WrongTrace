@@ -5,11 +5,55 @@ AI agent runs that produced it. Connecting a project takes one daemon plus
 one of three telemetry paths. Everything below matches the implementation
 verbatim — tool names, methods, defaults, and endpoints.
 
+- [Flagship Ecosystem — WrongStack](#flagship-ecosystem--wrongstack)
+- [Quick Setup — `wrongtrace init`](#quick-setup--wrongtrace-init)
 - [Option A — MCP (recommended)](#option-a--mcp-recommended)
 - [Option B — IPC socket / named pipe](#option-b--ipc-socket--named-pipe)
-- [Option C — REST API](#option-c--rest-api)
-- [Daemon setup](#1-start-the-daemon-in-your-project)
-- [Claude Code](#claude-code) · [Cursor](#cursor) · [Windsurf / Cline](#windsurf--cline) · [Any MCP client](#any-mcp-client)
+- [Option C — AI Gateway Reverse Proxy](#option-c--ai-gateway-reverse-proxy)
+- [Option D — REST API](#option-d--rest-api)
+- [Agent Guidance Files (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`)](#agent-guidance-files)
+
+---
+
+## Flagship Ecosystem — WrongStack
+
+[**WrongStack**](https://github.com/wrongstack/wrongstack) is the native autonomous multi-agent developer platform designed to work hand-in-hand with WrongTrace:
+
+```
+┌────────────────────────────────────────────────────────┐
+│                   WRONGSTACK PLATFORM                  │
+│  Multi-Agent Swarm • Session Lineage • Task DAG • CAS  │
+└───────────────────────────┬────────────────────────────┘
+                            │ (Zero-overhead Native IPC)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│                     WRONGTRACE HUB                     │
+│  Tree-sitter AST Diff • File Health • Token ROI • OTLP │
+└────────────────────────────────────────────────────────┘
+```
+
+* **Automatic Lineage & Workspace Discovery**: WrongTrace natively indexes `~/.wrongstack/projects.json` and parses all multi-agent session folders (`~/.wrongstack/projects/<slug>/sessions/`).
+* **High-Speed IPC Bus**: Communicates directly over local named pipes (`\\.\pipe\wrongtrace` on Windows, `/tmp/wrongtrace.sock` on POSIX) for zero-latency telemetry without network overhead.
+* **Granular Swarm Governance**: Tracks multi-agent delegation chains, subagent spawns, and code survival rates per model across your engineering fleet.
+
+---
+
+## Quick Setup — `wrongtrace init`
+
+Run in any repository to automatically configure MCP, Git hooks, and agent rules:
+
+```bash
+wrongtrace init
+```
+
+This creates:
+- `.mcp.json` (MCP server configuration for Claude Code, Cursor, Windsurf, Cline)
+- `CLAUDE.md` (Agent instructions for Claude Code)
+- `AGENTS.md` (Universal guidelines for Cursor, Devin, Antigravity, Pi, Kimi, MiniMax, etc.)
+- `.cursorrules` (Cursor IDE rules)
+- `.git/hooks/post-commit` (Automatic AST telemetry sync on git commits)
+
+---
 
 ## The mental model
 

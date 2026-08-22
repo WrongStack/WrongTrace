@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -213,7 +214,7 @@ func (s *Store) Thrashing(minEdits int, lookbackDays int) ([]ThrashingRow, error
 		FROM code_node_events
 		WHERE event_time >= datetime('now', ?)
 		GROUP BY file_path, node_signature
-		HAVING edit_count >= ?
+		HAVING edit_count >= ? AND (julianday(MAX(event_time)) - julianday(MIN(event_time))) <= 1.0
 		ORDER BY edit_count DESC
 		LIMIT 100
 	`, fmt.Sprintf("-%d days", lookbackDays), minEdits)
@@ -238,7 +239,7 @@ func (s *Store) Thrashing(minEdits int, lookbackDays int) ([]ThrashingRow, error
 			span = 0
 		}
 		r.WindowHours = span
-		if r.EditCount >= minEdits && span <= 24 {
+		if r.EditCount >= minEdits && span <= 24.0+1e-4 {
 			out = append(out, r)
 		}
 	}
@@ -365,12 +366,14 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 	out := FileHealth{FilePath: filePath, HealthScore: 100}
 
 	var edits, sigs int
+	normSlash := strings.ReplaceAll(filePath, "\\", "/")
+	normBackslash := strings.ReplaceAll(filePath, "/", "\\")
 	row := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*), COUNT(DISTINCT node_signature)
 		FROM code_node_events
-		WHERE file_path = ?
+		WHERE (file_path = ? OR file_path = ? OR file_path = ? OR file_path LIKE '%' || ? OR file_path LIKE '%' || ?)
 		  AND event_time >= datetime('now', '-1 day')
-	`, filePath)
+	`, filePath, normSlash, normBackslash, normSlash, normBackslash)
 	if err := row.Scan(&edits, &sigs); err != nil {
 		return out, fmt.Errorf("file health scan: %w", err)
 	}
@@ -515,3 +518,159 @@ func toFloat(v any) float64 {
 	}
 	return 0
 }
+
+// RuntimeTraceRecord is the persisted row for runtime execution & profiler events.
+type RuntimeTraceRecord struct {
+	TraceID       string    `json:"trace_id"`
+	RunID         string    `json:"run_id,omitempty"`
+	ServiceName   string    `json:"service_name"`
+	NodeSignature string    `json:"node_signature,omitempty"`
+	FilePath      string    `json:"file_path,omitempty"`
+	DurationMs    float64   `json:"duration_ms"`
+	CPUUsagePct   float64   `json:"cpu_usage_pct"`
+	MemoryBytes   int64     `json:"memory_bytes"`
+	StatusCode    int       `json:"status_code"`
+	ErrorMsg      string    `json:"error_msg,omitempty"`
+	ProfilerType  string    `json:"profiler_type"`
+	MetadataJSON  string    `json:"metadata_json,omitempty"`
+	Timestamp     time.Time `json:"timestamp"`
+}
+
+// ProfilerHotspotRow correlates AST churn with runtime execution latency/memory.
+type ProfilerHotspotRow struct {
+	NodeSignature string  `json:"node_signature"`
+	FilePath      string  `json:"file_path"`
+	TraceCount    int     `json:"trace_count"`
+	AvgDurationMs float64 `json:"avg_duration_ms"`
+	MaxDurationMs float64 `json:"max_duration_ms"`
+	TotalErrors   int     `json:"total_errors"`
+	LastSeen      time.Time `json:"last_seen"`
+}
+
+// ProfilerOverviewRow summarizes runtime profiling and test execution stats.
+type ProfilerOverviewRow struct {
+	TotalTraces   int     `json:"total_traces"`
+	TotalErrors   int     `json:"total_errors"`
+	AvgDurationMs float64 `json:"avg_duration_ms"`
+	ActiveServices int    `json:"active_services"`
+}
+
+// InsertTrace appends a runtime profiler trace row.
+func (s *Store) InsertTrace(t RuntimeTraceRecord) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	const q = `
+		INSERT INTO runtime_traces
+			(trace_id, run_id, service_name, node_signature, file_path,
+			 duration_ms, cpu_usage_pct, memory_bytes, status_code, error_msg,
+			 profiler_type, metadata_json, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+	`
+	var runID any
+	if t.RunID != "" {
+		runID = t.RunID
+	}
+	_, err := s.db.ExecContext(ctx, q,
+		t.TraceID, runID, t.ServiceName, t.NodeSignature, t.FilePath,
+		t.DurationMs, t.CPUUsagePct, t.MemoryBytes, t.StatusCode, t.ErrorMsg,
+		t.ProfilerType, t.MetadataJSON, fmtDBTime(t.Timestamp),
+	)
+	if err != nil {
+		return fmt.Errorf("insert trace %s: %w", t.TraceID, err)
+	}
+	return nil
+}
+
+// RecentTraces returns the N most recent runtime trace events.
+func (s *Store) RecentTraces(limit int) ([]RuntimeTraceRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(context.Background(), `
+		SELECT trace_id, COALESCE(run_id, ''), service_name, COALESCE(node_signature, ''),
+		       COALESCE(file_path, ''), duration_ms, cpu_usage_pct, memory_bytes,
+		       status_code, COALESCE(error_msg, ''), profiler_type, COALESCE(metadata_json, '{}'),
+		       timestamp
+		FROM runtime_traces
+		ORDER BY timestamp DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent traces: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]RuntimeTraceRecord, 0, limit)
+	for rows.Next() {
+		var (
+			t  RuntimeTraceRecord
+			ts string
+		)
+		if err := rows.Scan(&t.TraceID, &t.RunID, &t.ServiceName, &t.NodeSignature,
+			&t.FilePath, &t.DurationMs, &t.CPUUsagePct, &t.MemoryBytes,
+			&t.StatusCode, &t.ErrorMsg, &t.ProfilerType, &t.MetadataJSON, &ts); err != nil {
+			return nil, fmt.Errorf("scan recent trace: %w", err)
+		}
+		t.Timestamp = parseDBTime(ts)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ProfilerHotspots returns hotspot functions ranked by average execution duration and errors.
+func (s *Store) ProfilerHotspots(limit int) ([]ProfilerHotspotRow, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	rows, err := s.db.QueryContext(context.Background(), `
+		SELECT node_signature, file_path, COUNT(*) AS trace_count,
+		       AVG(duration_ms) AS avg_duration, MAX(duration_ms) AS max_duration,
+		       SUM(CASE WHEN status_code >= 400 OR error_msg != '' THEN 1 ELSE 0 END) AS total_errors,
+		       MAX(timestamp) AS last_seen
+		FROM runtime_traces
+		WHERE node_signature != ''
+		GROUP BY node_signature, file_path
+		ORDER BY avg_duration DESC, trace_count DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("profiler hotspots: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ProfilerHotspotRow
+	for rows.Next() {
+		var (
+			h  ProfilerHotspotRow
+			ts string
+		)
+		if err := rows.Scan(&h.NodeSignature, &h.FilePath, &h.TraceCount, &h.AvgDurationMs, &h.MaxDurationMs, &h.TotalErrors, &ts); err != nil {
+			return nil, fmt.Errorf("scan hotspot: %w", err)
+		}
+		h.LastSeen = parseDBTime(ts)
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// ProfilerOverview returns summary stats across all recorded runtime traces.
+func (s *Store) ProfilerOverview() (ProfilerOverviewRow, error) {
+	var o ProfilerOverviewRow
+	row := s.db.QueryRowContext(context.Background(), `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN status_code >= 400 OR error_msg != '' THEN 1 ELSE 0 END), 0),
+			COALESCE(AVG(duration_ms), 0.0),
+			COUNT(DISTINCT service_name)
+		FROM runtime_traces
+	`)
+	if err := row.Scan(&o.TotalTraces, &o.TotalErrors, &o.AvgDurationMs, &o.ActiveServices); err != nil {
+		return o, fmt.Errorf("profiler overview scan: %w", err)
+	}
+	return o, nil
+}
+

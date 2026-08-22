@@ -114,8 +114,8 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 	}
 	res := wireResult(t, resp)
 	tools, ok := res["tools"].([]interface{})
-	if !ok || len(tools) != 2 {
-		t.Fatalf("want 2 tools, got %#v", res["tools"])
+	if !ok || len(tools) != 5 {
+		t.Fatalf("want 5 tools, got %#v", res["tools"])
 	}
 
 	byName := map[string]map[string]interface{}{}
@@ -132,6 +132,9 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 	}
 	if _, ok := byName["get_file_health_score"]; !ok {
 		t.Fatalf("get_file_health_score missing: %v", byName)
+	}
+	if _, ok := byName["check_guardrail"]; !ok {
+		t.Fatalf("check_guardrail missing: %v", byName)
 	}
 
 	for name, tl := range byName {

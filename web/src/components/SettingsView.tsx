@@ -3,8 +3,6 @@ import { Settings, Save, ShieldAlert, Cpu, HardDrive, DollarSign, Check, Sliders
 import { useSettings, useProjects } from '../hooks/useMetrics';
 import type { AppSettings, Project, ImportFromWrongStackResult, PreviewFromWrongStackResult } from '../types';
 
-
-
 export function SettingsView() {
   const { data: initialSettings, refetch: refetchSettings } = useSettings();
   const { data: projects = [], refetch: refetchProjects } = useProjects();
@@ -42,7 +40,6 @@ export function SettingsView() {
   const [preview, setPreview] = useState<PreviewFromWrongStackResult | null>(null);
   const [isPreviewing, setIsPreviewing] = useState(false);
   const [selectedRoots, setSelectedRoots] = useState<Record<string, boolean>>({});
-
 
   // Project Edit state
   const [editingProject, setEditingProject] = useState<Record<string, Partial<Project>>>({});
@@ -265,7 +262,8 @@ export function SettingsView() {
         body: JSON.stringify({ days: 30 }),
       });
       const data = await res.json();
-      setPruneMsg(`Deleted ${data.deleted_rows || 0} stale events (> 30 days)`);
+      const count = data.deleted ?? data.deleted_rows ?? 0;
+      setPruneMsg(`Deleted ${count} stale events (> 30 days)`);
       setTimeout(() => setPruneMsg(null), 4000);
     } catch (err) {
       setPruneMsg('Prune failed');
@@ -646,25 +644,100 @@ export function SettingsView() {
                     </div>
                   </div>
 
+                  {/* Dynamic Multi-Agent Fleet Insight Note */}
+                  {(() => {
+                    const detectedAgentNames: string[] = [];
+                    if ((sessions.antigravity || 0) > 0) detectedAgentNames.push('Google Antigravity');
+                    if ((sessions.claude_code || 0) > 0) detectedAgentNames.push('Claude Code');
+                    if ((sessions.cursor || 0) > 0) detectedAgentNames.push('Cursor AI');
+                    if ((sessions.windsurf || 0) > 0) detectedAgentNames.push('Windsurf');
+                    if ((sessions.trae || 0) > 0) detectedAgentNames.push('Trae');
+                    if ((sessions.copilot || 0) > 0) detectedAgentNames.push('GitHub Copilot');
+                    if ((sessions.cline || 0) > 0) detectedAgentNames.push('Cline / Roo');
+                    if ((sessions.minimax || 0) > 0) detectedAgentNames.push('MiniMax Code');
+                    if ((sessions.kimi || 0) > 0) detectedAgentNames.push('Kimi Code');
+                    if ((sessions.zcode || 0) > 0) detectedAgentNames.push('ZCode');
+                    if ((sessions.devin || 0) > 0) detectedAgentNames.push('Devin');
+                    if ((sessions.aider || 0) > 0) detectedAgentNames.push('Aider');
+
+                    return (
+                      <div className="p-3 rounded-xl bg-gradient-to-r from-cyan-950/20 via-indigo-950/20 to-slate-900/40 border border-cyan-500/20 space-y-1">
+                        <div className="flex items-center gap-1.5 text-xs font-semibold text-cyan-300">
+                          <Sparkles className="h-3.5 w-3.5 text-cyan-400" />
+                          <span>AI Coding Fleet Observability</span>
+                        </div>
+                        <p className="text-[11px] text-slate-300 leading-relaxed">
+                          This project is natively managed within the <span className="text-cyan-400 font-semibold">WrongStack</span> workspace ecosystem.
+                          {detectedAgentNames.length > 0 ? (
+                            <>
+                              {' '}It is also actively co-developed using{' '}
+                              <span className="text-indigo-300 font-medium font-mono">
+                                {detectedAgentNames.join(', ')}
+                              </span>{' '}
+                              coding agents, with all telemetry automatically correlated.
+                            </>
+                          ) : (
+                            ' All external coding agent sessions are automatically discovered and tracked by the WrongTrace telemetry engine.'
+                          )}
+                        </p>
+                      </div>
+                    );
+                  })()}
+
                   {/* Auto-Discovered Agent Badges */}
                   <div className="space-y-2 pt-1">
-                    <div className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-                      <Sparkles className="h-3.5 w-3.5 text-indigo-400" />
+                    <div className="text-xs font-semibold text-slate-400 flex items-center justify-between">
                       <span>Discovered Coding Agent Sessions</span>
+                      <span className="text-[10px] text-slate-500 font-mono">Auto-detected without manual paths</span>
                     </div>
 
-                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <div className="p-2 rounded-lg bg-cyan-950/20 border border-cyan-500/30">
+                        <div className="text-[11px] text-cyan-400 font-semibold">⚡ WrongStack</div>
+                        <div className="text-sm font-bold text-cyan-300 font-mono">
+                          {sessions.wrongstack || 1} <span className="text-[10px] font-normal text-slate-500">sessions</span>
+                        </div>
+                      </div>
+
                       <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
-                        <div className="text-[11px] text-slate-400">WrongStack</div>
-                        <div className="text-sm font-bold text-rose-400 font-mono">
-                          {sessions.wrongstack || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
+                        <div className="text-[11px] text-slate-400">Antigravity</div>
+                        <div className="text-sm font-bold text-teal-400 font-mono">
+                          {sessions.antigravity || 0} <span className="text-[10px] font-normal text-slate-500">transcripts</span>
                         </div>
                       </div>
 
                       <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
                         <div className="text-[11px] text-slate-400">Claude Code</div>
                         <div className="text-sm font-bold text-indigo-400 font-mono">
-                          {sessions.claude_code || 0} <span className="text-[10px] font-normal text-slate-500">logs</span>
+                          {sessions.claude_code || 0} <span className="text-[10px] font-normal text-slate-500">projects</span>
+                        </div>
+                      </div>
+
+                      <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
+                        <div className="text-[11px] text-slate-400">Cursor AI</div>
+                        <div className="text-sm font-bold text-cyan-400 font-mono">
+                          {sessions.cursor || 0} <span className="text-[10px] font-normal text-slate-500">workspaces</span>
+                        </div>
+                      </div>
+
+                      <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
+                        <div className="text-[11px] text-slate-400">Windsurf</div>
+                        <div className="text-sm font-bold text-purple-400 font-mono">
+                          {sessions.windsurf || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
+                        </div>
+                      </div>
+
+                      <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
+                        <div className="text-[11px] text-slate-400">Trae (ByteDance)</div>
+                        <div className="text-sm font-bold text-amber-400 font-mono">
+                          {sessions.trae || 0} <span className="text-[10px] font-normal text-slate-500">workspaces</span>
+                        </div>
+                      </div>
+
+                      <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
+                        <div className="text-[11px] text-slate-400">GitHub Copilot</div>
+                        <div className="text-sm font-bold text-blue-400 font-mono">
+                          {sessions.copilot || 0} <span className="text-[10px] font-normal text-slate-500">detected</span>
                         </div>
                       </div>
 
@@ -674,115 +747,18 @@ export function SettingsView() {
                           {sessions.cline || 0} <span className="text-[10px] font-normal text-slate-500">tasks</span>
                         </div>
                       </div>
-
-                      <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
-                        <div className="text-[11px] text-slate-400">Cursor AI</div>
-                        <div className="text-sm font-bold text-cyan-400 font-mono">
-                          {sessions.cursor || 0} <span className="text-[10px] font-normal text-slate-500">detected</span>
-                        </div>
-                      </div>
-
-                      <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
-                        <div className="text-[11px] text-slate-400">Aider CLI</div>
-                        <div className="text-sm font-bold text-amber-400 font-mono">
-                          {sessions.aider || 0} <span className="text-[10px] font-normal text-slate-500">history</span>
-                        </div>
-                      </div>
                     </div>
                   </div>
 
-                  {/* Configurable Session Paths */}
-                  <div className="space-y-2 pt-2 border-t border-white/5">
-                    <span className="text-[11px] text-slate-400 font-medium block">Agent Session Paths (Auto / Custom):</span>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-mono">
-                      <div className="space-y-1">
-                        <span className="text-[10px] text-slate-500">WrongStack Project Sessions Path</span>
-                        <input
-                          type="text"
-                          value={edit.wrongstack_logs_path ?? p.wrongstack_logs_path ?? ''}
-                          placeholder="~/.wrongstack/projects/<slug>/sessions"
-                          onChange={(e) =>
-                            setEditingProject({
-                              ...editingProject,
-                              [p.id]: { ...edit, wrongstack_logs_path: e.target.value },
-                            })
-                          }
-                          className="w-full bg-slate-800 border border-white/10 rounded px-2 py-1 text-slate-300 text-[11px] focus:outline-none focus:border-accent"
-                        />
-                      </div>
-
-                      <div className="space-y-1">
-                        <span className="text-[10px] text-slate-500">Claude Code Path</span>
-                        <input
-                          type="text"
-                          value={edit.claude_logs_path ?? p.claude_logs_path ?? ''}
-                          onChange={(e) =>
-                            setEditingProject({
-                              ...editingProject,
-                              [p.id]: { ...edit, claude_logs_path: e.target.value },
-                            })
-                          }
-                          className="w-full bg-slate-800 border border-white/10 rounded px-2 py-1 text-slate-300 text-[11px] focus:outline-none focus:border-accent"
-                        />
-                      </div>
-
-                      <div className="space-y-1">
-                        <span className="text-[10px] text-slate-500">Aider History Path</span>
-                        <input
-                          type="text"
-                          value={edit.aider_logs_path ?? p.aider_logs_path ?? ''}
-                          onChange={(e) =>
-                            setEditingProject({
-                              ...editingProject,
-                              [p.id]: { ...edit, aider_logs_path: e.target.value },
-                            })
-                          }
-                          className="w-full bg-slate-800 border border-white/10 rounded px-2 py-1 text-slate-300 text-[11px] focus:outline-none focus:border-accent"
-                        />
-                      </div>
-
-                      <div className="space-y-1">
-                        <span className="text-[10px] text-slate-500">Cursor / Workspace Path</span>
-                        <input
-                          type="text"
-                          value={edit.cursor_logs_path ?? p.cursor_logs_path ?? ''}
-                          onChange={(e) =>
-                            setEditingProject({
-                              ...editingProject,
-                              [p.id]: { ...edit, cursor_logs_path: e.target.value },
-                            })
-                          }
-                          className="w-full bg-slate-800 border border-white/10 rounded px-2 py-1 text-slate-300 text-[11px] focus:outline-none focus:border-accent"
-                        />
-                      </div>
-
-                      <div className="space-y-1 md:col-span-2">
-                        <span className="text-[10px] text-slate-500">Custom Log Glob Path</span>
-                        <input
-                          type="text"
-                          value={edit.custom_logs_path ?? p.custom_logs_path ?? ''}
-                          placeholder=".myagent/logs/*.json"
-                          onChange={(e) =>
-                            setEditingProject({
-                              ...editingProject,
-                              [p.id]: { ...edit, custom_logs_path: e.target.value },
-                            })
-                          }
-                          className="w-full bg-slate-800 border border-white/10 rounded px-2 py-1 text-slate-300 text-[11px] focus:outline-none focus:border-accent"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="flex justify-end pt-2">
-                      <button
-                        type="button"
-                        onClick={() => handleUpdateProjectFields(p)}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors"
-                      >
-                        <Save className="h-3.5 w-3.5" />
-                        Save & Rescan Identity
-                      </button>
-                    </div>
+                  <div className="flex justify-end pt-2 border-t border-white/5">
+                    <button
+                      type="button"
+                      onClick={() => handleUpdateProjectFields(p)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors"
+                    >
+                      <Save className="h-3.5 w-3.5" />
+                      Save Project Settings
+                    </button>
                   </div>
                 </div>
               );

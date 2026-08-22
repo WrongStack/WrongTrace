@@ -9,44 +9,61 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/db"
 )
 
-func TestGenerateMarkdownReport(t *testing.T) {
-	snap := core.MetricsSnapshot{
-		Repo:        "test-repo",
-		GeneratedAt: time.Now().UTC(),
-		Overview: db.Overview{
-			TotalRuns:   10,
-			TotalEvents: 45,
-			TotalCost:   3.50,
-		},
-		Models: []db.ModelRow{
-			{
-				Model:              "claude-3-7-sonnet",
-				SurvivalRatePct:    85.5,
-				TotalSurvivedNodes: 12,
-				TotalCostUSD:       2.50,
-				CostPerSurvNode:    0.2083,
+func TestGenerateReports(t *testing.T) {
+	data := ReportData{
+		Snapshot: core.MetricsSnapshot{
+			Repo:        "test-repo",
+			GeneratedAt: time.Now().UTC(),
+			Overview: db.Overview{
+				TotalRuns:   10,
+				TotalEvents: 45,
+				TotalCost:   3.50,
+			},
+			Models: []db.ModelRow{
+				{
+					Model:              "claude-3-7-sonnet",
+					SurvivalRatePct:    85.5,
+					TotalSurvivedNodes: 12,
+					TotalCostUSD:       2.50,
+					CostPerSurvNode:    0.2083,
+				},
+			},
+			Thrashing: []db.ThrashingRow{
+				{
+					FilePath:    "main.go",
+					Signature:   "func:main",
+					EditCount:   4,
+					WindowHours: 2.5,
+				},
+			},
+			RecentEvents: []db.EventRecord{
+				{
+					FilePath:   "calc.go",
+					Signature:  "func:Add",
+					RunID:      "run-101",
+					Action:     "MODIFIED",
+					OccurredAt: time.Now().UTC(),
+				},
 			},
 		},
-		Thrashing: []db.ThrashingRow{
-			{
-				FilePath:    "main.go",
-				Signature:   "func:main",
-				EditCount:   4,
-				WindowHours: 2.5,
-			},
+		ProfilerOverview: db.ProfilerOverviewRow{
+			TotalTraces:    50,
+			TotalErrors:    2,
+			AvgDurationMs:  34.5,
+			ActiveServices: 3,
 		},
-		RecentEvents: []db.EventRecord{
+		Hotspots: []db.ProfilerHotspotRow{
 			{
-				FilePath:   "calc.go",
-				Signature:  "func:Add",
-				RunID:      "run-101",
-				Action:     "MODIFIED",
-				OccurredAt: time.Now().UTC(),
+				NodeSignature: "func:calc.go::Add",
+				FilePath:      "calc.go",
+				TraceCount:    25,
+				AvgDurationMs: 40.2,
+				TotalErrors:   1,
 			},
 		},
 	}
 
-	md := GenerateMarkdownReport(snap)
+	md := GenerateMarkdownReport(data)
 	if !strings.Contains(md, "WrongTrace") || !strings.Contains(md, "test-repo") {
 		t.Error("missing header or repo in markdown report")
 	}
@@ -57,9 +74,16 @@ func TestGenerateMarkdownReport(t *testing.T) {
 		t.Error("missing thrashing or recent event rows in markdown report")
 	}
 
+	// Test HTML Report
+	htmlStr := GenerateHTMLReport(data)
+	if !strings.Contains(htmlStr, "WrongTrace Observability Report") || !strings.Contains(htmlStr, "test-repo") {
+		t.Errorf("GenerateHTMLReport failed: %s", htmlStr)
+	}
+
 	// Test JSON Report
-	jsonStr, err := GenerateJSONReport(snap)
+	jsonStr, err := GenerateJSONReport(data)
 	if err != nil || !strings.Contains(jsonStr, `"test-repo"`) {
 		t.Errorf("GenerateJSONReport failed: %v", err)
 	}
 }
+

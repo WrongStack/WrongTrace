@@ -79,6 +79,14 @@ export function useModelCatalog() {
   });
 }
 
+export function useProviderCatalog() {
+  return useQuery<import('../types').ProviderInfo[]>({
+    queryKey: ['provider_catalog'],
+    queryFn: () => jget<import('../types').ProviderInfo[]>(`${base}/models/providers`),
+    staleTime: 60_000,
+  });
+}
+
 export function useProxyRoutes() {
   return useQuery<import('../types').ProxyRoute[]>({
     queryKey: ['proxy_routes'],
@@ -95,6 +103,14 @@ export function useProjects() {
   });
 }
 
+export function useProxyTraffic() {
+  return useQuery<import('../types').ProxyTrafficRecord[]>({
+    queryKey: ['proxy_traffic'],
+    queryFn: () => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic`),
+    refetchInterval: 3_000,
+  });
+}
+
 export function useSettings() {
   return useQuery<import('../types').AppSettings>({
     queryKey: ['app_settings'],
@@ -102,3 +118,28 @@ export function useSettings() {
     staleTime: 60_000,
   });
 }
+
+export function useProfilerTraces(limit: number = 50) {
+  return useQuery<import('../types').RuntimeTrace[]>({
+    queryKey: ['profiler_traces', limit],
+    queryFn: () => jget<import('../types').RuntimeTrace[]>(`${base}/profiler/traces?limit=${limit}`),
+    refetchInterval: 5_000,
+  });
+}
+
+export function useProfilerHotspots(limit: number = 25) {
+  return useQuery<import('../types').ProfilerHotspot[]>({
+    queryKey: ['profiler_hotspots', limit],
+    queryFn: () => jget<import('../types').ProfilerHotspot[]>(`${base}/profiler/hotspots?limit=${limit}`),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useProfilerOverview() {
+  return useQuery<import('../types').ProfilerOverview>({
+    queryKey: ['profiler_overview'],
+    queryFn: () => jget<import('../types').ProfilerOverview>(`${base}/profiler/overview`),
+    refetchInterval: 10_000,
+  });
+}
+

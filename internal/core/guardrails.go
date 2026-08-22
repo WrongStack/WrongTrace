@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/wrongstack/wrongtrace/internal/webhook"
 )
 
 // GuardrailResult indicates whether an agent should proceed editing a file.
@@ -58,6 +60,14 @@ func (e *Engine) IsFileLocked(path string) (bool, string) {
 func (e *Engine) CheckGuardrail(path string) (GuardrailResult, error) {
 	locked, reason := e.IsFileLocked(path)
 	if locked {
+		if e.webhooks != nil {
+			e.webhooks.Dispatch(webhook.Payload{
+				EventType: webhook.EventGuardrailBlock,
+				Severity:  "critical",
+				Message:   fmt.Sprintf("Guardrail blocked modification on locked file: %s (%s)", path, reason),
+				Details:   map[string]interface{}{"file_path": path, "reason": reason},
+			})
+		}
 		return GuardrailResult{
 			Allowed:        false,
 			IsLocked:       true,
@@ -83,6 +93,14 @@ func (e *Engine) CheckGuardrail(path string) (GuardrailResult, error) {
 	if h.IsFragile || h.HealthScore < 40 {
 		allowed = false
 		rec = fmt.Sprintf("GUARDRAIL WARNING: File %s has high churn (Health Score: %d/100, %d thrash events). Consider human review.", path, h.HealthScore, h.RecentThrashingCount)
+		if e.webhooks != nil {
+			e.webhooks.Dispatch(webhook.Payload{
+				EventType: webhook.EventThrashingAlert,
+				Severity:  "warning",
+				Message:   rec,
+				Details:   map[string]interface{}{"file_path": path, "health_score": h.HealthScore, "thrash_count": h.RecentThrashingCount},
+			})
+		}
 	} else if h.HealthScore < 70 {
 		rec = fmt.Sprintf("Caution: File health score is %d/100. Apply minimal localized diffs.", h.HealthScore)
 	}

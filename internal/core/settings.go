@@ -2,6 +2,8 @@ package core
 
 import (
 	"sync"
+
+	"github.com/wrongstack/wrongtrace/internal/webhook"
 )
 
 // AppSettings holds dynamic daemon configuration and user preferences.
@@ -68,19 +70,29 @@ func (e *Engine) UpdateSettings(s AppSettings) AppSettings {
 	if s.DefaultProvider != "" {
 		globalSettings.DefaultProvider = s.DefaultProvider
 	}
-	// Webhook URLs are guarded like every other field: an empty string means
-	// "not provided in this partial update", not "clear the configured URL".
-	// Assigning unconditionally let a partial settings POST wipe configured
-	// integrations. Clearing is explicit via a non-empty sentinel or a
-	// dedicated clear action, never an accident of omission.
-	if s.SlackWebhookURL != "" {
+	if s.SlackWebhookURL == "-" || s.SlackWebhookURL == "none" || s.SlackWebhookURL == "CLEAR" {
+		globalSettings.SlackWebhookURL = ""
+	} else if s.SlackWebhookURL != "" {
 		globalSettings.SlackWebhookURL = s.SlackWebhookURL
 	}
-	if s.DiscordWebhookURL != "" {
+	if s.DiscordWebhookURL == "-" || s.DiscordWebhookURL == "none" || s.DiscordWebhookURL == "CLEAR" {
+		globalSettings.DiscordWebhookURL = ""
+	} else if s.DiscordWebhookURL != "" {
 		globalSettings.DiscordWebhookURL = s.DiscordWebhookURL
 	}
-	if s.CustomWebhookURL != "" {
+	if s.CustomWebhookURL == "-" || s.CustomWebhookURL == "none" || s.CustomWebhookURL == "CLEAR" {
+		globalSettings.CustomWebhookURL = ""
+	} else if s.CustomWebhookURL != "" {
 		globalSettings.CustomWebhookURL = s.CustomWebhookURL
 	}
+
+	if e != nil && e.webhooks != nil {
+		e.webhooks.UpdateConfig(webhook.Config{
+			SlackURL:   globalSettings.SlackWebhookURL,
+			DiscordURL: globalSettings.DiscordWebhookURL,
+			GenericURL: globalSettings.CustomWebhookURL,
+		})
+	}
+
 	return globalSettings
 }

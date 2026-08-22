@@ -1,0 +1,164 @@
+2026/08/23 00:53:53 wrongtrace dev starting
+2026/08/23 00:53:53   watch  : D:\Codebox\PROJECTS\WrongTrace
+2026/08/23 00:53:53   port   : 4318
+2026/08/23 00:53:53   db     : C:\Users\ersin\.wrongtrace\wrongtrace.db
+2026/08/23 00:53:53   socket : \\.\pipe\wrongtrace
+2026/08/23 00:53:53   repo   : WrongTrace
+2026/08/23 00:53:54 ipc: listening on \\.\pipe\wrongtrace (windows)
+2026/08/23 00:53:54 http: listening on http://localhost:4318
+2026/08/23 00:53:54 models.dev sync: 6857 models loaded
+2026/08/23 00:53:55 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:53:56 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:54:00 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3685ms
+2026/08/23 00:54:01 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 5440ms
+2026/08/23 00:54:23 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:54:25 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:54:28 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 4218ms
+2026/08/23 00:54:30 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 5247ms
+2026/08/23 00:54:32 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:54:37 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4867ms
+2026/08/23 00:54:47 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:54:51 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3819ms
+2026/08/23 00:54:52 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:54:54 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1962ms
+2026/08/23 00:55:12 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:55:13 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1898ms
+2026/08/23 00:55:15 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:55:21 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 5590ms
+2026/08/23 00:55:23 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:55:24 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:55:27 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 3822ms
+2026/08/23 00:55:28 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4102ms
+2026/08/23 00:55:31 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:55:35 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3746ms
+2026/08/23 00:55:38 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:55:42 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3319ms
+2026/08/23 00:55:43 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:55:44 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:55:47 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 3864ms
+2026/08/23 00:55:48 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 5126ms
+2026/08/23 00:55:49 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:55:50 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:55:52 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:55:53 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 4234ms
+2026/08/23 00:55:55 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4047ms
+2026/08/23 00:55:57 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4916ms
+2026/08/23 00:55:57 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:56:03 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 5816ms
+2026/08/23 00:56:19 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:56:19 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:56:21 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1946ms
+2026/08/23 00:56:23 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4035ms
+2026/08/23 00:56:24 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:56:25 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 850ms
+2026/08/23 00:56:30 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:56:32 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1928ms
+2026/08/23 00:56:32 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:56:38 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 6229ms
+2026/08/23 00:56:39 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:56:40 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:56:41 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 802ms
+2026/08/23 00:56:43 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 4525ms
+2026/08/23 00:56:48 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:56:53 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 4385ms
+2026/08/23 00:56:58 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:56:59 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1472ms
+2026/08/23 00:57:10 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 00:57:10 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 893ms
+2026/08/23 00:57:32 proxy: forwarding POST /proxy/api.kimi.com/coding/v1/messages -> https://api.kimi.com/coding/v1/messages (provider: Kimi, model: k3)
+2026/08/23 00:57:36 proxy: https://api.kimi.com/coding/v1/messages responded with HTTP 200 in 4319ms
+2026/08/23 01:00:29 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:00:35 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 6656ms
+2026/08/23 01:01:20 proxy: forwarding POST /proxy/chatgpt.com/backend-api/codex/responses -> https://chatgpt.com/backend-api/codex/responses (provider: Chatgpt, model: gpt-5.6-sol)
+2026/08/23 01:01:20 proxy: forwarding POST /proxy/api.minimax.io/anthropic/v1/messages -> https://api.minimax.io/anthropic/v1/messages (provider: Minimax, model: MiniMax-M3)
+2026/08/23 01:01:21 proxy: https://chatgpt.com/backend-api/codex/responses responded with HTTP 400 in 1006ms
+2026/08/23 01:01:21 proxy: forwarding POST /proxy/opencode.ai/zen/go/v1/chat/completions -> https://opencode.ai/zen/go/v1/chat/completions (provider: Opencode, model: deepseek-v4-pro)
+2026/08/23 01:01:21 proxy: https://api.minimax.io/anthropic/v1/messages responded with HTTP 200 in 1231ms
+2026/08/23 01:01:22 proxy: https://opencode.ai/zen/go/v1/chat/completions responded with HTTP 200 in 876ms
+2026/08/23 01:01:22 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:01:23 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1409ms
+2026/08/23 01:01:24 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:01:27 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3687ms
+2026/08/23 01:01:31 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:01:34 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3334ms
+2026/08/23 01:01:38 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:01:41 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3623ms
+2026/08/23 01:01:43 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:01:47 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3428ms
+2026/08/23 01:02:04 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:02:07 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3256ms
+2026/08/23 01:02:32 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:02:37 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4506ms
+2026/08/23 01:03:06 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:09 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3348ms
+2026/08/23 01:03:19 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:20 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:20 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 821ms
+2026/08/23 01:03:22 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:23 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3480ms
+2026/08/23 01:03:23 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 797ms
+2026/08/23 01:03:25 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:26 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 872ms
+2026/08/23 01:03:27 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:29 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:31 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 2062ms
+2026/08/23 01:03:31 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4220ms
+2026/08/23 01:03:33 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:34 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 800ms
+2026/08/23 01:03:38 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:39 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 872ms
+2026/08/23 01:03:46 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:48 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1183ms
+2026/08/23 01:03:53 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:56 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3329ms
+2026/08/23 01:03:58 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:03:58 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 943ms
+2026/08/23 01:04:05 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:06 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:07 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 872ms
+2026/08/23 01:04:08 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3255ms
+2026/08/23 01:04:12 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:16 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:16 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3380ms
+2026/08/23 01:04:17 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1050ms
+2026/08/23 01:04:19 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:23 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3457ms
+2026/08/23 01:04:25 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:27 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:29 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4063ms
+2026/08/23 01:04:29 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 2773ms
+2026/08/23 01:04:32 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:33 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1269ms
+2026/08/23 01:04:38 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:40 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:41 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 873ms
+2026/08/23 01:04:43 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4816ms
+2026/08/23 01:04:44 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:48 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3501ms
+2026/08/23 01:04:54 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:04:57 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3321ms
+2026/08/23 01:05:12 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:05:14 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1093ms
+2026/08/23 01:05:41 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:05:45 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3361ms
+2026/08/23 01:05:51 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:05:52 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 932ms
+2026/08/23 01:06:31 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:06:35 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3557ms
+2026/08/23 01:06:38 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:06:42 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3549ms
+2026/08/23 01:06:44 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:06:49 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4620ms
+2026/08/23 01:06:51 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:06:56 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 4388ms
+2026/08/23 01:07:13 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:07:16 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3812ms
+2026/08/23 01:07:36 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:07:37 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 659ms
+2026/08/23 01:07:43 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:07:46 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:07:46 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 3345ms
+2026/08/23 01:07:48 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1851ms
+2026/08/23 01:07:55 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)
+2026/08/23 01:07:57 proxy: https://api.z.ai/api/coding/paas/v4/chat/completions responded with HTTP 200 in 1861ms
+2026/08/23 01:07:58 proxy: forwarding POST /proxy/api.z.ai/api/coding/paas/v4/chat/completions -> https://api.z.ai/api/coding/paas/v4/chat/completions (provider: Z.AI, model: glm-5.3)

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -35,11 +36,35 @@ type Config struct {
 	IgnoreDirs []string
 }
 
+// DefaultIgnoreDirs contains directory names that are always ignored from watching and AST diffs.
+var DefaultIgnoreDirs = []string{
+	".git",
+	".temp_files",
+	"temp_files",
+	".tmp",
+	"tmp",
+	"node_modules",
+	"vendor",
+	"dist",
+	"build",
+	"target",
+	".next",
+	".nuxt",
+	".turbo",
+	".cache",
+	".wrongtrace",
+	"coverage",
+	"out",
+	".out",
+	"bin",
+}
+
 // Watcher is a debouncing filesystem observer rooted at a single directory.
 type Watcher struct {
 	cfg      Config
 	fs       *fsnotify.Watcher
 	debounce time.Duration
+	patterns []string
 }
 
 // New constructs and primes a Watcher. It does not start the event loop; call
@@ -49,21 +74,43 @@ func New(cfg Config) (*Watcher, error) {
 		cfg.Debounce = 250 * time.Millisecond
 	}
 	if len(cfg.IgnoreDirs) == 0 {
-		cfg.IgnoreDirs = []string{
-			".git", "node_modules", "vendor", "dist", "build",
-			"target", ".next", ".turbo", ".cache", ".wrongtrace",
-		}
+		cfg.IgnoreDirs = make([]string, len(DefaultIgnoreDirs))
+		copy(cfg.IgnoreDirs, DefaultIgnoreDirs)
 	}
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
-	w := &Watcher{cfg: cfg, fs: fw, debounce: cfg.Debounce}
+	w := &Watcher{
+		cfg:      cfg,
+		fs:       fw,
+		debounce: cfg.Debounce,
+		patterns: loadGitIgnorePatterns(cfg.Dir),
+	}
 	if err := w.addRecursive(cfg.Dir); err != nil {
 		_ = fw.Close()
 		return nil, err
 	}
 	return w, nil
+}
+
+func loadGitIgnorePatterns(root string) []string {
+	var patterns []string
+	giPath := filepath.Join(root, ".gitignore")
+	data, err := os.ReadFile(giPath)
+	if err != nil {
+		return patterns
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		l = strings.TrimSuffix(l, "/")
+		patterns = append(patterns, l)
+	}
+	return patterns
 }
 
 // Close releases the underlying fsnotify resources.
@@ -91,13 +138,8 @@ func (w *Watcher) addRecursive(root string) error {
 		if !info.IsDir() {
 			return nil
 		}
-		// Apply ignore rules at registration time so we never even hear
-		// about events deep in vendored trees.
-		base := filepath.Base(path)
-		for _, ig := range w.cfg.IgnoreDirs {
-			if base == ig {
-				return filepath.SkipDir
-			}
+		if w.pathIgnored(path) {
+			return filepath.SkipDir
 		}
 		if err := w.fs.Add(path); err != nil {
 			log.Printf("watcher: cannot watch %s: %v", path, err)
@@ -106,17 +148,32 @@ func (w *Watcher) addRecursive(root string) error {
 	})
 }
 
-// pathIgnored is a fast-path filter for events on paths outside the registered
-// tree (defensive: in practice addRecursive's skips handle this).
+// pathIgnored is a fast-path filter for events and directory walking.
 func (w *Watcher) pathIgnored(p string) bool {
-	segs := strings.Split(filepath.ToSlash(p), "/")
+	norm := filepath.ToSlash(p)
+	segs := strings.Split(norm, "/")
+	base := filepath.Base(p)
+
+	// 1. Check directory segments
 	for _, seg := range segs {
 		for _, ig := range w.cfg.IgnoreDirs {
-			if seg == ig {
+			if strings.EqualFold(seg, ig) {
 				return true
 			}
 		}
 	}
+
+	// 2. Check .gitignore patterns
+	for _, pattern := range w.patterns {
+		patNorm := filepath.ToSlash(pattern)
+		if matched, _ := filepath.Match(patNorm, base); matched {
+			return true
+		}
+		if strings.Contains(norm, "/"+patNorm+"/") || strings.HasSuffix(norm, "/"+patNorm) || strings.HasPrefix(norm, patNorm+"/") {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -129,7 +186,19 @@ func (w *Watcher) Run(ctx context.Context) {
 		return
 	}
 
+	var pendingMu sync.Mutex
 	pending := make(map[string]*time.Timer)
+
+	defer func() {
+		pendingMu.Lock()
+		for _, t := range pending {
+			if t != nil {
+				t.Stop()
+			}
+		}
+		pendingMu.Unlock()
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -149,13 +218,19 @@ func (w *Watcher) Run(ctx context.Context) {
 			if !isRelevant(ev.Op) {
 				continue
 			}
-			if t, exists := pending[ev.Name]; exists && t != nil {
+
+			path := ev.Name
+			pendingMu.Lock()
+			if t, exists := pending[path]; exists && t != nil {
 				t.Stop()
 			}
-			path := ev.Name
-			pending[ev.Name] = time.AfterFunc(w.debounce, func() {
+			pending[path] = time.AfterFunc(w.debounce, func() {
+				pendingMu.Lock()
+				delete(pending, path)
+				pendingMu.Unlock()
 				w.cfg.Engine.HandleFileChange(ctx, path)
 			})
+			pendingMu.Unlock()
 		case err, ok := <-w.fs.Errors:
 			if !ok {
 				return

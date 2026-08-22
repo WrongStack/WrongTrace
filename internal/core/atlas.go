@@ -73,8 +73,13 @@ func (e *Engine) PrimeDirectory(dir string) {
 		}
 		if info.IsDir() {
 			base := filepath.Base(path)
-			for _, ig := range []string{".git", "node_modules", "vendor", "dist", "build", "target", ".wrongtrace"} {
-				if base == ig {
+			for _, ig := range []string{
+				".git", ".temp_files", "temp_files", ".tmp", "tmp",
+				"node_modules", "vendor", "dist", "build", "target",
+				".next", ".nuxt", ".turbo", ".cache", ".wrongtrace",
+				"coverage", "out", ".out", "bin",
+			} {
+				if strings.EqualFold(base, ig) {
 					return filepath.SkipDir
 				}
 			}
@@ -122,30 +127,51 @@ func (e *Engine) Atlas() (AtlasSnapshot, error) {
 		snapshots = make(map[string]*ast.FileSnapshot)
 	}
 
-	// Group files by directory / package
+	activeProj := e.GetActiveProject()
+	var activePath string
+	if activeProj != nil && activeProj.Path != "" {
+		activePath = filepath.Clean(activeProj.Path)
+	}
+
+	// Check if activePath actually matches loaded snapshots (or if running in isolated test)
+	var hasActivePathMatch bool
+	if activePath != "" {
+		for p := range snapshots {
+			if strings.HasPrefix(strings.ToLower(filepath.Clean(p)), strings.ToLower(activePath)) {
+				hasActivePathMatch = true
+				break
+			}
+		}
+	}
+
+	// Group files by top-level package scope (prevents granular subfolder explosion)
 	pkgMap := make(map[string]*AtlasPackage)
 
 	for path, fileSnap := range snapshots {
-		relPath := filepath.ToSlash(path)
-		dir := filepath.ToSlash(filepath.Dir(path))
-		if dir == "" || dir == "." {
-			dir = "root"
-		}
-		pkgName := filepath.Base(dir)
-		if pkgName == "." || pkgName == "/" || pkgName == "\\" {
-			pkgName = "root"
+		cleanPath := filepath.Clean(path)
+		if hasActivePathMatch && !strings.HasPrefix(strings.ToLower(cleanPath), strings.ToLower(activePath)) {
+			continue
 		}
 
-		pkg, exists := pkgMap[dir]
+		relPath := cleanPath
+		if hasActivePathMatch {
+			if r, err := filepath.Rel(activePath, cleanPath); err == nil && !strings.HasPrefix(r, "..") {
+				relPath = r
+			}
+		}
+		relPath = filepath.ToSlash(relPath)
+		pkgPath, pkgName, ws := resolvePackageScope(relPath)
+
+		pkg, exists := pkgMap[pkgPath]
 		if !exists {
 			pkg = &AtlasPackage{
-				Path:      dir,
+				Path:      pkgPath,
 				Name:      pkgName,
-				Workspace: resolveWorkspace(dir),
+				Workspace: ws,
 				Files:     []AtlasFile{},
 				TotalLOC:  0,
 			}
-			pkgMap[dir] = pkg
+			pkgMap[pkgPath] = pkg
 		}
 
 		lang := ast.DetectLanguage(path).String()
@@ -157,8 +183,18 @@ func (e *Engine) Atlas() (AtlasSnapshot, error) {
 			Symbols:     []AtlasSymbol{},
 		}
 
-		// Fast in-memory health lookup from batch query
-		if h, ok := allHealth[relPath]; ok {
+		// Fast in-memory health lookup from batch query with normalized and relative path fallback
+		h, ok := allHealth[relPath]
+		if !ok {
+			h, ok = allHealth[cleanPath]
+		}
+		if !ok {
+			h, ok = allHealth[filepath.ToSlash(cleanPath)]
+		}
+		if !ok {
+			h, ok = allHealth[path]
+		}
+		if ok {
 			af.HealthScore = h.HealthScore
 			af.IsFragile = h.IsFragile
 			af.RecentThrashingCount = h.RecentThrashingCount
@@ -235,19 +271,37 @@ func (e *Engine) Atlas() (AtlasSnapshot, error) {
 	return snap, nil
 }
 
-func resolveWorkspace(dir string) string {
+func resolvePackageScope(filePath string) (pkgPath string, pkgName string, workspace string) {
+	dir := filepath.ToSlash(filepath.Dir(filePath))
 	clean := filepath.ToSlash(filepath.Clean(dir))
+	if clean == "." || clean == "" || clean == "root" {
+		return "root", "root", "root"
+	}
+
 	parts := strings.Split(clean, "/")
-	if len(parts) == 0 || parts[0] == "." || parts[0] == "root" {
-		return "root"
+	if len(parts) == 1 {
+		return parts[0], parts[0], parts[0]
 	}
-	if len(parts) >= 2 {
-		first := parts[0]
-		if first == "packages" || first == "apps" || first == "services" || first == "libs" || first == "modules" {
-			return parts[0] + "/" + parts[1]
-		}
+
+	first := parts[0]
+	// Monorepo containers: packages/xyz, apps/xyz, services/xyz, libs/xyz, modules/xyz
+	if first == "packages" || first == "apps" || first == "services" || first == "libs" || first == "modules" {
+		ws := first + "/" + parts[1]
+		return ws, parts[1], ws
 	}
-	return parts[0]
+
+	// Standard Go layout: internal/<subpkg>, cmd/<subpkg>, pkg/<subpkg>
+	if first == "internal" || first == "cmd" || first == "pkg" {
+		return first + "/" + parts[1], parts[1], first
+	}
+
+	// Web / Frontend apps: web/src/components, web/src/pages -> group into "web"
+	if first == "web" || first == "frontend" || first == "client" || first == "ui" {
+		return first, first, first
+	}
+
+	// Default: 2 levels max (e.g. docs/api, test/e2e)
+	return parts[0] + "/" + parts[1], parts[1], parts[0]
 }
 
 func symbolShortName(sig string) string {

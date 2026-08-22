@@ -98,6 +98,15 @@ func (e *Engine) Close() {
 	e.snapshots = nil
 }
 
+// Reset drops all cached file snapshots. Used when switching active projects.
+func (e *Engine) Reset() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.snapshots != nil {
+		e.snapshots = make(map[string]*FileSnapshot)
+	}
+}
+
 // parserFor returns the parser for a language, or nil when the engine is
 // closed or has no grammar for it. TypeScript falls back to the JavaScript
 // grammar in this binding.
@@ -119,13 +128,21 @@ func (e *Engine) parserFor(lang Language) *sitter.Parser {
 // and an error when the engine is closed. The parse itself is serialized so a
 // shared *sitter.Parser is never driven concurrently.
 func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
+	e.mu.RLock()
+	closed := e.closed
+	e.mu.RUnlock()
+	if closed {
+		return nil, fmt.Errorf("engine closed")
+	}
+
 	lang := DetectLanguage(path)
 	if lang == LangUnknown {
 		return nil, nil
 	}
 	parser := e.parserFor(lang)
 	if parser == nil {
-		return nil, fmt.Errorf("no parser for language %s", lang)
+		// Generic heuristic parser for languages without native tree-sitter C grammar
+		return parseGenericSource(path, src, lang), nil
 	}
 
 	e.parseMu.Lock()
@@ -145,6 +162,112 @@ func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
 	collectNodes(root, src, lang, filepath.Base(path), snap)
 	return snap, nil
 }
+
+// parseGenericSource extracts declarations using robust pattern matching for languages without a compiled Tree-sitter grammar.
+func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
+	snap := &FileSnapshot{
+		Path:  path,
+		Nodes: map[string]Node{},
+		Hash:  hashBytes(src),
+	}
+	base := filepath.Base(path)
+	lines := strings.Split(string(src), "\n")
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		var kind NodeKind
+		var name string
+
+		switch {
+		case strings.HasPrefix(trimmed, "pub fn ") || strings.HasPrefix(trimmed, "fn "):
+			kind = NodeFunction
+			parts := strings.Fields(trimmed)
+			for j, p := range parts {
+				if p == "fn" && j+1 < len(parts) {
+					name = strings.Split(parts[j+1], "(")[0]
+					break
+				}
+			}
+		case strings.HasPrefix(trimmed, "pub struct ") || strings.HasPrefix(trimmed, "struct "):
+			kind = NodeStruct
+			parts := strings.Fields(trimmed)
+			for j, p := range parts {
+				if p == "struct" && j+1 < len(parts) {
+					name = strings.Split(parts[j+1], "{")[0]
+					name = strings.Split(name, "<")[0]
+					break
+				}
+			}
+		case strings.HasPrefix(trimmed, "class ") || strings.Contains(trimmed, " class "):
+			kind = NodeClass
+			parts := strings.Fields(trimmed)
+			for j, p := range parts {
+				if p == "class" && j+1 < len(parts) {
+					name = strings.Split(parts[j+1], "{")[0]
+					name = strings.Split(name, "(")[0]
+					break
+				}
+			}
+		case strings.HasPrefix(trimmed, "function ") || strings.HasPrefix(trimmed, "public function ") || strings.HasPrefix(trimmed, "private function "):
+			kind = NodeFunction
+			parts := strings.Fields(trimmed)
+			for j, p := range parts {
+				if p == "function" && j+1 < len(parts) {
+					name = strings.Split(parts[j+1], "(")[0]
+					break
+				}
+			}
+		case strings.HasPrefix(trimmed, "def ") || strings.HasPrefix(trimmed, "def self."):
+			kind = NodeFunction
+			parts := strings.Fields(trimmed)
+			if len(parts) > 1 {
+				name = strings.Split(parts[1], "(")[0]
+			}
+		}
+
+		if name != "" && kind != "" {
+			name = strings.TrimSpace(name)
+			sig := fmt.Sprintf("%s:%s::%s", kind, base, name)
+
+			startLine := i + 1
+			endLine := i + 1
+			var bodyLines []string
+			bodyLines = append(bodyLines, line)
+
+			if strings.Contains(line, "{") {
+				braceCount := strings.Count(line, "{") - strings.Count(line, "}")
+				j := i + 1
+				for ; j < len(lines) && braceCount > 0; j++ {
+					l := lines[j]
+					bodyLines = append(bodyLines, l)
+					braceCount += strings.Count(l, "{") - strings.Count(l, "}")
+				}
+				endLine = j
+			}
+
+			fullBody := strings.Join(bodyLines, "\n")
+			normalizedBody := normalizeForHash(fullBody, lang)
+			hash := sha256.Sum256([]byte(normalizedBody))
+
+			snap.Nodes[sig] = Node{
+				Signature: sig,
+				Kind:      kind,
+				Body:      normalizedBody,
+				StartLine: uint32(startLine),
+				EndLine:   uint32(endLine),
+				Hash:      hex.EncodeToString(hash[:]),
+				LOC:       endLine - startLine + 1,
+			}
+		}
+	}
+
+	return snap
+}
+
 
 // Snapshot returns the cached snapshot for a file, if any.
 func (e *Engine) Snapshot(path string) (*FileSnapshot, bool) {
@@ -429,8 +552,14 @@ func normalizeForHash(s string, lang Language) string {
 		}
 		if inString != 0 {
 			b.WriteByte(c)
-			if c == inString && (i == 0 || s[i-1] != '\\') {
-				inString = 0
+			if c == inString {
+				backslashes := 0
+				for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+					backslashes++
+				}
+				if backslashes%2 == 0 {
+					inString = 0
+				}
 			}
 			continue
 		}

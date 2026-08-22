@@ -155,6 +155,40 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 						"required": []string{"file_path"},
 					},
 				},
+				{
+					"name":        "lock_file",
+					"description": "Lock a fragile file against unwanted edits while another critical refactor is underway.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"file_path": map[string]string{"type": "string"},
+							"reason":    map[string]string{"type": "string"},
+						},
+						"required": []string{"file_path"},
+					},
+				},
+				{
+					"name":        "unlock_file",
+					"description": "Unlock a previously locked file when edits or refactoring is completed.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"file_path": map[string]string{"type": "string"},
+						},
+						"required": []string{"file_path"},
+					},
+				},
+				{
+					"name":        "check_guardrail",
+					"description": "Check if a file is safe to modify before performing automated AI refactoring.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"file_path": map[string]string{"type": "string"},
+						},
+						"required": []string{"file_path"},
+					},
+				},
 			},
 		}
 	case "tools/call":
@@ -221,6 +255,65 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 				{"type": "text", "text": text},
 			},
 			"data": h,
+		}
+	case "check_guardrail":
+		path, _ := args["file_path"].(string)
+		if path == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
+			return resp
+		}
+		h, err := sink.FileHealth(path)
+		if err != nil {
+			resp.Error = &rpcError{Code: -32011, Message: err.Error()}
+			return resp
+		}
+		allowed := !h.IsFragile && h.HealthScore >= 40
+		rec := "Safe to modify."
+		if h.IsFragile || h.HealthScore < 40 {
+			rec = fmt.Sprintf("GUARDRAIL WARNING: File %s has high churn (%d thrashing events, health score %d/100).", path, h.RecentThrashingCount, h.HealthScore)
+		}
+		text := fmt.Sprintf("allowed=%v health_score=%d fragile=%v recent_thrashing_count=%d recommendation=%q",
+			allowed, h.HealthScore, h.IsFragile, h.RecentThrashingCount, rec)
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": text},
+			},
+			"data": map[string]interface{}{
+				"allowed":                allowed,
+				"health_score":           h.HealthScore,
+				"is_fragile":             h.IsFragile,
+				"recent_thrashing_count": h.RecentThrashingCount,
+				"recommendation":         rec,
+			},
+		}
+	case "lock_file":
+		path, _ := args["file_path"].(string)
+		reason, _ := args["reason"].(string)
+		if path == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
+			return resp
+		}
+		if locker, ok := sink.(interface{ LockFile(path, reason string) }); ok {
+			locker.LockFile(path, reason)
+		}
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("File %s locked successfully. reason=%s", path, reason)},
+			},
+		}
+	case "unlock_file":
+		path, _ := args["file_path"].(string)
+		if path == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
+			return resp
+		}
+		if locker, ok := sink.(interface{ UnlockFile(path string) }); ok {
+			locker.UnlockFile(path)
+		}
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("File %s unlocked successfully.", path)},
+			},
 		}
 	default:
 		resp.Error = &rpcError{Code: -32601, Message: "unknown tool: " + name}

@@ -56,6 +56,7 @@ func (f *failingEngine) LockFile(string, string)              {}
 func (f *failingEngine) UnlockFile(string)                    {}
 func (f *failingEngine) IsFileLocked(string) (bool, string)   { return false, "" }
 func (f *failingEngine) ModelCatalog() []models.ModelInfo     { return nil }
+func (f *failingEngine) ProviderCatalog() []models.ProviderInfo { return nil }
 func (f *failingEngine) UpsertModel(models.ModelInfo)         {}
 func (f *failingEngine) CalculateCost(string, int64, int64) float64 {
 	return 0
@@ -88,6 +89,7 @@ func (f *failingEngine) UpdateSettings(s core.AppSettings) core.AppSettings {
 func (f *failingEngine) VacuumDB() error                       { return errForced }
 func (f *failingEngine) ClearStale(int) (int64, error)         { return 0, errForced }
 func (f *failingEngine) Hub() *core.Hub                        { return f.hub }
+func (f *failingEngine) Store() *db.Store                      { return nil }
 func (f *failingEngine) Repo() string                          { return "failing" }
 
 // callHandler invokes an http.HandlerFunc directly and returns the recorded

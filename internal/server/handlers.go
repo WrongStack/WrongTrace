@@ -14,12 +14,14 @@ import (
 
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/models"
+	"github.com/wrongstack/wrongtrace/internal/profiler"
 	"github.com/wrongstack/wrongtrace/internal/proxy"
 )
 
 // Handlers holds the dependencies the route handlers need.
 type Handlers struct {
 	Engine     EngineAPI
+	Profiler   *profiler.Collector
 	Proxy      *proxy.GatewayProxy
 	SocketPath string
 }
@@ -126,6 +128,12 @@ func (h *Handlers) FileHealth(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) ModelCatalog(w http.ResponseWriter, _ *http.Request) {
 	catalog := h.Engine.ModelCatalog()
 	writeJSON(w, http.StatusOK, catalog)
+}
+
+// ProviderCatalog returns all available AI providers and their hosted models.
+func (h *Handlers) ProviderCatalog(w http.ResponseWriter, _ *http.Request) {
+	providers := h.Engine.ProviderCatalog()
+	writeJSON(w, http.StatusOK, providers)
 }
 
 // UpsertModel allows adding or overriding a custom model spec in the catalog.
@@ -295,6 +303,23 @@ func (h *Handlers) DeleteProxyRoute(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ListProxyTraffic returns captured raw proxy traffic logs.
+func (h *Handlers) ListProxyTraffic(w http.ResponseWriter, _ *http.Request) {
+	if h.Proxy == nil {
+		writeJSON(w, http.StatusOK, []proxy.ProxyTrafficRecord{})
+		return
+	}
+	writeJSON(w, http.StatusOK, h.Proxy.AllTraffic(100))
+}
+
+// ClearProxyTraffic clears captured proxy traffic logs.
+func (h *Handlers) ClearProxyTraffic(w http.ResponseWriter, _ *http.Request) {
+	if h.Proxy != nil {
+		h.Proxy.ClearTraffic()
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+}
+
 // ListProjects returns all registered project profiles.
 func (h *Handlers) ListProjects(w http.ResponseWriter, _ *http.Request) {
 	projects := h.Engine.ListProjects()
@@ -368,7 +393,6 @@ func (h *Handlers) ImportFromWrongStack(w http.ResponseWriter, r *http.Request) 
 	}
 	writeJSON(w, http.StatusOK, res)
 }
-
 
 // UpdateProject updates metadata or log paths of a project. The project id
 // comes from the URL ({id}); a body id is optional and must agree with it.
@@ -533,4 +557,101 @@ func (h *Handlers) ClearStale(w http.ResponseWriter, r *http.Request) {
 		"days":    days,
 	})
 }
+
+// IngestProfiler accepts structured runtime, benchmark, and profiler test reports.
+func (h *Handlers) IngestProfiler(w http.ResponseWriter, r *http.Request) {
+	if h.Profiler == nil {
+		writeError(w, http.StatusServiceUnavailable, "profiler collector not available")
+		return
+	}
+	var payload profiler.ProfilerReportPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	ev, err := h.Profiler.IngestReport(payload)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, ev)
+}
+
+// IngestOTLPTraces parses OpenTelemetry traces (OTLP JSON) over standard HTTP.
+func (h *Handlers) IngestOTLPTraces(w http.ResponseWriter, r *http.Request) {
+	if h.Profiler == nil {
+		writeError(w, http.StatusServiceUnavailable, "profiler collector not available")
+		return
+	}
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	count, err := h.Profiler.IngestOTLP(data)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "parse otlp traces: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":        "ok",
+		"spans_ingested": count,
+		"message":       fmt.Sprintf("%d OTLP spans ingested into WrongTrace", count),
+	})
+}
+
+// GetProfilerTraces returns recent runtime traces.
+func (h *Handlers) GetProfilerTraces(w http.ResponseWriter, r *http.Request) {
+	if h.Profiler == nil {
+		writeJSON(w, http.StatusOK, []profiler.TraceEvent{})
+		return
+	}
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+	traces, err := h.Profiler.Recent(limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, traces)
+}
+
+// GetProfilerHotspots returns hotspot functions ranked by execution time and errors.
+func (h *Handlers) GetProfilerHotspots(w http.ResponseWriter, r *http.Request) {
+	if h.Profiler == nil {
+		writeJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	limit := 25
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+	hotspots, err := h.Profiler.Hotspots(limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, hotspots)
+}
+
+// GetProfilerOverview returns summary runtime telemetry metrics.
+func (h *Handlers) GetProfilerOverview(w http.ResponseWriter, _ *http.Request) {
+	if h.Profiler == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{})
+		return
+	}
+	ov, err := h.Profiler.Overview()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, ov)
+}
+
 

@@ -13,6 +13,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 	"github.com/wrongstack/wrongtrace/internal/models"
+	"github.com/wrongstack/wrongtrace/internal/webhook"
 )
 
 // IPCHealth is exported as an alias so the server package can reference the
@@ -59,6 +62,7 @@ type Engine struct {
 	projects        map[string]ProjectProfile
 	activeProjectID string
 	watcher         WatcherAPI
+	webhooks        *webhook.Dispatcher
 }
 
 // runMeta is the metadata kept for an active (or recently-seen) agent run —
@@ -78,6 +82,12 @@ func NewEngine(cfg Config) *Engine {
 		cfg.RepoName = "default"
 	}
 	loadedProjects := LoadProjectsIndex()
+	settings := globalSettings
+	dispatcher := webhook.NewDispatcher(webhook.Config{
+		SlackURL:   settings.SlackWebhookURL,
+		DiscordURL: settings.DiscordWebhookURL,
+		GenericURL: settings.CustomWebhookURL,
+	})
 	return &Engine{
 		cfg:         cfg,
 		hub:         NewHub(),
@@ -85,11 +95,15 @@ func NewEngine(cfg Config) *Engine {
 		correlate:   10 * time.Minute,
 		lockedFiles: make(map[string]bool),
 		projects:    loadedProjects,
+		webhooks:    dispatcher,
 	}
 }
 
 // Hub exposes the WebSocket broadcaster. The server package reads from it.
 func (e *Engine) Hub() *Hub { return e.hub }
+
+// Store exposes the underlying analytical database store.
+func (e *Engine) Store() *db.Store { return e.cfg.Store }
 
 // Repo returns the configured repository name (used by handlers).
 func (e *Engine) Repo() string { return e.cfg.RepoName }
@@ -181,9 +195,23 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 	}
 }
 
-// shouldSkip filters files we never want to watch: unsupported languages and
-// pathologies like very large generated bundles.
+// shouldSkip filters files we never want to watch: temporary files, ignored directories,
+// unsupported languages, and pathologies like very large generated bundles.
 func (e *Engine) shouldSkip(path string) bool {
+	norm := filepath.ToSlash(path)
+	segs := strings.Split(norm, "/")
+	for _, seg := range segs {
+		for _, ig := range []string{
+			".git", ".temp_files", "temp_files", ".tmp", "tmp",
+			"node_modules", "vendor", "dist", "build", "target",
+			".next", ".nuxt", ".turbo", ".cache", ".wrongtrace",
+			"coverage", "out", ".out", "bin",
+		} {
+			if strings.EqualFold(seg, ig) {
+				return true
+			}
+		}
+	}
 	if ast.DetectLanguage(path) == ast.LangUnknown {
 		return true
 	}
@@ -254,6 +282,11 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 // ModelCatalog returns all available AI models and their token pricing specs.
 func (e *Engine) ModelCatalog() []models.ModelInfo {
 	return models.Global.AllModels()
+}
+
+// ProviderCatalog returns all AI providers, their API endpoints, SDK adapters, and hosted models.
+func (e *Engine) ProviderCatalog() []models.ProviderInfo {
+	return models.Global.AllProviders()
 }
 
 // UpsertModel updates or adds a custom model into the catalog.

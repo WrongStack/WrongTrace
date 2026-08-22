@@ -121,3 +121,27 @@ func TestSessionWatcher_PollOnce(t *testing.T) {
 		t.Errorf("captured event mismatch: %+v", captured[0])
 	}
 }
+
+func TestExtractModelFromRow_AntigravityTranscript(t *testing.T) {
+	tempDir := t.TempDir()
+	logFile := filepath.Join(tempDir, "antigravity-transcript.jsonl")
+
+	sample := `{"type":"USER_INPUT","content":"<USER_SETTINGS_CHANGE>\nThe user changed setting ` + "`Model Selection`" + ` from None to Gemini 3.7 Flash (Medium).\n</USER_SETTINGS_CHANGE>"}
+{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"replace_file_content","args":{"TargetFile":"internal/db/queries.go"}}],"usage":{"input_tokens":8000,"output_tokens":400}}
+`
+	if err := os.WriteFile(logFile, []byte(sample), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	events, err := ParseJSONLTranscript(logFile)
+	if err != nil {
+		t.Fatalf("ParseJSONLTranscript failed: %v", err)
+	}
+
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].ModelName != "gemini-3.7-flash" {
+		t.Errorf("expected extracted model gemini-3.7-flash, got %s", events[0].ModelName)
+	}
+}

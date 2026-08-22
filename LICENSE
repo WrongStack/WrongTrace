@@ -1,0 +1,42 @@
+Business Source License 1.1
+
+Parameters:
+
+Licensor: WrongStack (Ersin Koç)
+Licensed Work: WrongTrace (including all source code, binaries, embedded UI, and documentation)
+Additional Use Grant: You may use the Licensed Work for all non-commercial purposes, personal development, internal testing, internal team observability, and production monitoring within your own organization, free of charge. You may NOT provide the Licensed Work as a managed service, hosted software-as-a-service (SaaS), paid API gateway, or cloud observability product to third parties without an explicit commercial license from the Licensor.
+Change Date: 2030-01-01
+Change License: Apache License, Version 2.0
+
+--------------------------------------------------------------------------------
+
+Text of the Business Source License 1.1:
+
+The Licensor hereby grants you the right to copy, modify, create derivative works,
+redistribute, and make non-production and production use of the Licensed Work.
+The grant of rights is contingent upon your compliance with the Additional Use
+Grant above and the terms of this License.
+
+1. USE OF THE LICENSED WORK
+You may run, copy, modify, and distribute the Licensed Work, provided that your use
+satisfies the Additional Use Grant. Any use not permitted under the Additional Use
+Grant requires a separate commercial license agreement from the Licensor.
+
+2. CHANGE TO CHANGE LICENSE
+Effective on the Change Date specified above, this License shall terminate and the
+Licensor hereby grants you rights under the terms of the Change License specified above.
+
+3. NOTICE AND ATTRIBUTION
+You must retain all copyright and license notices on all copies of the Licensed Work.
+Derivative works must clearly state that they are modified versions of the Licensed Work.
+
+4. DISCLAIMER OF WARRANTIES
+THE LICENSED WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE LICENSOR OR
+CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH
+THE LICENSED WORK OR THE USE OR OTHER DEALINGS IN THE LICENSED WORK.
+
+For commercial licensing, enterprise SLAs, and hosted deployment inquiries, contact:
+business@wrongstack.com / https://github.com/wrongstack

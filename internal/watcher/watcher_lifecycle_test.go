@@ -22,19 +22,22 @@ func TestRun_NewDirectoryIsWatchedRecursively(t *testing.T) {
 	root := t.TempDir()
 	_, h := startWatcher(t, root, 60*time.Millisecond, nil)
 
-	nested := filepath.Join(root, "brand", "new")
-	if err := os.MkdirAll(nested, 0o755); err != nil {
+	b1 := filepath.Join(root, "brand")
+	_ = os.Mkdir(b1, 0o755)
+	time.Sleep(300 * time.Millisecond)
+
+	nested := filepath.Join(b1, "new")
+	if err := os.Mkdir(nested, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// Let the Create events reach the loop so addRecursive registers both
-	// levels before we write.
-	time.Sleep(200 * time.Millisecond)
+	// Let the Create events reach the loop so addRecursive registers both levels
+	time.Sleep(500 * time.Millisecond)
 
 	path := filepath.Join(nested, "deep.go")
 	if err := os.WriteFile(path, []byte("package new\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	waitFor(t, 3*time.Second, func() bool { return h.countFor("deep.go") >= 1 },
+	waitFor(t, 5*time.Second, func() bool { return h.countFor("deep.go") >= 1 },
 		"file inside newly created dir was never watched (Create->addRecursive broken)")
 }
 

@@ -38,8 +38,8 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 	lines := strings.Split(string(data), "\n")
 	var events []ToolCallEvent
 	sessionID := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
-
-	currentModel := "claude-3-7-sonnet" // default fallback
+	agentName := detectAgentFromPath(filePath)
+	currentModel := "unknown-model"
 	currentIntent := ""
 
 	for _, line := range lines {
@@ -53,10 +53,11 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 			continue
 		}
 
-		// Check for model or prompt intent in row
-		if m, ok := row["model"].(string); ok && m != "" {
-			currentModel = m
+		// Dynamically extract model from deep json structures
+		if extracted := extractModelFromRow(row); extracted != "" {
+			currentModel = extracted
 		}
+
 		if intent, ok := row["content"].(string); ok && row["type"] == "USER_INPUT" {
 			if len(intent) > 80 {
 				currentIntent = intent[:80] + "…"
@@ -68,8 +69,8 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 		// Extract usage tokens if present
 		var promptTokens, completionTokens int64
 		if usage, ok := row["usage"].(map[string]interface{}); ok {
-			promptTokens = extractInt64(usage, "input_tokens", "prompt_tokens")
-			completionTokens = extractInt64(usage, "output_tokens", "completion_tokens")
+			promptTokens = extractInt64(usage, "input_tokens", "prompt_tokens", "promptTokenCount", "inputTokens")
+			completionTokens = extractInt64(usage, "output_tokens", "completion_tokens", "candidatesTokenCount", "outputTokens")
 		}
 
 		// Extract tool calls
@@ -88,6 +89,12 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 					continue
 				}
 
+				// Check if tool call has its own specific model override
+				tcModel := currentModel
+				if m := extractModelFromRow(tcMap); m != "" {
+					tcModel = m
+				}
+
 				// Extract args
 				var args map[string]interface{}
 				if a, ok := tcMap["args"].(map[string]interface{}); ok {
@@ -97,12 +104,12 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 				}
 
 				targetFile := ExtractTargetFile(args)
-				cost := models.Global.CalculateCost(currentModel, promptTokens, completionTokens)
+				cost := models.Global.CalculateCost(tcModel, promptTokens, completionTokens)
 
 				ev := ToolCallEvent{
 					SessionID:        sessionID,
-					AgentName:        detectAgentFromPath(filePath),
-					ModelName:        currentModel,
+					AgentName:        agentName,
+					ModelName:        tcModel,
 					ToolName:         name,
 					TargetFile:       targetFile,
 					PromptTokens:     promptTokens,
@@ -139,13 +146,13 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 	}
 
 	sessionID := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
-	modelName := "claude-3-5-sonnet"
-	if m, ok := root["apiModelId"].(string); ok && m != "" {
+	modelName := "unknown-model"
+	if m := extractModelFromRow(root); m != "" {
 		modelName = m
 	}
 
-	promptTokens := extractInt64(root, "tokensIn", "promptTokens")
-	completionTokens := extractInt64(root, "tokensOut", "completionTokens")
+	promptTokens := extractInt64(root, "tokensIn", "promptTokens", "input_tokens")
+	completionTokens := extractInt64(root, "tokensOut", "completionTokens", "output_tokens")
 	cost := models.Global.CalculateCost(modelName, promptTokens, completionTokens)
 
 	var events []ToolCallEvent
@@ -189,7 +196,7 @@ func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 	modelRe := regexp.MustCompile(`(?i)Model:\s*([\w\.\-]+)`)
 	fileRe := regexp.MustCompile(`(?i)(?:Applied edit to|Updated|Created|Modified)\s*([\w\.\/\\]+)`)
 
-	model := "deepseek-r1"
+	model := "unknown-model"
 	if match := modelRe.FindStringSubmatch(content); len(match) > 1 {
 		model = match[1]
 	}
@@ -203,13 +210,107 @@ func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 				ModelName:  model,
 				ToolName:   "apply_diff",
 				TargetFile: fm[1],
-				CostUSD:    0.02,
+				CostUSD:    0.0,
 				OccurredAt: time.Now().UTC(),
 			})
 		}
 	}
 
 	return events, nil
+}
+
+var (
+	modelSelectionRe = regexp.MustCompile(`(?i)(?:Model Selection|Active Model)[\x60'\s:]+(?:from\s+[^\n]+?\s+)?to\s+([A-Za-z0-9\.\-_ ]+?)(?:\s*\(|\n|$)`)
+	modelTagRe       = regexp.MustCompile(`(?i)\b(?:model|selected_model)\s*[:=]\s*["']?([a-zA-Z0-9\.\-_]+)["']?`)
+)
+
+func extractModelFromRow(m map[string]interface{}) string {
+	keys := []string{
+		"model", "model_name", "modelName", "model_id", "modelId",
+		"apiModelId", "selectedModel", "planner_model", "llm_model", "wire_model",
+	}
+	for _, k := range keys {
+		if val, ok := m[k]; ok {
+			if s, isStr := val.(string); isStr && s != "" && s != "inherit" {
+				return normalizeModelName(s)
+			}
+		}
+	}
+
+	nestedKeys := []string{"metadata", "params", "options", "config", "response", "system_info", "args"}
+	for _, nk := range nestedKeys {
+		if sub, ok := m[nk].(map[string]interface{}); ok {
+			for _, k := range keys {
+				if val, ok := sub[k]; ok {
+					if s, isStr := val.(string); isStr && s != "" && s != "inherit" {
+						return normalizeModelName(s)
+					}
+				}
+			}
+			if val, ok := sub["Model"]; ok {
+				if s, isStr := val.(string); isStr && s != "" && s != "inherit" {
+					return normalizeModelName(s)
+				}
+			}
+		}
+	}
+
+	// Extract from content text (e.g. Antigravity settings changes or prompt headers)
+	if content, ok := m["content"].(string); ok && content != "" {
+		if match := modelSelectionRe.FindStringSubmatch(content); len(match) > 1 {
+			extracted := strings.TrimSpace(match[1])
+			if extracted != "" && !strings.EqualFold(extracted, "none") {
+				return normalizeModelName(extracted)
+			}
+		}
+		if match := modelTagRe.FindStringSubmatch(content); len(match) > 1 {
+			extracted := strings.TrimSpace(match[1])
+			if extracted != "" {
+				return normalizeModelName(extracted)
+			}
+		}
+	}
+
+	return ""
+}
+
+func normalizeModelName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	lower := strings.ToLower(raw)
+
+	// Clean trailing annotations like "(Medium)" or "(Default)"
+	if idx := strings.Index(raw, "("); idx > 0 {
+		raw = strings.TrimSpace(raw[:idx])
+		lower = strings.ToLower(raw)
+	}
+
+	// Canonical mapping for common display names
+	switch {
+	case strings.Contains(lower, "gemini 3.7 flash"):
+		return "gemini-3.7-flash"
+	case strings.Contains(lower, "gemini 2.5 pro"):
+		return "gemini-2.5-pro"
+	case strings.Contains(lower, "gemini 2.0 flash"):
+		return "gemini-2.0-flash"
+	case strings.Contains(lower, "gemini 1.5 pro"):
+		return "gemini-1.5-pro"
+	case strings.Contains(lower, "claude 3.7 sonnet") || strings.Contains(lower, "claude-3-7-sonnet"):
+		return "claude-3-7-sonnet"
+	case strings.Contains(lower, "claude 3.5 sonnet") || strings.Contains(lower, "claude-3-5-sonnet"):
+		return "claude-3-5-sonnet"
+	case strings.Contains(lower, "deepseek v3") || strings.Contains(lower, "deepseek-v3"):
+		return "deepseek-v3"
+	case strings.Contains(lower, "deepseek r1") || strings.Contains(lower, "deepseek-r1"):
+		return "deepseek-r1"
+	case strings.Contains(lower, "gpt-4o"):
+		return "gpt-4o"
+	case strings.Contains(lower, "o3-mini"):
+		return "o3-mini"
+	default:
+		// Slugify human readable string: "Gemini Pro" -> "gemini-pro"
+		slug := strings.ReplaceAll(lower, " ", "-")
+		return slug
+	}
 }
 
 func extractInt64(m map[string]interface{}, keys ...string) int64 {
@@ -230,17 +331,57 @@ func extractInt64(m map[string]interface{}, keys ...string) int64 {
 
 func detectAgentFromPath(p string) string {
 	lower := strings.ToLower(p)
-	if strings.Contains(lower, "claude") {
+	switch {
+	case strings.Contains(lower, "wrongstack"):
+		return "WrongStack"
+	case strings.Contains(lower, "antigravity") || strings.Contains(lower, "gemini"):
+		return "Antigravity"
+	case strings.Contains(lower, "claude"):
 		return "Claude Code"
-	}
-	if strings.Contains(lower, "cline") || strings.Contains(lower, "roo") {
+	case strings.Contains(lower, "cline") || strings.Contains(lower, "roo"):
 		return "Cline/Roo"
-	}
-	if strings.Contains(lower, "aider") {
-		return "Aider"
-	}
-	if strings.Contains(lower, "cursor") {
+	case strings.Contains(lower, "replit"):
+		return "Replit Agent"
+	case strings.Contains(lower, "zed"):
+		return "Zed AI"
+	case strings.Contains(lower, "zcode") || strings.Contains(lower, "z.ai"):
+		return "ZCode"
+	case strings.Contains(lower, "minimax") || strings.Contains(lower, "abab"):
+		return "MiniMax Code"
+	case strings.Contains(lower, "kimi") || strings.Contains(lower, "moonshot"):
+		return "Kimi Code"
+	case strings.Contains(lower, "devin"):
+		return "Devin"
+	case strings.Contains(lower, "trae"):
+		return "Trae"
+	case strings.Contains(lower, "copilot") || strings.Contains(lower, "github-copilot"):
+		return "GitHub Copilot"
+	case strings.Contains(lower, "openhands") || strings.Contains(lower, "opendevin"):
+		return "OpenHands"
+	case strings.Contains(lower, "goose"):
+		return "Goose"
+	case strings.Contains(lower, "cursor"):
 		return "Cursor"
+	case strings.Contains(lower, "windsurf") || strings.Contains(lower, "codeium"):
+		return "Windsurf"
+	case strings.Contains(lower, "aider"):
+		return "Aider"
+	case strings.Contains(lower, "continue"):
+		return "Continue.dev"
+	case strings.Contains(lower, "tabnine"):
+		return "Tabnine"
+	case strings.Contains(lower, "bolt"):
+		return "Bolt.new"
+	case strings.Contains(lower, "lovable"):
+		return "Lovable"
+	case strings.Contains(lower, "v0"):
+		return "v0.dev"
+	case strings.Contains(lower, "plandex"):
+		return "Plandex"
+	case strings.Contains(lower, "sweep"):
+		return "Sweep"
+	default:
+		return "Coding Agent"
 	}
-	return "Agent Session"
 }
+

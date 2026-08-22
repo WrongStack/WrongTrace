@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Navbar } from '../components/Navbar';
+import { WrongStackBanner } from '../components/WrongStackBanner';
 import { MetricsOverview } from '../components/MetricsOverview';
+import { CodeChurnTimeline } from '../components/CodeChurnTimeline';
 import { ThrashingHeatmap } from '../components/ThrashingHeatmap';
 import { ModelLeaderboard } from '../components/ModelLeaderboard';
 import { LiveEventFeed } from '../components/LiveEventFeed';
@@ -8,9 +10,10 @@ import { ROIAnalysis } from '../components/ROIAnalysis';
 import { CodeAtlas } from '../components/CodeAtlas';
 import { DiffInspectorView } from '../components/DiffInspectorView';
 import { AgentSessionsView } from '../components/AgentSessionsView';
+import { ProfilerTracesView } from '../components/ProfilerTracesView';
 import { ProxyRoutingView } from '../components/ProxyRoutingView';
 import { SettingsView } from '../components/SettingsView';
-import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas } from '../hooks/useMetrics';
+import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas, useProxyTraffic, useProfilerTraces } from '../hooks/useMetrics';
 import { useWebSocket } from '../hooks/useWebSocket';
 
 // Dashboard is the single-page surface for WrongTrace. It loads via TanStack
@@ -18,17 +21,20 @@ import { useWebSocket } from '../hooks/useWebSocket';
 // WebSocket subscription. The WebSocket hook supplies incremental updates;
 // React Query handles full snapshot refetch on focus / interval.
 export function Dashboard() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'gateway' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'profiler' | 'gateway' | 'settings'>('dashboard');
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 
   const overview = useOverview();
   const thrashing = useThrashing();
   const models = useModels();
   const recent = useRecentEvents();
   const atlas = useAtlas();
+  const proxyTraffic = useProxyTraffic();
+  const profilerTraces = useProfilerTraces();
   const ws = useWebSocket();
 
-  // When the WS receives a code_event we invalidate the recent-events and atlas cache
-  // so the live feed and code map update without waiting for polling.
+  // When the WS receives a code_event, proxy_traffic, or project_switched we invalidate the caches
+  // so the live feed, code map, and telemetry update immediately without polling.
   useEffect(() => {
     if (ws.lastMessage?.type === 'code_event') {
       recent.refetch();
@@ -38,7 +44,23 @@ export function Dashboard() {
       overview.refetch();
       atlas.refetch();
     }
-  }, [ws.lastMessage, recent, overview, atlas]);
+    if (ws.lastMessage?.type === 'proxy_traffic') {
+      proxyTraffic.refetch();
+      overview.refetch();
+    }
+    if (ws.lastMessage?.type === 'profiler_trace') {
+      profilerTraces.refetch();
+    }
+    if (ws.lastMessage?.type === 'project_switched') {
+      overview.refetch();
+      thrashing.refetch();
+      models.refetch();
+      recent.refetch();
+      atlas.refetch();
+      proxyTraffic.refetch();
+      profilerTraces.refetch();
+    }
+  }, [ws.lastMessage, recent, overview, atlas, thrashing, models, proxyTraffic, profilerTraces]);
 
   // Socket path as REPORTED BY THE DAEMON (/api/health socket_path), so a
   // custom --socket is shown correctly on every platform. Falls back to a
@@ -51,7 +73,7 @@ export function Dashboard() {
   const activeRunCount = overview.data?.active_runs?.length ?? 0;
 
   return (
-    <div className="min-h-full">
+    <div className="min-h-full flex flex-col">
       <Navbar
         repo={overview.data?.repo ?? 'wrongtrace'}
         wsConnected={ws.connected}
@@ -59,9 +81,14 @@ export function Dashboard() {
         socketPath={socketPath}
         activeTab={activeTab}
         onTabChange={setActiveTab}
+        selectedProjectId={selectedProjectId}
+        onProjectChange={(p) => setSelectedProjectId(p?.id ?? null)}
       />
 
-      <main className="mx-auto max-w-7xl px-4 sm:px-6 py-6 space-y-6">
+      <main className="mx-auto max-w-7xl px-4 sm:px-6 py-6 space-y-6 flex-1 w-full">
+        {/* WrongStack Ecosystem Flagship Banner */}
+        <WrongStackBanner />
+
         {activeTab === 'dashboard' && (
           <>
             <MetricsOverview
@@ -69,6 +96,11 @@ export function Dashboard() {
               thrashing={thrashing.data ?? []}
               models={models.data ?? []}
               loading={overview.isLoading || thrashing.isLoading || models.isLoading}
+            />
+
+            <CodeChurnTimeline
+              events={recent.data ?? []}
+              loading={recent.isLoading}
             />
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -111,6 +143,10 @@ export function Dashboard() {
           />
         )}
 
+        {activeTab === 'profiler' && (
+          <ProfilerTracesView />
+        )}
+
         {activeTab === 'gateway' && (
           <ProxyRoutingView />
         )}
@@ -119,10 +155,32 @@ export function Dashboard() {
           <SettingsView />
         )}
 
-        <footer className="text-xs text-slate-500 pt-4 pb-8">
-          WrongTrace observes your filesystem and agent telemetry. Restart any
-          agent session with <span className="font-mono">wrongtrace start --watch .</span>{' '}
-          to begin collecting events.
+        {/* Global Footer with WrongStack Ecosystem Link */}
+        <footer className="border-t border-white/5 pt-6 pb-10 text-xs text-slate-500 flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <span>Powered by</span>
+            <a
+              href="https://github.com/wrongstack/wrongstack"
+              target="_blank"
+              rel="noreferrer"
+              className="font-bold text-cyan-400 hover:text-cyan-300 transition-colors"
+            >
+              WrongStack
+            </a>
+            <span>· Universal AI Observability & Multi-Agent Engine</span>
+          </div>
+
+          <div className="flex items-center gap-4 text-slate-400 font-mono text-[11px]">
+            <a href="https://github.com/wrongstack/wrongstack" target="_blank" rel="noreferrer" className="hover:text-white transition-colors">
+              WrongStack GitHub ↗
+            </a>
+            <span className="text-slate-700">|</span>
+            <a href="https://github.com/wrongstack/wrongtrace" target="_blank" rel="noreferrer" className="hover:text-white transition-colors">
+              WrongTrace Repository
+            </a>
+            <span className="text-slate-700">|</span>
+            <span className="text-slate-500">BUSL-1.1</span>
+          </div>
         </footer>
       </main>
     </div>

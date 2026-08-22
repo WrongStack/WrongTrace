@@ -149,6 +149,36 @@ export function DiffInspectorView({ events, loading }: DiffInspectorViewProps) {
         </div>
       </div>
 
+      {/* Summary KPI Strip */}
+      {filteredEvents.length > 0 && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="panel-raised p-2.5 font-mono text-xs">
+            <div className="text-[10px] text-slate-400">TOTAL INSERTIONS</div>
+            <div className="text-emerald-400 font-bold text-sm mt-0.5">
+              +{filteredEvents.reduce((acc, e) => acc + (e.added_lines ?? (e.action === 'ADDED' ? e.lines_of_code || 10 : 0)), 0).toLocaleString()} lines
+            </div>
+          </div>
+          <div className="panel-raised p-2.5 font-mono text-xs">
+            <div className="text-[10px] text-slate-400">TOTAL DELETIONS</div>
+            <div className="text-rose-400 font-bold text-sm mt-0.5">
+              -{filteredEvents.reduce((acc, e) => acc + (e.deleted_lines ?? (e.action === 'DELETED' ? e.lines_of_code || 10 : 0)), 0).toLocaleString()} lines
+            </div>
+          </div>
+          <div className="panel-raised p-2.5 font-mono text-xs">
+            <div className="text-[10px] text-slate-400">UNIQUE FILES CHURNED</div>
+            <div className="text-cyan-300 font-bold text-sm mt-0.5">
+              {uniqueFiles.length} files
+            </div>
+          </div>
+          <div className="panel-raised p-2.5 font-mono text-xs">
+            <div className="text-[10px] text-slate-400">AST MUTATION RATE</div>
+            <div className="text-amber-400 font-bold text-sm mt-0.5">
+              {filteredEvents.filter((e) => e.action === 'MODIFIED').length} modifications
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main Split Layout: Left List, Right Code Diff View */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         {/* Left: Events List */}

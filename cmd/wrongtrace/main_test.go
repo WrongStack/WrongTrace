@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -40,6 +41,87 @@ func TestStatusCmd(t *testing.T) {
 	}
 }
 
+func TestDoctorCmd(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "doctor_test.db")
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+
+	doctorCmd.Flags().Set("db", dbPath)
+	doctorCmd.Flags().Set("watch", tempDir)
+
+	rootCmd.SetArgs([]string{"doctor", "--db", dbPath, "--watch", tempDir})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute doctor failed: %v", err)
+	}
+}
+
+func TestExportCmd(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "export_test.db")
+	outFile := filepath.Join(tempDir, "export.json")
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+
+	exportCmd.Flags().Set("db", dbPath)
+	exportCmd.Flags().Set("out", outFile)
+
+	rootCmd.SetArgs([]string{"export", "--db", dbPath, "--out", outFile})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute export failed: %v", err)
+	}
+}
+
+func TestReportCmd(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "report_test.db")
+	outMd := filepath.Join(tempDir, "report.md")
+	outHtml := filepath.Join(tempDir, "report.html")
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+
+	// Test Markdown report
+	rootCmd.SetArgs([]string{"report", "--db", dbPath, "--format", "markdown", "--out", outMd})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute report markdown failed: %v", err)
+	}
+
+	// Test HTML report
+	rootCmd.SetArgs([]string{"report", "--db", dbPath, "--format", "html", "--out", outHtml})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute report html failed: %v", err)
+	}
+}
+
+func TestHookCmd(t *testing.T) {
+	tempDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(tempDir, ".git"), 0755)
+
+	oldCwd, _ := os.Getwd()
+	_ = os.Chdir(tempDir)
+	defer func() { _ = os.Chdir(oldCwd) }()
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+
+	rootCmd.SetArgs([]string{"hook", "install"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute hook install failed: %v", err)
+	}
+
+	rootCmd.SetArgs([]string{"hook", "uninstall"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute hook uninstall failed: %v", err)
+	}
+}
+
 func TestDefaultHelpers(t *testing.T) {
 	dataDir := defaultDataDir()
 	if len(dataDir) == 0 {
@@ -56,3 +138,4 @@ func TestDefaultHelpers(t *testing.T) {
 		t.Error("mustCwd returned empty string")
 	}
 }
+

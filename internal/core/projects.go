@@ -122,10 +122,24 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 		if newStore, err := db.Open(target.DBPath); err == nil {
 			_ = newStore.Migrate()
 			e.lockMu.Lock()
+			oldStore := e.cfg.Store
 			e.cfg.Store = newStore
 			e.lockMu.Unlock()
+			if oldStore != nil && oldStore != newStore {
+				_ = oldStore.Close()
+			}
 		}
 	}
+
+	// Reset in-memory AST snapshot cache so old repository symbols do not leak
+	if e.cfg.AST != nil {
+		e.cfg.AST.Reset()
+	}
+
+	// Clear active in-memory agent runs
+	e.runMu.Lock()
+	e.activeRuns = make(map[string]runMeta)
+	e.runMu.Unlock()
 
 	// Re-prime AST and watcher for target workspace directory
 	if target.Path != "" {
@@ -369,8 +383,8 @@ type WrongStackPreviewEntry struct {
 // PreviewFromWrongStackResult is the preview of an import run: every
 // WrongStack workspace with its eligibility, plus the source path.
 type PreviewFromWrongStackResult struct {
-	SourcePath string                    `json:"source_path"`
-	Entries    []WrongStackPreviewEntry  `json:"entries"`
+	SourcePath string                   `json:"source_path"`
+	Entries    []WrongStackPreviewEntry `json:"entries"`
 }
 
 // PreviewFromWrongStack lists every workspace in ~/.wrongstack/projects.json
@@ -420,13 +434,13 @@ func (e *Engine) PreviewFromWrongStack() (PreviewFromWrongStackResult, error) {
 
 // ImportFromWrongStackResult summarizes one import run from WrongStack.
 type ImportFromWrongStackResult struct {
-	SourcePath      string          `json:"source_path"`
-	Found           int             `json:"found"`
-	Imported        int             `json:"imported"`
-	SkippedExisting int             `json:"skipped_existing"`
-	SkippedMissing  int             `json:"skipped_missing"`
-	MissingRoots    []string        `json:"missing_roots"`
-	Errors          []string        `json:"errors,omitempty"`
+	SourcePath      string           `json:"source_path"`
+	Found           int              `json:"found"`
+	Imported        int              `json:"imported"`
+	SkippedExisting int              `json:"skipped_existing"`
+	SkippedMissing  int              `json:"skipped_missing"`
+	MissingRoots    []string         `json:"missing_roots"`
+	Errors          []string         `json:"errors,omitempty"`
 	Projects        []ProjectProfile `json:"projects"`
 }
 
@@ -517,7 +531,6 @@ func (e *Engine) ImportFromWrongStack(roots []string) (ImportFromWrongStackResul
 	return res, nil
 }
 
-
 // UpdateProject updates metadata or custom session log paths for a project.
 func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 	e.lockMu.Lock()
@@ -577,49 +590,16 @@ func (e *Engine) RemoveProject(id string) error {
 	return nil
 }
 
-// ScanAgentSessions inspects a workspace directory for coding agent artifacts and logs.
+// ScanAgentSessions inspects workspace and global application directories for coding agent artifacts and logs.
 func ScanAgentSessions(root string) map[string]int {
 	counts := make(map[string]int)
-
-	// 1. Claude Code
-	claudeDir := filepath.Join(root, ".claude")
-	if info, err := os.Stat(claudeDir); err == nil && info.IsDir() {
-		var cnt int
-		_ = filepath.Walk(claudeDir, func(p string, fi os.FileInfo, err error) error {
-			if err == nil && !fi.IsDir() && strings.HasSuffix(p, ".jsonl") {
-				cnt++
-			}
-			return nil
-		})
-		counts["claude_code"] = cnt
-	}
-
-	// 2. Aider
-	aiderHistory := filepath.Join(root, ".aider.chat.history.md")
-	if _, err := os.Stat(aiderHistory); err == nil {
-		counts["aider"] = 1
-	}
-
-	// 3. Cursor
-	cursorDir := filepath.Join(root, ".cursor")
-	if info, err := os.Stat(cursorDir); err == nil && info.IsDir() {
-		counts["cursor"] = 1
-	}
-
-	// 4. Cline / Roo Code
-	clineRules := filepath.Join(root, ".clinerules")
-	if _, err := os.Stat(clineRules); err == nil {
-		counts["cline"] = 1
-	}
-
-	// 5. Antigravity / Gemini CLI
-	geminiDir := filepath.Join(root, ".gemini")
-	if info, err := os.Stat(geminiDir); err == nil && info.IsDir() {
-		counts["antigravity"] = 1
-	}
-
-	// 6. WrongStack Deep Session Discovery
 	homeDir, _ := os.UserHomeDir()
+	appData := os.Getenv("APPDATA")
+	if appData == "" && homeDir != "" {
+		appData = filepath.Join(homeDir, "AppData", "Roaming")
+	}
+
+	// 1. WrongStack Deep Session Discovery
 	if homeDir != "" {
 		wsProjectsJSON := filepath.Join(homeDir, ".wrongstack", "projects.json")
 		if data, err := os.ReadFile(wsProjectsJSON); err == nil {
@@ -641,34 +621,173 @@ func ScanAgentSessions(root string) map[string]int {
 									if strings.HasPrefix(de.Name(), "sess_") {
 										sessCnt++
 									} else {
-										// Date folder (e.g. 2026-08-20)
-										subEntries, _ := os.ReadDir(filepath.Join(sessionsDir, de.Name()))
-										for _, se := range subEntries {
-											if se.IsDir() && strings.HasPrefix(se.Name(), "sess_") {
-												sessCnt++
+										if sessFiles, err := os.ReadDir(filepath.Join(sessionsDir, de.Name())); err == nil {
+											for _, sf := range sessFiles {
+												if sf.IsDir() && strings.HasPrefix(sf.Name(), "sess_") {
+													sessCnt++
+												}
 											}
 										}
 									}
 								}
 							}
 						}
-						if sessCnt > 0 {
-							counts["wrongstack"] = sessCnt
-						}
+						counts["wrongstack"] = sessCnt
 						break
 					}
 				}
 			}
 		}
-	}
-	if _, ok := counts["wrongstack"]; !ok {
-		wsLocal := filepath.Join(root, ".wrongstack")
-		if info, err := os.Stat(wsLocal); err == nil && info.IsDir() {
+		if counts["wrongstack"] == 0 && dirExists(filepath.Join(homeDir, ".wrongstack")) {
 			counts["wrongstack"] = 1
 		}
 	}
 
+	// 2. Antigravity & Gemini CLI
+	if homeDir != "" {
+		brainDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain")
+		if entries, err := os.ReadDir(brainDir); err == nil {
+			var brainCount int
+			for _, e := range entries {
+				if e.IsDir() {
+					brainCount++
+				}
+			}
+			if brainCount > 0 {
+				counts["antigravity"] = brainCount
+			}
+		}
+	}
+	if counts["antigravity"] == 0 && dirExists(filepath.Join(root, ".gemini")) {
+		counts["antigravity"] = 1
+	}
+
+	// 3. Claude Code
+	if homeDir != "" {
+		claudeProjectsDir := filepath.Join(homeDir, ".claude", "projects")
+		if entries, err := os.ReadDir(claudeProjectsDir); err == nil {
+			var claudeCount int
+			for _, e := range entries {
+				if e.IsDir() {
+					claudeCount++
+				}
+			}
+			if claudeCount > 0 {
+				counts["claude_code"] = claudeCount
+			}
+		}
+	}
+	if counts["claude_code"] == 0 && (dirExists(filepath.Join(root, ".claude")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".claude")))) {
+		counts["claude_code"] = 1
+	}
+
+	// 4. Cursor (Workspace Storage & Global)
+	if appData != "" {
+		cursorStorage := filepath.Join(appData, "Cursor", "User", "workspaceStorage")
+		if entries, err := os.ReadDir(cursorStorage); err == nil {
+			counts["cursor"] = len(entries)
+		}
+	}
+	if counts["cursor"] == 0 && (dirExists(filepath.Join(root, ".cursor")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".cursor")))) {
+		counts["cursor"] = 1
+	}
+
+	// 5. Windsurf
+	if appData != "" {
+		windsurfStorage := filepath.Join(appData, "Windsurf", "User", "workspaceStorage")
+		if entries, err := os.ReadDir(windsurfStorage); err == nil {
+			counts["windsurf"] = len(entries)
+		}
+	}
+	if counts["windsurf"] == 0 && (dirExists(filepath.Join(root, ".windsurf")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".windsurf")))) {
+		counts["windsurf"] = 1
+	}
+
+	// 6. Trae (ByteDance)
+	if appData != "" {
+		traeStorage := filepath.Join(appData, "Trae", "User", "workspaceStorage")
+		if entries, err := os.ReadDir(traeStorage); err == nil {
+			counts["trae"] = len(entries)
+		}
+	}
+	if counts["trae"] == 0 && (dirExists(filepath.Join(root, ".trae")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".trae")))) {
+		counts["trae"] = 1
+	}
+
+	// 7. GitHub Copilot
+	if appData != "" {
+		copilotChat := filepath.Join(appData, "Code", "User", "globalStorage", "github.copilot-chat")
+		if dirExists(copilotChat) {
+			counts["copilot"] = 1
+		}
+	}
+	if counts["copilot"] == 0 && (dirExists(filepath.Join(root, ".copilot")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".copilot")))) {
+		counts["copilot"] = 1
+	}
+
+	// 8. Cline / Roo Code
+	if appData != "" {
+		clineTasks := filepath.Join(appData, "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks")
+		if entries, err := os.ReadDir(clineTasks); err == nil {
+			counts["cline"] = len(entries)
+		}
+	}
+	if counts["cline"] == 0 && fileExists(filepath.Join(root, ".clinerules")) {
+		counts["cline"] = 1
+	}
+
+	// 9. Aider
+	aiderHistory := filepath.Join(root, ".aider.chat.history.md")
+	if fileExists(aiderHistory) || (homeDir != "" && fileExists(filepath.Join(homeDir, ".aider.conf.yml"))) {
+		counts["aider"] = 1
+	}
+
+	// 10. MiniMax Code & Kimi Code & ZCode
+	if homeDir != "" {
+		if dirExists(filepath.Join(homeDir, ".minimax")) {
+			counts["minimax"] = 1
+		}
+		if dirExists(filepath.Join(homeDir, ".kimi")) || dirExists(filepath.Join(homeDir, ".moonshot")) {
+			counts["kimi"] = 1
+		}
+		if dirExists(filepath.Join(homeDir, ".zcode")) {
+			counts["zcode"] = 1
+		}
+	}
+
+	// 11. Continue.dev & Zed & Replit & Devin & Goose & OpenHands
+	if homeDir != "" {
+		if dirExists(filepath.Join(homeDir, ".continue")) {
+			counts["continue"] = 1
+		}
+		if dirExists(filepath.Join(homeDir, ".replit")) || fileExists(filepath.Join(root, ".replit")) {
+			counts["replit"] = 1
+		}
+		if dirExists(filepath.Join(homeDir, ".devin")) {
+			counts["devin"] = 1
+		}
+		if dirExists(filepath.Join(homeDir, ".goose")) {
+			counts["goose"] = 1
+		}
+		if dirExists(filepath.Join(homeDir, ".openhands")) {
+			counts["openhands"] = 1
+		}
+	}
+	if appData != "" && dirExists(filepath.Join(appData, "Zed")) {
+		counts["zed"] = 1
+	}
+
 	return counts
+}
+
+func dirExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
 }
 
 // ignorePatterns returns the effective directory ignore patterns from the
@@ -761,4 +880,3 @@ func (e *Engine) ClearStale(days int) (int64, error) {
 	}
 	return res.RowsAffected()
 }
-

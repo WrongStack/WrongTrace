@@ -46,13 +46,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "==> starting daemon on :$PORT (watching $WATCH_DIR)"
+echo "==> starting daemon on :$PORT (multi-project workspace hub)"
 "$BIN" start \
   --port "$PORT" \
   --watch "$WATCH_DIR" \
-  --repo "$(basename "$WATCH_DIR")" \
-  --db "$ROOT/bin/dev-wrongtrace.db" \
-  --socket "$ROOT/bin/dev-wrongtrace.sock" &
+  --repo "$(basename "$WATCH_DIR")" &
 DAEMON_PID=$!
 
 # Wait for the daemon's health endpoint before starting vite so the proxy

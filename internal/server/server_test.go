@@ -461,17 +461,26 @@ func TestServerLifecycle(t *testing.T) {
 func TestModelCatalogEndpoints(t *testing.T) {
 	_, _, ts := newTestServer(t)
 
-	// 1. GET /api/models/catalog
+	// 1. GET /api/models/catalog & GET /api/models/providers
 	var catalog []map[string]interface{}
 	resp := getJSON(t, ts.URL+"/api/models/catalog", &catalog)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if len(catalog) == 0 {
-		t.Fatal("expected non-empty model catalog")
+	for _, m := range catalog {
+		if m["id"] == "" {
+			t.Errorf("catalog entry missing id: %v", m)
+		}
+	}
+
+	var providers []map[string]interface{}
+	pResp := getJSON(t, ts.URL+"/api/models/providers", &providers)
+	if pResp.StatusCode != http.StatusOK {
+		t.Fatalf("providers status = %d, want 200", pResp.StatusCode)
 	}
 
 	// 2. POST /api/models/catalog (Add custom model)
+	countBefore := len(catalog)
 	customBody := `{"id":"custom-deepseek-coder","name":"Custom DeepSeek Coder","provider":"Internal","input_price_per_m":0.1,"output_price_per_m":0.2,"context_window":64000}`
 	postResp, err := http.Post(ts.URL+"/api/models/catalog", "application/json", strings.NewReader(customBody))
 	if err != nil {
@@ -482,7 +491,28 @@ func TestModelCatalogEndpoints(t *testing.T) {
 		t.Fatalf("POST status = %d, want 200", postResp.StatusCode)
 	}
 
-	// 3. POST /api/models/calculate-cost
+	// 3. The custom model lands in the catalog as exactly one new entry
+	// (models.Global is shared across this package's tests, so compare
+	// against the pre-upsert count instead of an absolute number).
+	var catalogAfter []map[string]interface{}
+	getJSON(t, ts.URL+"/api/models/catalog", &catalogAfter)
+	if len(catalogAfter) != countBefore+1 {
+		t.Fatalf("expected catalog to grow by 1 (%d -> %d), got %d", countBefore, countBefore+1, len(catalogAfter))
+	}
+	found := false
+	for _, m := range catalogAfter {
+		if m["id"] == "custom-deepseek-coder" {
+			found = true
+			if m["is_custom"] != true {
+				t.Errorf("custom model not marked is_custom: %v", m)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("custom-deepseek-coder missing from catalog after upsert")
+	}
+
+	// 4. POST /api/models/calculate-cost
 	calcBody := `{"model":"custom-deepseek-coder","prompt_tokens":1000000,"completion_tokens":1000000}`
 	calcResp, err := http.Post(ts.URL+"/api/models/calculate-cost", "application/json", strings.NewReader(calcBody))
 	if err != nil {
@@ -498,3 +528,89 @@ func TestModelCatalogEndpoints(t *testing.T) {
 		t.Errorf("expected ~$0.30 total cost, got %v", calcResult["total_cost_usd"])
 	}
 }
+
+func TestProfilerEndpoints(t *testing.T) {
+	_, _, ts := newTestServer(t)
+
+	// 1. POST /api/profiler/ingest
+	reportJSON := `{
+		"service_name": "checkout-svc",
+		"node_signature": "func:checkout.go::ProcessOrder",
+		"file_path": "src/checkout.go",
+		"duration_ms": 125.4,
+		"cpu_usage_pct": 18.2,
+		"memory_bytes": 2048576,
+		"status_code": 200,
+		"profiler_type": "pprof"
+	}`
+	resp, err := http.Post(ts.URL+"/api/profiler/ingest", "application/json", strings.NewReader(reportJSON))
+	if err != nil {
+		t.Fatalf("POST /api/profiler/ingest: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("ingest status = %d, want 201", resp.StatusCode)
+	}
+
+	// 2. POST /v1/traces (OTLP)
+	otlpJSON := `{
+		"resourceSpans": [{
+			"resource": {
+				"attributes": [{"key": "service.name", "value": {"stringValue": "auth-svc"}}]
+			},
+			"scopeSpans": [{
+				"spans": [{
+					"traceId": "trace-9999",
+					"spanId": "span-99",
+					"name": "VerifyToken",
+					"startTimeUnixNano": "1700000000000000000",
+					"endTimeUnixNano": "1700000000025000000",
+					"attributes": [
+						{"key": "code.filepath", "value": {"stringValue": "src/auth.go"}},
+						{"key": "code.function", "value": {"stringValue": "VerifyToken"}},
+						{"key": "http.status_code", "value": {"intValue": "200"}}
+					]
+				}]
+			}]
+		}]
+	}`
+	otlpResp, err := http.Post(ts.URL+"/v1/traces", "application/json", strings.NewReader(otlpJSON))
+	if err != nil {
+		t.Fatalf("POST /v1/traces: %v", err)
+	}
+	defer otlpResp.Body.Close()
+	if otlpResp.StatusCode != http.StatusOK {
+		t.Fatalf("OTLP traces status = %d, want 200", otlpResp.StatusCode)
+	}
+
+	// 3. GET /api/profiler/traces
+	var traces []map[string]interface{}
+	getResp := getJSON(t, ts.URL+"/api/profiler/traces", &traces)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("traces status = %d, want 200", getResp.StatusCode)
+	}
+	if len(traces) != 2 {
+		t.Errorf("expected 2 traces, got %d", len(traces))
+	}
+
+	// 4. GET /api/profiler/hotspots
+	var hotspots []map[string]interface{}
+	hResp := getJSON(t, ts.URL+"/api/profiler/hotspots", &hotspots)
+	if hResp.StatusCode != http.StatusOK {
+		t.Fatalf("hotspots status = %d, want 200", hResp.StatusCode)
+	}
+	if len(hotspots) == 0 {
+		t.Error("expected hotspots, got none")
+	}
+
+	// 5. GET /api/profiler/overview
+	var ov map[string]interface{}
+	ovResp := getJSON(t, ts.URL+"/api/profiler/overview", &ov)
+	if ovResp.StatusCode != http.StatusOK {
+		t.Fatalf("overview status = %d, want 200", ovResp.StatusCode)
+	}
+	if total, ok := ov["total_traces"].(float64); !ok || total != 2 {
+		t.Errorf("expected total_traces = 2, got %v", ov["total_traces"])
+	}
+}
+

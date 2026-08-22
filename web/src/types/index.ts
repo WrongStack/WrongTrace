@@ -84,10 +84,56 @@ export interface FileHealth {
   warning: string;
 }
 
+export interface ProxyToolCall {
+  id?: string;
+  name: string;
+  target_file?: string;
+  arguments?: string;
+}
+
+export interface ProxyTrafficRecord {
+  id: string;
+  timestamp: string;
+  duration_ms: number;
+  method: string;
+  incoming_path: string;
+  target_url: string;
+  provider: string;
+  model: string;
+  agent_name: string;
+  task_id: string;
+  project_id?: string;
+  project_slug?: string;
+  status_code: number;
+  is_stream: boolean;
+  request_headers: Record<string, string>;
+  request_body: string;
+  response_headers: Record<string, string>;
+  response_body: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_tokens?: number;
+  reasoning_tokens?: number;
+  cache_hit_rate?: number;
+  cost_usd: number;
+  cache_savings_usd?: number;
+  tool_calls?: ProxyToolCall[];
+  tool_count?: number;
+  assistant_reply?: string;
+  reasoning?: string;
+  system_prompt?: string;
+  message_count?: number;
+  finish_reason?: string;
+}
+
 export type WSMessage =
   | { type: 'hello'; at: string; repo: string }
   | { type: 'code_event'; event_id: string; payload: WsCodeEvent; at: string }
   | { type: 'run_reported'; payload: ActiveRun; at: string }
+  | { type: 'project_switched'; payload: Project; at?: string }
+  | { type: 'proxy_traffic'; payload: ProxyTrafficRecord; at?: string }
+  | { type: 'profiler_trace'; payload: RuntimeTrace; at?: string }
   | { type: 'metrics_refresh'; payload: MetricsSnapshot; at: string };
 
 export interface WsCodeEvent {
@@ -153,16 +199,31 @@ export interface AtlasSnapshot {
   total_nodes: number;
 }
 
-export interface ModelInfo {
+export interface ProviderInfo {
   id: string;
   name: string;
+  api?: string;
+  npm?: string;
+  doc?: string;
+  model_count: number;
+  models: ModelInfo[];
+}
+
+export interface ModelInfo {
+  id: string;
+  model_id?: string;
+  name: string;
   provider: string;
+  provider_id?: string;
+  provider_api?: string;
+  npm_package?: string;
   input_price_per_m: number;
   output_price_per_m: number;
   cache_read_price_per_m: number;
   context_window: number;
   description: string;
   is_custom?: boolean;
+  is_canonical?: boolean;
 }
 
 export interface CalculateCostResponse {
@@ -194,11 +255,20 @@ export interface Project {
   primary_language?: string;
   discovered_sessions?: {
     wrongstack?: number;
-    claude_code?: number;
-    cline?: number;
-    cursor?: number;
-    aider?: number;
     antigravity?: number;
+    claude_code?: number;
+    cursor?: number;
+    windsurf?: number;
+    trae?: number;
+    copilot?: number;
+    cline?: number;
+    aider?: number;
+    minimax?: number;
+    kimi?: number;
+    zcode?: number;
+    replit?: number;
+    zed?: number;
+    [key: string]: number | undefined;
   };
   custom_logs_path?: string;
   claude_logs_path?: string;
@@ -250,4 +320,38 @@ export interface AppSettings {
   ignore_patterns?: string[];
   db_path?: string;
 }
+
+export interface RuntimeTrace {
+  trace_id: string;
+  run_id?: string;
+  service_name: string;
+  node_signature?: string;
+  file_path?: string;
+  duration_ms: number;
+  cpu_usage_pct: number;
+  memory_bytes: number;
+  status_code: number;
+  error_msg?: string;
+  profiler_type: 'otlp' | 'pprof' | 'test_runner' | 'custom' | string;
+  metadata?: Record<string, any>;
+  timestamp: string;
+}
+
+export interface ProfilerHotspot {
+  node_signature: string;
+  file_path: string;
+  trace_count: number;
+  avg_duration_ms: number;
+  max_duration_ms: number;
+  total_errors: number;
+  last_seen: string;
+}
+
+export interface ProfilerOverview {
+  total_traces: number;
+  total_errors: number;
+  avg_duration_ms: number;
+  active_services: number;
+}
+
 

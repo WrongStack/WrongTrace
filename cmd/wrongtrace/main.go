@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/ingest"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 	"github.com/wrongstack/wrongtrace/internal/mcp"
+	"github.com/wrongstack/wrongtrace/internal/report"
 	"github.com/wrongstack/wrongtrace/internal/server"
 	"github.com/wrongstack/wrongtrace/internal/watcher"
 )
@@ -33,6 +37,7 @@ var rootCmd = &cobra.Command{
 lifecycle of code nodes (functions, classes, methods) and correlates them with
 agent telemetry to expose churn, thrashing, model survival, and token ROI.`,
 	Version: version,
+	RunE:    runStart,
 }
 
 var startCmd = &cobra.Command{
@@ -53,14 +58,58 @@ var statusCmd = &cobra.Command{
 	RunE:  runStatus,
 }
 
-func init() {
-	rootCmd.AddCommand(startCmd, mcpCmd, statusCmd)
+var doctorCmd = &cobra.Command{
+	Use:   "doctor",
+	Short: "Run comprehensive diagnostics on database, IPC, agent logs, and AST parsers",
+	RunE:  runDoctor,
+}
 
-	startCmd.Flags().StringP("watch", "w", ".", "directory to observe")
-	startCmd.Flags().IntP("port", "p", 4318, "HTTP port for the embedded dashboard")
-	startCmd.Flags().String("db", filepath.Join(defaultDataDir(), "wrongtrace.db"), "SQLite database file")
-	startCmd.Flags().String("socket", defaultSocketPath(), "Unix Domain Socket / Named Pipe path")
-	startCmd.Flags().String("repo", filepath.Base(mustCwd()), "repository name to record events under")
+var traceCmd = &cobra.Command{
+	Use:   "trace -- <command...>",
+	Short: "Execute any command/test, measure runtime latency, and record profiler telemetry",
+	RunE:  runTrace,
+}
+
+var exportCmd = &cobra.Command{
+	Use:   "export",
+	Short: "Export telemetry and code churn records to JSON",
+	RunE:  runExport,
+}
+
+var reportCmd = &cobra.Command{
+	Use:   "report",
+	Short: "Generate an executive Markdown, HTML, or JSON observability report",
+	RunE:  runReport,
+}
+
+var hookCmd = &cobra.Command{
+	Use:   "hook [install|uninstall]",
+	Short: "Install or remove git hooks for telemetry and code churn tracking",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runHook,
+}
+
+var initCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Initialize WrongTrace observability configs, agent rules (CLAUDE.md, AGENTS.md), and git hooks",
+	RunE:  runInit,
+}
+
+func init() {
+	rootCmd.AddCommand(startCmd, mcpCmd, statusCmd, doctorCmd, traceCmd, exportCmd, reportCmd, hookCmd, initCmd)
+
+	rootCmd.PersistentFlags().StringP("watch", "w", ".", "directory to observe")
+	rootCmd.PersistentFlags().IntP("port", "p", 4318, "HTTP port for the embedded dashboard")
+	rootCmd.PersistentFlags().String("db", filepath.Join(defaultDataDir(), "wrongtrace.db"), "SQLite database file")
+	rootCmd.PersistentFlags().String("socket", defaultSocketPath(), "Unix Domain Socket / Named Pipe path")
+	rootCmd.PersistentFlags().String("repo", filepath.Base(mustCwd()), "repository name to record events under")
+
+	traceCmd.Flags().String("service", "cli-command", "service name for the trace")
+	traceCmd.Flags().String("node", "", "optional AST node or function signature to correlate")
+	exportCmd.Flags().String("out", "", "output file path (default stdout)")
+
+	reportCmd.Flags().String("format", "markdown", "report format: markdown, html, or json")
+	reportCmd.Flags().String("out", "", "output file path (default stdout)")
 }
 
 func main() {
@@ -165,6 +214,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		})
 	})
 	sessionWatcher.DiscoverAgentDirs(abs)
+	sessionWatcher.DiscoverGlobalAgentDirs()
 	sessionWatcher.StartPolling(ctx, 3*time.Second)
 
 	go func() {
@@ -175,6 +225,19 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	}()
 	go w.Run(ctx)
 	go engine.Run(ctx)
+
+	// Refresh the model pricing catalog from models.dev/api.json so the
+	// dashboard starts with live data. Runs in the background: an offline or
+	// slow upstream must not delay server startup, and the registry keeps
+	// whatever it already has when the fetch fails (POST /api/models/sync
+	// retries on demand).
+	go func() {
+		if n, err := engine.SyncModelsDev(); err != nil {
+			log.Printf("models.dev sync: %v — using catalog already in memory", err)
+		} else {
+			log.Printf("models.dev sync: %d models loaded", n)
+		}
+	}()
 
 	// Graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
@@ -217,7 +280,7 @@ func runMCP(cmd *cobra.Command, _ []string) error {
 }
 
 func runStatus(cmd *cobra.Command, _ []string) error {
-	dbPath, _ := startCmd.Flags().GetString("db")
+	dbPath, _ := cmd.Flags().GetString("db")
 	store, err := db.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
@@ -237,6 +300,425 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 	fmt.Printf("  total spend USD: %.4f\n", stats.TotalCost)
 	fmt.Printf("  unique models  : %d\n", stats.UniqueModels)
 	return nil
+}
+
+func runDoctor(cmd *cobra.Command, _ []string) error {
+	dbPath, _ := cmd.Flags().GetString("db")
+	socketPath, _ := cmd.Flags().GetString("socket")
+	watchDir, _ := cmd.Flags().GetString("watch")
+	absWatch, _ := filepath.Abs(watchDir)
+
+	fmt.Printf("=== WrongTrace Diagnostics (%s) ===\n", version)
+	fmt.Printf("OS / Arch      : %s / %s (CPUs: %d)\n", runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
+	fmt.Printf("Workspace      : %s\n", absWatch)
+
+	// 1. Storage Check
+	fmt.Print("\n[1] SQLite Database: ")
+	store, err := db.Open(dbPath)
+	if err != nil {
+		fmt.Printf("FAIL (%v)\n", err)
+	} else {
+		defer store.Close()
+		if err := store.Migrate(); err != nil {
+			fmt.Printf("FAIL MIGRATION (%v)\n", err)
+		} else {
+			overview, _ := store.Overview()
+			profOverview, _ := store.ProfilerOverview()
+			fmt.Printf("OK (Runs: %d, Events: %d, Traces: %d)\n",
+				overview.TotalRuns, overview.TotalEvents, profOverview.TotalTraces)
+		}
+	}
+
+	// 2. Multi-language AST Engine Check
+	fmt.Print("[2] AST Engine (Tree-sitter & Multi-lang): ")
+	astEng, err := ast.NewEngine()
+	if err != nil {
+		fmt.Printf("FAIL (%v)\n", err)
+	} else {
+		defer astEng.Close()
+		testSnap, err := astEng.Parse("doctor_test.go", []byte("package main\nfunc Test() {}"))
+		if err != nil || len(testSnap.Nodes) == 0 {
+			fmt.Printf("WARN (parsed 0 nodes)\n")
+		} else {
+			fmt.Printf("OK (Languages supported: Go, TS/JS, Python, Rust, C/C++, Java, C#, PHP, Ruby)\n")
+		}
+	}
+
+	// 3. IPC / Named Pipe Path
+	fmt.Printf("[3] IPC Path: %s\n", socketPath)
+
+	// 4. Discovered Coding Agent Logs
+	fmt.Println("\n[4] Coding Agent Logs & Transcripts Discovery:")
+	sw := ingest.NewSessionWatcher(nil)
+	sw.DiscoverAgentDirs(absWatch)
+	sw.DiscoverGlobalAgentDirs()
+
+	home, _ := os.UserHomeDir()
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		appData = filepath.Join(home, "AppData", "Roaming")
+	}
+	localAppData := os.Getenv("LOCALAPPDATA")
+	if localAppData == "" {
+		localAppData = filepath.Join(home, "AppData", "Local")
+	}
+
+	checkAgents := []struct {
+		Name  string
+		Paths []string
+	}{
+		{"WrongStack (Native)", []string{filepath.Join(home, ".wrongstack")}},
+		{"Antigravity / Gemini", []string{filepath.Join(home, ".gemini", "antigravity-cli", "brain"), filepath.Join(home, ".gemini")}},
+		{"Claude Code", []string{filepath.Join(home, ".claude", "projects"), filepath.Join(home, ".claude", "logs"), filepath.Join(home, ".claude")}},
+		{"Cursor", []string{filepath.Join(appData, "Cursor", "User", "workspaceStorage"), filepath.Join(appData, "Cursor"), filepath.Join(home, ".cursor")}},
+		{"Windsurf / Codeium", []string{filepath.Join(appData, "Windsurf", "User", "workspaceStorage"), filepath.Join(appData, "Windsurf"), filepath.Join(home, ".codeium", "windsurf")}},
+		{"Trae (ByteDance)", []string{filepath.Join(appData, "Trae", "User", "workspaceStorage"), filepath.Join(appData, "Trae"), filepath.Join(home, ".trae")}},
+		{"GitHub Copilot", []string{filepath.Join(appData, "Code", "User", "globalStorage", "github.copilot-chat"), filepath.Join(localAppData, "github-copilot"), filepath.Join(home, ".copilot")}},
+		{"Cline / Roo Code", []string{
+			filepath.Join(appData, "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks"),
+			filepath.Join(appData, "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "tasks"),
+			filepath.Join(appData, "Cursor", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks"),
+			filepath.Join(home, ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks"),
+		}},
+		{"MiniMax Code", []string{filepath.Join(home, ".minimax", "sessions"), filepath.Join(home, ".minimax")}},
+		{"Kimi Code (Moonshot)", []string{filepath.Join(home, ".kimi", "sessions"), filepath.Join(home, ".kimi"), filepath.Join(home, ".moonshot")}},
+		{"Continue.dev", []string{filepath.Join(home, ".continue", "sessions"), filepath.Join(home, ".continue")}},
+		{"Zed AI", []string{filepath.Join(appData, "Zed", "conversations"), filepath.Join(home, ".config", "zed", "conversations")}},
+		{"Replit Agent", []string{filepath.Join(home, ".replit", "agent"), filepath.Join(home, ".replit")}},
+		{"ZCode (Z.ai)", []string{filepath.Join(home, ".zcode", "tasks"), filepath.Join(home, ".zcode")}},
+		{"Devin (Cognition)", []string{filepath.Join(home, ".devin", "sessions"), filepath.Join(home, ".devin")}},
+		{"Goose AI Agent", []string{filepath.Join(home, ".goose", "sessions"), filepath.Join(home, ".goose"), filepath.Join(localAppData, "goose")}},
+		{"OpenHands (OpenDevin)", []string{filepath.Join(home, ".openhands", "conversations"), filepath.Join(home, ".openhands")}},
+		{"Aider (Workspace)", []string{filepath.Join(absWatch, ".aider.chat.history.md"), filepath.Join(home, ".aider.conf.yml")}},
+	}
+
+	for _, a := range checkAgents {
+		detectedPath := ""
+		for _, p := range a.Paths {
+			if _, err := os.Stat(p); err == nil {
+				detectedPath = p
+				break
+			}
+		}
+		if detectedPath != "" {
+			fmt.Printf("  ✓ %-24s: Detected (%s)\n", a.Name, detectedPath)
+		} else {
+			fmt.Printf("  - %-24s: Not found (or standard path inactive)\n", a.Name)
+		}
+	}
+
+	fmt.Println("\n✓ Diagnostics complete. WrongTrace is operational.")
+	return nil
+}
+
+func runTrace(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("trace requires a command to execute (e.g. wrongtrace trace -- go test ./...)")
+	}
+
+	service, _ := cmd.Flags().GetString("service")
+	nodeSig, _ := cmd.Flags().GetString("node")
+	dbPath, _ := cmd.Flags().GetString("db")
+
+	startTime := time.Now()
+	execCmd := exec.Command(args[0], args[1:]...)
+	execCmd.Stdin = os.Stdin
+	execCmd.Stdout = os.Stdout
+	execCmd.Stderr = os.Stderr
+
+	fmt.Printf("⏱  [WrongTrace] Profiling command: %s\n", strings.Join(args, " "))
+	runErr := execCmd.Run()
+	duration := time.Since(startTime)
+	durationMs := float64(duration.Microseconds()) / 1000.0
+
+	statusCode := 200
+	var errMsg string
+	if runErr != nil {
+		statusCode = 500
+		errMsg = runErr.Error()
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			statusCode = exitErr.ExitCode()
+		}
+	}
+
+	if nodeSig == "" {
+		nodeSig = fmt.Sprintf("exec:%s", args[0])
+	}
+
+	// Persist to local database
+	store, err := db.Open(dbPath)
+	if err == nil {
+		defer store.Close()
+		_ = store.Migrate()
+		_ = store.InsertTrace(db.RuntimeTraceRecord{
+			TraceID:       fmt.Sprintf("tr-exec-%d", time.Now().UnixNano()),
+			ServiceName:   service,
+			NodeSignature: nodeSig,
+			DurationMs:    durationMs,
+			StatusCode:    statusCode,
+			ErrorMsg:      errMsg,
+			ProfilerType:  "test_runner",
+			MetadataJSON:  fmt.Sprintf(`{"command":%q}`, strings.Join(args, " ")),
+			Timestamp:     startTime.UTC(),
+		})
+	}
+
+	fmt.Printf("\n📊 [WrongTrace] Captured Execution Trace: duration=%.2fms status=%d node=%s\n",
+		durationMs, statusCode, nodeSig)
+
+	return runErr
+}
+
+func runExport(cmd *cobra.Command, _ []string) error {
+	dbPath, _ := cmd.Flags().GetString("db")
+	outFile, _ := cmd.Flags().GetString("out")
+
+	store, err := db.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
+	overview, err := store.Overview()
+	if err != nil {
+		return fmt.Errorf("overview: %w", err)
+	}
+
+	events, _ := store.RecentEvents(1000)
+	traces, _ := store.RecentTraces(1000)
+	models, _ := store.ModelComparison()
+
+	exportData := map[string]interface{}{
+		"generated_at":   time.Now().UTC().Format(time.RFC3339),
+		"overview":       overview,
+		"models":         models,
+		"recent_events":  events,
+		"runtime_traces": traces,
+	}
+
+	b, err := json.MarshalIndent(exportData, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal export: %w", err)
+	}
+
+	if outFile != "" {
+		if err := os.WriteFile(outFile, b, 0644); err != nil {
+			return fmt.Errorf("write export file: %w", err)
+		}
+		fmt.Printf("Exported telemetry to %s (%d bytes)\n", outFile, len(b))
+	} else {
+		fmt.Println(string(b))
+	}
+
+	return nil
+}
+
+func runReport(cmd *cobra.Command, _ []string) error {
+	dbPath, _ := cmd.Flags().GetString("db")
+	outFile, _ := cmd.Flags().GetString("out")
+	format, _ := cmd.Flags().GetString("format")
+	repoName, _ := cmd.Flags().GetString("repo")
+
+	store, err := db.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
+	overview, err := store.Overview()
+	if err != nil {
+		return fmt.Errorf("overview: %w", err)
+	}
+
+	events, _ := store.RecentEvents(20)
+	thrashing, _ := store.Thrashing(3, 7)
+	models, _ := store.ModelComparison()
+	profOverview, _ := store.ProfilerOverview()
+	hotspots, _ := store.ProfilerHotspots(10)
+
+	data := report.ReportData{
+		Snapshot: core.MetricsSnapshot{
+			Repo:         repoName,
+			GeneratedAt:  time.Now().UTC(),
+			Overview:     overview,
+			Thrashing:    thrashing,
+			Models:       models,
+			RecentEvents: events,
+		},
+		ProfilerOverview: profOverview,
+		Hotspots:         hotspots,
+	}
+
+	var outputContent string
+	switch strings.ToLower(format) {
+	case "html":
+		outputContent = report.GenerateHTMLReport(data)
+	case "json":
+		outputContent, err = report.GenerateJSONReport(data)
+		if err != nil {
+			return fmt.Errorf("generate json report: %w", err)
+		}
+	default:
+		outputContent = report.GenerateMarkdownReport(data)
+	}
+
+	if outFile != "" {
+		if err := os.WriteFile(outFile, []byte(outputContent), 0644); err != nil {
+			return fmt.Errorf("write report file: %w", err)
+		}
+		fmt.Printf("Generated %s report at %s (%d bytes)\n", format, outFile, len(outputContent))
+	} else {
+		fmt.Println(outputContent)
+	}
+
+	return nil
+}
+
+func runInit(cmd *cobra.Command, _ []string) error {
+	dir, err := os.Getwd()
+	if err != nil {
+		dir = "."
+	}
+
+	fmt.Printf("🚀 Initializing WrongTrace AI Observability in %s\n\n", dir)
+
+	// 1. Generate .mcp.json
+	mcpJSON := `{
+  "mcpServers": {
+    "wrongtrace": {
+      "command": "wrongtrace",
+      "args": ["mcp"]
+    }
+  }
+}
+`
+	mcpPath := filepath.Join(dir, ".mcp.json")
+	if !fileExists(mcpPath) {
+		_ = os.WriteFile(mcpPath, []byte(mcpJSON), 0644)
+		fmt.Printf("  ✓ Created %s (MCP server registration for Claude Code, Cursor, Windsurf)\n", filepath.Base(mcpPath))
+	} else {
+		fmt.Printf("  - %s already exists\n", filepath.Base(mcpPath))
+	}
+
+	// 2. Generate CLAUDE.md
+	claudeMD := `# WrongTrace AI Observability Instructions for Claude Code
+
+When working in this repository:
+1. **Report Telemetry**: If available, report run intent and tokens using the ` + "`wrongtrace`" + ` MCP tools or IPC.
+2. **File Health Guardrail**: Before modifying fragile or unfamiliar files, call ` + "`check_guardrail(file_path)`" + ` or ` + "`get_file_health_score(file_path)`" + `.
+3. **Minimize Churn**: Avoid repeated whole-file rewrites. Use targeted semantic edits (` + "`replace_file_content`" + `) to prevent thrashing.
+`
+	claudePath := filepath.Join(dir, "CLAUDE.md")
+	if !fileExists(claudePath) {
+		_ = os.WriteFile(claudePath, []byte(claudeMD), 0644)
+		fmt.Printf("  ✓ Created %s (Claude Code agent instructions)\n", filepath.Base(claudePath))
+	} else {
+		fmt.Printf("  - %s already exists\n", filepath.Base(claudePath))
+	}
+
+	// 3. Generate AGENTS.md
+	agentsMD := `# Universal AI Coding Agent Guidelines (WrongTrace)
+
+This repository is monitored by **WrongTrace AI Observability**.
+
+## Standard Protocols for All AI Agents (WrongStack, Cursor, Devin, Windsurf, Antigravity, Cline, Aider, Replit Agent, Zed AI, Kimi, MiniMax, ZCode, Trae, Goose, OpenHands, Copilot):
+- **Pre-flight Check**: Check file fragility before heavy refactoring. If a file health score is below 40%, review recent thrash events.
+- **Precision Diffs**: Prefer minimal localized AST modifications over wholesale overwrites.
+- **Safety First**: Do not modify files locked by guardrails.
+- **Telemetry Verification**: WrongTrace tracks token expenditure and code survival rates per model. Write clean, durable code.
+`
+	agentsPath := filepath.Join(dir, "AGENTS.md")
+	if !fileExists(agentsPath) {
+		_ = os.WriteFile(agentsPath, []byte(agentsMD), 0644)
+		fmt.Printf("  ✓ Created %s (Universal instructions for all coding agents)\n", filepath.Base(agentsPath))
+	} else {
+		fmt.Printf("  - %s already exists\n", filepath.Base(agentsPath))
+	}
+
+	// 4. Generate .cursorrules
+	cursorRules := `# WrongTrace Rules for Cursor
+- Always check if the target file has high churn before making large refactors.
+- Prefer targeted semantic diffs to preserve code longevity and survival score.
+- Run ` + "`wrongtrace doctor`" + ` to check local telemetry health.
+`
+	cursorRulesPath := filepath.Join(dir, ".cursorrules")
+	if !fileExists(cursorRulesPath) {
+		_ = os.WriteFile(cursorRulesPath, []byte(cursorRules), 0644)
+		fmt.Printf("  ✓ Created %s (Cursor IDE rules)\n", filepath.Base(cursorRulesPath))
+	} else {
+		fmt.Printf("  - %s already exists\n", filepath.Base(cursorRulesPath))
+	}
+
+	// 5. Install Git Hooks if repository exists
+	if err := runHook(cmd, []string{"install"}); err == nil {
+		fmt.Println("  ✓ Configured Git post-commit telemetry hook")
+	}
+
+	fmt.Println("\n✨ Setup complete! WrongTrace is now ready to observe and guide all coding agents.")
+	return nil
+}
+
+func runHook(cmd *cobra.Command, args []string) error {
+	action := strings.ToLower(args[0])
+
+	// Find .git directory starting from cwd and walking up
+	dir, err := os.Getwd()
+	if err != nil {
+		dir = "."
+	}
+	var gitRoot string
+	for {
+		candidate := filepath.Join(dir, ".git")
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			gitRoot = candidate
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	if gitRoot == "" {
+		return fmt.Errorf("current directory is not a git repository (.git folder not found)")
+	}
+	gitHooksDir := filepath.Join(gitRoot, "hooks")
+	_ = os.MkdirAll(gitHooksDir, 0755)
+	hookFile := filepath.Join(gitHooksDir, "post-commit")
+
+	switch action {
+	case "install":
+		hookScript := `#!/bin/sh
+# WrongTrace automatic post-commit telemetry ping
+if command -v wrongtrace >/dev/null 2>&1; then
+  wrongtrace status >/dev/null 2>&1 &
+fi
+`
+		if err := os.WriteFile(hookFile, []byte(hookScript), 0755); err != nil {
+			return fmt.Errorf("write git hook: %w", err)
+		}
+		fmt.Printf("✓ Installed WrongTrace post-commit hook at %s\n", hookFile)
+	case "uninstall":
+		if err := os.Remove(hookFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove git hook: %w", err)
+		}
+		fmt.Printf("✓ Removed WrongTrace post-commit hook\n")
+	default:
+		return fmt.Errorf("unknown hook action: %s (supported: install, uninstall)", action)
+	}
+	return nil
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
 }
 
 func mustCwd() string {

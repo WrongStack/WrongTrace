@@ -18,7 +18,9 @@ import (
 	"github.com/go-chi/cors"
 
 	"github.com/wrongstack/wrongtrace/internal/core"
+	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/models"
+	"github.com/wrongstack/wrongtrace/internal/profiler"
 	"github.com/wrongstack/wrongtrace/internal/proxy"
 )
 
@@ -33,6 +35,7 @@ type EngineAPI interface {
 	UnlockFile(path string)
 	IsFileLocked(path string) (bool, string)
 	ModelCatalog() []models.ModelInfo
+	ProviderCatalog() []models.ProviderInfo
 	UpsertModel(m models.ModelInfo)
 	CalculateCost(model string, promptTokens, completionTokens int64) float64
 	SyncModelsDev() (int, error)
@@ -49,6 +52,7 @@ type EngineAPI interface {
 	VacuumDB() error
 	ClearStale(days int) (int64, error)
 	Hub() *core.Hub
+	Store() *db.Store
 	Repo() string
 }
 
@@ -131,19 +135,48 @@ func (s *Server) buildRouter() chi.Router {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(15 * time.Second))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
 		AllowCredentials: false,
 		MaxAge:           300,
 	}))
 
+	var store *db.Store
+	if s.cfg.Engine != nil {
+		store = s.cfg.Engine.Store()
+	}
+	var hub *core.Hub
+	if s.cfg.Engine != nil {
+		hub = s.cfg.Engine.Hub()
+	}
+
 	h := &Handlers{
 		Engine:     s.cfg.Engine,
 		SocketPath: s.cfg.SocketPath,
-		Proxy:      proxy.NewGatewayProxy(proxy.Config{Reporter: s.cfg.Engine}),
+		Profiler: profiler.NewCollector(profiler.Config{
+			Store: store,
+			OnTrace: func(ev profiler.TraceEvent) {
+				if hub != nil {
+					hub.Broadcast(core.WSEvent{
+						Type:    "profiler_trace",
+						Payload: ev,
+					})
+				}
+			},
+		}),
+		Proxy: proxy.NewGatewayProxy(proxy.Config{
+			Reporter: s.cfg.Engine,
+			OnTraffic: func(rec proxy.ProxyTrafficRecord) {
+				if s.cfg.Engine != nil && s.cfg.Engine.Hub() != nil {
+					s.cfg.Engine.Hub().Broadcast(core.WSEvent{
+						Type:    "proxy_traffic",
+						Payload: rec,
+					})
+				}
+			},
+		}),
 	}
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", h.Health)
@@ -160,6 +193,8 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/proxy/routes", h.ListProxyRoutes)
 		r.Post("/proxy/routes", h.UpsertProxyRoute)
 		r.Delete("/proxy/routes/{id}", h.DeleteProxyRoute)
+		r.Get("/proxy/traffic", h.ListProxyTraffic)
+		r.Delete("/proxy/traffic", h.ClearProxyTraffic)
 
 		r.Get("/projects", h.ListProjects)
 		r.Post("/projects", h.AddProject)
@@ -176,11 +211,29 @@ func (s *Server) buildRouter() chi.Router {
 		r.Post("/settings/clear-stale", h.ClearStale)
 
 		r.Get("/models/catalog", h.ModelCatalog)
+		r.Get("/models/providers", h.ProviderCatalog)
 		r.Post("/models/catalog", h.UpsertModel)
 		r.Post("/models/sync", h.SyncModels)
 		r.Post("/models/calculate-cost", h.CalculateCost)
+
+		// Universal Runtime & Profiler Telemetry endpoints
+		r.Post("/profiler/ingest", h.IngestProfiler)
+		r.Post("/profiler/otlp/v1/traces", h.IngestOTLPTraces)
+		r.Get("/profiler/traces", h.GetProfilerTraces)
+		r.Get("/profiler/hotspots", h.GetProfilerHotspots)
+		r.Get("/profiler/overview", h.GetProfilerOverview)
+
 		r.Get("/ws", h.WebSocket)
 	})
+
+	// Standard OpenTelemetry OTLP endpoint support at root /v1/traces
+	r.Post("/v1/traces", h.IngestOTLPTraces)
+
+	// Transparent AI Gateway routes for LLM proxies and OpenAI / Anthropic / Gemini endpoints.
+	r.Handle("/proxy/*", h.Proxy)
+	r.Handle("/proxy", h.Proxy)
+	r.Handle("/v1/*", h.Proxy)
+	r.Handle("/v1", h.Proxy)
 
 	// Static React assets with SPA fallback. WebDistFS lives in the root
 	// package's embed.go and returns the web/dist sub-filesystem.

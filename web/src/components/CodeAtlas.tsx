@@ -269,11 +269,37 @@ function SymbolNode({ data }: NodeProps<Node<SymbolNodeData>>) {
   );
 }
 
+interface MoreItemsNodeData extends Record<string, unknown> {
+  count: number;
+  label: string;
+  onSwitchToTree?: () => void;
+}
+
+function MoreItemsNode({ data }: NodeProps<Node<MoreItemsNodeData>>) {
+  const { count, label, onSwitchToTree } = data;
+  return (
+    <div
+      onClick={onSwitchToTree}
+      className="px-4 py-3 rounded-xl border border-dashed border-indigo-500/40 bg-slate-900/80 hover:bg-indigo-950/40 hover:border-indigo-400 transition-all cursor-pointer text-center backdrop-blur-md min-w-[200px] shadow-lg"
+    >
+      <Handle type="target" position={Position.Left} className="!bg-indigo-400 !w-2 !h-2" />
+      <div className="text-xs font-mono font-semibold text-slate-300">
+        + {count} more {label}
+      </div>
+      <div className="text-[10px] text-accent mt-1 font-medium">
+        Explore in Tree View →
+      </div>
+      <Handle type="source" position={Position.Right} className="!bg-indigo-400 !w-2 !h-2" />
+    </div>
+  );
+}
+
 const nodeTypes = {
   rootProjectNode: RootProjectNode,
   packageNode: PackageNode,
   fileNode: FileNode,
   symbolNode: SymbolNode,
+  moreItemsNode: MoreItemsNode,
 };
 
 // ----------------------------------------------------
@@ -529,10 +555,18 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
       const { pkg } = focusedScope;
       const pkgNodeId = `pkg-focus-${pkg.path}`;
 
+      const MAX_CANVAS_FILES = 14;
+      const sortedFiles = [...pkg.files].sort((a, b) => {
+        if (a.is_fragile !== b.is_fragile) return b.is_fragile ? 1 : -1;
+        return b.total_loc - a.total_loc;
+      });
+      const visibleFiles = sortedFiles.slice(0, MAX_CANVAS_FILES);
+      const remainingFiles = sortedFiles.length - visibleFiles.length;
+
       if (graphLayout === 'radial') {
         const CENTER_X = 400;
         const CENTER_Y = 300;
-        const total = Math.max(1, pkg.files.length);
+        const total = Math.max(1, visibleFiles.length + (remainingFiles > 0 ? 1 : 0));
         const R = Math.max(260, total * 30);
 
         nList.push({
@@ -542,7 +576,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
           data: { pkg, onSelect: handleSelectPkg },
         });
 
-        pkg.files.forEach((file, fIdx) => {
+        visibleFiles.forEach((file, fIdx) => {
           const theta = (2 * Math.PI * fIdx) / total - Math.PI / 2;
           const fx = CENTER_X + R * Math.cos(theta) - 110;
           const fy = CENTER_Y + R * Math.sin(theta) - 35;
@@ -563,6 +597,23 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
             markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#818cf8' },
           });
         });
+
+        if (remainingFiles > 0) {
+          const theta = (2 * Math.PI * visibleFiles.length) / total - Math.PI / 2;
+          const moreNodeId = `more-files-${pkg.path}`;
+          nList.push({
+            id: moreNodeId,
+            type: 'moreItemsNode',
+            position: { x: CENTER_X + R * Math.cos(theta) - 100, y: CENTER_Y + R * Math.sin(theta) - 30 },
+            data: { count: remainingFiles, label: 'files', onSwitchToTree: () => setViewMode('tree') },
+          });
+          eList.push({
+            id: `edge-${pkgNodeId}-${moreNodeId}`,
+            source: pkgNodeId,
+            target: moreNodeId,
+            style: { stroke: 'rgba(148, 163, 184, 0.3)', strokeDasharray: '4 4' },
+          });
+        }
       } else {
         // Tree / Linear mode for package
         nList.push({
@@ -576,7 +627,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
         const FILE_COL_WIDTH = 280;
         const FILE_ROW_HEIGHT = 110;
 
-        pkg.files.forEach((file, fIdx) => {
+        visibleFiles.forEach((file, fIdx) => {
           const fileNodeId = `file-focus-${fIdx}-${file.path}`;
           const fCol = fIdx % FILE_COLS;
           const fRow = Math.floor(fIdx / FILE_COLS);
@@ -596,15 +647,45 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
             markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#818cf8' },
           });
         });
+
+        if (remainingFiles > 0) {
+          const fIdx = visibleFiles.length;
+          const fCol = fIdx % FILE_COLS;
+          const fRow = Math.floor(fIdx / FILE_COLS);
+          const moreNodeId = `more-files-${pkg.path}`;
+
+          nList.push({
+            id: moreNodeId,
+            type: 'moreItemsNode',
+            position: { x: 380 + fCol * FILE_COL_WIDTH, y: 50 + fRow * FILE_ROW_HEIGHT },
+            data: { count: remainingFiles, label: 'files', onSwitchToTree: () => setViewMode('tree') },
+          });
+
+          eList.push({
+            id: `edge-${pkgNodeId}-${moreNodeId}`,
+            source: pkgNodeId,
+            target: moreNodeId,
+            style: { stroke: 'rgba(148, 163, 184, 0.3)', strokeDasharray: '4 4' },
+          });
+        }
       }
     } else if (focusedScope.level === 'file') {
       const { pkg, file } = focusedScope;
       const fileNodeId = `file-focus-${file.path}`;
 
+      const MAX_CANVAS_SYMBOLS = 14;
+      const sortedSymbols = [...file.symbols].sort((a, b) => {
+        if (a.status !== b.status) return a.status === 'MODIFIED' ? -1 : 1;
+        if (a.edit_count !== b.edit_count) return b.edit_count - a.edit_count;
+        return b.lines_of_code - a.lines_of_code;
+      });
+      const visibleSymbols = sortedSymbols.slice(0, MAX_CANVAS_SYMBOLS);
+      const remainingSymbols = sortedSymbols.length - visibleSymbols.length;
+
       if (graphLayout === 'radial') {
         const CENTER_X = 380;
         const CENTER_Y = 280;
-        const total = Math.max(1, file.symbols.length);
+        const total = Math.max(1, visibleSymbols.length + (remainingSymbols > 0 ? 1 : 0));
         const R = Math.max(220, total * 24);
 
         nList.push({
@@ -614,7 +695,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
           data: { file, onSelect: (f: AtlasFile) => handleSelectFile(f, pkg) },
         });
 
-        file.symbols.forEach((sym, sIdx) => {
+        visibleSymbols.forEach((sym, sIdx) => {
           const theta = (2 * Math.PI * sIdx) / total - Math.PI / 2;
           const sx = CENTER_X + R * Math.cos(theta) - 100;
           const sy = CENTER_Y + R * Math.sin(theta) - 25;
@@ -639,6 +720,23 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
             markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#64748b' },
           });
         });
+
+        if (remainingSymbols > 0) {
+          const theta = (2 * Math.PI * visibleSymbols.length) / total - Math.PI / 2;
+          const moreNodeId = `more-syms-${file.path}`;
+          nList.push({
+            id: moreNodeId,
+            type: 'moreItemsNode',
+            position: { x: CENTER_X + R * Math.cos(theta) - 90, y: CENTER_Y + R * Math.sin(theta) - 25 },
+            data: { count: remainingSymbols, label: 'symbols', onSwitchToTree: () => setViewMode('tree') },
+          });
+          eList.push({
+            id: `edge-${fileNodeId}-${moreNodeId}`,
+            source: fileNodeId,
+            target: moreNodeId,
+            style: { stroke: 'rgba(148, 163, 184, 0.3)', strokeDasharray: '4 4' },
+          });
+        }
       } else {
         // Tree mode for symbols
         nList.push({
@@ -652,7 +750,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
         const SYM_COL_WIDTH = 260;
         const SYM_ROW_HEIGHT = 65;
 
-        file.symbols.forEach((sym, sIdx) => {
+        visibleSymbols.forEach((sym, sIdx) => {
           const symNodeId = `sym-focus-${sIdx}-${sym.node_signature}`;
           const sCol = sIdx % SYM_COLS;
           const sRow = Math.floor(sIdx / SYM_COLS);
@@ -676,6 +774,27 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
             markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#64748b' },
           });
         });
+
+        if (remainingSymbols > 0) {
+          const sIdx = visibleSymbols.length;
+          const sCol = sIdx % SYM_COLS;
+          const sRow = Math.floor(sIdx / SYM_COLS);
+          const moreNodeId = `more-syms-${file.path}`;
+
+          nList.push({
+            id: moreNodeId,
+            type: 'moreItemsNode',
+            position: { x: 380 + sCol * SYM_COL_WIDTH, y: 50 + sRow * SYM_ROW_HEIGHT },
+            data: { count: remainingSymbols, label: 'symbols', onSwitchToTree: () => setViewMode('tree') },
+          });
+
+          eList.push({
+            id: `edge-${fileNodeId}-${moreNodeId}`,
+            source: fileNodeId,
+            target: moreNodeId,
+            style: { stroke: 'rgba(148, 163, 184, 0.3)', strokeDasharray: '4 4' },
+          });
+        }
       }
     }
 

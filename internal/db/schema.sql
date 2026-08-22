@@ -38,3 +38,24 @@ CREATE INDEX IF NOT EXISTS idx_node_sig   ON code_node_events(file_path, node_si
 CREATE INDEX IF NOT EXISTS idx_node_time  ON code_node_events(event_time);
 CREATE INDEX IF NOT EXISTS idx_node_run   ON code_node_events(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_model ON agent_runs(model_name);
+
+CREATE TABLE IF NOT EXISTS runtime_traces (
+    trace_id         VARCHAR PRIMARY KEY,
+    run_id           VARCHAR,
+    service_name     VARCHAR NOT NULL,
+    node_signature   VARCHAR DEFAULT '',
+    file_path        VARCHAR DEFAULT '',
+    duration_ms      DOUBLE DEFAULT 0.0,
+    cpu_usage_pct    DOUBLE DEFAULT 0.0,
+    memory_bytes     BIGINT DEFAULT 0,
+    status_code      INTEGER DEFAULT 200,
+    error_msg        TEXT DEFAULT '',
+    profiler_type    VARCHAR NOT NULL, -- 'otlp', 'pprof', 'test_runner', 'custom'
+    metadata_json    TEXT DEFAULT '{}',
+    timestamp        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_sig   ON runtime_traces(file_path, node_signature);
+CREATE INDEX IF NOT EXISTS idx_trace_time  ON runtime_traces(timestamp);
+CREATE INDEX IF NOT EXISTS idx_trace_type  ON runtime_traces(profiler_type);
+

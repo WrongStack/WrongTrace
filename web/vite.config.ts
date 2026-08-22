@@ -19,6 +19,14 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
+      '/proxy': {
+        target: `http://localhost:${daemonPort}`,
+        changeOrigin: true,
+      },
+      '/v1': {
+        target: `http://localhost:${daemonPort}`,
+        changeOrigin: true,
+      },
     },
   },
   build: {

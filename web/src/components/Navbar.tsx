@@ -1,4 +1,5 @@
 import { Activity, Cpu, Plug, Radio, LayoutDashboard, Boxes, Code2, Bot, Network, Settings, FolderGit2 } from 'lucide-react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useProjects } from '../hooks/useMetrics';
 import type { Project } from '../types';
 
@@ -7,8 +8,10 @@ interface NavbarProps {
   wsConnected: boolean;
   agentCount: number;
   socketPath: string;
-  activeTab: 'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'gateway' | 'settings';
-  onTabChange: (tab: 'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'gateway' | 'settings') => void;
+  activeTab: 'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'profiler' | 'gateway' | 'settings';
+  onTabChange: (tab: 'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'profiler' | 'gateway' | 'settings') => void;
+  selectedProjectId?: string | null;
+  onProjectChange?: (project: Project | null) => void;
 }
 
 export function Navbar({
@@ -18,14 +21,21 @@ export function Navbar({
   socketPath,
   activeTab,
   onTabChange,
+  selectedProjectId,
+  onProjectChange,
 }: NavbarProps) {
+  const queryClient = useQueryClient();
   const { data: projects = [], refetch: refetchProjects } = useProjects();
 
   const handleSwitchProject = async (projectId: string) => {
     try {
       await fetch(`/api/projects/${projectId}/activate`, { method: 'POST' });
-      refetchProjects();
-      window.location.reload();
+      await refetchProjects();
+      await queryClient.invalidateQueries();
+      const switched = projects.find((p: Project) => p.id === projectId) || null;
+      if (onProjectChange) {
+        onProjectChange(switched);
+      }
     } catch (err) {
       console.error('Failed to switch project:', err);
     }
@@ -41,8 +51,8 @@ export function Navbar({
               <Activity className="h-4 w-4" />
             </span>
             <span>WrongTrace</span>
-            <span className="hidden sm:inline text-[11px] font-normal text-slate-400 bg-white/5 px-2 py-0.5 rounded-full border border-white/5">
-              agent observability
+            <span className="hidden sm:inline text-[11px] font-normal text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded-full border border-cyan-500/20">
+              WrongStack Ecosystem
             </span>
           </div>
 
@@ -50,7 +60,7 @@ export function Navbar({
             <div className="flex items-center gap-1.5 bg-slate-900/90 border border-white/10 rounded-lg px-2 py-1 text-xs text-slate-300 font-mono">
               <FolderGit2 className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
               <select
-                value={projects.find((p: Project) => p.name === repo || p.is_active)?.id || ''}
+                value={selectedProjectId || projects.find((p: Project) => p.name === repo || p.is_active)?.id || (projects[0]?.id ?? '')}
                 onChange={(e) => handleSwitchProject(e.target.value)}
                 className="bg-transparent border-none text-slate-200 text-xs font-semibold focus:outline-none cursor-pointer"
                 title="Switch Active Monitored Workspace"
@@ -115,6 +125,17 @@ export function Navbar({
           >
             <Bot className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Agent Sessions</span>
+          </button>
+          <button
+            onClick={() => onTabChange('profiler')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg transition-all ${
+              activeTab === 'profiler'
+                ? 'bg-accent text-white font-medium shadow-md shadow-accent/20'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Activity className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Profiler & Traces</span>
           </button>
           <button
             onClick={() => onTabChange('gateway')}

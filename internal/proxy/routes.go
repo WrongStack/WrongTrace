@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -10,25 +13,27 @@ import (
 type ProxyRoute struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
-	PathPrefix     string    `json:"path_prefix"`     // e.g. "/proxy/ollama", "/v1/groq", "/gemini"
-	TargetUpstream string    `json:"target_upstream"` // e.g. "http://localhost:11434/v1", "https://api.groq.com/openai/v1"
+	PathPrefix     string    `json:"path_prefix"`     // e.g. "/proxy/zai", "/proxy/ollama", "/v1/groq"
+	TargetUpstream string    `json:"target_upstream"` // e.g. "https://api.z.ai/api/coding/paas/v4", "http://localhost:11434/v1"
 	ProtocolType   string    `json:"protocol_type"`   // "openai", "openai-compatible", "anthropic", "gemini", "custom"
 	DefaultModel   string    `json:"default_model,omitempty"`
 	Enabled        bool      `json:"enabled"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// RouteManager manages user-configured dynamic gateway routes.
+// RouteManager manages user-configured dynamic gateway routes with disk persistence.
 type RouteManager struct {
 	mu     sync.RWMutex
 	routes map[string]ProxyRoute
 }
 
-// NewRouteManager initializes a clean dynamic route manager.
+// NewRouteManager initializes a dynamic route manager and loads saved routes from disk.
 func NewRouteManager() *RouteManager {
-	return &RouteManager{
+	rm := &RouteManager{
 		routes: make(map[string]ProxyRoute),
 	}
+	rm.loadDisk()
+	return rm
 }
 
 // AllRoutes returns a snapshot list of all configured routes.
@@ -42,7 +47,7 @@ func (rm *RouteManager) AllRoutes() []ProxyRoute {
 	return out
 }
 
-// UpsertRoute saves or updates a route.
+// UpsertRoute saves or updates a route and persists it to disk.
 func (rm *RouteManager) UpsertRoute(r ProxyRoute) ProxyRoute {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -55,37 +60,114 @@ func (rm *RouteManager) UpsertRoute(r ProxyRoute) ProxyRoute {
 	}
 	r.CreatedAt = time.Now().UTC()
 	rm.routes[r.ID] = r
+	rm.saveDisk()
 	return r
 }
 
-// DeleteRoute removes a route by ID.
+// DeleteRoute removes a route by ID and updates disk persistence.
 func (rm *RouteManager) DeleteRoute(id string) bool {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	if _, ok := rm.routes[id]; ok {
 		delete(rm.routes, id)
+		rm.saveDisk()
 		return true
 	}
 	return false
 }
 
-// MatchRoute matches an incoming URL path against configured routes.
+// MatchRoute matches an incoming URL path against configured routes flexibly.
 func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
-	cleanPath := path
+	normPath := "/" + strings.Trim(filepath.ToSlash(path), "/")
+	lowerPath := strings.ToLower(normPath)
+
 	for _, r := range rm.routes {
 		if !r.Enabled {
 			continue
 		}
-		if strings.HasPrefix(cleanPath, r.PathPrefix) {
-			remaining := strings.TrimPrefix(cleanPath, r.PathPrefix)
+
+		pfx := "/" + strings.Trim(filepath.ToSlash(r.PathPrefix), "/")
+		lowerPfx := strings.ToLower(pfx)
+
+		// 1. Direct or prefix match with configured PathPrefix (e.g. /proxy/zai -> /proxy/zai/...)
+		if strings.HasPrefix(lowerPath, lowerPfx) {
+			remaining := normPath[len(pfx):]
+			if remaining == "" {
+				remaining = "/"
+			}
+			return &r, remaining
+		}
+
+		// 2. Flexible /proxy/<prefix> match if route was configured as /<name> or <name>
+		slug := strings.TrimPrefix(lowerPfx, "/proxy")
+		slug = "/" + strings.Trim(slug, "/")
+		proxySlug := "/proxy" + slug
+
+		if strings.HasPrefix(lowerPath, proxySlug) {
+			remaining := normPath[len(proxySlug):]
+			if remaining == "" {
+				remaining = "/"
+			}
+			return &r, remaining
+		}
+
+		// 3. Match by Route Name (e.g. /proxy/zai matches route named "zai" or "ZAI")
+		nameSlug := "/proxy/" + strings.ToLower(strings.TrimSpace(r.Name))
+		if strings.HasPrefix(lowerPath, nameSlug) {
+			remaining := normPath[len(nameSlug):]
 			if remaining == "" {
 				remaining = "/"
 			}
 			return &r, remaining
 		}
 	}
-	return nil, cleanPath
+	return nil, path
+}
+
+func routesJSONPath() string {
+	if dir := os.Getenv("WRONGTRACE_HOME"); dir != "" {
+		return filepath.Join(dir, "proxy_routes.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(".", ".wrongtrace", "proxy_routes.json")
+	}
+	return filepath.Join(home, ".wrongtrace", "proxy_routes.json")
+}
+
+func (rm *RouteManager) saveDisk() {
+	p := routesJSONPath()
+	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+
+	list := make([]ProxyRoute, 0, len(rm.routes))
+	for _, r := range rm.routes {
+		list = append(list, r)
+	}
+
+	data, err := json.MarshalIndent(map[string]interface{}{"routes": list}, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(p, data, 0o644)
+	}
+}
+
+func (rm *RouteManager) loadDisk() {
+	p := routesJSONPath()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+
+	var parsed struct {
+		Routes []ProxyRoute `json:"routes"`
+	}
+	if err := json.Unmarshal(data, &parsed); err == nil {
+		for _, r := range parsed.Routes {
+			if r.ID != "" {
+				rm.routes[r.ID] = r
+			}
+		}
+	}
 }

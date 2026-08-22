@@ -28,8 +28,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $Bin = Join-Path $Root 'bin\wrongtrace.exe'
-$Db = Join-Path $Root 'bin\dev-wrongtrace.db'
-$Socket = '\\.\pipe\dev-wrongtrace'
+$Socket = '\\.\pipe\wrongtrace'
 
 foreach ($tool in 'go', 'npm') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
@@ -46,6 +45,9 @@ if (-not $NoBuild) {
     if ($LASTEXITCODE -ne 0) { Write-Error 'daemon build failed' }
 }
 
+# Clean up any lingering wrongtrace processes before starting
+Get-Process -Name wrongtrace -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
 if (-not $NoUI -and -not (Test-Path (Join-Path $Root 'web\node_modules'))) {
     Write-Host '==> installing dashboard dependencies (first run)' -ForegroundColor Cyan
     Push-Location (Join-Path $Root 'web')
@@ -56,18 +58,26 @@ if (-not $NoUI -and -not (Test-Path (Join-Path $Root 'web\node_modules'))) {
 
 $daemon = $null
 $vite = $null
+$daemonLog = Join-Path $Root 'dev-daemon.log'
+
 try {
-    Write-Host "==> starting daemon on :$Port (watching $WatchDir)" -ForegroundColor Cyan
-    $daemon = Start-Process -FilePath $Bin -PassThru -WindowStyle Hidden -ArgumentList @(
+    Write-Host "==> starting daemon on :$Port (multi-project workspace hub)" -ForegroundColor Cyan
+    $daemonArgs = @(
         'start',
         "--port=$Port",
-        "--watch=$WatchDir",
-        "--repo=$(Split-Path $WatchDir -Leaf)",
-        "--db=$Db",
         "--socket=$Socket"
     )
+    if ($WatchDir -ne '') {
+        $daemonArgs += "--watch=$WatchDir"
+        $daemonArgs += "--repo=$(Split-Path $WatchDir -Leaf)"
+    }
+    $daemon = Start-Process -FilePath $Bin -PassThru -WindowStyle Hidden -ArgumentList $daemonArgs -RedirectStandardError $daemonLog
 
     for ($i = 0; $i -lt 50; $i++) {
+        if ($daemon.HasExited) {
+            $errContent = if (Test-Path $daemonLog) { Get-Content $daemonLog -Raw } else { 'unknown error' }
+            Write-Error "daemon failed to start: $errContent"
+        }
         try {
             Invoke-WebRequest "http://localhost:$Port/api/health" -UseBasicParsing -TimeoutSec 1 | Out-Null
             break
@@ -102,19 +112,30 @@ try {
 
     # Park until interrupted or either child exits on its own.
     while ($true) {
-        if ($daemon.HasExited) { Write-Warning 'daemon exited; shutting down'; break }
-        if ($vite -and $vite.HasExited) { Write-Warning 'vite exited; shutting down'; break }
-        Start-Sleep -Milliseconds 500
+        $daemonProc = Get-Process -Id $daemon.Id -ErrorAction SilentlyContinue
+        if (-not $daemonProc) {
+            Write-Warning 'daemon process stopped; shutting down'
+            if (Test-Path $daemonLog) { Get-Content $daemonLog | Select-Object -Last 15 | Write-Host -ForegroundColor Red }
+            break
+        }
+        if ($vite) {
+            $viteProc = Get-Process -Id $vite.Id -ErrorAction SilentlyContinue
+            if (-not $viteProc) {
+                Write-Warning 'vite dev server stopped; shutting down'
+                break
+            }
+        }
+        Start-Sleep -Seconds 1
     }
 } finally {
     Write-Host '==> stopping dev processes' -ForegroundColor Cyan
 
     # Kill the vite tree first (cmd -> npm -> node) so no orphan lingers;
     # taskkill /T walks the whole process tree, unlike Stop-Process.
-    if ($vite -and -not $vite.HasExited) {
+    if ($vite) {
         & taskkill /PID $vite.Id /T /F 2>$null | Out-Null
     }
-    if ($daemon -and -not $daemon.HasExited) {
+    if ($daemon) {
         Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
     }
 }
