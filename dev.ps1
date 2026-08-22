@@ -29,7 +29,7 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $Bin = Join-Path $Root 'bin\wrongtrace.exe'
 $Db = Join-Path $Root 'bin\dev-wrongtrace.db'
-$Socket = Join-Path $Root 'bin\dev-wrongtrace.pipe'
+$Socket = '\\.\pipe\dev-wrongtrace'
 
 foreach ($tool in 'go', 'npm') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
