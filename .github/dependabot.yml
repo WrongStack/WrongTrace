@@ -1,0 +1,40 @@
+# Dependabot version-update configuration.
+#
+# Security alerts (dependabot/alerts) are enabled by GitHub regardless; this
+# file adds scheduled version-update PRs so routine dependency bumps arrive as
+# reviewable PRs that must pass CI, instead of manual fixes like the vite CVE
+# bump (98fde65) and the actions-version bumps (96423fe, e7f7cab).
+version: 2
+updates:
+  # Go module: the daemon backend (go.mod at the repo root).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    open-pull-requests-limit: 5
+
+  # npm: the dashboard frontend. package.json lives in web/, not the root.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "fix(deps)"
+      prefix-development: "chore(deps)"
+    # Group development-dependency bumps so toolchain noise (typescript,
+    # vite, tailwind, postcss) lands as one reviewable PR instead of many.
+    groups:
+      dev-toolchain:
+        dependency-type: development
+    open-pull-requests-limit: 5
+
+  # GitHub Actions versions in .github/workflows/*.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 3
