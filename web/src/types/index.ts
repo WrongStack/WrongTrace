@@ -208,6 +208,30 @@ export interface Project {
   wrongstack_logs_path?: string;
 }
 
+export interface WrongStackPreviewEntry {
+  name: string;
+  root: string;
+  slug: string;
+  already_registered: boolean;
+  exists_on_disk: boolean;
+}
+
+export interface PreviewFromWrongStackResult {
+  source_path: string;
+  entries: WrongStackPreviewEntry[];
+}
+
+export interface ImportFromWrongStackResult {
+  source_path: string;
+  found: number;
+  imported: number;
+  skipped_existing: number;
+  skipped_missing: number;
+  missing_roots: string[];
+  errors?: string[];
+  projects: Project[];
+}
+
 export interface AppSettings {
   auto_vacuum_enabled?: boolean;
   retention_days?: number;

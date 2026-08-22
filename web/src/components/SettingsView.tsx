@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
-import { Settings, Save, ShieldAlert, Cpu, HardDrive, DollarSign, Check, Sliders, BellRing, Trash2, Wrench, X, FolderTree, Plus, Database, Sparkles, FolderPlus, ArrowRight } from 'lucide-react';
+import { Settings, Save, ShieldAlert, Cpu, HardDrive, DollarSign, Check, Sliders, BellRing, Trash2, Wrench, X, FolderTree, Plus, Database, Sparkles, FolderPlus, ArrowRight, Download, AlertTriangle, Eye } from 'lucide-react';
 import { useSettings, useProjects } from '../hooks/useMetrics';
-import type { AppSettings, Project } from '../types';
+import type { AppSettings, Project, ImportFromWrongStackResult, PreviewFromWrongStackResult } from '../types';
+
+
 
 export function SettingsView() {
   const { data: initialSettings, refetch: refetchSettings } = useSettings();
@@ -30,6 +32,17 @@ export function SettingsView() {
   const [newProjPath, setNewProjPath] = useState('');
   const [isAddingProj, setIsAddingProj] = useState(false);
   const [projActionMsg, setProjActionMsg] = useState<string | null>(null);
+
+  // WrongStack Import state
+  const [isImporting, setIsImporting] = useState(false);
+  const [importResult, setImportResult] = useState<ImportFromWrongStackResult | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+
+  // WrongStack Preview state (pick-what-to-import step)
+  const [preview, setPreview] = useState<PreviewFromWrongStackResult | null>(null);
+  const [isPreviewing, setIsPreviewing] = useState(false);
+  const [selectedRoots, setSelectedRoots] = useState<Record<string, boolean>>({});
+
 
   // Project Edit state
   const [editingProject, setEditingProject] = useState<Record<string, Partial<Project>>>({});
@@ -130,6 +143,70 @@ export function SettingsView() {
       window.location.reload();
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const handlePreviewFromWrongStack = async () => {
+    setIsPreviewing(true);
+    setImportError(null);
+    setImportResult(null);
+    try {
+      const res = await fetch('/api/projects/import/wrongstack');
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setImportError(data?.error || `Preview failed (${res.status})`);
+        return;
+      }
+      const prev = data as PreviewFromWrongStackResult;
+      setPreview(prev);
+      // Default selection: importable = on disk and not already registered.
+      const sel: Record<string, boolean> = {};
+      for (const en of prev.entries ?? []) {
+        sel[en.root] = en.exists_on_disk && !en.already_registered;
+      }
+      setSelectedRoots(sel);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'Preview failed');
+    } finally {
+      setIsPreviewing(false);
+    }
+  };
+
+  const toggleSelectedRoot = (root: string) => {
+    setSelectedRoots((s) => ({ ...s, [root]: !s[root] }));
+  };
+
+  const selectedRootList = preview
+    ? Object.entries(selectedRoots)
+        .filter(([, on]) => on)
+        .map(([root]) => root)
+    : [];
+
+  const handleImportFromWrongStack = async (roots?: string[]) => {
+    setIsImporting(true);
+    setImportError(null);
+    setImportResult(null);
+    try {
+      const res = await fetch('/api/projects/import/wrongstack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roots: roots ?? [] }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        // The API returns {"error": "..."} on 404 (no source file) / 422 (bad JSON).
+        setImportError(data?.error || `Import failed (${res.status})`);
+        return;
+      }
+      setImportResult(data as ImportFromWrongStackResult);
+      setPreview(null);
+      if ((data as ImportFromWrongStackResult).imported > 0) {
+        refetchProjects();
+      }
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'Import failed');
+    } finally {
+      setIsImporting(false);
     }
   };
 
@@ -318,6 +395,167 @@ export function SettingsView() {
                 </button>
               </div>
             </form>
+          </div>
+
+          {/* Import from WrongStack Card */}
+          <div className="panel space-y-3 border border-rose-500/20 bg-slate-900/60">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-slate-200 font-semibold text-sm">
+                <Download className="h-4 w-4 text-rose-400" />
+                <h3>Import from WrongStack</h3>
+              </div>
+              <div className="flex items-center gap-2">
+                {!preview && (
+                  <button
+                    type="button"
+                    onClick={handlePreviewFromWrongStack}
+                    disabled={isPreviewing || isImporting}
+                    className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Eye className="h-3.5 w-3.5" />
+                    {isPreviewing ? 'Loading...' : 'Preview & Select'}
+                  </button>
+                )}
+                {preview && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setPreview(null)}
+                      disabled={isImporting}
+                      className="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-white/10 text-xs transition-colors disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleImportFromWrongStack(selectedRootList)}
+                      disabled={isImporting || selectedRootList.length === 0}
+                      className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/20 text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      {isImporting ? 'Importing...' : `Import Selected (${selectedRootList.length})`}
+                    </button>
+                  </>
+                )}
+                {!preview && (
+                  <button
+                    type="button"
+                    onClick={() => handleImportFromWrongStack()}
+                    disabled={isImporting || isPreviewing}
+                    className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/20 text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    {isImporting ? 'Importing...' : 'Import All'}
+                  </button>
+                )}
+              </div>
+            </div>
+            <p className="text-xs text-slate-400">
+              Bulk-registers workspaces listed in{' '}
+              <code className="text-[11px] text-slate-300 bg-slate-950/80 px-1.5 py-0.5 rounded border border-white/5">~/.wrongstack/projects.json</code>{' '}
+              that WrongTrace does not already monitor. Use <strong className="text-slate-300">Preview &amp; Select</strong> to pick which ones; already-registered roots are skipped either way.
+            </p>
+
+            {importError && (
+              <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-start gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                <span className="break-all">{importError}</span>
+              </div>
+            )}
+
+            {preview && (
+              <div className="space-y-2">
+                <div className="text-[11px] text-slate-500 font-mono truncate" title={preview.source_path}>
+                  {preview.source_path}
+                </div>
+                <div className="max-h-64 overflow-y-auto space-y-1">
+                  {preview.entries.map((en) => {
+                    const importable = en.exists_on_disk && !en.already_registered;
+                    return (
+                      <label
+                        key={en.root}
+                        className={`flex items-center gap-3 p-2 rounded border text-xs cursor-pointer transition-colors ${
+                          importable ? 'border-white/5 bg-slate-950/60 hover:border-rose-500/20' : 'border-white/5 bg-slate-950/30 opacity-60 cursor-not-allowed'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!selectedRoots[en.root]}
+                          onChange={() => toggleSelectedRoot(en.root)}
+                          disabled={!importable}
+                          className="accent-rose-500 h-3.5 w-3.5 shrink-0"
+                        />
+                        <span className="font-mono text-slate-200 truncate" title={en.root}>{en.name || en.slug}</span>
+                        <span className="flex-1 truncate text-slate-500 font-mono text-[11px]" title={en.root}>{en.root}</span>
+                        {en.already_registered ? (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-700/60 text-slate-300 font-mono shrink-0">REGISTERED</span>
+                        ) : en.exists_on_disk ? (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-300 font-mono shrink-0">NEW</span>
+                        ) : (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-300 font-mono shrink-0">MISSING</span>
+                        )}
+                      </label>
+                    );
+                  })}
+                  {preview.entries.length === 0 && (
+                    <div className="text-xs text-slate-500 p-2">No workspaces found in the WrongStack registry.</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {importResult && (
+              <div className="space-y-2 text-xs">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
+                    <div className="text-[11px] text-slate-400">Found</div>
+                    <div className="text-sm font-bold text-slate-200 font-mono">{importResult.found}</div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-slate-950/60 border border-emerald-500/10">
+                    <div className="text-[11px] text-slate-400">Imported</div>
+                    <div className="text-sm font-bold text-emerald-400 font-mono">{importResult.imported}</div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
+                    <div className="text-[11px] text-slate-400">Already Registered</div>
+                    <div className="text-sm font-bold text-slate-200 font-mono">{importResult.skipped_existing}</div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
+                    <div className="text-[11px] text-slate-400">Missing on Disk</div>
+                    <div className="text-sm font-bold text-amber-400 font-mono">{importResult.skipped_missing}</div>
+                  </div>
+                </div>
+
+                {importResult.imported > 0 && (
+                  <div className="space-y-1">
+                    {importResult.projects.map((p) => (
+                      <div key={p.id} className="flex items-center justify-between gap-2 p-2 rounded bg-slate-950/60 border border-white/5 font-mono text-[11px]">
+                        <span className="text-slate-200 truncate" title={p.path}>{p.name}</span>
+                        <span className="text-slate-500 truncate" title={p.path}>{p.path}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {importResult.missing_roots?.length > 0 && (
+                  <div className="p-2 rounded bg-amber-500/5 border border-amber-500/10 space-y-1">
+                    <div className="text-[11px] text-amber-300 flex items-center gap-1">
+                      <AlertTriangle className="h-3 w-3" /> Skipped — directory no longer exists:
+                    </div>
+                    {importResult.missing_roots.map((r) => (
+                      <div key={r} className="text-[11px] text-slate-400 font-mono truncate" title={r}>{r}</div>
+                    ))}
+                  </div>
+                )}
+
+                {importResult.errors?.length ? (
+                  <div className="p-2 rounded bg-rose-500/5 border border-rose-500/10 space-y-1">
+                    {importResult.errors.map((e) => (
+                      <div key={e} className="text-[11px] text-rose-300 font-mono break-all">{e}</div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            )}
           </div>
 
           {/* List of Registered Projects (Full Identity Cards) */}

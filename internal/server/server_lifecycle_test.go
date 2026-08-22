@@ -68,6 +68,12 @@ func (f *failingEngine) GetProject(string) (core.ProjectProfile, error) {
 func (f *failingEngine) AddProject(string, string) (core.Project, error) {
 	return core.Project{}, errForced
 }
+func (f *failingEngine) ImportFromWrongStack([]string) (core.ImportFromWrongStackResult, error) {
+	return core.ImportFromWrongStackResult{}, errForced
+}
+func (f *failingEngine) PreviewFromWrongStack() (core.PreviewFromWrongStackResult, error) {
+	return core.PreviewFromWrongStackResult{}, errForced
+}
 func (f *failingEngine) UpdateProject(core.ProjectProfile) (core.ProjectProfile, error) {
 	return core.ProjectProfile{}, errForced
 }

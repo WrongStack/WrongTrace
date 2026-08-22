@@ -16,6 +16,10 @@ import (
 // unknown project ID. HTTP callers map it to 404 (see server handlers).
 var ErrProjectNotFound = errors.New("project not found")
 
+// ErrWrongStackSourceMissing is returned by ImportFromWrongStack when
+// ~/.wrongstack/projects.json does not exist. HTTP callers map it to 404.
+var ErrWrongStackSourceMissing = errors.New("wrongstack projects.json not found")
+
 // ProjectProfile represents a monitored workspace/repository with its dedicated SQLite DB,
 // agent session log paths, and auto-discovered agent statistics.
 type ProjectProfile struct {
@@ -294,26 +298,225 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 func FindWrongStackLogsPath(root string) string {
 	homeDir, _ := os.UserHomeDir()
 	if homeDir != "" {
-		wsProjectsJSON := filepath.Join(homeDir, ".wrongstack", "projects.json")
-		if data, err := os.ReadFile(wsProjectsJSON); err == nil {
-			var pFile struct {
-				Projects []struct {
-					Root string `json:"root"`
-					Slug string `json:"slug"`
-				} `json:"projects"`
-			}
-			if json.Unmarshal(data, &pFile) == nil {
-				targetNorm := strings.ToLower(filepath.Clean(root))
-				for _, proj := range pFile.Projects {
-					if strings.ToLower(filepath.Clean(proj.Root)) == targetNorm && proj.Slug != "" {
-						return filepath.Join(homeDir, ".wrongstack", "projects", proj.Slug, "sessions")
-					}
+		if entries, _, err := readWrongStackProjects(homeDir); err == nil {
+			targetNorm := normalizeRoot(root)
+			for _, proj := range entries {
+				if normalizeRoot(proj.Root) == targetNorm && proj.Slug != "" {
+					return filepath.Join(homeDir, ".wrongstack", "projects", proj.Slug, "sessions")
 				}
 			}
 		}
 	}
 	return filepath.Join(root, ".wrongstack")
 }
+
+// WrongStackProject is a single entry of ~/.wrongstack/projects.json. Fields
+// beyond root/name/slug (lastSeen, createdAt, projectId, ...) are tolerated
+// but not needed by WrongTrace, so they are not modeled.
+type WrongStackProject struct {
+	Name string `json:"name"`
+	Root string `json:"root"`
+	Slug string `json:"slug"`
+}
+
+// wrongStackProjectsPath returns ~/.wrongstack/projects.json for the given
+// home directory. WrongStack has no home override of its own, so the path is
+// always <home>/.wrongstack/projects.json.
+func wrongStackProjectsPath(homeDir string) string {
+	return filepath.Join(homeDir, ".wrongstack", "projects.json")
+}
+
+// readWrongStackProjects reads and validates ~/.wrongstack/projects.json. It
+// returns ErrWrongStackSourceMissing when the file is absent.
+func readWrongStackProjects(homeDir string) ([]WrongStackProject, string, error) {
+	path := wrongStackProjectsPath(homeDir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, path, fmt.Errorf("%w: %s", ErrWrongStackSourceMissing, path)
+		}
+		return nil, path, fmt.Errorf("read %s: %w", path, err)
+	}
+	var parsed struct {
+		Projects []WrongStackProject `json:"projects"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, path, fmt.Errorf("invalid %s: %w", path, err)
+	}
+	return parsed.Projects, path, nil
+}
+
+// normalizeRoot canonicalizes a workspace path for comparison. Case-folding
+// matches the existing WrongStack matching convention in ScanAgentSessions —
+// Windows roots arrive with mixed case from both sides.
+func normalizeRoot(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	return strings.ToLower(filepath.Clean(p))
+}
+
+// WrongStackPreviewEntry is one workspace in the preview of
+// ~/.wrongstack/projects.json, annotated with what importing it would do.
+type WrongStackPreviewEntry struct {
+	Name              string `json:"name"`
+	Root              string `json:"root"`
+	Slug              string `json:"slug"`
+	AlreadyRegistered bool   `json:"already_registered"`
+	ExistsOnDisk      bool   `json:"exists_on_disk"`
+}
+
+// PreviewFromWrongStackResult is the preview of an import run: every
+// WrongStack workspace with its eligibility, plus the source path.
+type PreviewFromWrongStackResult struct {
+	SourcePath string                    `json:"source_path"`
+	Entries    []WrongStackPreviewEntry  `json:"entries"`
+}
+
+// PreviewFromWrongStack lists every workspace in ~/.wrongstack/projects.json
+// with the action an import would take for it. It only stats directories and
+// consults the in-memory registry — no tree walks — so it stays fast even
+// though ImportFromWrongStack itself scans each imported workspace.
+func (e *Engine) PreviewFromWrongStack() (PreviewFromWrongStackResult, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return PreviewFromWrongStackResult{}, fmt.Errorf("resolve home directory: %w", err)
+	}
+	entries, sourcePath, err := readWrongStackProjects(homeDir)
+	if err != nil {
+		return PreviewFromWrongStackResult{}, err
+	}
+
+	e.lockMu.RLock()
+	known := make(map[string]struct{}, len(e.projects))
+	for _, p := range e.projects {
+		known[normalizeRoot(p.Path)] = struct{}{}
+	}
+	e.lockMu.RUnlock()
+
+	res := PreviewFromWrongStackResult{
+		SourcePath: sourcePath,
+		Entries:    make([]WrongStackPreviewEntry, 0, len(entries)),
+	}
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Root) == "" {
+			continue
+		}
+		absRoot := entry.Root
+		if abs, absErr := filepath.Abs(absRoot); absErr == nil {
+			absRoot = abs
+		}
+		info, statErr := os.Stat(absRoot)
+		res.Entries = append(res.Entries, WrongStackPreviewEntry{
+			Name:              entry.Name,
+			Root:              absRoot,
+			Slug:              entry.Slug,
+			AlreadyRegistered: func() bool { _, ok := known[normalizeRoot(absRoot)]; return ok }(),
+			ExistsOnDisk:      statErr == nil && info.IsDir(),
+		})
+	}
+	return res, nil
+}
+
+// ImportFromWrongStackResult summarizes one import run from WrongStack.
+type ImportFromWrongStackResult struct {
+	SourcePath      string          `json:"source_path"`
+	Found           int             `json:"found"`
+	Imported        int             `json:"imported"`
+	SkippedExisting int             `json:"skipped_existing"`
+	SkippedMissing  int             `json:"skipped_missing"`
+	MissingRoots    []string        `json:"missing_roots"`
+	Errors          []string        `json:"errors,omitempty"`
+	Projects        []ProjectProfile `json:"projects"`
+}
+
+// ImportFromWrongStack registers workspaces listed in
+// ~/.wrongstack/projects.json that WrongTrace does not already monitor.
+// roots selects which entries to import (matched case-insensitively against
+// the registry entries' root paths); nil or empty means "all of them", the
+// original one-click behavior. Roots already registered are skipped (same
+// case-insensitive convention as ScanAgentSessions), so repeated runs are
+// idempotent. Entries whose root directory no longer exists on disk are
+// reported under missing_roots instead of failing the whole import; the
+// first imported project becomes the active workspace (AddProject's rule
+// for an empty registry).
+//
+// The duplicate guard snapshots the registry once: a concurrent AddProject
+// registering the same root mid-import can still create a second profile.
+// Accepted — AddProject itself is not duplicate-guarded, and making it
+// idempotent by path would change the existing POST /api/projects contract.
+func (e *Engine) ImportFromWrongStack(roots []string) (ImportFromWrongStackResult, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ImportFromWrongStackResult{}, fmt.Errorf("resolve home directory: %w", err)
+	}
+	entries, sourcePath, err := readWrongStackProjects(homeDir)
+	if err != nil {
+		return ImportFromWrongStackResult{}, err
+	}
+
+	// Empty selection means all entries (the no-preview, one-click path).
+	selected := make(map[string]struct{}, len(roots))
+	for _, r := range roots {
+		if strings.TrimSpace(r) != "" {
+			selected[normalizeRoot(r)] = struct{}{}
+		}
+	}
+	if len(selected) == 0 {
+		for _, entry := range entries {
+			if strings.TrimSpace(entry.Root) != "" {
+				selected[normalizeRoot(entry.Root)] = struct{}{}
+			}
+		}
+	}
+
+	res := ImportFromWrongStackResult{
+		SourcePath:   sourcePath,
+		Found:        len(entries),
+		MissingRoots: []string{},
+		Projects:     []ProjectProfile{},
+	}
+
+	e.lockMu.RLock()
+	known := make(map[string]struct{}, len(e.projects))
+	for _, p := range e.projects {
+		known[normalizeRoot(p.Path)] = struct{}{}
+	}
+	e.lockMu.RUnlock()
+
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Root) == "" {
+			continue
+		}
+		root := entry.Root
+		if abs, absErr := filepath.Abs(root); absErr == nil {
+			root = abs
+		}
+		if _, ok := selected[normalizeRoot(root)]; !ok {
+			continue
+		}
+		if _, ok := known[normalizeRoot(root)]; ok {
+			res.SkippedExisting++
+			continue
+		}
+		if info, statErr := os.Stat(root); statErr != nil || !info.IsDir() {
+			res.SkippedMissing++
+			res.MissingRoots = append(res.MissingRoots, root)
+			continue
+		}
+		p, addErr := e.AddProject(entry.Name, root)
+		if addErr != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("%s (%s): %v", entry.Name, root, addErr))
+			continue
+		}
+		known[normalizeRoot(p.Path)] = struct{}{}
+		res.Imported++
+		res.Projects = append(res.Projects, p)
+	}
+
+	return res, nil
+}
+
 
 // UpdateProject updates metadata or custom session log paths for a project.
 func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {

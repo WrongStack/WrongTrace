@@ -10,6 +10,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"io"
+
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/models"
 	"github.com/wrongstack/wrongtrace/internal/proxy"
@@ -316,6 +318,57 @@ func (h *Handlers) AddProject(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, p)
 }
+
+// PreviewFromWrongStack lists every workspace in
+// ~/.wrongstack/projects.json with what importing it would do, so the
+// dashboard can render a choose-what-to-import view before committing.
+// Same error mapping as the import: 404 when the source file is missing,
+// 422 when it is malformed.
+func (h *Handlers) PreviewFromWrongStack(w http.ResponseWriter, _ *http.Request) {
+	res, err := h.Engine.PreviewFromWrongStack()
+	if err != nil {
+		if errors.Is(err, core.ErrWrongStackSourceMissing) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// ImportFromWrongStack bulk-registers workspaces listed in
+// ~/.wrongstack/projects.json that WrongTrace does not already monitor.
+// The body is optional: {"roots":["D:\\path", ...]} imports only the listed
+// roots (case-insensitive match against the registry entries); an absent or
+// empty body imports everything available, the original one-click behavior.
+// The source file's absence is a 404 (nothing to import from), a malformed
+// file is a 422; per-entry problems (missing root, add failure) are reported
+// in the result body rather than failing the batch.
+func (h *Handlers) ImportFromWrongStack(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Roots []string `json:"roots"`
+	}
+	if r.Body != nil {
+		// A body that decodes to zero roots (absent, null, or {}) means
+		// "import all"; only a present-but-unparseable body is rejected.
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+	}
+	res, err := h.Engine.ImportFromWrongStack(req.Roots)
+	if err != nil {
+		if errors.Is(err, core.ErrWrongStackSourceMissing) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 
 // UpdateProject updates metadata or log paths of a project. The project id
 // comes from the URL ({id}); a body id is optional and must agree with it.

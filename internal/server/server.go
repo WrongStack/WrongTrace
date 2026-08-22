@@ -39,6 +39,8 @@ type EngineAPI interface {
 	ListProjects() []core.Project
 	GetProject(id string) (core.ProjectProfile, error)
 	AddProject(name, path string) (core.Project, error)
+	PreviewFromWrongStack() (core.PreviewFromWrongStackResult, error)
+	ImportFromWrongStack(roots []string) (core.ImportFromWrongStackResult, error)
 	UpdateProject(p core.ProjectProfile) (core.ProjectProfile, error)
 	SwitchActiveProject(id string) (*core.ProjectProfile, error)
 	RemoveProject(id string) error
@@ -161,6 +163,8 @@ func (s *Server) buildRouter() chi.Router {
 
 		r.Get("/projects", h.ListProjects)
 		r.Post("/projects", h.AddProject)
+		r.Get("/projects/import/wrongstack", h.PreviewFromWrongStack)
+		r.Post("/projects/import/wrongstack", h.ImportFromWrongStack)
 		r.Get("/projects/{id}", h.GetProject)
 		r.Put("/projects/{id}", h.UpdateProject)
 		r.Post("/projects/{id}/activate", h.SwitchActiveProject)
