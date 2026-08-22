@@ -358,7 +358,10 @@ func TestDebounce_CoalescesBurstIntoSingleCall(t *testing.T) {
 	// lag past the debounce window and split the burst into two coalesced
 	// calls (the same failure mode observed on CI for the two-burst test,
 	// fixed in 3ba8166), so the ceiling tolerates one split. 3+ calls would
-	// indicate a genuine coalescing regression.
+	// indicate a genuine coalescing regression. The EXACT single-call
+	// contract is enforced deterministically by
+	// TestDebounce_SyntheticBurstFiresExactlyOnce, which injects events
+	// directly and involves no fsnotify delivery.
 	time.Sleep(2*120*time.Millisecond + 100*time.Millisecond)
 	if n := h.countFor("hot.go"); n < 1 || n > 2 {
 		t.Errorf("burst coalesced into %d calls, want 1-2 (floor: coalescing happened; ceiling: no splatter): %v", n, h.snapshot())
@@ -366,6 +369,64 @@ func TestDebounce_CoalescesBurstIntoSingleCall(t *testing.T) {
 	// Single-lock multi-count: every handler call must belong to hot.go.
 	if total, per := h.counts("hot.go"); total != per["hot.go"] || total > 2 {
 		t.Errorf("total handler calls = %d (%d for hot.go), want them equal and at most 2: %v",
+			total, per["hot.go"], h.snapshot())
+	}
+}
+
+// TestDebounce_SyntheticBurstFiresExactlyOnce enforces the EXACT coalescing
+// contract deterministically. Real-filesystem tests cannot: under -race on a
+// loaded runner, fsnotify delivery can lag past the debounce window and split
+// one burst (the failure mode behind 91bef3d, 3ba8166, e1f7116), so the
+// integration test only bounds the count to 1-2. Here events are injected
+// directly into the watcher's fsnotify channel — no kernel delivery, no lag —
+// so one burst MUST fire exactly once, and a second burst after the window
+// closed MUST re-arm to exactly two total. A regression that always fires
+// twice per burst fails here even though it passes the bounded test.
+func TestDebounce_SyntheticBurstFiresExactlyOnce(t *testing.T) {
+	root := t.TempDir()
+	h := &recordingHandler{}
+	w, err := New(Config{Dir: root, Engine: h, Debounce: 120 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		_ = w.Close()
+	})
+	go w.Run(ctx)
+
+	name := filepath.Join(root, "hot.go")
+	inject := func(n int, gap time.Duration) {
+		for i := 0; i < n; i++ {
+			w.fs.Events <- fsnotify.Event{Name: name, Op: fsnotify.Write}
+			if i < n-1 {
+				time.Sleep(gap)
+			}
+		}
+	}
+
+	// Burst one: 6 events well inside the window — every one resets the
+	// timer, so exactly one call may fire, after the last settles.
+	inject(6, 20*time.Millisecond)
+	waitFor(t, 2*time.Second, func() bool { return h.countFor("hot.go") == 1 },
+		"synthetic burst never fired")
+
+	// Quiet window: nothing else may arrive. Exact, because no further
+	// events exist and no kernel delivery can inject lag.
+	time.Sleep(2*120*time.Millisecond + 100*time.Millisecond)
+	if n := h.countFor("hot.go"); n != 1 {
+		t.Fatalf("first burst fired %d times, want exactly 1: %v", n, h.snapshot())
+	}
+
+	// Second burst after the window closed: the timer must have re-armed,
+	// and the total must be exactly two.
+	inject(4, 20*time.Millisecond)
+	waitFor(t, 2*time.Second, func() bool { return h.countFor("hot.go") == 2 },
+		"second synthetic burst never fired")
+	time.Sleep(2*120*time.Millisecond + 100*time.Millisecond)
+	if total, per := h.counts("hot.go"); total != 2 || per["hot.go"] != 2 {
+		t.Errorf("after two bursts: total=%d hot.go=%d, want exactly 2/2: %v",
 			total, per["hot.go"], h.snapshot())
 	}
 }
