@@ -50,12 +50,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # mingw cross-compiler for the windows leg (built on ubuntu).
+      # mingw cross-compiler for the windows leg (built on ubuntu). Debian
+      # package name is hyphenated (gcc-mingw-w64-x86-64); the compiler
+      # binary it installs is x86_64-w64-mingw32-gcc.
       - name: Install mingw-w64 (windows cross-build)
         if: matrix.goos == 'windows'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-mingw-w64-x86_64
+          sudo apt-get install -y -qq gcc-mingw-w64-x86-64
 
       - uses: actions/setup-go@v7
         with:
@@ -95,7 +97,7 @@ jobs:
             ./cmd/wrongtrace
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wrongtrace-${{ matrix.goos }}-${{ matrix.goarch }}
           path: release/*
@@ -114,7 +116,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download all platform binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release
           merge-multiple: true
