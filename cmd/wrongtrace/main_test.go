@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -136,6 +137,23 @@ func TestDefaultHelpers(t *testing.T) {
 	cwd := mustCwd()
 	if len(cwd) == 0 {
 		t.Error("mustCwd returned empty string")
+	}
+}
+
+func TestSingleInstance_PreventDuplicate(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("WRONGTRACE_HOME", tempDir)
+
+	// Writing the current process PID to daemon.pid simulates a running daemon
+	pidPath := filepath.Join(tempDir, "daemon.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatalf("write pid: %v", err)
+	}
+
+	// Calling runStart should detect the running instance and return nil gracefully
+	err := runStart(rootCmd, []string{})
+	if err != nil {
+		t.Errorf("expected runStart to return nil on duplicate instance, got: %v", err)
 	}
 }
 

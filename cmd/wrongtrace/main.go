@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ingest"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
+	"github.com/wrongstack/wrongtrace/internal/lock"
 	"github.com/wrongstack/wrongtrace/internal/mcp"
 	"github.com/wrongstack/wrongtrace/internal/report"
 	"github.com/wrongstack/wrongtrace/internal/server"
@@ -148,12 +150,25 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	socketPath, _ := cmd.Flags().GetString("socket")
 	repoName, _ := cmd.Flags().GetString("repo")
 
+	// Enforce single instance: prevent 2nd copy from running concurrently
+	instanceLock, err := lock.Acquire(dataDir, port)
+	if err != nil {
+		if errors.Is(err, lock.ErrAlreadyRunning) {
+			log.Printf("daemon: %v — refusing duplicate execution", err)
+			fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
+			return nil
+		}
+		log.Printf("daemon: lock warning: %v", err)
+	} else {
+		defer instanceLock.Release()
+	}
+
 	abs, err := filepath.Abs(watchDir)
 	if err != nil {
 		return fmt.Errorf("resolve watch dir: %w", err)
 	}
 
-	log.Printf("wrongtrace %s starting", version)
+	log.Printf("wrongtrace %s starting (resilient daemon mode)", version)
 	log.Printf("  watch  : %s", abs)
 	log.Printf("  port   : %d", port)
 	log.Printf("  db     : %s", dbPath)
@@ -199,8 +214,6 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	engine.SetWatcher(w)
 
 	// IPC listener: Unix Domain Socket on POSIX, Named Pipe on Windows.
-	// A bind failure (pipe held by another instance, ACL denial) is logged
-	// but not fatal: HTTP + watching still work, and agents fall back to MCP.
 	ipcServer := ipc.NewServer(ipc.Config{
 		SocketPath: socketPath,
 		Engine:     engine,
@@ -224,6 +237,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	// Automatic Session Log & Tool Call Ingestor.
 	sessionWatcher := ingest.NewSessionWatcher(func(ev ingest.ToolCallEvent) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("sessionWatcher ingest recover: %v", r)
+			}
+		}()
 		projectID := ""
 		projectSlug := ""
 		if ev.TargetFile != "" {
@@ -247,6 +265,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		})
 	})
 	sessionWatcher.SetOnReadEvent(func(rev ingest.FileReadEvent) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("sessionWatcher read recover: %v", r)
+			}
+		}()
 		_ = engine.RecordReadEvent(db.FileReadRecord{
 			ReadID:         rev.ReadID,
 			SessionID:      rev.SessionID,
@@ -271,51 +294,74 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	sessionWatcher.DiscoverGlobalAgentDirs()
 	sessionWatcher.StartPolling(ctx, 3*time.Second)
 
+	// Resilient HTTP Server Loop: never drops daemon on temporary listener issues
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("FATAL PANIC in httpServer.Start: %v\n%s", r, debug.Stack())
-				cancel()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
 			}
-		}()
-		if err := httpServer.Start(); err != nil {
-			log.Printf("http server stopped with error: %v", err)
-			cancel()
-		} else {
-			log.Printf("http server stopped normally")
-			cancel()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC in httpServer: %v\n%s (recovering in 2s)", r, debug.Stack())
+						time.Sleep(2 * time.Second)
+					}
+				}()
+				if err := httpServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					log.Printf("http server warning: %v (restarting in 2s)", err)
+					time.Sleep(2 * time.Second)
+				}
+			}()
 		}
 	}()
 
+	// Resilient Watcher Loop
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("FATAL PANIC in watcher.Run: %v\n%s", r, debug.Stack())
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
 			}
-		}()
-		w.Run(ctx)
-		log.Printf("filesystem watcher stopped")
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC in watcher.Run: %v\n%s (recovering in 2s)", r, debug.Stack())
+						time.Sleep(2 * time.Second)
+					}
+				}()
+				w.Run(ctx)
+			}()
+		}
 	}()
 
+	// Resilient Core Engine Loop
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("FATAL PANIC in engine.Run: %v\n%s", r, debug.Stack())
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
 			}
-		}()
-		engine.Run(ctx)
-		log.Printf("core engine stopped")
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC in engine.Run: %v\n%s (recovering in 2s)", r, debug.Stack())
+						time.Sleep(2 * time.Second)
+					}
+				}()
+				engine.Run(ctx)
+			}()
+		}
 	}()
 
-	// Refresh the model pricing catalog from models.dev/api.json so the
-	// dashboard starts with live data. Runs in the background: an offline or
-	// slow upstream must not delay server startup, and the registry keeps
-	// whatever it already has when the fetch fails (POST /api/models/sync
-	// retries on demand).
+	// Model catalog background sync
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("FATAL PANIC in SyncModelsDev: %v\n%s", r, debug.Stack())
+				log.Printf("PANIC in SyncModelsDev: %v\n%s", r, debug.Stack())
 			}
 		}()
 		if n, err := engine.SyncModelsDev(); err != nil {
@@ -339,15 +385,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// Graceful shutdown.
+	// Graceful shutdown ONLY on explicit user interruption (SIGINT, SIGTERM, Ctrl+C)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case sig := <-sigCh:
-		log.Printf("received signal %s (%T), initiating graceful shutdown", sig, sig)
-	case <-ctx.Done():
-		log.Printf("context cancelled (cause=%v), initiating graceful shutdown", ctx.Err())
-	}
+	sig := <-sigCh
+	log.Printf("received signal %s (%T), shutting down daemon", sig, sig)
 
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
