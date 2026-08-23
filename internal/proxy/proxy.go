@@ -199,8 +199,9 @@ func stripProxyMountLabel(path string) string {
 
 // isModelCatalogPath reports whether the resolved upstream path addresses the
 // model catalog / metadata API rather than an inference endpoint, e.g. /v1/models
-// (list) or /v1/models/gpt-4o (retrieve). Catalog calls carry no model request:
-// no inference, no usage, nothing to trace — ServeHTTP relays them transparently.
+// (list), /v1/models/gpt-4o (retrieve), or Ollama's native tag listing /api/tags.
+// Catalog calls carry no model request: no inference, no usage, nothing to
+// trace — ServeHTTP relays them transparently.
 func isModelCatalogPath(cleanPath string) bool {
 	trimmed := strings.Trim(cleanPath, "/")
 	if trimmed == "" {
@@ -215,6 +216,10 @@ func isModelCatalogPath(cleanPath string) bool {
 	// models/<model>:generateContent — the ":" method suffix distinguishes
 	// those, so they stay on the traced model-request path.
 	if len(segs) >= 2 && strings.ToLower(segs[len(segs)-2]) == "models" && !strings.Contains(last, ":") {
+		return true
+	}
+	// Ollama native tag listing: <base>/api/tags (no version prefix).
+	if last == "tags" && len(segs) >= 2 && strings.ToLower(segs[len(segs)-2]) == "api" {
 		return true
 	}
 	return false

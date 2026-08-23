@@ -889,10 +889,16 @@ func TestIsModelCatalogPath(t *testing.T) {
 		{"v1/models", true},
 		{"/v1/models/gpt-4o", true},
 		{"/openai/v1/models", true},
+		{"/api/tags", true},
+		{"api/tags", true},
 		{"/v1/chat/completions", false},
 		{"/v1/completions", false},
 		{"/v1/embeddings", false},
 		{"/v1/messages", false},
+		// Ollama native endpoints other than the tag listing stay traced.
+		{"/api/chat", false},
+		{"/api/generate", false},
+		{"/api/show", false},
 		{"/v1beta/models", true},
 		// Gemini method-suffix inference must NOT be classified as catalog.
 		{"/v1beta/models/gemini-2.0-flash:generateContent", false},
@@ -904,5 +910,66 @@ func TestIsModelCatalogPath(t *testing.T) {
 		if got := isModelCatalogPath(c.in); got != c.want {
 			t.Errorf("isModelCatalogPath(%q) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// TestGatewayProxy_OllamaTagsRelayedButChatTraced extends the catalog-relay
+// regression to Ollama's native API: GET /api/tags is a tag listing (metadata,
+// not a model request) and must be relayed untraced, while POST /api/chat is
+// real inference and must stay fully traced.
+func TestGatewayProxy_OllamaTagsRelayedButChatTraced(t *testing.T) {
+	var hits int
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/tags" {
+			_, _ = w.Write([]byte(`{"models":[{"name":"llama3.2:latest"},{"name":"qwen2.5:7b"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"model":"llama3","message":{"role":"assistant","content":"ok"},"prompt_eval_count":30,"eval_count":10}`))
+	}))
+	defer mockUpstream.Close()
+
+	reporter := &fakeReporter{}
+	p := NewGatewayProxy(Config{Reporter: reporter})
+
+	// Ollama bases carry no /v1 suffix; clients address the gateway root.
+	req := httptest.NewRequest(http.MethodGet, "/api/tags", nil)
+	req.Header.Set("X-Target-Upstream", mockUpstream.URL)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tags status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "llama3.2") {
+		t.Errorf("tag list not relayed to client: %s", rec.Body.String())
+	}
+
+	// Nothing may be traced for the tag listing.
+	if len(reporter.reports) != 0 {
+		t.Errorf("tag listing must not produce telemetry, got %d report(s)", len(reporter.reports))
+	}
+	if traffic := p.AllTraffic(0); len(traffic) != 0 {
+		t.Errorf("tag listing must not produce a traffic record, got %d", len(traffic))
+	}
+
+	// Native Ollama inference stays traced end-to-end.
+	req2 := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"model":"llama3","messages":[{"role":"user","content":"hi"}]}`))
+	req2.Header.Set("X-Target-Upstream", mockUpstream.URL)
+	rec2 := httptest.NewRecorder()
+	p.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200", rec2.Code)
+	}
+	if len(reporter.reports) == 0 {
+		t.Errorf("native /api/chat inference must stay traced (0 reports)")
+	}
+	if len(p.AllTraffic(0)) == 0 {
+		t.Errorf("native /api/chat must produce a traffic record")
+	}
+	if hits != 2 {
+		t.Errorf("upstream hits = %d, want 2 (both calls must reach upstream)", hits)
 	}
 }
