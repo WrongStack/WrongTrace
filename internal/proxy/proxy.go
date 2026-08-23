@@ -481,9 +481,9 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var userIntent string
 	for i := len(parsedReq.Messages) - 1; i >= 0; i-- {
 		if parsedReq.Messages[i].Role == "user" {
-			userIntent = parsedReq.Messages[i].Content
-			if len(userIntent) > 80 {
-				userIntent = userIntent[:80] + "…"
+			userIntent = runeSafePrefix(parsedReq.Messages[i].Content, 80)
+			if len(parsedReq.Messages[i].Content) > len(userIntent) {
+				userIntent += "…"
 			}
 			break
 		}
@@ -822,14 +822,13 @@ func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader,
 	rec.FinishReason = analysis.FinishReason
 
 	if intent == "" && analysis.AssistantReply != "" {
-		if len(analysis.AssistantReply) > 80 {
-			intent = analysis.AssistantReply[:80] + "…"
-		} else {
-			intent = analysis.AssistantReply
+		intent = runeSafePrefix(analysis.AssistantReply, 80)
+		if len(analysis.AssistantReply) > len(intent) {
+			intent += "…"
 		}
 	}
 
-	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, intent)
+	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, rec.CostUSD, intent)
 	if runID != "" {
 		rec.RunID = runID
 	}
@@ -959,14 +958,13 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 	rec.FinishReason = analysis.FinishReason
 
 	if intent == "" && analysis.AssistantReply != "" {
-		if len(analysis.AssistantReply) > 80 {
-			intent = analysis.AssistantReply[:80] + "…"
-		} else {
-			intent = analysis.AssistantReply
+		intent = runeSafePrefix(analysis.AssistantReply, 80)
+		if len(analysis.AssistantReply) > len(intent) {
+			intent += "…"
 		}
 	}
 
-	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, intent)
+	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, rec.CostUSD, intent)
 	if runID != "" {
 		rec.RunID = runID
 	}
@@ -1274,13 +1272,15 @@ func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, 
 	return runID, promptTokens, completionTokens, costUSD
 }
 
-func (p *GatewayProxy) recordRun(modelName, provider, agentName, taskID, projectID, projectSlug, explicitRunID, sessionKey string, promptTokens, completionTokens int64, intent string) string {
+func (p *GatewayProxy) recordRun(modelName, provider, agentName, taskID, projectID, projectSlug, explicitRunID, sessionKey string, promptTokens, completionTokens int64, costUSD float64, intent string) string {
 	if p.cfg.Reporter == nil {
 		return ""
 	}
 
-	cost := models.Global.CalculateCostWithProvider(provider, modelName, promptTokens, completionTokens)
-	runID, totalPrompt, totalCompletion, totalCost := p.getOrCreateSession(explicitRunID, sessionKey, promptTokens, completionTokens, cost)
+	if costUSD <= 0 {
+		costUSD = models.Global.CalculateCostWithProvider(provider, modelName, promptTokens, completionTokens)
+	}
+	runID, totalPrompt, totalCompletion, totalCost := p.getOrCreateSession(explicitRunID, sessionKey, promptTokens, completionTokens, costUSD)
 
 	_ = p.cfg.Reporter.ReportRun(ipc.TelemetryReport{
 		RunID:            runID,
@@ -1308,7 +1308,7 @@ func copyProxyHeaders(dst *http.Request, src http.Header) {
 		lowerK := strings.ToLower(k)
 		switch lowerK {
 		case "host", "content-length", "connection", "keep-alive", "proxy-authenticate",
-			"proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade":
+			"proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "accept-encoding":
 			continue
 		}
 		if strings.HasPrefix(lowerK, "x-wrongtrace-") ||

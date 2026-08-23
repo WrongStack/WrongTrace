@@ -100,6 +100,9 @@ func (f *failingEngine) GetFileReadStats(string) (db.FileReadStats, error) {
 func (f *failingEngine) GetRecentFileReads(int, ...string) ([]db.FileReadRecord, error) {
 	return nil, errForced
 }
+func (f *failingEngine) GetRecentFileEvents(string, int) ([]db.EventRecord, error) {
+	return nil, errForced
+}
 func (f *failingEngine) GetFileReadHeatmap(string) ([]db.LineReadHeatmap, error) {
 	return nil, errForced
 }

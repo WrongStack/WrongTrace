@@ -186,4 +186,13 @@ export function useFileReadHeatmap(path: string | null) {
   });
 }
 
+export function useRecentFileEvents(filePath: string | null, limit: number = 50) {
+  return useQuery<EventRecord[]>({
+    queryKey: ['recent_file_events', filePath, limit],
+    queryFn: () => jget<EventRecord[]>(`${base}/metrics/recent?file_path=${encodeURIComponent(filePath ?? '')}&limit=${limit}`),
+    enabled: !!filePath,
+    refetchInterval: 5_000,
+  });
+}
+
 

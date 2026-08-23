@@ -213,6 +213,52 @@ func (s *Store) RecentEvents(limit int, repoFilter ...string) ([]EventRecord, er
 	return out, rows.Err()
 }
 
+// RecentFileEvents returns the N most recent AST events specifically matching a file path.
+func (s *Store) RecentFileEvents(filePath string, limit int) ([]EventRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	normSlash := strings.ReplaceAll(filePath, "\\", "/")
+	normBackslash := strings.ReplaceAll(filePath, "/", "\\")
+
+	query := `
+		SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
+		       action, ast_content_hash, lines_of_code,
+		       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
+		       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
+		FROM code_node_events
+		WHERE (file_path = ? OR file_path = ? OR file_path = ? OR file_path LIKE '%/' || ? OR file_path LIKE '%\' || ?)
+		ORDER BY event_time DESC
+		LIMIT ?
+	`
+	rows, err := s.db.QueryContext(ctx, query, filePath, normSlash, normBackslash, normSlash, normBackslash, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent file events: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]EventRecord, 0, limit)
+	for rows.Next() {
+		var (
+			e        EventRecord
+			ts       string
+			runID    = nullable(&e.RunID)
+			bodyHash = nullable(&e.BodyHash)
+		)
+		if err := rows.Scan(&e.EventID, runID, &e.RepoName, &e.FilePath,
+			&e.Signature, &e.NodeType, &e.Action, bodyHash, &e.LOC,
+			&e.StartLine, &e.EndLine, &e.DiffSnippet, &e.AddedLines, &e.DeletedLines, &ts); err != nil {
+			return nil, fmt.Errorf("scan recent file event: %w", err)
+		}
+		e.OccurredAt = parseDBTime(ts)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // ThrashingRow is a single entry in the thrashing heatmap.
 type ThrashingRow struct {
 	FilePath    string    `json:"file_path"`
@@ -325,7 +371,8 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 			SELECT e.node_signature,
 			       COALESCE(r.model_name, 'unknown') AS model_name,
 			       MIN(e.event_time) AS birth_time,
-			       MAX(CASE WHEN e.action = 'DELETED' THEN e.event_time END) AS death_time
+			       MAX(CASE WHEN e.action = 'DELETED' THEN e.event_time END) AS death_time,
+			       MAX(e.event_time) AS last_event_time
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
 			GROUP BY e.node_signature, COALESCE(r.model_name, 'unknown')
@@ -333,8 +380,8 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 		lc AS (
 			SELECT model_name,
 			       COUNT(*) AS total_nodes,
-			       SUM(CASE WHEN death_time IS NULL THEN 1 ELSE 0 END) AS active_nodes,
-			       AVG(julianday(COALESCE(death_time, CURRENT_TIMESTAMP)) - julianday(birth_time)) AS avg_longevity
+			       SUM(CASE WHEN death_time IS NULL OR last_event_time > death_time THEN 1 ELSE 0 END) AS active_nodes,
+			       AVG(julianday(COALESCE(CASE WHEN last_event_time > death_time THEN NULL ELSE death_time END, CURRENT_TIMESTAMP)) - julianday(birth_time)) AS avg_longevity
 			FROM lifecycle
 			GROUP BY model_name
 		),
@@ -381,7 +428,8 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 			SELECT e.node_signature,
 			       COALESCE(r.model_name, 'unknown') AS model_name,
 			       MIN(e.event_time) AS birth_time,
-			       MAX(CASE WHEN e.action = 'DELETED' THEN e.event_time END) AS death_time
+			       MAX(CASE WHEN e.action = 'DELETED' THEN e.event_time END) AS death_time,
+			       MAX(e.event_time) AS last_event_time
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
 			WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
@@ -390,8 +438,8 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 		lc AS (
 			SELECT model_name,
 			       COUNT(*) AS total_nodes,
-			       SUM(CASE WHEN death_time IS NULL THEN 1 ELSE 0 END) AS active_nodes,
-			       AVG(julianday(COALESCE(death_time, CURRENT_TIMESTAMP)) - julianday(birth_time)) AS avg_longevity
+			       SUM(CASE WHEN death_time IS NULL OR last_event_time > death_time THEN 1 ELSE 0 END) AS active_nodes,
+			       AVG(julianday(COALESCE(CASE WHEN last_event_time > death_time THEN NULL ELSE death_time END, CURRENT_TIMESTAMP)) - julianday(birth_time)) AS avg_longevity
 			FROM lifecycle
 			GROUP BY model_name
 		),
@@ -1119,6 +1167,69 @@ func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
 		out = append(out, hm)
 	}
 	return out, rows.Err()
+}
+
+// ClearStale prunes old telemetry records older than N days across all analytical tables.
+func (s *Store) ClearStale(days int) (int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.DateTime)
+	var totalDeleted int64
+
+	// 1. Delete code_node_events
+	if res, err := s.db.ExecContext(ctx, "DELETE FROM code_node_events WHERE event_time < ?", cutoff); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			totalDeleted += n
+		}
+	} else {
+		return totalDeleted, fmt.Errorf("clear code_node_events: %w", err)
+	}
+
+	// 2. Delete runtime_traces
+	if res, err := s.db.ExecContext(ctx, "DELETE FROM runtime_traces WHERE timestamp < ?", cutoff); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			totalDeleted += n
+		}
+	} else {
+		return totalDeleted, fmt.Errorf("clear runtime_traces: %w", err)
+	}
+
+	// 3. Delete file_read_events
+	if res, err := s.db.ExecContext(ctx, "DELETE FROM file_read_events WHERE read_time < ?", cutoff); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			totalDeleted += n
+		}
+	} else {
+		return totalDeleted, fmt.Errorf("clear file_read_events: %w", err)
+	}
+
+	// 4. Delete unreferenced old agent_runs
+	if res, err := s.db.ExecContext(ctx, `
+		DELETE FROM agent_runs
+		WHERE created_at < ?
+		  AND run_id NOT IN (SELECT DISTINCT run_id FROM code_node_events WHERE run_id IS NOT NULL)
+		  AND run_id NOT IN (SELECT DISTINCT run_id FROM runtime_traces WHERE run_id IS NOT NULL)
+		  AND run_id NOT IN (SELECT DISTINCT run_id FROM file_read_events WHERE run_id IS NOT NULL)
+	`, cutoff); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			totalDeleted += n
+		}
+	}
+
+	return totalDeleted, nil
+}
+
+// Vacuum defragments and reclaims unused disk pages in SQLite.
+func (s *Store) Vacuum() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	_, err := s.db.ExecContext(context.Background(), "VACUUM")
+	return err
 }
 
 

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/wrongstack/wrongtrace/internal/db"
@@ -24,6 +23,7 @@ type EngineSink interface {
 	RecordReadEvent(rec db.FileReadRecord) error
 	GetFileReadStats(filePath string) (db.FileReadStats, error)
 	GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error)
+	GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error)
 }
 
 // jsonRPCRequest is the MCP wire format. Notifications (no id) are valid.
@@ -265,6 +265,10 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		var tokens int64
 		if v, ok := args["tokens_used"]; ok && v != nil {
 			tokens = toInt64(v)
+		} else if v, ok := args["tokens"]; ok && v != nil {
+			tokens = toInt64(v)
+		} else if v, ok := args["prompt_tokens"]; ok && v != nil {
+			tokens = toInt64(v)
 		}
 		var cost float64
 		if v, ok := args["cost"]; ok && v != nil {
@@ -308,6 +312,27 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		if path == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
 			return resp
+		}
+		if locker, ok := sink.(interface{ IsFileLocked(path string) (bool, string) }); ok {
+			if locked, reason := locker.IsFileLocked(path); locked {
+				rec := fmt.Sprintf("GUARDRAIL BLOCKED: File %s is locked (%s).", path, reason)
+				text := fmt.Sprintf("allowed=false health_score=0 fragile=true recent_thrashing_count=0 is_locked=true lock_reason=%q recommendation=%q", reason, rec)
+				resp.Result = map[string]interface{}{
+					"content": []map[string]interface{}{
+						{"type": "text", "text": text},
+					},
+					"data": map[string]interface{}{
+						"allowed":                false,
+						"health_score":           0,
+						"is_fragile":             true,
+						"is_locked":              true,
+						"lock_reason":            reason,
+						"recent_thrashing_count": 0,
+						"recommendation":         rec,
+					},
+				}
+				return resp
+			}
 		}
 		h, err := sink.FileHealth(path)
 		if err != nil {
@@ -428,24 +453,23 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		if l := int(toInt64(args["limit"])); l > 0 {
 			limit = l
 		}
-		events, err := sink.GetRecentEvents(limit)
+		var events []db.EventRecord
+		var err error
+		if path != "" {
+			events, err = sink.GetRecentFileEvents(path, limit)
+		} else {
+			events, err = sink.GetRecentEvents(limit)
+		}
 		if err != nil {
 			resp.Error = &rpcError{Code: -32014, Message: err.Error()}
 			return resp
 		}
-		var filtered []db.EventRecord
-		normPath := strings.ReplaceAll(path, "\\", "/")
-		for _, e := range events {
-			if path == "" || e.FilePath == path || strings.Contains(strings.ReplaceAll(e.FilePath, "\\", "/"), normPath) {
-				filtered = append(filtered, e)
-			}
-		}
-		summary := fmt.Sprintf("Found %d diff events for file filter %q.", len(filtered), path)
+		summary := fmt.Sprintf("Found %d diff events for file filter %q.", len(events), path)
 		resp.Result = map[string]interface{}{
 			"content": []map[string]interface{}{
 				{"type": "text", "text": summary},
 			},
-			"data": filtered,
+			"data": events,
 		}
 	default:
 		resp.Error = &rpcError{Code: -32601, Message: "unknown tool: " + name}

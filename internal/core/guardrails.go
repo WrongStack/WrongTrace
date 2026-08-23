@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,7 +28,7 @@ func (e *Engine) LockFile(path, reason string) {
 	if e.lockedFiles == nil {
 		e.lockedFiles = make(map[string]bool)
 	}
-	norm := strings.ReplaceAll(strings.TrimSpace(path), "\\", "/")
+	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))))
 	e.lockedFiles[norm] = true
 }
 
@@ -38,20 +39,30 @@ func (e *Engine) UnlockFile(path string) {
 	if e.lockedFiles == nil {
 		return
 	}
-	norm := strings.ReplaceAll(strings.TrimSpace(path), "\\", "/")
+	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))))
 	delete(e.lockedFiles, norm)
+	for k := range e.lockedFiles {
+		if k == norm || strings.HasSuffix(norm, "/"+k) || strings.HasSuffix(k, "/"+norm) {
+			delete(e.lockedFiles, k)
+		}
+	}
 }
 
 // IsFileLocked checks if a file is currently locked.
 func (e *Engine) IsFileLocked(path string) (bool, string) {
 	e.lockMu.RLock()
 	defer e.lockMu.RUnlock()
-	if e.lockedFiles == nil {
+	if len(e.lockedFiles) == 0 {
 		return false, ""
 	}
-	norm := strings.ReplaceAll(strings.TrimSpace(path), "\\", "/")
+	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))))
 	if e.lockedFiles[norm] {
 		return true, "file is explicitly locked by administrator guardrail"
+	}
+	for k := range e.lockedFiles {
+		if k == norm || strings.HasSuffix(norm, "/"+k) || strings.HasSuffix(k, "/"+norm) {
+			return true, "file is explicitly locked by administrator guardrail"
+		}
 	}
 	return false, ""
 }

@@ -1096,22 +1096,16 @@ func DetectPrimaryLanguage(root string) string {
 
 // VacuumDB executes SQLite VACUUM optimization on the database.
 func (e *Engine) VacuumDB() error {
-	if e.cfg.Store == nil || e.cfg.Store.DB() == nil {
+	if e.cfg.Store == nil {
 		return nil
 	}
-	_, err := e.cfg.Store.DB().Exec("VACUUM")
-	return err
+	return e.cfg.Store.Vacuum()
 }
 
-// ClearStale removes telemetry events older than N days.
+// ClearStale removes telemetry events older than N days across all tables.
 func (e *Engine) ClearStale(days int) (int64, error) {
-	if e.cfg.Store == nil || e.cfg.Store.DB() == nil {
+	if e.cfg.Store == nil {
 		return 0, nil
 	}
-	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.DateTime)
-	res, err := e.cfg.Store.DB().Exec("DELETE FROM code_node_events WHERE event_time < ?", cutoff)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return e.cfg.Store.ClearStale(days)
 }

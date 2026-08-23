@@ -57,6 +57,7 @@ type EngineAPI interface {
 	ClearStale(days int) (int64, error)
 	GetFileReadStats(filePath string) (db.FileReadStats, error)
 	GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileReadRecord, error)
+	GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error)
 	GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, error)
 	IndexStatus() core.IndexProgress
 	Hub() *core.Hub

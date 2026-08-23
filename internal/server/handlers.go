@@ -99,8 +99,27 @@ func (h *Handlers) Models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snap.Models)
 }
 
-// RecentEvents returns the most recent AST events for the live feed.
+// RecentEvents returns the most recent AST events for the live feed, optionally filtered by file_path or repo.
 func (h *Handlers) RecentEvents(w http.ResponseWriter, r *http.Request) {
+	if filePath := r.URL.Query().Get("file_path"); filePath != "" {
+		limit := 50
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if val, err := strconv.Atoi(l); err == nil && val > 0 {
+				limit = val
+			}
+		}
+		events, err := h.Engine.GetRecentFileEvents(filePath, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if events == nil {
+			events = []db.EventRecord{}
+		}
+		writeJSON(w, http.StatusOK, events)
+		return
+	}
+
 	snap, err := h.Engine.Metrics(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

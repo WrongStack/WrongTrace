@@ -3,17 +3,7 @@ import {
   Code2,
   FileCode,
   Search,
-  Filter,
-  Copy,
-  Check,
-  Plus,
-  Pencil,
-  Trash2,
-  Layers,
-  ArrowUpDown,
-  Sparkles,
   Download,
-  Calendar,
   Bot,
 } from 'lucide-react';
 import { RichDiffViewer } from './RichDiffViewer';
@@ -31,8 +21,6 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
   const [search, setSearch] = useState('');
   const [selectedAction, setSelectedAction] = useState<string>('ALL');
   const [selectedFile, setSelectedFile] = useState<string>('ALL');
-  const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [viewFormat, setViewFormat] = useState<'unified' | 'raw'>('unified');
 
   // Unique files for dropdown filter
   const uniqueFiles = useMemo(() => {
@@ -69,11 +57,6 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
     return filteredEvents[0] ?? null;
   }, [selectedEventId, filteredEvents]);
 
-  const handleCopy = (id: string, text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
-  };
 
   const handleExportJSON = () => {
     const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(filteredEvents, null, 2));

@@ -25,14 +25,19 @@ export function MetricsOverview({ overview, thrashing, models, loading, currentP
     (acc, m) =>
       acc +
       (m.total_nodes > 0
-        ? m.total_cost_usd * ((m.total_nodes - m.active_nodes) / m.total_nodes)
-        : m.total_cost_usd),
+        ? m.total_cost_usd * Math.max(0, (m.total_nodes - m.active_nodes) / m.total_nodes)
+        : 0),
     0,
   );
 
   const topModel = [...validModels]
-    .filter((m) => m.total_survived_nodes > 0)
-    .sort((a, b) => b.survival_rate_pct - a.survival_rate_pct)[0];
+    .filter((m) => m.total_survived_nodes > 0 || m.active_nodes > 0 || m.total_nodes > 0)
+    .sort((a, b) => {
+      if (b.survival_rate_pct !== a.survival_rate_pct) {
+        return b.survival_rate_pct - a.survival_rate_pct;
+      }
+      return b.active_nodes - a.active_nodes;
+    })[0];
 
   const totalReadCount = recentReads.length;
   const totalReadTokens = recentReads.reduce((acc, r) => acc + (r.prompt_tokens || 0), 0);
@@ -154,7 +159,9 @@ export function MetricsOverview({ overview, thrashing, models, loading, currentP
           </span>
           {topModel && (
             <span className="text-[10px] text-accent font-mono">
-              ${topModel.cost_per_surviving_node.toFixed(4)}/node
+              {topModel.total_survived_nodes > 0
+                ? `$${topModel.cost_per_surviving_node.toFixed(4)}/node`
+                : `${topModel.active_nodes} active`}
             </span>
           )}
         </div>

@@ -31,6 +31,22 @@ type fakeSink struct {
 	readStatsErr                                error
 	readStats                                   db.FileReadStats
 	lastReadRecord                              db.FileReadRecord
+	isLocked                                    bool
+	lockReason                                  string
+}
+
+func (f *fakeSink) IsFileLocked(path string) (bool, string) {
+	return f.isLocked, f.lockReason
+}
+
+func (f *fakeSink) LockFile(path, reason string) {
+	f.isLocked = true
+	f.lockReason = reason
+}
+
+func (f *fakeSink) UnlockFile(path string) {
+	f.isLocked = false
+	f.lockReason = ""
 }
 
 func (f *fakeSink) ReportRunMCP(model, provider, taskID, intent string, promptTokens, completionTokens int64, cost float64) (string, error) {
@@ -62,6 +78,22 @@ func (f *fakeSink) GetRecentEvents(limit int, repoFilter ...string) ([]db.EventR
 		{
 			EventID:      "ev-1",
 			FilePath:     f.gotPath,
+			Signature:    "function:auth.go::Login",
+			NodeType:     "function",
+			Action:       "MODIFIED",
+			AddedLines:   3,
+			DeletedLines: 1,
+			DiffSnippet:  "+ login_v2\n- login_v1",
+		},
+	}, nil
+}
+
+func (f *fakeSink) GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error) {
+	f.gotPath = filePath
+	return []db.EventRecord{
+		{
+			EventID:      "ev-1",
+			FilePath:     filePath,
 			Signature:    "function:auth.go::Login",
 			NodeType:     "function",
 			Action:       "MODIFIED",
@@ -580,6 +612,40 @@ func TestCallTool_ReadTools(t *testing.T) {
 	}
 	if sink.gotPath != "test.go" {
 		t.Errorf("expected path test.go, got %s", sink.gotPath)
+	}
+}
+
+func TestCallTool_CheckGuardrail_LockedFile(t *testing.T) {
+	sink := &fakeSink{
+		isLocked:   true,
+		lockReason: "critical maintenance",
+		health: ipc.FileHealthReply{
+			FilePath:    "src/locked.go",
+			HealthScore: 90,
+			IsFragile:   false,
+		},
+	}
+
+	req := toolCallReq(3, "check_guardrail", `{"file_path":"src/locked.go"}`)
+	resp := dispatch(sink, req)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %+v", resp.Error)
+	}
+
+	res := resp.Result.(map[string]interface{})
+	data, ok := res["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected data map in result, got %#v", res)
+	}
+
+	if allowed, _ := data["allowed"].(bool); allowed {
+		t.Errorf("expected allowed=false for locked file, got true")
+	}
+	if isLocked, _ := data["is_locked"].(bool); !isLocked {
+		t.Errorf("expected is_locked=true for locked file, got false")
+	}
+	if reason, _ := data["lock_reason"].(string); reason != "critical maintenance" {
+		t.Errorf("expected lock_reason 'critical maintenance', got %q", reason)
 	}
 }
 

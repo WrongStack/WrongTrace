@@ -402,7 +402,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 }
 
 func runMCP(cmd *cobra.Command, _ []string) error {
-	dbPath, _ := startCmd.Flags().GetString("db")
+	dbPath, _ := cmd.Flags().GetString("db")
 	if dbPath == "" {
 		dbPath = filepath.Join(defaultDataDir(), "wrongtrace.db")
 	}

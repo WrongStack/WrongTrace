@@ -237,11 +237,23 @@ func safePath(a, b *FileSnapshot) string {
 	return ""
 }
 
+func splitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.TrimSuffix(s, "\n")
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
+}
+
 func formatAddedDiff(body string) (string, int, int) {
-	if body == "" {
+	lines := splitLines(body)
+	if len(lines) == 0 {
 		return "", 0, 0
 	}
-	lines := strings.Split(body, "\n")
 	var b strings.Builder
 	for i, l := range lines {
 		if i > 0 {
@@ -254,10 +266,10 @@ func formatAddedDiff(body string) (string, int, int) {
 }
 
 func formatDeletedDiff(body string) (string, int, int) {
-	if body == "" {
+	lines := splitLines(body)
+	if len(lines) == 0 {
 		return "", 0, 0
 	}
-	lines := strings.Split(body, "\n")
 	var b strings.Builder
 	for i, l := range lines {
 		if i > 0 {
@@ -270,8 +282,18 @@ func formatDeletedDiff(body string) (string, int, int) {
 }
 
 func generateLineDiff(oldText, newText string) (string, int, int) {
-	oldLines := strings.Split(oldText, "\n")
-	newLines := strings.Split(newText, "\n")
+	oldLines := splitLines(oldText)
+	newLines := splitLines(newText)
+
+	if len(oldLines) == 0 && len(newLines) == 0 {
+		return "", 0, 0
+	}
+	if len(oldLines) == 0 {
+		return formatAddedDiff(newText)
+	}
+	if len(newLines) == 0 {
+		return formatDeletedDiff(oldText)
+	}
 
 	var b strings.Builder
 	added := 0

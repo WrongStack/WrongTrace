@@ -96,8 +96,17 @@ func saveSettingsToDisk(s AppSettings) {
 // GetSettings returns a snapshot of the current settings.
 func (e *Engine) GetSettings() AppSettings {
 	settingsMu.RLock()
-	defer settingsMu.RUnlock()
-	return globalSettings
+	s := globalSettings
+	settingsMu.RUnlock()
+
+	if e != nil && s.DBPath == "" {
+		if active := e.GetActiveProject(); active != nil && active.DBPath != "" {
+			s.DBPath = active.DBPath
+		} else {
+			s.DBPath = filepath.Join(UserWrongTraceDir(), "wrongtrace.db")
+		}
+	}
+	return s
 }
 
 // UpdateSettings updates the application settings.

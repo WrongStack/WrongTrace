@@ -301,3 +301,36 @@ func TestFileHealth_DelegatesToStore(t *testing.T) {
 		t.Errorf("warning should mention edit count: %q", hot.Warning)
 	}
 }
+
+func TestFileLockingGuardrail_PathNormalization(t *testing.T) {
+	e, _ := newTestEngine(t)
+
+	// Lock with relative Windows-style path
+	e.LockFile("internal\\core\\engine.go", "critical core file")
+
+	// Check with various representations
+	cases := []string{
+		"internal/core/engine.go",
+		"internal\\core\\engine.go",
+		"INTERNAL/CORE/ENGINE.GO",
+		"D:/Codebox/PROJECTS/WrongTrace/internal/core/engine.go",
+		"d:\\codebox\\projects\\wrongtrace\\internal\\core\\engine.go",
+		"engine.go",
+	}
+
+	for _, c := range cases {
+		locked, _ := e.IsFileLocked(c)
+		if !locked {
+			t.Errorf("expected %q to be recognized as locked", c)
+		}
+	}
+
+	// Unlock and verify
+	e.UnlockFile("internal/core/engine.go")
+	for _, c := range cases {
+		locked, _ := e.IsFileLocked(c)
+		if locked {
+			t.Errorf("expected %q to be unlocked", c)
+		}
+	}
+}

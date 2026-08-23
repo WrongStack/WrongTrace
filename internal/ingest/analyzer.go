@@ -146,11 +146,7 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 				}
 
 				if intent, ok := row["content"].(string); ok && row["type"] == "USER_INPUT" {
-					if len(intent) > 80 {
-						currentIntent = intent[:80] + "…"
-					} else {
-						currentIntent = intent
-					}
+					currentIntent = runeSafeTruncate(intent, 80)
 				}
 
 				// Extract usage tokens if present
@@ -540,5 +536,13 @@ func detectAgentDefaultModel(agentName string) string {
 	default:
 		return "claude-3-7-sonnet"
 	}
+}
+
+func runeSafeTruncate(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "…"
 }
 

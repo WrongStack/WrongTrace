@@ -49,11 +49,7 @@ func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysi
 						role, _ := mMap["role"].(string)
 						if role == "system" && analysis.SystemPrompt == "" {
 							if sysContent, ok := mMap["content"].(string); ok {
-								if len(sysContent) > 120 {
-									analysis.SystemPrompt = sysContent[:120] + "…"
-								} else {
-									analysis.SystemPrompt = sysContent
-								}
+								analysis.SystemPrompt = runeSafeTruncate(sysContent, 120)
 							}
 						}
 					}
@@ -62,11 +58,7 @@ func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysi
 
 			// Anthropic top-level system prompt
 			if sys, ok := reqMap["system"].(string); ok && analysis.SystemPrompt == "" {
-				if len(sys) > 120 {
-					analysis.SystemPrompt = sys[:120] + "…"
-				} else {
-					analysis.SystemPrompt = sys
-				}
+				analysis.SystemPrompt = runeSafeTruncate(sys, 120)
 			}
 		}
 	}
@@ -421,18 +413,20 @@ func (pa *PayloadAnalysis) extractUsage(usageMap map[string]interface{}) {
 	}
 
 	// Prompt / Input Tokens
-	if pt, ok := usageMap["input_tokens"].(float64); ok && pt > 0 {
+	if pt, ok := usageMap["input_tokens"].(float64); ok && (pt > 0 || cacheRead > 0 || cacheCreate > 0) {
 		// In Anthropic/MiniMax API specs, input_tokens is NON-cached delta.
 		// Total actual prompt context sent to model is input_tokens + cache_read + cache_creation.
 		pa.PromptTokens = int64(pt) + cacheRead + cacheCreate
-	} else if pt, ok := usageMap["prompt_tokens"].(float64); ok && pt > 0 {
+	} else if pt, ok := usageMap["prompt_tokens"].(float64); ok {
 		pa.PromptTokens = int64(pt)
 		if pa.CachedTokens > pa.PromptTokens {
 			// Some providers report non-cached delta as prompt_tokens while returning large cache_read
 			pa.PromptTokens += pa.CachedTokens
 		}
-	} else if pt, ok := usageMap["promptTokenCount"].(float64); ok && pt > 0 {
+	} else if pt, ok := usageMap["promptTokenCount"].(float64); ok {
 		pa.PromptTokens = int64(pt)
+	} else if cacheRead > 0 {
+		pa.PromptTokens = cacheRead + cacheCreate
 	}
 
 	// Completion / Output Tokens
@@ -557,3 +551,12 @@ func extractFileFromMap(m map[string]interface{}) string {
 	}
 	return ""
 }
+
+func runeSafeTruncate(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "…"
+}
+

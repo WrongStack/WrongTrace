@@ -505,6 +505,14 @@ func (e *Engine) GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRec
 	return e.cfg.Store.RecentEvents(limit, filter)
 }
 
+// GetRecentFileEvents returns recent diff and AST events specifically matching a file.
+func (e *Engine) GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error) {
+	if e.cfg.Store == nil {
+		return nil, nil
+	}
+	return e.cfg.Store.RecentFileEvents(filePath, limit)
+}
+
 // GetRecentFileReads returns the most recent read records across the system, optionally filtered by repo_name.
 func (e *Engine) GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileReadRecord, error) {
 	var filter string
