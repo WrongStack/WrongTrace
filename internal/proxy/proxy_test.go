@@ -1058,3 +1058,40 @@ func TestGatewayProxy_OllamaTagsRelayedButChatTraced(t *testing.T) {
 		t.Errorf("upstream hits = %d, want 2 (both calls must reach upstream)", hits)
 	}
 }
+
+func TestRouteManager_MatchRoute_PathBoundary(t *testing.T) {
+	rm := &RouteManager{
+		routes: make(map[string]ProxyRoute),
+	}
+	rm.routes["route-1"] = ProxyRoute{
+		ID:             "route-1",
+		Name:           "zai",
+		PathPrefix:     "/proxy/zai",
+		TargetUpstream: "https://api.z.ai/api/coding/paas/v4",
+		ProtocolType:   "openai-compatible",
+		Enabled:        true,
+	}
+
+	// 1. Exact match
+	r, rem := rm.MatchRoute("/proxy/zai")
+	if r == nil || r.ID != "route-1" || rem != "/" {
+		t.Fatalf("expected exact match on /proxy/zai, got route=%v, rem=%s", r, rem)
+	}
+
+	// 2. Subpath match
+	r, rem = rm.MatchRoute("/proxy/zai/chat/completions")
+	if r == nil || r.ID != "route-1" || rem != "/chat/completions" {
+		t.Fatalf("expected subpath match, got route=%v, rem=%s", r, rem)
+	}
+
+	// 3. Must NOT match prefix collision like /proxy/zaix or /proxy/zai-pro
+	r, rem = rm.MatchRoute("/proxy/zaix/chat/completions")
+	if r != nil {
+		t.Fatalf("expected NO match for /proxy/zaix, got route=%v, rem=%s", r, rem)
+	}
+	r, rem = rm.MatchRoute("/proxy/zai-pro/chat/completions")
+	if r != nil {
+		t.Fatalf("expected NO match for /proxy/zai-pro, got route=%v, rem=%s", r, rem)
+	}
+}
+

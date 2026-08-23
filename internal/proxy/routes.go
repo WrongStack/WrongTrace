@@ -92,11 +92,14 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 		pfx := "/" + strings.Trim(filepath.ToSlash(r.PathPrefix), "/")
 		lowerPfx := strings.ToLower(pfx)
 
-		// 1. Direct or prefix match with configured PathPrefix (e.g. /proxy/zai -> /proxy/zai/...)
-		if strings.HasPrefix(lowerPath, lowerPfx) {
+		// 1. Direct or prefix match with configured PathPrefix (e.g. /proxy/zai or /proxy/zai/...)
+		if lowerPath == lowerPfx {
+			return &r, "/"
+		}
+		if strings.HasPrefix(lowerPath, lowerPfx+"/") {
 			remaining := normPath[len(pfx):]
-			if remaining == "" {
-				remaining = "/"
+			if remaining == "" || !strings.HasPrefix(remaining, "/") {
+				remaining = "/" + strings.TrimPrefix(remaining, "/")
 			}
 			return &r, remaining
 		}
@@ -104,24 +107,34 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 		// 2. Flexible /proxy/<prefix> match if route was configured as /<name> or <name>
 		slug := strings.TrimPrefix(lowerPfx, "/proxy")
 		slug = "/" + strings.Trim(slug, "/")
-		proxySlug := "/proxy" + slug
-
-		if strings.HasPrefix(lowerPath, proxySlug) {
-			remaining := normPath[len(proxySlug):]
-			if remaining == "" {
-				remaining = "/"
+		if slug != "/" {
+			proxySlug := "/proxy" + slug
+			if lowerPath == proxySlug {
+				return &r, "/"
 			}
-			return &r, remaining
+			if strings.HasPrefix(lowerPath, proxySlug+"/") {
+				remaining := normPath[len(proxySlug):]
+				if remaining == "" || !strings.HasPrefix(remaining, "/") {
+					remaining = "/" + strings.TrimPrefix(remaining, "/")
+				}
+				return &r, remaining
+			}
 		}
 
 		// 3. Match by Route Name (e.g. /proxy/zai matches route named "zai" or "ZAI")
-		nameSlug := "/proxy/" + strings.ToLower(strings.TrimSpace(r.Name))
-		if strings.HasPrefix(lowerPath, nameSlug) {
-			remaining := normPath[len(nameSlug):]
-			if remaining == "" {
-				remaining = "/"
+		trimmedName := strings.ToLower(strings.TrimSpace(r.Name))
+		if trimmedName != "" {
+			nameSlug := "/proxy/" + trimmedName
+			if lowerPath == nameSlug {
+				return &r, "/"
 			}
-			return &r, remaining
+			if strings.HasPrefix(lowerPath, nameSlug+"/") {
+				remaining := normPath[len(nameSlug):]
+				if remaining == "" || !strings.HasPrefix(remaining, "/") {
+					remaining = "/" + strings.TrimPrefix(remaining, "/")
+				}
+				return &r, remaining
+			}
 		}
 	}
 	return nil, path
