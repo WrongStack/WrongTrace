@@ -197,6 +197,29 @@ func stripProxyMountLabel(path string) string {
 	return remain
 }
 
+// isModelCatalogPath reports whether the resolved upstream path addresses the
+// model catalog / metadata API rather than an inference endpoint, e.g. /v1/models
+// (list) or /v1/models/gpt-4o (retrieve). Catalog calls carry no model request:
+// no inference, no usage, nothing to trace — ServeHTTP relays them transparently.
+func isModelCatalogPath(cleanPath string) bool {
+	trimmed := strings.Trim(cleanPath, "/")
+	if trimmed == "" {
+		return false
+	}
+	segs := strings.Split(trimmed, "/")
+	last := strings.ToLower(segs[len(segs)-1])
+	if last == "models" {
+		return true
+	}
+	// Detail form: .../models/<id>. Gemini routes inference THROUGH the path as
+	// models/<model>:generateContent — the ":" method suffix distinguishes
+	// those, so they stay on the traced model-request path.
+	if len(segs) >= 2 && strings.ToLower(segs[len(segs)-2]) == "models" && !strings.Contains(last, ":") {
+		return true
+	}
+	return false
+}
+
 // DetectProvider resolves the exact provider using configured dynamic routes, headers, URL path, or API key signature.
 func (p *GatewayProxy) DetectProvider(r *http.Request) (provider string, targetBaseURL string, cleanPath string) {
 	path := r.URL.Path
@@ -383,6 +406,16 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cleanPath = strings.TrimPrefix(cleanPath, "v1/")
 	}
 
+	// Model catalog / metadata calls (e.g. GET /v1/models) are not model
+	// requests: no inference runs, no usage comes back, and there is nothing
+	// to trace. Relay them transparently — no run recording, no traffic
+	// record, no quota or cache involvement — so the proxy/trace flow only
+	// ever sees real inference calls.
+	if isModelCatalogPath(cleanPath) {
+		p.relayCatalogRequest(w, r, provider, targetBase, cleanPath)
+		return
+	}
+
 	// Default POST to chat/completions if path is empty
 	if (cleanPath == "" || cleanPath == "/") && r.Method == http.MethodPost {
 		cleanPath = "chat/completions"
@@ -541,17 +574,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Copy headers (strip Host, Content-Length, hop-by-hop, and internal tracing headers)
-	for k, vv := range r.Header {
-		lowerK := strings.ToLower(k)
-		if lowerK == "host" || lowerK == "content-length" || lowerK == "connection" || lowerK == "upgrade" ||
-			strings.HasPrefix(lowerK, "x-project-") || strings.HasPrefix(lowerK, "x-agent-") || strings.HasPrefix(lowerK, "x-task-") ||
-			strings.HasPrefix(lowerK, "x-target-") || strings.HasPrefix(lowerK, "x-upstream-") || strings.HasPrefix(lowerK, "x-provider-") {
-			continue
-		}
-		for _, v := range vv {
-			outReq.Header.Add(k, v)
-		}
-	}
+	copyProxyHeaders(outReq, r.Header)
 	outReq.Host = outReq.URL.Host
 
 	log.Printf("proxy: forwarding %s %s -> %s (provider: %s, model: %s)", r.Method, r.URL.Path, safeTargetURL, provider, modelName)
@@ -639,6 +662,46 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p.handleJSONResponse(w, resp.Body, baseRecord, userIntent)
 	}
+}
+
+// relayCatalogRequest transparently forwards a model-catalog / metadata call
+// (e.g. GET /v1/models, GET /v1/models/<id>) to the resolved upstream and
+// streams the answer back to the client. Catalog calls are not model requests
+// — nothing is inferred, no usage is returned, no tokens or cost exist — so
+// they must never enter the proxy/trace flow: no run recording, no traffic
+// record, no cache or quota interaction.
+func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Request, provider, targetBase, cleanPath string) {
+	targetURL := strings.TrimSuffix(targetBase, "/") + "/" + strings.TrimPrefix(cleanPath, "/")
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	if err != nil {
+		http.Error(w, "create proxy request failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	copyProxyHeaders(outReq, r.Header)
+	outReq.Host = outReq.URL.Host
+
+	log.Printf("proxy: relaying catalog call %s %s -> %s (provider: %s, untraced)", r.Method, r.URL.Path, sanitizeURLForRecord(targetURL), provider)
+
+	resp, err := p.httpClient.Do(outReq)
+	if err != nil {
+		safeErr := scrubErrorString(err.Error())
+		log.Printf("proxy: upstream error for %s: %s", sanitizeURLForRecord(targetURL), safeErr)
+		http.Error(w, "upstream error: "+safeErr, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent string) {
@@ -1101,6 +1164,30 @@ func (p *GatewayProxy) recordRun(modelName, provider, agentName, taskID, project
 		CostUSD:          cost,
 		Intent:           intent,
 	})
+}
+
+// copyProxyHeaders forwards client headers onto the outgoing upstream request,
+// stripping hop-by-hop headers and WrongTrace-internal routing/tracing headers
+// (X-Target-Upstream, X-Project-*, X-Agent-*, …) that must never leak to a
+// provider endpoint.
+func copyProxyHeaders(dst *http.Request, src http.Header) {
+	for k, vv := range src {
+		lowerK := strings.ToLower(k)
+		switch lowerK {
+		case "host", "content-length", "connection", "keep-alive", "proxy-authenticate",
+			"proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade":
+			continue
+		}
+		if strings.HasPrefix(lowerK, "x-wrongtrace-") ||
+			strings.HasPrefix(lowerK, "x-project-") || strings.HasPrefix(lowerK, "x-agent-") ||
+			strings.HasPrefix(lowerK, "x-task-") || strings.HasPrefix(lowerK, "x-target-") ||
+			strings.HasPrefix(lowerK, "x-upstream-") || strings.HasPrefix(lowerK, "x-provider-") {
+			continue
+		}
+		for _, v := range vv {
+			dst.Header.Add(k, v)
+		}
+	}
 }
 
 func randomID(prefix string) string {

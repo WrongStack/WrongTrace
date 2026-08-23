@@ -764,3 +764,145 @@ func TestQuotaLimiter_BudgetExceeded(t *testing.T) {
 		t.Errorf("unexpected quota warning: %s", warn)
 	}
 }
+
+// TestGatewayProxy_ModelCatalogCallIsRelayedNotTraced is the regression for
+// the live-traffic misinterpretation: GET /v1/models (and /v1/models/<id>)
+// are catalog/metadata calls, not model requests. They must be relayed to the
+// upstream transparently — body passed through, auth forwarded — and must
+// NEVER produce a telemetry run, a traffic record, or a cached response.
+func TestGatewayProxy_ModelCatalogCallIsRelayedNotTraced(t *testing.T) {
+	authValue := "Bearer " + fakeTok("catalog-", "authz-", "tok-9")
+
+	var upstreamPath string
+	var upstreamAuth string
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		upstreamAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}`))
+	}))
+	defer mockUpstream.Close()
+
+	reporter := &fakeReporter{}
+	p := NewGatewayProxy(Config{Reporter: reporter})
+
+	// Mounted at /v1 like server.go does (r.Handle("/v1/*", h.Proxy)).
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("X-Target-Upstream", mockUpstream.URL+"/v1")
+	req.Header.Set("Authorization", authValue)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"gpt-4o"`) {
+		t.Errorf("catalog body not relayed to client: %s", rec.Body.String())
+	}
+
+	// The upstream must see the real catalog path on its /v1 base.
+	if upstreamPath != "/v1/models" {
+		t.Errorf("upstream path = %q, want /v1/models (catalog path must be relayed as-is)", upstreamPath)
+	}
+	// Client credentials still flow through on the untraced relay.
+	if upstreamAuth != authValue {
+		t.Errorf("Authorization header not forwarded on catalog relay: %q", upstreamAuth)
+	}
+
+	// Nothing may be traced: no run, no traffic record.
+	if len(reporter.reports) != 0 {
+		t.Errorf("catalog call must not produce telemetry, got %d report(s)", len(reporter.reports))
+	}
+	if traffic := p.AllTraffic(0); len(traffic) != 0 {
+		t.Errorf("catalog call must not produce a traffic record, got %d", len(traffic))
+	}
+
+	// A following catalog call must reach the upstream again (never served
+	// from the response cache — catalog lists change server-side).
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req2.Header.Set("X-Target-Upstream", mockUpstream.URL+"/v1")
+	rec2 := httptest.NewRecorder()
+	p.ServeHTTP(rec2, req2)
+	if rec2.Header().Get("X-WrongTrace-Cache") == "HIT" {
+		t.Errorf("catalog response must never be cached")
+	}
+}
+
+// TestGatewayProxy_ModelCatalogDetailAndGeminiInferenceDistinguished: the
+// detail form /v1/models/<id> is a catalog call, while Gemini-style inference
+// routed through the path (models/<model>:generateContent) is NOT — its ":"
+// method suffix marks a real model request that must stay traced.
+func TestGatewayProxy_ModelCatalogDetailAndGeminiInferenceDistinguished(t *testing.T) {
+	var hits int
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemini-2.0-flash"}]}`))
+	}))
+	defer mockUpstream.Close()
+
+	reporter := &fakeReporter{}
+	p := NewGatewayProxy(Config{Reporter: reporter})
+
+	// Catalog detail: /v1/models/gemini-2.0-flash → untraced relay.
+	req := httptest.NewRequest(http.MethodGet, "/v1/models/gemini-2.0-flash", nil)
+	req.Header.Set("X-Target-Upstream", mockUpstream.URL+"/v1")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog detail status = %d, want 200", rec.Code)
+	}
+	if len(reporter.reports) != 0 || len(p.AllTraffic(0)) != 0 {
+		t.Errorf("catalog detail must stay untraced (reports=%d traffic=%d)", len(reporter.reports), len(p.AllTraffic(0)))
+	}
+
+	// Gemini inference through the path: <model>:generateContent — this IS a
+	// model request and must remain fully traced.
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/models/gemini-2.0-flash:generateContent", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+	req2.Header.Set("X-Target-Upstream", mockUpstream.URL+"/v1")
+	rec2 := httptest.NewRecorder()
+	p.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("gemini inference status = %d, want 200", rec2.Code)
+	}
+	if len(reporter.reports) == 0 {
+		t.Errorf("gemini-style inference through the path must stay traced (0 reports)")
+	}
+	if len(p.AllTraffic(0)) == 0 {
+		t.Errorf("gemini-style inference must produce a traffic record")
+	}
+	if hits != 2 {
+		t.Errorf("upstream hits = %d, want 2 (both calls must reach upstream)", hits)
+	}
+}
+
+// TestIsModelCatalogPath pins the pure classifier used by the relay branch.
+func TestIsModelCatalogPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"/v1/models", true},
+		{"/models", true},
+		{"v1/models", true},
+		{"/v1/models/gpt-4o", true},
+		{"/openai/v1/models", true},
+		{"/v1/chat/completions", false},
+		{"/v1/completions", false},
+		{"/v1/embeddings", false},
+		{"/v1/messages", false},
+		{"/v1beta/models", true},
+		// Gemini method-suffix inference must NOT be classified as catalog.
+		{"/v1beta/models/gemini-2.0-flash:generateContent", false},
+		{"/v1beta/models/gemini-2.0-flash:streamGenerateContent", false},
+		{"", false},
+		{"/", false},
+	}
+	for _, c := range cases {
+		if got := isModelCatalogPath(c.in); got != c.want {
+			t.Errorf("isModelCatalogPath(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
