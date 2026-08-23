@@ -1,8 +1,11 @@
 package ingest
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -99,135 +102,156 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 	return modEvents, err
 }
 
-// ParseJSONLTranscriptFull parses a JSONL file line-by-line, extracting both write tool calls and read tool events.
+// ParseJSONLTranscriptFull parses a JSONL file line-by-line from start to finish.
 func ParseJSONLTranscriptFull(filePath string) ([]ToolCallEvent, []FileReadEvent, error) {
-	data, err := os.ReadFile(filePath)
+	modEvents, readEvents, _, err := ParseJSONLTranscriptFromOffset(filePath, 0)
+	return modEvents, readEvents, err
+}
+
+// ParseJSONLTranscriptFromOffset streams a JSONL file line-by-line starting from startOffset without loading the entire file into memory.
+func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolCallEvent, []FileReadEvent, int64, error) {
+	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read transcript: %w", err)
+		return nil, nil, startOffset, fmt.Errorf("open transcript: %w", err)
+	}
+	defer f.Close()
+
+	if startOffset > 0 {
+		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+			return nil, nil, startOffset, fmt.Errorf("seek transcript: %w", err)
+		}
 	}
 
-	lines := strings.Split(string(data), "\n")
+	reader := bufio.NewReaderSize(f, 64*1024)
 	var modEvents []ToolCallEvent
 	var readEvents []FileReadEvent
 	sessionID := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
 	agentName := detectAgentFromPath(filePath)
 	currentModel := detectAgentDefaultModel(agentName)
 	currentIntent := ""
+	currentOffset := startOffset
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
+	for {
+		lineBytes, err := reader.ReadBytes('\n')
+		readLen := int64(len(lineBytes))
+		currentOffset += readLen
 
-		var row map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &row); err != nil {
-			continue
-		}
+		trimmed := bytes.TrimSpace(lineBytes)
+		if len(trimmed) > 0 {
+			var row map[string]interface{}
+			if uErr := json.Unmarshal(trimmed, &row); uErr == nil {
+				// Dynamically extract model from deep json structures
+				if extracted := extractModelFromRow(row); extracted != "" && !models.IsJunkModel(extracted) {
+					currentModel = extracted
+				}
 
-		// Dynamically extract model from deep json structures
-		if extracted := extractModelFromRow(row); extracted != "" && !models.IsJunkModel(extracted) {
-			currentModel = extracted
-		}
+				if intent, ok := row["content"].(string); ok && row["type"] == "USER_INPUT" {
+					if len(intent) > 80 {
+						currentIntent = intent[:80] + "…"
+					} else {
+						currentIntent = intent
+					}
+				}
 
-		if intent, ok := row["content"].(string); ok && row["type"] == "USER_INPUT" {
-			if len(intent) > 80 {
-				currentIntent = intent[:80] + "…"
-			} else {
-				currentIntent = intent
+				// Extract usage tokens if present
+				var promptTokens, completionTokens int64
+				if usage, ok := row["usage"].(map[string]interface{}); ok {
+					promptTokens = extractInt64(usage, "input_tokens", "prompt_tokens", "promptTokenCount", "inputTokens")
+					completionTokens = extractInt64(usage, "output_tokens", "completion_tokens", "candidatesTokenCount", "outputTokens")
+				}
+
+				// Extract tool calls
+				if toolCalls, ok := row["tool_calls"].([]interface{}); ok {
+					for _, tc := range toolCalls {
+						tcMap, ok := tc.(map[string]interface{})
+						if !ok {
+							continue
+						}
+
+						name, _ := tcMap["name"].(string)
+						if name == "" {
+							name, _ = tcMap["tool"].(string)
+						}
+
+						isMod := IsFileModifyingTool(name)
+						isRead := IsFileReadingTool(name)
+						if !isMod && !isRead {
+							continue
+						}
+
+						// Check if tool call has its own specific model override
+						tcModel := currentModel
+						if m := extractModelFromRow(tcMap); m != "" {
+							tcModel = m
+						}
+
+						// Extract args
+						var args map[string]interface{}
+						if a, ok := tcMap["args"].(map[string]interface{}); ok {
+							args = a
+						} else if a, ok := tcMap["parameters"].(map[string]interface{}); ok {
+							args = a
+						}
+
+						targetFile := ExtractTargetFile(args)
+						cost := models.Global.CalculateCost(tcModel, promptTokens, completionTokens)
+
+						occurredAt := time.Now().UTC()
+						if created, ok := row["created_at"].(string); ok {
+							if t, err := time.Parse(time.RFC3339, created); err == nil {
+								occurredAt = t
+							}
+						}
+
+						if isMod {
+							ev := ToolCallEvent{
+								SessionID:        sessionID,
+								AgentName:        agentName,
+								ModelName:        tcModel,
+								ToolName:         name,
+								TargetFile:       targetFile,
+								PromptTokens:     promptTokens,
+								CompletionTokens: completionTokens,
+								CostUSD:          cost,
+								Intent:           currentIntent,
+								OccurredAt:       occurredAt,
+							}
+							modEvents = append(modEvents, ev)
+						}
+
+						if isRead && targetFile != "" {
+							sLine, eLine, lCount := ExtractLineRange(args)
+							rEv := FileReadEvent{
+								ReadID:         fmt.Sprintf("read-%s-%d", sessionID, len(readEvents)+1),
+								SessionID:      sessionID,
+								FilePath:       targetFile,
+								AgentName:      agentName,
+								ModelName:      tcModel,
+								ToolName:       name,
+								StartLine:      sLine,
+								EndLine:        eLine,
+								LinesReadCount: lCount,
+								PromptTokens:   promptTokens,
+								CostUSD:        cost,
+								Intent:         currentIntent,
+								OccurredAt:     occurredAt,
+							}
+							readEvents = append(readEvents, rEv)
+						}
+					}
+				}
 			}
 		}
 
-		// Extract usage tokens if present
-		var promptTokens, completionTokens int64
-		if usage, ok := row["usage"].(map[string]interface{}); ok {
-			promptTokens = extractInt64(usage, "input_tokens", "prompt_tokens", "promptTokenCount", "inputTokens")
-			completionTokens = extractInt64(usage, "output_tokens", "completion_tokens", "candidatesTokenCount", "outputTokens")
-		}
-
-		// Extract tool calls
-		if toolCalls, ok := row["tool_calls"].([]interface{}); ok {
-			for _, tc := range toolCalls {
-				tcMap, ok := tc.(map[string]interface{})
-				if !ok {
-					continue
-				}
-
-				name, _ := tcMap["name"].(string)
-				if name == "" {
-					name, _ = tcMap["tool"].(string)
-				}
-
-				isMod := IsFileModifyingTool(name)
-				isRead := IsFileReadingTool(name)
-				if !isMod && !isRead {
-					continue
-				}
-
-				// Check if tool call has its own specific model override
-				tcModel := currentModel
-				if m := extractModelFromRow(tcMap); m != "" {
-					tcModel = m
-				}
-
-				// Extract args
-				var args map[string]interface{}
-				if a, ok := tcMap["args"].(map[string]interface{}); ok {
-					args = a
-				} else if a, ok := tcMap["parameters"].(map[string]interface{}); ok {
-					args = a
-				}
-
-				targetFile := ExtractTargetFile(args)
-				cost := models.Global.CalculateCost(tcModel, promptTokens, completionTokens)
-
-				occurredAt := time.Now().UTC()
-				if created, ok := row["created_at"].(string); ok {
-					if t, err := time.Parse(time.RFC3339, created); err == nil {
-						occurredAt = t
-					}
-				}
-
-				if isMod {
-					ev := ToolCallEvent{
-						SessionID:        sessionID,
-						AgentName:        agentName,
-						ModelName:        tcModel,
-						ToolName:         name,
-						TargetFile:       targetFile,
-						PromptTokens:     promptTokens,
-						CompletionTokens: completionTokens,
-						CostUSD:          cost,
-						Intent:           currentIntent,
-						OccurredAt:       occurredAt,
-					}
-					modEvents = append(modEvents, ev)
-				}
-
-				if isRead && targetFile != "" {
-					sLine, eLine, lCount := ExtractLineRange(args)
-					rEv := FileReadEvent{
-						ReadID:         fmt.Sprintf("read-%s-%d", sessionID, len(readEvents)+1),
-						SessionID:      sessionID,
-						FilePath:       targetFile,
-						AgentName:      agentName,
-						ModelName:      tcModel,
-						ToolName:       name,
-						StartLine:      sLine,
-						EndLine:        eLine,
-						LinesReadCount: lCount,
-						PromptTokens:   promptTokens,
-						CostUSD:        cost,
-						Intent:         currentIntent,
-						OccurredAt:     occurredAt,
-					}
-					readEvents = append(readEvents, rEv)
-				}
+		if err != nil {
+			if err == io.EOF {
+				break
 			}
+			return modEvents, readEvents, currentOffset, err
 		}
 	}
 
-	return modEvents, readEvents, nil
+	return modEvents, readEvents, currentOffset, nil
 }
 
 // ParseClineTask parses a Cline / Roo Code task JSON structure.

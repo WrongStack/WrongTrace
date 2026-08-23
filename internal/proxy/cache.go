@@ -37,7 +37,7 @@ type ResponseCache struct {
 // NewResponseCache creates a new in-memory response cache.
 func NewResponseCache(maxEntries int, defaultTTL time.Duration) *ResponseCache {
 	if maxEntries <= 0 {
-		maxEntries = 1000
+		maxEntries = 200
 	}
 	if defaultTTL <= 0 {
 		defaultTTL = 24 * time.Hour
@@ -85,6 +85,11 @@ func (c *ResponseCache) Get(key string) (*CachedResponse, bool) {
 
 // Set saves a response in the cache.
 func (c *ResponseCache) Set(key, provider, model string, statusCode int, headers map[string]string, body []byte, isStream bool, tokensSaved int64, costSavedUSD float64, ttl time.Duration) {
+	// Guard against caching excessively large bodies in memory (cap at 256KB per entry)
+	if len(body) > 256*1024 {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

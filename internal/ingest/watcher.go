@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -13,7 +14,7 @@ import (
 type SessionWatcher struct {
 	mu          sync.Mutex
 	watchPaths  []string
-	seenFiles   map[string]int64
+	seenOffsets map[string]int64
 	onToolCall  func(ToolCallEvent)
 	onReadEvent func(FileReadEvent)
 }
@@ -21,8 +22,8 @@ type SessionWatcher struct {
 // NewSessionWatcher creates a watcher for agent log files.
 func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 	return &SessionWatcher{
-		seenFiles:  make(map[string]int64),
-		onToolCall: onToolCall,
+		seenOffsets: make(map[string]int64),
+		onToolCall:  onToolCall,
 	}
 }
 
@@ -50,12 +51,12 @@ func (sw *SessionWatcher) DiscoverAgentDirs(workspaceDir string) {
 	if workspaceDir == "" {
 		return
 	}
-	// Current workspace agent folders
+	// Current workspace agent folders (targeted session subfolders where available)
 	for _, sub := range []string{
-		".claude", ".cursor", ".gemini", ".wrongtrace", ".wrongstack",
-		".continue", ".windsurf", ".aider", ".pi", ".codex", ".zcode",
-		".minimax", ".kimi", ".devin", ".trae", ".copilot", ".openhands",
-		".goose", ".bolt", ".lovable", ".v0", ".plandex", ".sweep", ".tabnine",
+		".claude/projects", ".claude/logs", ".cursor", ".gemini/antigravity-cli/brain",
+		".wrongtrace", ".wrongstack/projects", ".continue/sessions", ".windsurf",
+		".minimax/sessions", ".kimi/sessions", ".devin/sessions", ".trae",
+		".openhands/conversations", ".goose/sessions",
 	} {
 		if p := filepath.Join(workspaceDir, sub); dirExists(p) {
 			sw.AddWatchDir(p)
@@ -66,7 +67,7 @@ func (sw *SessionWatcher) DiscoverAgentDirs(workspaceDir string) {
 	}
 }
 
-// DiscoverGlobalAgentDirs scans user home directory and OS application storage for global coding agent session logs.
+// DiscoverGlobalAgentDirs scans user home directory and OS application storage for specific coding agent session log folders.
 func (sw *SessionWatcher) DiscoverGlobalAgentDirs() {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -82,46 +83,35 @@ func (sw *SessionWatcher) DiscoverGlobalAgentDirs() {
 		localAppData = filepath.Join(home, "AppData", "Local")
 	}
 
+	// TARGETED subdirectories only — NEVER add top-level AppData or tool roots (which contain gigabytes of Electron caches)
 	candidateDirs := []string{
-		// 1. WrongStack (Native Flagship)
-		filepath.Join(home, ".wrongstack"),
+		// 1. WrongStack
 		filepath.Join(home, ".wrongstack", "projects"),
+		filepath.Join(home, ".wrongstack"),
 
-		// 2. Google Antigravity & Gemini CLI
+		// 2. Google Antigravity & Gemini CLI (ONLY brain/logs, NOT ~/.gemini root)
 		filepath.Join(home, ".gemini", "antigravity-cli", "brain"),
-		filepath.Join(home, ".gemini", "antigravity-cli"),
-		filepath.Join(home, ".gemini"),
 
 		// 3. Claude Code (Anthropic)
 		filepath.Join(home, ".claude", "projects"),
 		filepath.Join(home, ".claude", "logs"),
-		filepath.Join(home, ".claude"),
 
 		// 4. Cursor (Anysphere)
 		filepath.Join(appData, "Cursor", "User", "workspaceStorage"),
 		filepath.Join(appData, "Cursor", "User", "globalStorage"),
-		filepath.Join(appData, "Cursor"),
-		filepath.Join(home, ".cursor"),
 
 		// 5. Windsurf (Codeium)
 		filepath.Join(appData, "Windsurf", "User", "workspaceStorage"),
 		filepath.Join(appData, "Windsurf", "User", "globalStorage"),
-		filepath.Join(appData, "Windsurf"),
-		filepath.Join(home, ".codeium", "windsurf"),
-		filepath.Join(home, ".windsurf"),
 
 		// 6. ByteDance Trae IDE
 		filepath.Join(appData, "Trae", "User", "workspaceStorage"),
 		filepath.Join(appData, "Trae", "User", "globalStorage"),
-		filepath.Join(appData, "Trae"),
-		filepath.Join(home, ".trae"),
 
 		// 7. GitHub Copilot
 		filepath.Join(appData, "Code", "User", "globalStorage", "github.copilot-chat"),
-		filepath.Join(appData, "Code", "User", "globalStorage", "github.copilot"),
 		filepath.Join(localAppData, "github-copilot"),
 		filepath.Join(home, ".copilot", "logs"),
-		filepath.Join(home, ".copilot"),
 
 		// 8. Cline / Roo Code / Roo-Cline
 		filepath.Join(appData, "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks"),
@@ -132,34 +122,24 @@ func (sw *SessionWatcher) DiscoverGlobalAgentDirs() {
 		filepath.Join(home, ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks"),
 		filepath.Join(home, ".config", "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "tasks"),
 
-		// 9. MiniMax Code & Kimi Code (Moonshot) & ZCode
+		// 9. MiniMax Code & Kimi Code & ZCode
 		filepath.Join(home, ".minimax", "sessions"),
-		filepath.Join(home, ".minimax"),
 		filepath.Join(home, ".kimi", "sessions"),
-		filepath.Join(home, ".kimi"),
-		filepath.Join(home, ".moonshot"),
 		filepath.Join(home, ".zcode", "tasks"),
-		filepath.Join(home, ".zcode"),
 
-		// 10. Continue.dev & Aider
+		// 10. Continue.dev
 		filepath.Join(home, ".continue", "sessions"),
-		filepath.Join(home, ".continue"),
 
 		// 11. Replit Agent & Zed AI
 		filepath.Join(home, ".replit", "agent"),
-		filepath.Join(home, ".replit"),
 		filepath.Join(appData, "Zed", "conversations"),
 		filepath.Join(home, ".config", "zed", "conversations"),
 
 		// 12. Devin & Goose & OpenHands
 		filepath.Join(home, ".devin", "sessions"),
-		filepath.Join(home, ".devin"),
 		filepath.Join(home, ".goose", "sessions"),
-		filepath.Join(home, ".goose"),
-		filepath.Join(localAppData, "goose"),
 		filepath.Join(home, ".local", "share", "goose", "sessions"),
 		filepath.Join(home, ".openhands", "conversations"),
-		filepath.Join(home, ".openhands"),
 	}
 
 	for _, cd := range candidateDirs {
@@ -169,7 +149,21 @@ func (sw *SessionWatcher) DiscoverGlobalAgentDirs() {
 	}
 }
 
-// PollOnce inspects watched directories and processes new or modified transcript files.
+// isIgnoredLogDir reports whether a directory segment should be skipped during walk.
+func isIgnoredLogDir(name string) bool {
+	lower := strings.ToLower(name)
+	switch lower {
+	case ".git", "node_modules", "cache", "gpucache", "code cache", "cachestorage",
+		"temp", "tmp", "extensions", "dist", "build", "bin", "obj", "venv", ".venv",
+		"__pycache__", "crashpad", "dawngraphitecache", "grshadercache", "shadercache",
+		"indexeddb", "local storage", "session storage", "blob_storage", "service worker",
+		"dictionaries", "webrtc", "packaged-extensions":
+		return true
+	}
+	return false
+}
+
+// PollOnce inspects watched directories and incrementally processes new transcript lines.
 func (sw *SessionWatcher) PollOnce() {
 	sw.mu.Lock()
 	paths := make([]string, len(sw.watchPaths))
@@ -178,44 +172,81 @@ func (sw *SessionWatcher) PollOnce() {
 
 	for _, dir := range paths {
 		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info == nil || info.IsDir() {
+			if err != nil || info == nil {
+				return nil
+			}
+
+			if info.IsDir() {
+				if path != dir && isIgnoredLogDir(info.Name()) {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 
 			ext := filepath.Ext(path)
 			base := filepath.Base(path)
 
+			// Skip transcript_full.jsonl when transcript.jsonl exists (compact version is sufficient)
+			if base == "transcript_full.jsonl" {
+				return nil
+			}
+
 			if ext != ".jsonl" && ext != ".json" && base != ".aider.chat.history.md" {
 				return nil
 			}
 
+			// For .json files, only process known task files (Cline/Roo tasks)
+			if ext == ".json" {
+				parent := filepath.Base(filepath.Dir(path))
+				if parent != "tasks" && parent != "cline" && parent != "sessions" && parent != "conversations" {
+					return nil
+				}
+			}
+
 			sw.mu.Lock()
-			lastSize, seen := sw.seenFiles[path]
+			lastOffset, seen := sw.seenOffsets[path]
 			currentSize := info.Size()
-			if seen && lastSize == currentSize {
+			if seen && currentSize <= lastOffset {
 				sw.mu.Unlock()
 				return nil
 			}
-			sw.seenFiles[path] = currentSize
+			if currentSize < lastOffset {
+				lastOffset = 0 // File truncated or rewritten
+			}
 			sw.mu.Unlock()
 
-			// Parse file
+			// Incrementally parse file from lastOffset
 			var events []ToolCallEvent
 			var readEvents []FileReadEvent
+			var newOffset int64
 			var parseErr error
 
 			if ext == ".jsonl" {
-				events, readEvents, parseErr = ParseJSONLTranscriptFull(path)
-			} else if ext == ".json" && (filepath.Base(filepath.Dir(path)) == "tasks" || filepath.Base(filepath.Dir(path)) == "cline") {
+				events, readEvents, newOffset, parseErr = ParseJSONLTranscriptFromOffset(path, lastOffset)
+			} else if ext == ".json" {
 				events, parseErr = ParseClineTask(path)
+				newOffset = currentSize
 			} else if base == ".aider.chat.history.md" {
 				events, parseErr = ParseAiderHistory(path)
+				newOffset = currentSize
 			}
 
 			if parseErr != nil {
 				log.Printf("ingest: parse %s: %v", path, parseErr)
 				return nil
 			}
+
+			sw.mu.Lock()
+			sw.seenOffsets[path] = newOffset
+			// Prevent seenOffsets map unbounded growth
+			if len(sw.seenOffsets) > 10000 {
+				for k := range sw.seenOffsets {
+					if !fileExists(k) {
+						delete(sw.seenOffsets, k)
+					}
+				}
+			}
+			sw.mu.Unlock()
 
 			for _, ev := range events {
 				if sw.onToolCall != nil {

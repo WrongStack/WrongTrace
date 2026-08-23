@@ -129,6 +129,9 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
+	// Soft memory limit to keep Go GC and virtual memory footprint lean (< 256MB)
+	debug.SetMemoryLimit(256 * 1024 * 1024)
+
 	watchDir, _ := cmd.Flags().GetString("watch")
 	port, _ := cmd.Flags().GetInt("port")
 	dbPath, _ := cmd.Flags().GetString("db")
@@ -309,6 +312,20 @@ func runStart(cmd *cobra.Command, _ []string) error {
 			log.Printf("models.dev sync: %v — using catalog already in memory", err)
 		} else {
 			log.Printf("models.dev sync: %d models loaded", n)
+		}
+	}()
+
+	// Periodic memory recycler: returns unused pages back to the OS kernel
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				debug.FreeOSMemory()
+			}
 		}
 	}()
 
