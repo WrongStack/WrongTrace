@@ -40,10 +40,10 @@ func newStoreAt(t *testing.T) *db.Store {
 	return store
 }
 
-func (f *failingEngine) Metrics() (core.MetricsSnapshot, error) {
+func (f *failingEngine) Metrics(...string) (core.MetricsSnapshot, error) {
 	return core.MetricsSnapshot{}, errForced
 }
-func (f *failingEngine) Atlas() (core.AtlasSnapshot, error) {
+func (f *failingEngine) Atlas(...string) (core.AtlasSnapshot, error) {
 	return core.AtlasSnapshot{}, errForced
 }
 func (f *failingEngine) FileHealth(string) (core.IPCHealth, error) {
@@ -81,6 +81,12 @@ func (f *failingEngine) UpdateProject(core.ProjectProfile) (core.ProjectProfile,
 func (f *failingEngine) SwitchActiveProject(string) (*core.ProjectProfile, error) {
 	return nil, errForced
 }
+func (f *failingEngine) RescanProject(string) (*core.ProjectProfile, error) {
+	return nil, errForced
+}
+func (f *failingEngine) RescanAllProjects() []core.ProjectProfile {
+	return nil
+}
 func (f *failingEngine) RemoveProject(string) error            { return errForced }
 func (f *failingEngine) GetSettings() core.AppSettings         { return core.AppSettings{} }
 func (f *failingEngine) UpdateSettings(s core.AppSettings) core.AppSettings {
@@ -88,6 +94,18 @@ func (f *failingEngine) UpdateSettings(s core.AppSettings) core.AppSettings {
 }
 func (f *failingEngine) VacuumDB() error                       { return errForced }
 func (f *failingEngine) ClearStale(int) (int64, error)         { return 0, errForced }
+func (f *failingEngine) GetFileReadStats(string) (db.FileReadStats, error) {
+	return db.FileReadStats{}, errForced
+}
+func (f *failingEngine) GetRecentFileReads(int, ...string) ([]db.FileReadRecord, error) {
+	return nil, errForced
+}
+func (f *failingEngine) GetFileReadHeatmap(string) ([]db.LineReadHeatmap, error) {
+	return nil, errForced
+}
+func (f *failingEngine) IndexStatus() core.IndexProgress {
+	return core.IndexProgress{}
+}
 func (f *failingEngine) Hub() *core.Hub                        { return f.hub }
 func (f *failingEngine) Store() *db.Store                      { return nil }
 func (f *failingEngine) Repo() string                          { return "failing" }

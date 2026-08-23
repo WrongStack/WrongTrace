@@ -82,18 +82,68 @@ func (e *Engine) GetProject(id string) (ProjectProfile, error) {
 func (e *Engine) GetActiveProject() *ProjectProfile {
 	e.lockMu.RLock()
 	defer e.lockMu.RUnlock()
+	if e.cfg.RepoName != "" && e.cfg.RepoName != "default" {
+		for _, p := range e.projects {
+			if strings.EqualFold(p.Name, e.cfg.RepoName) || strings.EqualFold(p.ID, e.cfg.RepoName) {
+				cp := p
+				return &cp
+			}
+		}
+		return nil
+	}
+	if e.activeProjectID != "" {
+		if p, ok := e.projects[e.activeProjectID]; ok {
+			cp := p
+			return &cp
+		}
+	}
 	for _, p := range e.projects {
 		if p.IsActive {
 			cp := p
 			return &cp
 		}
 	}
-	// Fallback to first project if none marked active
-	for _, p := range e.projects {
-		cp := p
-		return &cp
-	}
 	return nil
+}
+
+// FindProjectForFile finds the registered project whose root directory contains the given file path.
+func (e *Engine) FindProjectForFile(filePath string) (ProjectProfile, bool) {
+	if filePath == "" {
+		return ProjectProfile{}, false
+	}
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		absPath = filePath
+	}
+	normFile := strings.ToLower(filepath.Clean(absPath))
+
+	e.lockMu.RLock()
+	defer e.lockMu.RUnlock()
+
+	var bestMatch ProjectProfile
+	var bestMatchLen int
+
+	for _, p := range e.projects {
+		if p.Path == "" {
+			continue
+		}
+		absRoot, err := filepath.Abs(p.Path)
+		if err != nil {
+			absRoot = p.Path
+		}
+		normRoot := strings.ToLower(filepath.Clean(absRoot))
+		if normFile == normRoot || strings.HasPrefix(normFile, normRoot+string(filepath.Separator)) {
+			if len(normRoot) > bestMatchLen {
+				bestMatch = p
+				bestMatchLen = len(normRoot)
+			}
+		}
+	}
+
+	if bestMatchLen > 0 {
+		return bestMatch, true
+	}
+	return ProjectProfile{}, false
 }
 
 // SwitchActiveProject marks a project as active and switches the active database context.
@@ -590,12 +640,44 @@ func (e *Engine) RemoveProject(id string) error {
 	return nil
 }
 
-// ScanAgentSessions inspects workspace and global application directories for coding agent artifacts and logs.
-// It deliberately issues only bounded os.ReadDir calls against well-known global
-// directories (never a recursive filepath.Walk of the workspace), so it needs
-// no ignore-pattern filtering and its cost is independent of tree size.
+// RescanProject re-runs agent session discovery for a specific project.
+func (e *Engine) RescanProject(id string) (*ProjectProfile, error) {
+	e.lockMu.Lock()
+	defer e.lockMu.Unlock()
+	proj, ok := e.projects[id]
+	if !ok {
+		return nil, fmt.Errorf("project not found: %s", id)
+	}
+	proj.DiscoveredSessions = ScanAgentSessions(proj.Path)
+	e.projects[id] = proj
+	SaveProjectsIndex(e.projects)
+	return &proj, nil
+}
+
+// RescanAllProjects re-runs session discovery on all registered workspaces.
+func (e *Engine) RescanAllProjects() []ProjectProfile {
+	e.lockMu.Lock()
+	defer e.lockMu.Unlock()
+	for id, proj := range e.projects {
+		proj.DiscoveredSessions = ScanAgentSessions(proj.Path)
+		e.projects[id] = proj
+	}
+	SaveProjectsIndex(e.projects)
+	out := make([]ProjectProfile, 0, len(e.projects))
+	for _, p := range e.projects {
+		out = append(out, p)
+	}
+	return out
+}
+
+// ScanAgentSessions inspects workspace and global application directories for coding agent artifacts and logs specifically belonging to the target root workspace.
 func ScanAgentSessions(root string) map[string]int {
 	counts := make(map[string]int)
+	if root == "" {
+		return counts
+	}
+	normRoot := strings.ToLower(filepath.Clean(root))
+	rootBase := strings.ToLower(filepath.Base(root))
 	homeDir, _ := os.UserHomeDir()
 	appData := os.Getenv("APPDATA")
 	if appData == "" && homeDir != "" {
@@ -613,9 +695,8 @@ func ScanAgentSessions(root string) map[string]int {
 				} `json:"projects"`
 			}
 			if json.Unmarshal(data, &pFile) == nil {
-				targetNorm := strings.ToLower(filepath.Clean(root))
 				for _, proj := range pFile.Projects {
-					if strings.ToLower(filepath.Clean(proj.Root)) == targetNorm && proj.Slug != "" {
+					if strings.ToLower(filepath.Clean(proj.Root)) == normRoot && proj.Slug != "" {
 						sessionsDir := filepath.Join(homeDir, ".wrongstack", "projects", proj.Slug, "sessions")
 						var sessCnt int
 						if dateEntries, err := os.ReadDir(sessionsDir); err == nil {
@@ -635,29 +716,75 @@ func ScanAgentSessions(root string) map[string]int {
 								}
 							}
 						}
-						counts["wrongstack"] = sessCnt
+						if sessCnt > 0 {
+							counts["wrongstack"] = sessCnt
+						}
 						break
 					}
 				}
 			}
 		}
-		if counts["wrongstack"] == 0 && dirExists(filepath.Join(homeDir, ".wrongstack")) {
+		if counts["wrongstack"] == 0 && dirExists(filepath.Join(root, ".wrongstack")) {
 			counts["wrongstack"] = 1
 		}
 	}
 
-	// 2. Antigravity & Gemini CLI
+	// 2. Claude Code (Check specific workspace directory under ~/.claude/projects/ & local .claude)
+	if homeDir != "" {
+		claudeProjectsDir := filepath.Join(homeDir, ".claude", "projects")
+		if entries, err := os.ReadDir(claudeProjectsDir); err == nil {
+			var claudeSessCount int
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				dirNameLower := strings.ToLower(e.Name())
+				// Claude encodes path by replacing separators/colons with - or --
+				if strings.Contains(dirNameLower, rootBase) {
+					projDir := filepath.Join(claudeProjectsDir, e.Name())
+					if pFiles, err := os.ReadDir(projDir); err == nil {
+						for _, pf := range pFiles {
+							if !pf.IsDir() && strings.HasSuffix(pf.Name(), ".jsonl") {
+								claudeSessCount++
+							}
+						}
+					}
+				}
+			}
+			if claudeSessCount > 0 {
+				counts["claude_code"] = claudeSessCount
+			}
+		}
+	}
+	if counts["claude_code"] == 0 && dirExists(filepath.Join(root, ".claude")) {
+		counts["claude_code"] = 1
+	}
+
+	// 3. Google Antigravity & Gemini CLI
 	if homeDir != "" {
 		brainDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain")
 		if entries, err := os.ReadDir(brainDir); err == nil {
-			var brainCount int
+			var agyCount int
 			for _, e := range entries {
-				if e.IsDir() {
-					brainCount++
+				if !e.IsDir() {
+					continue
+				}
+				convDir := filepath.Join(brainDir, e.Name())
+				logPath := filepath.Join(convDir, ".system_generated", "logs", "transcript.jsonl")
+				if fileExists(logPath) {
+					if f, err := os.Open(logPath); err == nil {
+						buf := make([]byte, 4096)
+						n, _ := f.Read(buf)
+						_ = f.Close()
+						contentLower := strings.ToLower(string(buf[:n]))
+						if strings.Contains(contentLower, normRoot) || strings.Contains(contentLower, rootBase) {
+							agyCount++
+						}
+					}
 				}
 			}
-			if brainCount > 0 {
-				counts["antigravity"] = brainCount
+			if agyCount > 0 {
+				counts["antigravity"] = agyCount
 			}
 		}
 	}
@@ -665,33 +792,43 @@ func ScanAgentSessions(root string) map[string]int {
 		counts["antigravity"] = 1
 	}
 
-	// 3. Claude Code
-	if homeDir != "" {
-		claudeProjectsDir := filepath.Join(homeDir, ".claude", "projects")
-		if entries, err := os.ReadDir(claudeProjectsDir); err == nil {
-			var claudeCount int
-			for _, e := range entries {
-				if e.IsDir() {
-					claudeCount++
-				}
-			}
-			if claudeCount > 0 {
-				counts["claude_code"] = claudeCount
-			}
-		}
-	}
-	if counts["claude_code"] == 0 && (dirExists(filepath.Join(root, ".claude")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".claude")))) {
-		counts["claude_code"] = 1
-	}
-
-	// 4. Cursor (Workspace Storage & Global)
+	// 4. Cursor AI
 	if appData != "" {
 		cursorStorage := filepath.Join(appData, "Cursor", "User", "workspaceStorage")
 		if entries, err := os.ReadDir(cursorStorage); err == nil {
-			counts["cursor"] = len(entries)
+			var cursorCount int
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				wsDir := filepath.Join(cursorStorage, e.Name())
+				wsFile := filepath.Join(wsDir, "workspace.json")
+				stateFile := filepath.Join(wsDir, "state.vscdb")
+				matched := false
+				if data, err := os.ReadFile(wsFile); err == nil {
+					if strings.Contains(strings.ToLower(string(data)), normRoot) || strings.Contains(strings.ToLower(string(data)), rootBase) {
+						matched = true
+					}
+				} else if fileExists(stateFile) {
+					if f, err := os.Open(stateFile); err == nil {
+						buf := make([]byte, 8192)
+						n, _ := f.Read(buf)
+						_ = f.Close()
+						if strings.Contains(strings.ToLower(string(buf[:n])), normRoot) || strings.Contains(strings.ToLower(string(buf[:n])), rootBase) {
+							matched = true
+						}
+					}
+				}
+				if matched {
+					cursorCount++
+				}
+			}
+			if cursorCount > 0 {
+				counts["cursor"] = cursorCount
+			}
 		}
 	}
-	if counts["cursor"] == 0 && (dirExists(filepath.Join(root, ".cursor")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".cursor")))) {
+	if counts["cursor"] == 0 && dirExists(filepath.Join(root, ".cursor")) {
 		counts["cursor"] = 1
 	}
 
@@ -699,10 +836,25 @@ func ScanAgentSessions(root string) map[string]int {
 	if appData != "" {
 		windsurfStorage := filepath.Join(appData, "Windsurf", "User", "workspaceStorage")
 		if entries, err := os.ReadDir(windsurfStorage); err == nil {
-			counts["windsurf"] = len(entries)
+			var wsCount int
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				wsDir := filepath.Join(windsurfStorage, e.Name())
+				wsFile := filepath.Join(wsDir, "workspace.json")
+				if data, err := os.ReadFile(wsFile); err == nil {
+					if strings.Contains(strings.ToLower(string(data)), normRoot) || strings.Contains(strings.ToLower(string(data)), rootBase) {
+						wsCount++
+					}
+				}
+			}
+			if wsCount > 0 {
+				counts["windsurf"] = wsCount
+			}
 		}
 	}
-	if counts["windsurf"] == 0 && (dirExists(filepath.Join(root, ".windsurf")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".windsurf")))) {
+	if counts["windsurf"] == 0 && dirExists(filepath.Join(root, ".windsurf")) {
 		counts["windsurf"] = 1
 	}
 
@@ -710,74 +862,110 @@ func ScanAgentSessions(root string) map[string]int {
 	if appData != "" {
 		traeStorage := filepath.Join(appData, "Trae", "User", "workspaceStorage")
 		if entries, err := os.ReadDir(traeStorage); err == nil {
-			counts["trae"] = len(entries)
+			var traeCount int
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				wsDir := filepath.Join(traeStorage, e.Name())
+				wsFile := filepath.Join(wsDir, "workspace.json")
+				if data, err := os.ReadFile(wsFile); err == nil {
+					if strings.Contains(strings.ToLower(string(data)), normRoot) || strings.Contains(strings.ToLower(string(data)), rootBase) {
+						traeCount++
+					}
+				}
+			}
+			if traeCount > 0 {
+				counts["trae"] = traeCount
+			}
 		}
 	}
-	if counts["trae"] == 0 && (dirExists(filepath.Join(root, ".trae")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".trae")))) {
+	if counts["trae"] == 0 && dirExists(filepath.Join(root, ".trae")) {
 		counts["trae"] = 1
 	}
 
-	// 7. GitHub Copilot
+	// 7. Cline / Roo Code
 	if appData != "" {
-		copilotChat := filepath.Join(appData, "Code", "User", "globalStorage", "github.copilot-chat")
-		if dirExists(copilotChat) {
-			counts["copilot"] = 1
-		}
-	}
-	if counts["copilot"] == 0 && (dirExists(filepath.Join(root, ".copilot")) || (homeDir != "" && dirExists(filepath.Join(homeDir, ".copilot")))) {
-		counts["copilot"] = 1
-	}
-
-	// 8. Cline / Roo Code
-	if appData != "" {
-		clineTasks := filepath.Join(appData, "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks")
-		if entries, err := os.ReadDir(clineTasks); err == nil {
-			counts["cline"] = len(entries)
+		for _, clineExt := range []string{"saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"} {
+			clineTasks := filepath.Join(appData, "Code", "User", "globalStorage", clineExt, "tasks")
+			if entries, err := os.ReadDir(clineTasks); err == nil {
+				var taskCount int
+				for _, e := range entries {
+					if !e.IsDir() {
+						continue
+					}
+					apiHistory := filepath.Join(clineTasks, e.Name(), "api_conversation_history.json")
+					uiMessages := filepath.Join(clineTasks, e.Name(), "ui_messages.json")
+					matched := false
+					for _, checkFile := range []string{apiHistory, uiMessages} {
+						if fileExists(checkFile) {
+							if f, err := os.Open(checkFile); err == nil {
+								buf := make([]byte, 4096)
+								n, _ := f.Read(buf)
+								_ = f.Close()
+								if strings.Contains(strings.ToLower(string(buf[:n])), normRoot) || strings.Contains(strings.ToLower(string(buf[:n])), rootBase) {
+									matched = true
+									break
+								}
+							}
+						}
+					}
+					if matched {
+						taskCount++
+					}
+				}
+				if taskCount > 0 {
+					counts["cline"] += taskCount
+				}
+			}
 		}
 	}
 	if counts["cline"] == 0 && fileExists(filepath.Join(root, ".clinerules")) {
 		counts["cline"] = 1
 	}
 
-	// 9. Aider
+	// 8. Aider
 	aiderHistory := filepath.Join(root, ".aider.chat.history.md")
-	if fileExists(aiderHistory) || (homeDir != "" && fileExists(filepath.Join(homeDir, ".aider.conf.yml"))) {
-		counts["aider"] = 1
-	}
-
-	// 10. MiniMax Code & Kimi Code & ZCode
-	if homeDir != "" {
-		if dirExists(filepath.Join(homeDir, ".minimax")) {
-			counts["minimax"] = 1
-		}
-		if dirExists(filepath.Join(homeDir, ".kimi")) || dirExists(filepath.Join(homeDir, ".moonshot")) {
-			counts["kimi"] = 1
-		}
-		if dirExists(filepath.Join(homeDir, ".zcode")) {
-			counts["zcode"] = 1
+	if fileExists(aiderHistory) {
+		if data, err := os.ReadFile(aiderHistory); err == nil {
+			chatMatches := strings.Count(string(data), "# aider chat started at")
+			if chatMatches == 0 {
+				chatMatches = strings.Count(string(data), "#### ")
+			}
+			if chatMatches == 0 && len(data) > 0 {
+				chatMatches = 1
+			}
+			counts["aider"] = chatMatches
 		}
 	}
 
-	// 11. Continue.dev & Zed & Replit & Devin & Goose & OpenHands
-	if homeDir != "" {
-		if dirExists(filepath.Join(homeDir, ".continue")) {
-			counts["continue"] = 1
-		}
-		if dirExists(filepath.Join(homeDir, ".replit")) || fileExists(filepath.Join(root, ".replit")) {
-			counts["replit"] = 1
-		}
-		if dirExists(filepath.Join(homeDir, ".devin")) {
-			counts["devin"] = 1
-		}
-		if dirExists(filepath.Join(homeDir, ".goose")) {
-			counts["goose"] = 1
-		}
-		if dirExists(filepath.Join(homeDir, ".openhands")) {
-			counts["openhands"] = 1
-		}
+	// 9. GitHub Copilot & other tools in workspace
+	if dirExists(filepath.Join(root, ".copilot")) {
+		counts["copilot"] = 1
 	}
-	if appData != "" && dirExists(filepath.Join(appData, "Zed")) {
-		counts["zed"] = 1
+	if dirExists(filepath.Join(root, ".minimax")) {
+		counts["minimax"] = 1
+	}
+	if dirExists(filepath.Join(root, ".kimi")) || dirExists(filepath.Join(root, ".moonshot")) {
+		counts["kimi"] = 1
+	}
+	if dirExists(filepath.Join(root, ".zcode")) {
+		counts["zcode"] = 1
+	}
+	if dirExists(filepath.Join(root, ".continue")) {
+		counts["continue"] = 1
+	}
+	if dirExists(filepath.Join(root, ".replit")) || fileExists(filepath.Join(root, ".replit")) {
+		counts["replit"] = 1
+	}
+	if dirExists(filepath.Join(root, ".devin")) {
+		counts["devin"] = 1
+	}
+	if dirExists(filepath.Join(root, ".goose")) {
+		counts["goose"] = 1
+	}
+	if dirExists(filepath.Join(root, ".openhands")) {
+		counts["openhands"] = 1
 	}
 
 	return counts
@@ -814,6 +1002,8 @@ var alwaysIgnoredDirs = []string{
 	"node_modules", "vendor", "dist", "build", "target",
 	".next", ".nuxt", ".turbo", ".cache", ".wrongtrace",
 	"coverage", "out", ".out", "bin",
+	"__pycache__", ".venv", "venv", ".pytest_cache",
+	".idea", ".vscode", ".svelte-kit", ".astro",
 }
 
 // isIgnoredDir reports whether a directory base name is excluded from all
@@ -847,10 +1037,17 @@ func DetectPrimaryLanguage(root string) string {
 		if err != nil || info == nil {
 			return nil
 		}
-		if info.IsDir() {
-			if p == root {
-				return nil
+		if p == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err == nil && rel != "." && ignoredPathSegment(rel) {
+			if info.IsDir() {
+				return filepath.SkipDir
 			}
+			return nil
+		}
+		if info.IsDir() {
 			if isIgnoredDir(filepath.Base(p)) {
 				return filepath.SkipDir
 			}
@@ -880,6 +1077,14 @@ func DetectPrimaryLanguage(root string) string {
 
 	var bestLang = "Generic"
 	var maxCount = 0
+	// Deterministic precedence on tie
+	precedence := []string{"Go", "Rust", "TypeScript", "JavaScript", "Python", "Java", "C++", "C#"}
+	for _, lang := range precedence {
+		if cnt, ok := extCounts[lang]; ok && cnt > maxCount {
+			maxCount = cnt
+			bestLang = lang
+		}
+	}
 	for lang, cnt := range extCounts {
 		if cnt > maxCount {
 			maxCount = cnt

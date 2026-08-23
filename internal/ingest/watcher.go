@@ -11,10 +11,11 @@ import (
 
 // SessionWatcher continuously scans or tails session logs in well-known agent directories.
 type SessionWatcher struct {
-	mu           sync.Mutex
-	watchPaths   []string
-	seenFiles    map[string]int64
-	onToolCall   func(ToolCallEvent)
+	mu          sync.Mutex
+	watchPaths  []string
+	seenFiles   map[string]int64
+	onToolCall  func(ToolCallEvent)
+	onReadEvent func(FileReadEvent)
 }
 
 // NewSessionWatcher creates a watcher for agent log files.
@@ -25,10 +26,22 @@ func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 	}
 }
 
+// SetOnReadEvent registers a callback for file read/inspection events.
+func (sw *SessionWatcher) SetOnReadEvent(cb func(FileReadEvent)) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	sw.onReadEvent = cb
+}
+
 // AddWatchDir registers a directory path to monitor for session logs.
 func (sw *SessionWatcher) AddWatchDir(dir string) {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
+	for _, p := range sw.watchPaths {
+		if p == dir {
+			return
+		}
+	}
 	sw.watchPaths = append(sw.watchPaths, dir)
 }
 
@@ -188,10 +201,11 @@ func (sw *SessionWatcher) PollOnce() {
 
 			// Parse file
 			var events []ToolCallEvent
+			var readEvents []FileReadEvent
 			var parseErr error
 
 			if ext == ".jsonl" {
-				events, parseErr = ParseJSONLTranscript(path)
+				events, readEvents, parseErr = ParseJSONLTranscriptFull(path)
 			} else if ext == ".json" && (filepath.Base(filepath.Dir(path)) == "tasks" || filepath.Base(filepath.Dir(path)) == "cline") {
 				events, parseErr = ParseClineTask(path)
 			} else if base == ".aider.chat.history.md" {
@@ -206,6 +220,12 @@ func (sw *SessionWatcher) PollOnce() {
 			for _, ev := range events {
 				if sw.onToolCall != nil {
 					sw.onToolCall(ev)
+				}
+			}
+
+			for _, rev := range readEvents {
+				if sw.onReadEvent != nil {
+					sw.onReadEvent(rev)
 				}
 			}
 

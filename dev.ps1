@@ -59,6 +59,7 @@ if (-not $NoUI -and -not (Test-Path (Join-Path $Root 'web\node_modules'))) {
 $daemon = $null
 $vite = $null
 $daemonLog = Join-Path $Root 'dev-daemon.log'
+$daemonOut = Join-Path $Root 'dev-daemon-out.log'
 
 try {
     Write-Host "==> starting daemon on :$Port (multi-project workspace hub)" -ForegroundColor Cyan
@@ -71,7 +72,7 @@ try {
         $daemonArgs += "--watch=$WatchDir"
         $daemonArgs += "--repo=$(Split-Path $WatchDir -Leaf)"
     }
-    $daemon = Start-Process -FilePath $Bin -PassThru -WindowStyle Hidden -ArgumentList $daemonArgs -RedirectStandardError $daemonLog
+    $daemon = Start-Process -FilePath $Bin -PassThru -WindowStyle Hidden -ArgumentList $daemonArgs -RedirectStandardError $daemonLog -RedirectStandardOutput $daemonOut
 
     for ($i = 0; $i -lt 50; $i++) {
         if ($daemon.HasExited) {
@@ -112,18 +113,21 @@ try {
 
     # Park until interrupted or either child exits on its own.
     while ($true) {
-        $daemonProc = Get-Process -Id $daemon.Id -ErrorAction SilentlyContinue
-        if (-not $daemonProc) {
-            Write-Warning 'daemon process stopped; shutting down'
-            if (Test-Path $daemonLog) { Get-Content $daemonLog | Select-Object -Last 15 | Write-Host -ForegroundColor Red }
+        if ($daemon.HasExited) {
+            Write-Warning "daemon process stopped (exit code: $($daemon.ExitCode)); shutting down"
+            if (Test-Path $daemonLog) {
+                Write-Host "--- Last 30 lines of dev-daemon.log (stderr) ---" -ForegroundColor Yellow
+                Get-Content $daemonLog | Select-Object -Last 30 | Write-Host -ForegroundColor Red
+            }
+            if (Test-Path $daemonOut) {
+                Write-Host "--- Last 30 lines of dev-daemon-out.log (stdout) ---" -ForegroundColor Yellow
+                Get-Content $daemonOut | Select-Object -Last 30 | Write-Host -ForegroundColor Red
+            }
             break
         }
-        if ($vite) {
-            $viteProc = Get-Process -Id $vite.Id -ErrorAction SilentlyContinue
-            if (-not $viteProc) {
-                Write-Warning 'vite dev server stopped; shutting down'
-                break
-            }
+        if ($vite -and $vite.HasExited) {
+            Write-Warning "vite dev server stopped (exit code: $($vite.ExitCode)); shutting down"
+            break
         }
         Start-Sleep -Seconds 1
     }

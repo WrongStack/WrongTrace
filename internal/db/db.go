@@ -97,16 +97,50 @@ type Overview struct {
 	UniqueModels int
 }
 
-// Overview returns at-a-glance counts from the store.
-func (s *Store) Overview() (Overview, error) {
+// Overview returns at-a-glance counts from the store, optionally filtered by repo_name.
+func (s *Store) Overview(repoFilter ...string) (Overview, error) {
+	var repo string
+	if len(repoFilter) > 0 {
+		repo = repoFilter[0]
+	}
+
 	var o Overview
+	if repo == "" {
+		row := s.db.QueryRowContext(context.Background(), `
+			SELECT
+				(SELECT COUNT(*) FROM agent_runs),
+				(SELECT COUNT(*) FROM code_node_events),
+				COALESCE((SELECT SUM(cost_usd) FROM agent_runs), 0),
+				(SELECT COUNT(DISTINCT model_name) FROM agent_runs)
+		`)
+		if err := row.Scan(&o.TotalRuns, &o.TotalEvents, &o.TotalCost, &o.UniqueModels); err != nil {
+			return Overview{}, fmt.Errorf("overview scan: %w", err)
+		}
+		return o, nil
+	}
+
 	row := s.db.QueryRowContext(context.Background(), `
 		SELECT
-			(SELECT COUNT(*) FROM agent_runs),
-			(SELECT COUNT(*) FROM code_node_events),
-			COALESCE((SELECT SUM(cost_usd) FROM agent_runs), 0),
-			(SELECT COUNT(DISTINCT model_name) FROM agent_runs)
-	`)
+			(SELECT COUNT(DISTINCT r.run_id) FROM agent_runs r
+			 WHERE r.run_id IN (
+				SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+				UNION
+				SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+			 ) OR NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL)),
+			(SELECT COUNT(*) FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL)),
+			COALESCE((SELECT SUM(r.cost_usd) FROM agent_runs r
+			 WHERE r.run_id IN (
+				SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+				UNION
+				SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+			 ) OR NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL)), 0),
+			(SELECT COUNT(DISTINCT r.model_name) FROM agent_runs r
+			 WHERE r.run_id IN (
+				SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+				UNION
+				SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+			 ) OR NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL))
+	`, repo, repo, repo, repo, repo, repo, repo, repo, repo, repo)
 	if err := row.Scan(&o.TotalRuns, &o.TotalEvents, &o.TotalCost, &o.UniqueModels); err != nil {
 		return Overview{}, fmt.Errorf("overview scan: %w", err)
 	}

@@ -60,7 +60,7 @@ export function Navbar({
             <div className="flex items-center gap-1.5 bg-slate-900/90 border border-white/10 rounded-lg px-2 py-1 text-xs text-slate-300 font-mono">
               <FolderGit2 className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
               <select
-                value={selectedProjectId || projects.find((p: Project) => p.name === repo || p.is_active)?.id || (projects[0]?.id ?? '')}
+                value={selectedProjectId || projects.find((p: Project) => p.is_active)?.id || projects.find((p: Project) => p.name === repo)?.id || (projects[0]?.id ?? '')}
                 onChange={(e) => handleSwitchProject(e.target.value)}
                 className="bg-transparent border-none text-slate-200 text-xs font-semibold focus:outline-none cursor-pointer"
                 title="Switch Active Monitored Workspace"

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Settings, Save, ShieldAlert, Cpu, HardDrive, DollarSign, Check, Sliders, BellRing, Trash2, Wrench, X, FolderTree, Plus, Database, Sparkles, FolderPlus, ArrowRight, Download, AlertTriangle, Eye } from 'lucide-react';
+import { Settings, Save, ShieldAlert, Cpu, HardDrive, DollarSign, Check, Sliders, BellRing, Trash2, Wrench, X, FolderTree, Plus, Database, Sparkles, FolderPlus, ArrowRight, Download, AlertTriangle, Eye, RefreshCw } from 'lucide-react';
 import { useSettings, useProjects } from '../hooks/useMetrics';
 import type { AppSettings, Project, ImportFromWrongStackResult, PreviewFromWrongStackResult } from '../types';
 
@@ -49,6 +49,32 @@ export function SettingsView() {
   const [pruneMsg, setPruneMsg] = useState<string | null>(null);
   const [isVacuuming, setIsVacuuming] = useState(false);
   const [isPruning, setIsPruning] = useState(false);
+  const [rescanningId, setRescanningId] = useState<string | null>(null);
+  const [isRescanningAll, setIsRescanningAll] = useState(false);
+
+  const handleRescanProject = async (id: string) => {
+    setRescanningId(id);
+    try {
+      await fetch(`/api/projects/${id}/rescan`, { method: 'POST' });
+      refetchProjects();
+    } catch (err) {
+      console.error('Failed to rescan project', err);
+    } finally {
+      setRescanningId(null);
+    }
+  };
+
+  const handleRescanAllProjects = async () => {
+    setIsRescanningAll(true);
+    try {
+      await fetch('/api/projects/rescan', { method: 'POST' });
+      refetchProjects();
+    } catch (err) {
+      console.error('Failed to rescan all projects', err);
+    } finally {
+      setIsRescanningAll(false);
+    }
+  };
 
   useEffect(() => {
     if (initialSettings) {
@@ -90,9 +116,9 @@ export function SettingsView() {
         cost_alert_usd: costAlertUSD,
         auto_prune_days: autoPruneDays,
         default_provider: defaultProvider,
-        slack_webhook_url: slackURL,
-        discord_webhook_url: discordURL,
-        custom_webhook_url: customWebhookURL,
+        slack_webhook_url: slackURL.trim() === '' ? '-' : slackURL.trim(),
+        discord_webhook_url: discordURL.trim() === '' ? '-' : discordURL.trim(),
+        custom_webhook_url: customWebhookURL.trim() === '' ? '-' : customWebhookURL.trim(),
         ignore_patterns: ignorePatterns,
       };
 
@@ -558,9 +584,25 @@ export function SettingsView() {
 
           {/* List of Registered Projects (Full Identity Cards) */}
           <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-slate-400">
+                Registered Workspaces ({projects.length})
+              </span>
+              <button
+                type="button"
+                onClick={handleRescanAllProjects}
+                disabled={isRescanningAll}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-indigo-950/40 hover:bg-indigo-900/60 text-indigo-300 border border-indigo-500/20 text-xs font-mono transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${isRescanningAll ? 'animate-spin' : ''}`} />
+                <span>{isRescanningAll ? 'Scanning Fleets...' : 'Rescan All Fleets'}</span>
+              </button>
+            </div>
+
             {projects.map((p: Project) => {
               const edit = editingProject[p.id] || {};
               const sessions = p.discovered_sessions || {};
+              const isRescanning = rescanningId === p.id;
 
               return (
                 <div key={p.id} className="panel space-y-4 relative group border border-white/10">
@@ -614,13 +656,26 @@ export function SettingsView() {
                       </div>
                     </div>
 
-                    <button
-                      onClick={() => handleRemoveProject(p.id)}
-                      className="text-slate-500 hover:text-rose-400 p-1.5 rounded hover:bg-rose-500/10 self-start sm:self-center transition-colors"
-                      title="Stop watching workspace"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
+                    <div className="flex items-center gap-2 self-start sm:self-center">
+                      <button
+                        type="button"
+                        onClick={() => handleRescanProject(p.id)}
+                        disabled={isRescanning}
+                        className="flex items-center gap-1 text-[11px] px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-white/10 font-mono transition-colors disabled:opacity-50"
+                        title="Re-scan coding agent transcripts specifically for this workspace"
+                      >
+                        <RefreshCw className={`h-3 w-3 ${isRescanning ? 'animate-spin' : ''}`} />
+                        <span>{isRescanning ? 'Scanning...' : 'Rescan Fleet'}</span>
+                      </button>
+
+                      <button
+                        onClick={() => handleRemoveProject(p.id)}
+                        className="text-slate-500 hover:text-rose-400 p-1.5 rounded hover:bg-rose-500/10 transition-colors"
+                        title="Stop watching workspace"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
                   </div>
 
                   {/* Paths & DB Info */}
@@ -667,14 +722,14 @@ export function SettingsView() {
                           <span>AI Coding Fleet Observability</span>
                         </div>
                         <p className="text-[11px] text-slate-300 leading-relaxed">
-                          This project is natively managed within the <span className="text-cyan-400 font-semibold">WrongStack</span> workspace ecosystem.
+                          This project is natively monitored within the <span className="text-cyan-400 font-semibold">WrongStack</span> workspace ecosystem.
                           {detectedAgentNames.length > 0 ? (
                             <>
-                              {' '}It is also actively co-developed using{' '}
+                              {' '}Discovered historical & live sessions from{' '}
                               <span className="text-indigo-300 font-medium font-mono">
                                 {detectedAgentNames.join(', ')}
-                              </span>{' '}
-                              coding agents, with all telemetry automatically correlated.
+                              </span>{', '}
+                              with all telemetry automatically correlated.
                             </>
                           ) : (
                             ' All external coding agent sessions are automatically discovered and tracked by the WrongTrace telemetry engine.'
@@ -687,36 +742,36 @@ export function SettingsView() {
                   {/* Auto-Discovered Agent Badges */}
                   <div className="space-y-2 pt-1">
                     <div className="text-xs font-semibold text-slate-400 flex items-center justify-between">
-                      <span>Discovered Coding Agent Sessions</span>
-                      <span className="text-[10px] text-slate-500 font-mono">Auto-detected without manual paths</span>
+                      <span>Discovered Workspace Agent Sessions</span>
+                      <span className="text-[10px] text-slate-500 font-mono">Isolated per workspace path</span>
                     </div>
 
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                       <div className="p-2 rounded-lg bg-cyan-950/20 border border-cyan-500/30">
                         <div className="text-[11px] text-cyan-400 font-semibold">⚡ WrongStack</div>
                         <div className="text-sm font-bold text-cyan-300 font-mono">
-                          {sessions.wrongstack || 1} <span className="text-[10px] font-normal text-slate-500">sessions</span>
+                          {sessions.wrongstack || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
                         </div>
                       </div>
 
                       <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
                         <div className="text-[11px] text-slate-400">Antigravity</div>
                         <div className="text-sm font-bold text-teal-400 font-mono">
-                          {sessions.antigravity || 0} <span className="text-[10px] font-normal text-slate-500">transcripts</span>
+                          {sessions.antigravity || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
                         </div>
                       </div>
 
                       <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
                         <div className="text-[11px] text-slate-400">Claude Code</div>
                         <div className="text-sm font-bold text-indigo-400 font-mono">
-                          {sessions.claude_code || 0} <span className="text-[10px] font-normal text-slate-500">projects</span>
+                          {sessions.claude_code || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
                         </div>
                       </div>
 
                       <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
                         <div className="text-[11px] text-slate-400">Cursor AI</div>
                         <div className="text-sm font-bold text-cyan-400 font-mono">
-                          {sessions.cursor || 0} <span className="text-[10px] font-normal text-slate-500">workspaces</span>
+                          {sessions.cursor || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
                         </div>
                       </div>
 
@@ -730,14 +785,14 @@ export function SettingsView() {
                       <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
                         <div className="text-[11px] text-slate-400">Trae (ByteDance)</div>
                         <div className="text-sm font-bold text-amber-400 font-mono">
-                          {sessions.trae || 0} <span className="text-[10px] font-normal text-slate-500">workspaces</span>
+                          {sessions.trae || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
                         </div>
                       </div>
 
                       <div className="p-2 rounded-lg bg-slate-950/60 border border-white/5">
                         <div className="text-[11px] text-slate-400">GitHub Copilot</div>
                         <div className="text-sm font-bold text-blue-400 font-mono">
-                          {sessions.copilot || 0} <span className="text-[10px] font-normal text-slate-500">detected</span>
+                          {sessions.copilot || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
                         </div>
                       </div>
 

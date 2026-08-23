@@ -57,6 +57,14 @@ var DefaultIgnoreDirs = []string{
 	"out",
 	".out",
 	"bin",
+	"__pycache__",
+	".venv",
+	"venv",
+	".pytest_cache",
+	".idea",
+	".vscode",
+	".svelte-kit",
+	".astro",
 }
 
 // Watcher is a debouncing filesystem observer rooted at a single directory.
@@ -119,6 +127,28 @@ func (w *Watcher) Close() error {
 		return nil
 	}
 	return w.fs.Close()
+}
+
+// AddWatchDir dynamically registers a directory tree with fsnotify for live observation.
+func (w *Watcher) AddWatchDir(dir string) error {
+	if w == nil || w.fs == nil {
+		return nil
+	}
+	return w.addRecursive(dir)
+}
+
+// RemoveWatchDir unregisters a directory tree from fsnotify.
+func (w *Watcher) RemoveWatchDir(dir string) error {
+	if w == nil || w.fs == nil {
+		return nil
+	}
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || !info.IsDir() {
+			return nil
+		}
+		_ = w.fs.Remove(path)
+		return nil
+	})
 }
 
 // addRecursive walks the root and registers every directory with fsnotify.

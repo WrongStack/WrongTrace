@@ -1,5 +1,6 @@
 import { Coins } from 'lucide-react';
 import type { ModelRow } from '../types';
+import { isJunkModel } from '../types';
 
 interface ROIAnalysisProps {
   models: ModelRow[];
@@ -9,14 +10,15 @@ interface ROIAnalysisProps {
 // days. A higher value means the model is expensive relative to durable
 // output; a lower value is the goal.
 export function ROIAnalysis({ models }: ROIAnalysisProps) {
-  const sorted = [...models].sort((a, b) => {
+  const validModels = models.filter((m) => !isJunkModel(m.model));
+  const sorted = [...validModels].sort((a, b) => {
     if (a.total_survived_nodes === 0 && b.total_survived_nodes === 0) return 0;
     if (a.total_survived_nodes === 0) return 1;
     if (b.total_survived_nodes === 0) return -1;
     return a.cost_per_surviving_node - b.cost_per_surviving_node;
   });
-  const totalCost = models.reduce((acc, m) => acc + m.total_cost_usd, 0);
-  const totalSurvived = models.reduce((acc, m) => acc + m.total_survived_nodes, 0);
+  const totalCost = validModels.reduce((acc, m) => acc + m.total_cost_usd, 0);
+  const totalSurvived = validModels.reduce((acc, m) => acc + m.total_survived_nodes, 0);
   const blended = totalSurvived > 0 ? totalCost / totalSurvived : 0;
 
   return (

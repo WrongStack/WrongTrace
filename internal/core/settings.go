@@ -1,6 +1,9 @@
 package core
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/wrongstack/wrongtrace/internal/webhook"
@@ -36,6 +39,59 @@ var (
 		Version:            "0.2.0",
 	}
 )
+
+func init() {
+	loadSettingsFromDisk()
+}
+
+func settingsFilePath() string {
+	return filepath.Join(UserWrongTraceDir(), "settings.json")
+}
+
+func loadSettingsFromDisk() {
+	path := settingsFilePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var loaded AppSettings
+	if err := json.Unmarshal(data, &loaded); err == nil {
+		settingsMu.Lock()
+		if loaded.DebounceMs > 0 {
+			globalSettings.DebounceMs = loaded.DebounceMs
+		}
+		if len(loaded.IgnorePatterns) > 0 {
+			globalSettings.IgnorePatterns = loaded.IgnorePatterns
+		}
+		if loaded.ThrashingThreshold > 0 {
+			globalSettings.ThrashingThreshold = loaded.ThrashingThreshold
+		}
+		if loaded.FragilityCutoff > 0 {
+			globalSettings.FragilityCutoff = loaded.FragilityCutoff
+		}
+		if loaded.CostAlertUSD > 0 {
+			globalSettings.CostAlertUSD = loaded.CostAlertUSD
+		}
+		if loaded.AutoPruneDays > 0 {
+			globalSettings.AutoPruneDays = loaded.AutoPruneDays
+		}
+		if loaded.DefaultProvider != "" {
+			globalSettings.DefaultProvider = loaded.DefaultProvider
+		}
+		globalSettings.SlackWebhookURL = loaded.SlackWebhookURL
+		globalSettings.DiscordWebhookURL = loaded.DiscordWebhookURL
+		globalSettings.CustomWebhookURL = loaded.CustomWebhookURL
+		settingsMu.Unlock()
+	}
+}
+
+func saveSettingsToDisk(s AppSettings) {
+	path := settingsFilePath()
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	if data, err := json.MarshalIndent(s, "", "  "); err == nil {
+		_ = os.WriteFile(path, data, 0o644)
+	}
+}
 
 // GetSettings returns a snapshot of the current settings.
 func (e *Engine) GetSettings() AppSettings {
@@ -85,6 +141,8 @@ func (e *Engine) UpdateSettings(s AppSettings) AppSettings {
 	} else if s.CustomWebhookURL != "" {
 		globalSettings.CustomWebhookURL = s.CustomWebhookURL
 	}
+
+	saveSettingsToDisk(globalSettings)
 
 	if e != nil && e.webhooks != nil {
 		e.webhooks.UpdateConfig(webhook.Config{

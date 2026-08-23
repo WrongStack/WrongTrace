@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -120,6 +123,12 @@ func main() {
 }
 
 func runStart(cmd *cobra.Command, _ []string) error {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("FATAL PANIC in runStart: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	watchDir, _ := cmd.Flags().GetString("watch")
 	port, _ := cmd.Flags().GetInt("port")
 	dbPath, _ := cmd.Flags().GetString("db")
@@ -174,6 +183,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("init watcher: %w", err)
 	}
 	defer w.Close()
+	engine.SetWatcher(w)
 
 	// IPC listener: Unix Domain Socket on POSIX, Named Pipe on Windows.
 	// A bind failure (pipe held by another instance, ACL denial) is logged
@@ -201,9 +211,19 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	// Automatic Session Log & Tool Call Ingestor.
 	sessionWatcher := ingest.NewSessionWatcher(func(ev ingest.ToolCallEvent) {
+		projectID := ""
+		projectSlug := ""
+		if ev.TargetFile != "" {
+			if proj, ok := engine.FindProjectForFile(ev.TargetFile); ok {
+				projectID = proj.ID
+				projectSlug = proj.Name
+			}
+		}
 		_ = engine.ReportRun(ipc.TelemetryReport{
 			RunID:            ev.SessionID,
 			TaskID:           ev.ToolName,
+			ProjectID:        projectID,
+			ProjectSlug:      projectSlug,
 			AgentName:        ev.AgentName,
 			ModelName:        ev.ModelName,
 			Provider:         ev.Provider,
@@ -213,18 +233,66 @@ func runStart(cmd *cobra.Command, _ []string) error {
 			Intent:           ev.Intent,
 		})
 	})
+	sessionWatcher.SetOnReadEvent(func(rev ingest.FileReadEvent) {
+		_ = engine.RecordReadEvent(db.FileReadRecord{
+			ReadID:         rev.ReadID,
+			SessionID:      rev.SessionID,
+			RunID:          rev.RunID,
+			RepoName:       rev.RepoName,
+			FilePath:       rev.FilePath,
+			AgentName:      rev.AgentName,
+			ModelName:      rev.ModelName,
+			Provider:       rev.Provider,
+			ToolName:       rev.ToolName,
+			StartLine:      rev.StartLine,
+			EndLine:        rev.EndLine,
+			LinesReadCount: rev.LinesReadCount,
+			PromptTokens:   rev.PromptTokens,
+			CachedTokens:   rev.CachedTokens,
+			CostUSD:        rev.CostUSD,
+			Intent:         rev.Intent,
+			ReadTime:       rev.OccurredAt,
+		})
+	})
 	sessionWatcher.DiscoverAgentDirs(abs)
 	sessionWatcher.DiscoverGlobalAgentDirs()
 	sessionWatcher.StartPolling(ctx, 3*time.Second)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("FATAL PANIC in httpServer.Start: %v\n%s", r, debug.Stack())
+				cancel()
+			}
+		}()
 		if err := httpServer.Start(); err != nil {
-			log.Printf("http server: %v", err)
+			log.Printf("http server stopped with error: %v", err)
+			cancel()
+		} else {
+			log.Printf("http server stopped normally")
 			cancel()
 		}
 	}()
-	go w.Run(ctx)
-	go engine.Run(ctx)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("FATAL PANIC in watcher.Run: %v\n%s", r, debug.Stack())
+			}
+		}()
+		w.Run(ctx)
+		log.Printf("filesystem watcher stopped")
+	}()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("FATAL PANIC in engine.Run: %v\n%s", r, debug.Stack())
+			}
+		}()
+		engine.Run(ctx)
+		log.Printf("core engine stopped")
+	}()
 
 	// Refresh the model pricing catalog from models.dev/api.json so the
 	// dashboard starts with live data. Runs in the background: an offline or
@@ -232,6 +300,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	// whatever it already has when the fetch fails (POST /api/models/sync
 	// retries on demand).
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("FATAL PANIC in SyncModelsDev: %v\n%s", r, debug.Stack())
+			}
+		}()
 		if n, err := engine.SyncModelsDev(); err != nil {
 			log.Printf("models.dev sync: %v — using catalog already in memory", err)
 		} else {
@@ -241,20 +314,21 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	// Graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case sig := <-sigCh:
-		log.Printf("received %s, shutting down", sig)
+		log.Printf("received signal %s (%T), initiating graceful shutdown", sig, sig)
 	case <-ctx.Done():
+		log.Printf("context cancelled (cause=%v), initiating graceful shutdown", ctx.Err())
 	}
 
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("http shutdown: %v", err)
+		log.Printf("http shutdown error: %v", err)
 	}
-	log.Printf("wrongtrace stopped")
+	log.Printf("wrongtrace stopped gracefully")
 	return nil
 }
 
@@ -445,22 +519,50 @@ func runTrace(cmd *cobra.Command, args []string) error {
 		nodeSig = fmt.Sprintf("exec:%s", args[0])
 	}
 
-	// Persist to local database
-	store, err := db.Open(dbPath)
-	if err == nil {
-		defer store.Close()
-		_ = store.Migrate()
-		_ = store.InsertTrace(db.RuntimeTraceRecord{
-			TraceID:       fmt.Sprintf("tr-exec-%d", time.Now().UnixNano()),
-			ServiceName:   service,
-			NodeSignature: nodeSig,
-			DurationMs:    durationMs,
-			StatusCode:    statusCode,
-			ErrorMsg:      errMsg,
-			ProfilerType:  "test_runner",
-			MetadataJSON:  fmt.Sprintf(`{"command":%q}`, strings.Join(args, " ")),
-			Timestamp:     startTime.UTC(),
-		})
+	// 1. Try sending trace to active daemon via HTTP API
+	port, _ := cmd.Flags().GetInt("port")
+	if port <= 0 {
+		port = 4318
+	}
+	daemonURL := fmt.Sprintf("http://localhost:%d/api/profiler/ingest", port)
+	payload := map[string]interface{}{
+		"service_name":   service,
+		"node_signature": nodeSig,
+		"duration_ms":    durationMs,
+		"status_code":    statusCode,
+		"error_msg":      errMsg,
+		"profiler_type":  "test_runner",
+		"metadata":       map[string]interface{}{"command": strings.Join(args, " ")},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	sentToDaemon := false
+	httpClient := &http.Client{Timeout: 800 * time.Millisecond}
+	if resp, err := httpClient.Post(daemonURL, "application/json", bytes.NewReader(payloadBytes)); err == nil {
+		if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+			sentToDaemon = true
+		}
+		_ = resp.Body.Close()
+	}
+
+	// 2. If daemon is offline, persist directly to local SQLite database
+	if !sentToDaemon {
+		store, err := db.Open(dbPath)
+		if err == nil {
+			defer store.Close()
+			_ = store.Migrate()
+			_ = store.InsertTrace(db.RuntimeTraceRecord{
+				TraceID:       fmt.Sprintf("tr-exec-%d", time.Now().UnixNano()),
+				ServiceName:   service,
+				NodeSignature: nodeSig,
+				DurationMs:    durationMs,
+				StatusCode:    statusCode,
+				ErrorMsg:      errMsg,
+				ProfilerType:  "test_runner",
+				MetadataJSON:  fmt.Sprintf(`{"command":%q}`, strings.Join(args, " ")),
+				Timestamp:     startTime.UTC(),
+			})
+		}
 	}
 
 	fmt.Printf("\n📊 [WrongTrace] Captured Execution Trace: duration=%.2fms status=%d node=%s\n",

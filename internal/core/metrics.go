@@ -19,28 +19,35 @@ type MetricsSnapshot struct {
 	ActiveRuns   []ActiveRun      `json:"active_runs"`
 }
 
-// Metrics assembles a fresh snapshot from the underlying store. The queries
-// are independent; they run sequentially to respect SQLite's single-writer
-// model and keep the query planner simple.
-func (e *Engine) Metrics() (MetricsSnapshot, error) {
-	overview, err := e.cfg.Store.Overview()
+// Metrics assembles a fresh snapshot from the underlying store, optionally filtered by repo_name.
+func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
+	var filter string
+	if len(repoFilter) > 0 && repoFilter[0] != "" {
+		filter = repoFilter[0]
+	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
+		filter = active.Name
+	} else {
+		filter = e.cfg.RepoName
+	}
+
+	overview, err := e.cfg.Store.Overview(filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
-	thrashing, err := e.cfg.Store.Thrashing(3, 7)
+	thrashing, err := e.cfg.Store.Thrashing(3, 7, filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
-	models, err := e.cfg.Store.ModelComparison()
+	models, err := e.cfg.Store.ModelComparison(filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
-	recent, err := e.cfg.Store.RecentEvents(50)
+	recent, err := e.cfg.Store.RecentEvents(50, filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
 	return MetricsSnapshot{
-		Repo:         e.cfg.RepoName,
+		Repo:         filter,
 		GeneratedAt:  time.Now().UTC(),
 		Overview:     overview,
 		Thrashing:    thrashing,

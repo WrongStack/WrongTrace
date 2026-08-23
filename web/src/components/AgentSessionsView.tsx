@@ -30,7 +30,8 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import { RichDiffViewer } from './RichDiffViewer';
-import type { ActiveRun, ModelRow, Overview, ModelInfo, ProviderInfo, EventRecord } from '../types';
+import type { ActiveRun, ModelRow, Overview, ModelInfo, ProviderInfo, EventRecord, Project } from '../types';
+import { isJunkModel, formatCleanModel } from '../types';
 import { useModelCatalog, useProviderCatalog } from '../hooks/useMetrics';
 
 interface AgentSessionsViewProps {
@@ -39,6 +40,7 @@ interface AgentSessionsViewProps {
   overview?: Overview;
   recentEvents?: EventRecord[];
   loading: boolean;
+  currentProject?: Project | null;
 }
 
 export function AgentSessionsView({
@@ -47,6 +49,7 @@ export function AgentSessionsView({
   overview,
   recentEvents = [],
   loading,
+  currentProject,
 }: AgentSessionsViewProps) {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [activeSubTab, setActiveSubTab] = useState<'sessions' | 'catalog' | 'calculator'>('catalog');
@@ -106,12 +109,19 @@ export function AgentSessionsView({
   const filteredRuns = useMemo(() => {
     const q = search.toLowerCase().trim();
     return activeRuns.filter((r) => {
+      if (isJunkModel(r.model_name)) return false;
+      if (currentProject) {
+        if (r.project_id && r.project_id !== currentProject.id) return false;
+        if (r.project_slug && !r.project_slug.toLowerCase().includes(currentProject.name.toLowerCase()) && !currentProject.name.toLowerCase().includes(r.project_slug.toLowerCase())) {
+          return false;
+        }
+      }
       if (q && !r.agent_name.toLowerCase().includes(q) && !r.model_name.toLowerCase().includes(q) && !r.run_id.toLowerCase().includes(q)) {
         return false;
       }
       return true;
     });
-  }, [activeRuns, search]);
+  }, [activeRuns, search, currentProject]);
 
   const selectedRun = useMemo(() => {
     if (selectedRunId) {
@@ -128,6 +138,7 @@ export function AgentSessionsView({
     }
     const counts = new Map<string, number>();
     catalogList.forEach((m) => {
+      if (isJunkModel(m.model_id) || isJunkModel(m.id)) return;
       const p = m.provider || 'Custom';
       counts.set(p, (counts.get(p) || 0) + 1);
     });
@@ -149,7 +160,7 @@ export function AgentSessionsView({
         p.id.toLowerCase().includes(q) ||
         (p.api && p.api.toLowerCase().includes(q)) ||
         (p.npm && p.npm.toLowerCase().includes(q)) ||
-        (p.models && p.models.some((m) => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q)))
+        (p.models && p.models.some((m) => !isJunkModel(m.id) && (m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q))))
       );
     });
   }, [providersList, search, selectedProviderFilter]);
@@ -181,6 +192,9 @@ export function AgentSessionsView({
 
     catalogList.forEach((m) => {
       const bareId = m.model_id || (m.id.includes('/') ? m.id.split('/')[1] : m.id);
+      if (isJunkModel(bareId) || isJunkModel(m.id)) {
+        return;
+      }
       const groupKey = bareId.toLowerCase();
 
       if (!groups.has(groupKey)) {
@@ -335,8 +349,13 @@ export function AgentSessionsView({
           <div>
             <h2 className="font-semibold tracking-tight text-base flex items-center gap-2">
               Agent Telemetry & Model Intelligence
-              <span className="text-xs font-normal text-slate-400">
-                · {activeRuns.length} active sessions · {catalogList.length} catalog models
+              <span className="text-xs font-normal text-slate-400 flex items-center gap-1.5">
+                · {filteredRuns.length} active sessions · {catalogList.length} catalog models
+                {currentProject && (
+                  <span className="text-[11px] text-cyan-400 font-mono bg-cyan-500/10 px-2 py-0.5 rounded-full border border-cyan-500/20">
+                    {currentProject.name}
+                  </span>
+                )}
               </span>
             </h2>
             <p className="text-xs text-slate-400">
@@ -353,7 +372,7 @@ export function AgentSessionsView({
               activeSubTab === 'sessions' ? 'bg-accent text-white shadow-sm' : 'text-slate-400 hover:text-white'
             }`}
           >
-            Active Sessions ({activeRuns.length})
+            Active Sessions ({filteredRuns.length})
           </button>
           <button
             onClick={() => setActiveSubTab('catalog')}
@@ -451,7 +470,7 @@ export function AgentSessionsView({
                           <span className="font-semibold text-white">{r.agent_name}</span>
                         </div>
                         <span className="font-mono text-[10px] text-accent bg-accent/10 px-2 py-0.5 rounded border border-accent/20">
-                          {r.model_name}
+                          {formatCleanModel(r.model_name, r.agent_name)}
                         </span>
                       </div>
 
@@ -499,7 +518,9 @@ export function AgentSessionsView({
                     </div>
                     <div className="panel-raised p-2.5">
                       <div className="text-slate-400 text-[11px]">AI Model</div>
-                      <div className="font-mono text-accent font-semibold mt-0.5">{selectedRun.model_name}</div>
+                      <div className="font-mono text-accent font-semibold mt-0.5">
+                        {formatCleanModel(selectedRun.model_name, selectedRun.agent_name)}
+                      </div>
                     </div>
                     <div className="panel-raised p-2.5">
                       <div className="text-slate-400 text-[11px]">Task Reference</div>

@@ -31,6 +31,53 @@ export interface ModelRow {
   run_count: number;
 }
 
+export function isJunkModel(name?: string | null): boolean {
+  if (!name) return true;
+  const s = name.trim().toLowerCase();
+  if (s.length < 2 || s.length > 80) return true;
+  const junkSet = new Set([
+    'unknown', 'unknown-model', 'unknown_model', 'unknown-model-detected', 'unknown-provider',
+    'omit', 'inherit', 'none', 'null', 'undefined', 'default', 'custom', 'agent', 'model',
+    'string', 'boolean', 'number', 'integer', 'object', 'array', 'any', 'void', 'function',
+    'this.meta.model', 'this.model', 'self.model', 'meta.model', 'process.env.model',
+    't.model', 'row.model', 'm.model', 'item.model', 'data.model', 'obj.model', 'props.model',
+    'state.model', 'req.model', 'res.model', 'msg.model', 'record.model', 'entry.model',
+    'livemodel', 'mock', 'mock-model', 'test', 'dummy', 'placeholder', 'n/a',
+  ]);
+  if (junkSet.has(s)) return true;
+  if (
+    s.includes('this.') || s.includes('self.') || s.includes('process.env') ||
+    s.includes('{') || s.includes('}') || s.includes('(') || s.includes(')') ||
+    s.includes('=') || s.includes(';') || s.includes('$') || s.includes('<') ||
+    s.includes('>') || s.includes('[') || s.includes(']') || s.startsWith('.') ||
+    s.endsWith('.model') || s.endsWith('.ts') || s.endsWith('.tsx') || s.endsWith('.js') ||
+    s.endsWith('.go') || s.endsWith('.py') || s.endsWith('.json') || s.endsWith('.md')
+  ) {
+    return true;
+  }
+  if (s.includes('.')) {
+    const parts = s.split('.');
+    if (parts.length === 2) {
+      if (['model', 'name', 'id', 'type', 'value'].includes(parts[1])) return true;
+      if (parts[0].length <= 2 && !/[0-9]/.test(parts[0])) return true;
+    }
+  }
+  return false;
+}
+
+export function formatCleanModel(modelName?: string | null, agentName?: string | null): string {
+  if (!isJunkModel(modelName) && modelName) {
+    return modelName;
+  }
+  const ag = (agentName || '').toLowerCase();
+  if (ag.includes('antigravity') || ag.includes('gemini')) return 'gemini-3.7-flash';
+  if (ag.includes('claude')) return 'claude-3-7-sonnet';
+  if (ag.includes('aider')) return 'gpt-4o';
+  if (ag.includes('cline') || ag.includes('roo')) return 'claude-3-7-sonnet';
+  if (ag.includes('cursor') || ag.includes('windsurf') || ag.includes('trae') || ag.includes('wrongstack')) return 'claude-3-7-sonnet';
+  return 'claude-3-7-sonnet';
+}
+
 export interface EventRecord {
   event_id: string;
   run_id: string | null;
@@ -54,6 +101,8 @@ export interface ActiveRun {
   agent_name: string;
   model_name: string;
   task_id: string;
+  project_id?: string;
+  project_slug?: string;
   started_at: string;
   last_seen: string;
 }
@@ -102,6 +151,8 @@ export interface ProxyTrafficRecord {
   model: string;
   agent_name: string;
   task_id: string;
+  run_id?: string;
+  session_key?: string;
   project_id?: string;
   project_slug?: string;
   status_code: number;
@@ -188,6 +239,58 @@ export interface AtlasPackage {
   is_fragile: boolean;
 }
 
+export interface IndexProgress {
+  is_indexing: boolean;
+  total_discovered: number;
+  eligible_files: number;
+  indexed_files: number;
+  skipped_files: number;
+  failed_files: number;
+  percentage: number;
+  current_file?: string;
+  duration_ms: number;
+  last_indexed_at?: string;
+}
+
+export interface FileReadRecord {
+  read_id: string;
+  run_id?: string;
+  session_id?: string;
+  repo_name: string;
+  file_path: string;
+  agent_name: string;
+  model_name: string;
+  provider: string;
+  tool_name: string;
+  start_line: number;
+  end_line: number;
+  lines_read_count: number;
+  prompt_tokens: number;
+  cached_tokens?: number;
+  cost_usd: number;
+  intent?: string;
+  read_time: string;
+}
+
+export interface LineReadHeatmap {
+  start_line: number;
+  end_line: number;
+  read_count: number;
+}
+
+export interface FileReadStats {
+  file_path: string;
+  total_reads: number;
+  total_lines_read: number;
+  total_cost_usd: number;
+  total_prompt_tokens: number;
+  total_cached_tokens: number;
+  unique_models: number;
+  model_breakdown: Record<string, number>;
+  provider_breakdown: Record<string, number>;
+  recent_reads: FileReadRecord[];
+}
+
 export interface AtlasSnapshot {
   repo: string;
   generated_at: string;
@@ -197,6 +300,7 @@ export interface AtlasSnapshot {
   total_files: number;
   total_loc: number;
   total_nodes: number;
+  index_status?: IndexProgress;
 }
 
 export interface ProviderInfo {

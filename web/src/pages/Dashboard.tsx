@@ -13,7 +13,7 @@ import { AgentSessionsView } from '../components/AgentSessionsView';
 import { ProfilerTracesView } from '../components/ProfilerTracesView';
 import { ProxyRoutingView } from '../components/ProxyRoutingView';
 import { SettingsView } from '../components/SettingsView';
-import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas, useProxyTraffic, useProfilerTraces } from '../hooks/useMetrics';
+import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas, useProxyTraffic, useProfilerTraces, useProjects } from '../hooks/useMetrics';
 import { useWebSocket } from '../hooks/useWebSocket';
 
 // Dashboard is the single-page surface for WrongTrace. It loads via TanStack
@@ -24,13 +24,24 @@ export function Dashboard() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'profiler' | 'gateway' | 'settings'>('dashboard');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 
-  const overview = useOverview();
-  const thrashing = useThrashing();
-  const models = useModels();
-  const recent = useRecentEvents();
-  const atlas = useAtlas();
-  const proxyTraffic = useProxyTraffic();
-  const profilerTraces = useProfilerTraces();
+  const { data: projects = [] } = useProjects();
+
+  const currentProject = useMemo(() => {
+    if (selectedProjectId) {
+      return projects.find((p) => p.id === selectedProjectId) || null;
+    }
+    return projects.find((p) => p.is_active) || projects[0] || null;
+  }, [projects, selectedProjectId]);
+
+  const activeProjId = currentProject?.id ?? null;
+
+  const overview = useOverview(activeProjId);
+  const thrashing = useThrashing(activeProjId);
+  const models = useModels(activeProjId);
+  const recent = useRecentEvents(activeProjId);
+  const atlas = useAtlas(activeProjId);
+  const proxyTraffic = useProxyTraffic(activeProjId);
+  const profilerTraces = useProfilerTraces(50, activeProjId);
   const ws = useWebSocket();
 
   // When the WS receives a code_event, proxy_traffic, or project_switched we invalidate the caches
@@ -96,6 +107,7 @@ export function Dashboard() {
               thrashing={thrashing.data ?? []}
               models={models.data ?? []}
               loading={overview.isLoading || thrashing.isLoading || models.isLoading}
+              currentProject={currentProject}
             />
 
             <CodeChurnTimeline
@@ -130,6 +142,7 @@ export function Dashboard() {
           <DiffInspectorView
             events={recent.data ?? []}
             loading={recent.isLoading}
+            currentProject={currentProject}
           />
         )}
 
@@ -140,6 +153,7 @@ export function Dashboard() {
             overview={overview.data?.overview}
             recentEvents={recent.data ?? []}
             loading={overview.isLoading}
+            currentProject={currentProject}
           />
         )}
 
@@ -148,7 +162,7 @@ export function Dashboard() {
         )}
 
         {activeTab === 'gateway' && (
-          <ProxyRoutingView />
+          <ProxyRoutingView currentProject={currentProject} />
         )}
 
         {activeTab === 'settings' && (

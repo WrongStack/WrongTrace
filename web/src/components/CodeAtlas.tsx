@@ -41,6 +41,7 @@ import {
   GitFork,
 } from 'lucide-react';
 import { RichDiffViewer } from './RichDiffViewer';
+import { FileReadDetails } from './FileReadDetails';
 import type { AtlasSnapshot, AtlasPackage, AtlasFile, AtlasSymbol, EventRecord } from '../types';
 
 interface CodeAtlasProps {
@@ -911,6 +912,90 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
         </div>
       </div>
 
+      {/* Codebase Index Completeness Banner */}
+      {atlas?.index_status && (
+        <div className="panel p-3.5 bg-gradient-to-r from-slate-900/95 via-indigo-950/40 to-slate-900/95 border border-indigo-500/30 rounded-xl flex flex-wrap items-center justify-between gap-3 shadow-lg">
+          <div className="flex items-center gap-3">
+            <div
+              className={`p-2 rounded-lg ${
+                atlas.index_status.is_indexing
+                  ? 'bg-amber-500/20 text-amber-400 animate-spin'
+                  : atlas.index_status.percentage >= 100
+                  ? 'bg-emerald-500/20 text-emerald-400'
+                  : 'bg-indigo-500/20 text-indigo-400'
+              }`}
+            >
+              <Boxes className="h-4 w-4" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-xs text-white">Codebase Index Completeness</span>
+                <span
+                  className={`chip text-[10px] font-mono font-bold ${
+                    atlas.index_status.percentage >= 100
+                      ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                      : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                  }`}
+                >
+                  {atlas.index_status.percentage.toFixed(1)}% Scanned
+                </span>
+                {atlas.index_status.is_indexing && (
+                  <span className="text-[10px] text-amber-400 font-mono animate-pulse">
+                    Parsing {atlas.index_status.current_file || 'files'}…
+                  </span>
+                )}
+              </div>
+              <div className="text-[11px] text-slate-400 mt-0.5 flex flex-wrap items-center gap-2 font-mono">
+                <span className="text-emerald-300 font-medium">
+                  {atlas.index_status.indexed_files} / {atlas.index_status.eligible_files} eligible files indexed
+                </span>
+                <span>·</span>
+                <span>{atlas.index_status.total_discovered} scanned on disk</span>
+                <span>·</span>
+                <span>{atlas.index_status.skipped_files} skipped (vendor/ignored)</span>
+                {atlas.index_status.failed_files > 0 && (
+                  <>
+                    <span>·</span>
+                    <span className="text-rose-400 font-bold">{atlas.index_status.failed_files} failed</span>
+                  </>
+                )}
+                {atlas.index_status.duration_ms > 0 && (
+                  <>
+                    <span>·</span>
+                    <span className="text-slate-500">{atlas.index_status.duration_ms}ms scan duration</span>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {/* Visual Progress bar */}
+            <div className="hidden sm:block w-36 bg-slate-800 h-2 rounded-full overflow-hidden border border-white/10">
+              <div
+                className={`h-full transition-all duration-500 ${
+                  atlas.index_status.percentage >= 100
+                    ? 'bg-gradient-to-r from-emerald-500 to-cyan-400'
+                    : 'bg-gradient-to-r from-amber-500 to-indigo-500'
+                }`}
+                style={{ width: `${Math.min(100, Math.max(0, atlas.index_status.percentage))}%` }}
+              />
+            </div>
+
+            {onRefresh && (
+              <button
+                onClick={onRefresh}
+                className="px-2.5 py-1 text-xs rounded-lg bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 border border-indigo-500/30 transition-all font-medium flex items-center gap-1.5"
+                title="Force Rescan Codebase AST"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+                <span>Rescan</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Main Content Area */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         {/* Canvas or Tree View */}
@@ -1338,6 +1423,9 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                     </div>
                   </div>
                 </div>
+
+                {/* File Read & Context Analytics */}
+                <FileReadDetails filePath={selectedItem.file.path} />
               </div>
             )}
 

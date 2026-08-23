@@ -39,9 +39,12 @@ type Event struct {
 // The order is stable: DELETED, MODIFIED, ADDED — which matches what
 // downstream consumers (DB writers, websocket hub) prefer for display.
 type DiffResult struct {
-	FilePath string
-	Events   []Event
-	NewSnap  *FileSnapshot
+	FilePath    string
+	Events      []Event
+	NewSnap     *FileSnapshot
+	FileDiff    string // Unified full-file diff snippet
+	FileAdded   int    // Total lines added in the whole file
+	FileDeleted int    // Total lines deleted in the whole file
 }
 
 // Diff computes the semantic delta between a previous snapshot (possibly nil)
@@ -55,6 +58,13 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		return res
 	}
 	if prev == nil {
+		if next.RawContent != "" {
+			fileDiff, fileAdded, fileDeleted := formatAddedDiff(next.RawContent)
+			res.FileDiff = fileDiff
+			res.FileAdded = fileAdded
+			res.FileDeleted = fileDeleted
+		}
+
 		for _, sig := range next.SortedSignatures() {
 			n := next.Nodes[sig]
 			diff, added, deleted := formatAddedDiff(n.Body)
@@ -74,10 +84,18 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 				OccurredAt:   now,
 			})
 		}
+
 		res.NewSnap = next
 		return res
 	}
 	if next == nil {
+		if prev.RawContent != "" {
+			fileDiff, fileAdded, fileDeleted := formatDeletedDiff(prev.RawContent)
+			res.FileDiff = fileDiff
+			res.FileAdded = fileAdded
+			res.FileDeleted = fileDeleted
+		}
+
 		for _, sig := range prev.SortedSignatures() {
 			n := prev.Nodes[sig]
 			diff, added, deleted := formatDeletedDiff(n.Body)
@@ -97,7 +115,15 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 				OccurredAt:   now,
 			})
 		}
+
 		return res
+	}
+
+	if prev.RawContent != "" || next.RawContent != "" {
+		fileDiff, fileAdded, fileDeleted := generateLineDiff(prev.RawContent, next.RawContent)
+		res.FileDiff = fileDiff
+		res.FileAdded = fileAdded
+		res.FileDeleted = fileDeleted
 	}
 
 	prevSigs := prev.SortedSignatures()
@@ -251,47 +277,6 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 	added := 0
 	deleted := 0
 
-	type match struct {
-		oldIdx, newIdx int
-	}
-
-	// Fast line LCS
-	m, n := len(oldLines), len(newLines)
-	dp := make([][]int, m+1)
-	for i := range dp {
-		dp[i] = make([]int, n+1)
-	}
-	for i := 1; i <= m; i++ {
-		for j := 1; j <= n; j++ {
-			if oldLines[i-1] == newLines[j-1] {
-				dp[i][j] = dp[i-1][j-1] + 1
-			} else if dp[i-1][j] >= dp[i][j-1] {
-				dp[i][j] = dp[i-1][j]
-			} else {
-				dp[i][j] = dp[i][j-1]
-			}
-		}
-	}
-
-	// Backtrack matches
-	var matches []match
-	i, j := m, n
-	for i > 0 && j > 0 {
-		if oldLines[i-1] == newLines[j-1] {
-			matches = append(matches, match{oldIdx: i - 1, newIdx: j - 1})
-			i--
-			j--
-		} else if dp[i-1][j] >= dp[i][j-1] {
-			i--
-		} else {
-			j--
-		}
-	}
-	for l, r := 0, len(matches)-1; l < r; l, r = l+1, r-1 {
-		matches[l], matches[r] = matches[r], matches[l]
-	}
-
-	currOld, currNew := 0, 0
 	first := true
 	emit := func(prefix, line string) {
 		if !first {
@@ -302,30 +287,104 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 		b.WriteString(line)
 	}
 
-	for _, mat := range matches {
-		for currOld < mat.oldIdx {
-			emit("- ", oldLines[currOld])
+	// 1. Strip and emit common prefix
+	prefixLen := 0
+	for prefixLen < len(oldLines) && prefixLen < len(newLines) && oldLines[prefixLen] == newLines[prefixLen] {
+		emit("  ", oldLines[prefixLen])
+		prefixLen++
+	}
+
+	// 2. Strip common suffix
+	suffixLen := 0
+	for suffixLen < (len(oldLines)-prefixLen) && suffixLen < (len(newLines)-prefixLen) &&
+		oldLines[len(oldLines)-1-suffixLen] == newLines[len(newLines)-1-suffixLen] {
+		suffixLen++
+	}
+
+	midOld := oldLines[prefixLen : len(oldLines)-suffixLen]
+	midNew := newLines[prefixLen : len(newLines)-suffixLen]
+
+	m, n := len(midOld), len(midNew)
+
+	// Memory guard: for huge un-aligned diffs (> 200,000 cells), emit straightforward deletion then addition
+	if m*n > 200000 {
+		for _, l := range midOld {
+			emit("- ", l)
+			deleted++
+		}
+		for _, l := range midNew {
+			emit("+ ", l)
+			added++
+		}
+	} else if m > 0 || n > 0 {
+		type match struct {
+			oldIdx, newIdx int
+		}
+
+		dp := make([][]int, m+1)
+		for i := range dp {
+			dp[i] = make([]int, n+1)
+		}
+		for i := 1; i <= m; i++ {
+			for j := 1; j <= n; j++ {
+				if midOld[i-1] == midNew[j-1] {
+					dp[i][j] = dp[i-1][j-1] + 1
+				} else if dp[i-1][j] >= dp[i][j-1] {
+					dp[i][j] = dp[i-1][j]
+				} else {
+					dp[i][j] = dp[i][j-1]
+				}
+			}
+		}
+
+		var matches []match
+		i, j := m, n
+		for i > 0 && j > 0 {
+			if midOld[i-1] == midNew[j-1] {
+				matches = append(matches, match{oldIdx: i - 1, newIdx: j - 1})
+				i--
+				j--
+			} else if dp[i-1][j] >= dp[i][j-1] {
+				i--
+			} else {
+				j--
+			}
+		}
+		for l, r := 0, len(matches)-1; l < r; l, r = l+1, r-1 {
+			matches[l], matches[r] = matches[r], matches[l]
+		}
+
+		currOld, currNew := 0, 0
+		for _, mat := range matches {
+			for currOld < mat.oldIdx {
+				emit("- ", midOld[currOld])
+				deleted++
+				currOld++
+			}
+			for currNew < mat.newIdx {
+				emit("+ ", midNew[currNew])
+				added++
+				currNew++
+			}
+			emit("  ", midOld[currOld])
+			currOld++
+			currNew++
+		}
+		for currOld < len(midOld) {
+			emit("- ", midOld[currOld])
 			deleted++
 			currOld++
 		}
-		for currNew < mat.newIdx {
-			emit("+ ", newLines[currNew])
+		for currNew < len(midNew) {
+			emit("+ ", midNew[currNew])
 			added++
 			currNew++
 		}
-		emit("  ", oldLines[currOld])
-		currOld++
-		currNew++
 	}
-	for currOld < len(oldLines) {
-		emit("- ", oldLines[currOld])
-		deleted++
-		currOld++
-	}
-	for currNew < len(newLines) {
-		emit("+ ", newLines[currNew])
-		added++
-		currNew++
+
+	// 3. Emit common suffix
+	for s := len(oldLines) - suffixLen; s < len(oldLines); s++ {
+		emit("  ", oldLines[s])
 	}
 
 	return b.String(), added, deleted

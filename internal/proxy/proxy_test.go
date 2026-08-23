@@ -301,7 +301,7 @@ func TestSanitizeBodyForRecord_UsageFieldsPreserved(t *testing.T) {
 	tokKey := fakeTok("access_", "token")
 
 	m := map[string]interface{}{
-		"usage": map[string]int{"prompt_tokens": 1000, "completion_tokens": 50},
+		"usage":      map[string]int{"prompt_tokens": 1000, "completion_tokens": 50},
 		"max_tokens": 4096,
 		tokKey:       accessSecret,
 	}
@@ -762,6 +762,91 @@ func TestQuotaLimiter_BudgetExceeded(t *testing.T) {
 	}
 	if !strings.Contains(warn, "budget of $5.00 exceeded") {
 		t.Errorf("unexpected quota warning: %s", warn)
+	}
+}
+
+func TestGatewayProxy_SessionGrouping(t *testing.T) {
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "chatcmpl-test",
+			"choices": [{"message": {"role": "assistant", "content": "Hello!"}}],
+			"usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+		}`))
+	}))
+	defer mockUpstream.Close()
+
+	reporter := &fakeReporter{}
+	p := NewGatewayProxy(Config{
+		Reporter: reporter,
+		CustomUpstreams: map[string]string{
+			"testprov": mockUpstream.URL,
+		},
+	})
+
+	// Make 2 consecutive requests from same client without explicit session header
+	prompts := []string{`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`, `{"model":"gpt-4o","messages":[{"role":"user","content":"how are you"}]}`}
+	for i, body := range prompts {
+		req := httptest.NewRequest(http.MethodPost, "/proxy/testprov/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("X-Agent-Name", "TestAgent")
+		req.RemoteAddr = "127.0.0.1:54321"
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d failed with code %d", i, rec.Code)
+		}
+	}
+
+	if len(reporter.reports) != 2 {
+		t.Fatalf("expected 2 reported events, got %d", len(reporter.reports))
+	}
+
+	// Both reports must share the same RunID (session grouping)
+	if reporter.reports[0].RunID != reporter.reports[1].RunID {
+		t.Errorf("expected same RunID for session, got %s and %s", reporter.reports[0].RunID, reporter.reports[1].RunID)
+	}
+
+	// Tokens must accumulate across the session
+	if reporter.reports[0].PromptTokens != 100 || reporter.reports[0].CompletionTokens != 50 {
+		t.Errorf("first report tokens = (%d, %d), want (100, 50)", reporter.reports[0].PromptTokens, reporter.reports[0].CompletionTokens)
+	}
+	if reporter.reports[1].PromptTokens != 200 || reporter.reports[1].CompletionTokens != 100 {
+		t.Errorf("second report tokens = (%d, %d), want (200, 100)", reporter.reports[1].PromptTokens, reporter.reports[1].CompletionTokens)
+	}
+}
+
+func TestGatewayProxy_ExplicitSessionHeader(t *testing.T) {
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "chatcmpl-test-2",
+			"choices": [{"message": {"role": "assistant", "content": "Hello explicit!"}}],
+			"usage": {"prompt_tokens": 120, "completion_tokens": 60, "total_tokens": 180}
+		}`))
+	}))
+	defer mockUpstream.Close()
+
+	reporter := &fakeReporter{}
+	p := NewGatewayProxy(Config{
+		Reporter: reporter,
+		CustomUpstreams: map[string]string{
+			"testprov": mockUpstream.URL,
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/proxy/testprov/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Session-ID", "explicit-sess-99")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request failed with code %d", rec.Code)
+	}
+	if len(reporter.reports) != 1 {
+		t.Fatalf("expected 1 report, got %d", len(reporter.reports))
+	}
+	if reporter.reports[0].RunID != "explicit-sess-99" {
+		t.Errorf("expected RunID explicit-sess-99, got %s", reporter.reports[0].RunID)
 	}
 }
 

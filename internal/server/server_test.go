@@ -614,3 +614,60 @@ func TestProfilerEndpoints(t *testing.T) {
 	}
 }
 
+func TestServer_FileReadEndpoints(t *testing.T) {
+	engine, store, ts := newTestServer(t)
+	now := time.Now().UTC()
+
+	// Seed read events
+	err := store.InsertReadEvent(db.FileReadRecord{
+		ReadID:         "read-t1",
+		RunID:          "run-101",
+		RepoName:       engine.Repo(),
+		FilePath:       "internal/core/engine.go",
+		AgentName:      "Antigravity",
+		ModelName:      "gemini-3.7-flash",
+		Provider:       "google",
+		ToolName:       "view_file",
+		StartLine:      1,
+		EndLine:        100,
+		LinesReadCount: 100,
+		PromptTokens:   1200,
+		CostUSD:        0.002,
+		ReadTime:       now,
+	})
+	if err != nil {
+		t.Fatalf("insert read failed: %v", err)
+	}
+
+	// 1. GET /api/reads/recent
+	var recentReads []db.FileReadRecord
+	resp := getJSON(t, ts.URL+"/api/reads/recent", &recentReads)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/reads/recent = %d", resp.StatusCode)
+	}
+	if len(recentReads) != 1 || recentReads[0].ReadID != "read-t1" {
+		t.Errorf("unexpected recent reads: %+v", recentReads)
+	}
+
+	// 2. GET /api/files/reads?path=internal/core/engine.go
+	var stats db.FileReadStats
+	resp = getJSON(t, ts.URL+"/api/files/reads?path=internal/core/engine.go", &stats)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/files/reads = %d", resp.StatusCode)
+	}
+	if stats.TotalReads != 1 || stats.TotalLinesRead != 100 {
+		t.Errorf("unexpected file read stats: %+v", stats)
+	}
+
+	// 3. GET /api/files/heatmap?path=internal/core/engine.go
+	var heatmap []db.LineReadHeatmap
+	resp = getJSON(t, ts.URL+"/api/files/heatmap?path=internal/core/engine.go", &heatmap)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/files/heatmap = %d", resp.StatusCode)
+	}
+	if len(heatmap) != 1 || heatmap[0].StartLine != 1 || heatmap[0].EndLine != 100 {
+		t.Errorf("unexpected heatmap: %+v", heatmap)
+	}
+}
+
+

@@ -30,3 +30,9 @@ vendor/
 /.wrongstack/*
 !/.wrongstack/project.json
 .temp_files/
+
+dev-daemon.log
+dev-daemon-out.log
+
+*.log
+dev-daemon.log

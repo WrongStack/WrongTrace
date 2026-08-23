@@ -15,8 +15,10 @@ import (
 // ExtractTargetFile attempts to extract the destination file path from a tool call payload.
 func ExtractTargetFile(args map[string]interface{}) string {
 	keys := []string{
-		"TargetFile", "target_file", "TargetContent",
-		"path", "FilePath", "file_path", "filename", "file", "target", "dest",
+		"AbsolutePath", "absolute_path", "TargetFile", "target_file", "targetFile", "TargetContent",
+		"path", "FilePath", "file_path", "filePath", "filename", "fileName", "file_name", "file", "target", "dest",
+		"URI", "uri", "Url", "url", "relative_path", "relativePath", "rel_path",
+		"SourceFile", "source_file", "SearchPath", "search_path", "DirectoryPath", "directory_path",
 	}
 	for _, k := range keys {
 		if val, ok := args[k]; ok {
@@ -28,18 +30,88 @@ func ExtractTargetFile(args map[string]interface{}) string {
 	return ""
 }
 
-// ParseJSONLTranscript parses a JSONL file line-by-line, extracting tool calls and token usage.
+// ExtractLineRange extracts start line and end line from tool arguments if present.
+func ExtractLineRange(args map[string]interface{}) (int, int, int) {
+	startLine := 1
+	endLine := 0
+	linesCount := 0
+
+	startKeys := []string{"StartLine", "start_line", "startLine", "offset", "line_start", "lineStart", "from_line", "fromLine", "start"}
+	for _, k := range startKeys {
+		if val, ok := args[k]; ok {
+			if n := extractInt(val); n > 0 {
+				startLine = n
+				break
+			}
+		}
+	}
+
+	endKeys := []string{"EndLine", "end_line", "endLine", "line_end", "lineEnd", "to_line", "toLine", "end"}
+	for _, k := range endKeys {
+		if val, ok := args[k]; ok {
+			if n := extractInt(val); n > 0 {
+				endLine = n
+				break
+			}
+		}
+	}
+
+	countKeys := []string{"lines", "line_count", "count", "num_lines", "limit"}
+	for _, k := range countKeys {
+		if val, ok := args[k]; ok {
+			if n := extractInt(val); n > 0 {
+				linesCount = n
+				break
+			}
+		}
+	}
+
+	if linesCount == 0 && endLine >= startLine {
+		linesCount = endLine - startLine + 1
+	}
+	if endLine == 0 && linesCount > 0 {
+		endLine = startLine + linesCount - 1
+	}
+
+	return startLine, endLine, linesCount
+}
+
+func extractInt(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case string:
+		var parsed int
+		if _, err := fmt.Sscanf(n, "%d", &parsed); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+// ParseJSONLTranscript parses a JSONL file line-by-line, extracting file modifying tool calls.
 func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
+	modEvents, _, err := ParseJSONLTranscriptFull(filePath)
+	return modEvents, err
+}
+
+// ParseJSONLTranscriptFull parses a JSONL file line-by-line, extracting both write tool calls and read tool events.
+func ParseJSONLTranscriptFull(filePath string) ([]ToolCallEvent, []FileReadEvent, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("read transcript: %w", err)
+		return nil, nil, fmt.Errorf("read transcript: %w", err)
 	}
 
 	lines := strings.Split(string(data), "\n")
-	var events []ToolCallEvent
+	var modEvents []ToolCallEvent
+	var readEvents []FileReadEvent
 	sessionID := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
 	agentName := detectAgentFromPath(filePath)
-	currentModel := "unknown-model"
+	currentModel := detectAgentDefaultModel(agentName)
 	currentIntent := ""
 
 	for _, line := range lines {
@@ -54,7 +126,7 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 		}
 
 		// Dynamically extract model from deep json structures
-		if extracted := extractModelFromRow(row); extracted != "" {
+		if extracted := extractModelFromRow(row); extracted != "" && !models.IsJunkModel(extracted) {
 			currentModel = extracted
 		}
 
@@ -85,7 +157,10 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 				if name == "" {
 					name, _ = tcMap["tool"].(string)
 				}
-				if !IsFileModifyingTool(name) {
+
+				isMod := IsFileModifyingTool(name)
+				isRead := IsFileReadingTool(name)
+				if !isMod && !isRead {
 					continue
 				}
 
@@ -106,31 +181,53 @@ func ParseJSONLTranscript(filePath string) ([]ToolCallEvent, error) {
 				targetFile := ExtractTargetFile(args)
 				cost := models.Global.CalculateCost(tcModel, promptTokens, completionTokens)
 
-				ev := ToolCallEvent{
-					SessionID:        sessionID,
-					AgentName:        agentName,
-					ModelName:        tcModel,
-					ToolName:         name,
-					TargetFile:       targetFile,
-					PromptTokens:     promptTokens,
-					CompletionTokens: completionTokens,
-					CostUSD:          cost,
-					Intent:           currentIntent,
-					OccurredAt:       time.Now().UTC(),
-				}
-
+				occurredAt := time.Now().UTC()
 				if created, ok := row["created_at"].(string); ok {
 					if t, err := time.Parse(time.RFC3339, created); err == nil {
-						ev.OccurredAt = t
+						occurredAt = t
 					}
 				}
 
-				events = append(events, ev)
+				if isMod {
+					ev := ToolCallEvent{
+						SessionID:        sessionID,
+						AgentName:        agentName,
+						ModelName:        tcModel,
+						ToolName:         name,
+						TargetFile:       targetFile,
+						PromptTokens:     promptTokens,
+						CompletionTokens: completionTokens,
+						CostUSD:          cost,
+						Intent:           currentIntent,
+						OccurredAt:       occurredAt,
+					}
+					modEvents = append(modEvents, ev)
+				}
+
+				if isRead && targetFile != "" {
+					sLine, eLine, lCount := ExtractLineRange(args)
+					rEv := FileReadEvent{
+						ReadID:         fmt.Sprintf("read-%s-%d", sessionID, len(readEvents)+1),
+						SessionID:      sessionID,
+						FilePath:       targetFile,
+						AgentName:      agentName,
+						ModelName:      tcModel,
+						ToolName:       name,
+						StartLine:      sLine,
+						EndLine:        eLine,
+						LinesReadCount: lCount,
+						PromptTokens:   promptTokens,
+						CostUSD:        cost,
+						Intent:         currentIntent,
+						OccurredAt:     occurredAt,
+					}
+					readEvents = append(readEvents, rEv)
+				}
 			}
 		}
 	}
 
-	return events, nil
+	return modEvents, readEvents, nil
 }
 
 // ParseClineTask parses a Cline / Roo Code task JSON structure.
@@ -221,7 +318,7 @@ func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 
 var (
 	modelSelectionRe = regexp.MustCompile(`(?i)(?:Model Selection|Active Model)[\x60'\s:]+(?:from\s+[^\n]+?\s+)?to\s+([A-Za-z0-9\.\-_ ]+?)(?:\s*\(|\n|$)`)
-	modelTagRe       = regexp.MustCompile(`(?i)\b(?:model|selected_model)\s*[:=]\s*["']?([a-zA-Z0-9\.\-_]+)["']?`)
+	modelTagRe       = regexp.MustCompile(`(?i)<(?:model|model_name)>([^<]+)</(?:model|model_name)>|<!--\s*model:\s*([a-zA-Z0-9\.\-_/]+)\s*-->`)
 )
 
 func extractModelFromRow(m map[string]interface{}) string {
@@ -232,7 +329,9 @@ func extractModelFromRow(m map[string]interface{}) string {
 	for _, k := range keys {
 		if val, ok := m[k]; ok {
 			if s, isStr := val.(string); isStr && s != "" && s != "inherit" {
-				return normalizeModelName(s)
+				if norm := normalizeModelName(s); norm != "" {
+					return norm
+				}
 			}
 		}
 	}
@@ -243,13 +342,17 @@ func extractModelFromRow(m map[string]interface{}) string {
 			for _, k := range keys {
 				if val, ok := sub[k]; ok {
 					if s, isStr := val.(string); isStr && s != "" && s != "inherit" {
-						return normalizeModelName(s)
+						if norm := normalizeModelName(s); norm != "" {
+							return norm
+						}
 					}
 				}
 			}
 			if val, ok := sub["Model"]; ok {
 				if s, isStr := val.(string); isStr && s != "" && s != "inherit" {
-					return normalizeModelName(s)
+					if norm := normalizeModelName(s); norm != "" {
+						return norm
+					}
 				}
 			}
 		}
@@ -260,13 +363,19 @@ func extractModelFromRow(m map[string]interface{}) string {
 		if match := modelSelectionRe.FindStringSubmatch(content); len(match) > 1 {
 			extracted := strings.TrimSpace(match[1])
 			if extracted != "" && !strings.EqualFold(extracted, "none") {
-				return normalizeModelName(extracted)
+				if norm := normalizeModelName(extracted); norm != "" {
+					return norm
+				}
 			}
 		}
-		if match := modelTagRe.FindStringSubmatch(content); len(match) > 1 {
-			extracted := strings.TrimSpace(match[1])
-			if extracted != "" {
-				return normalizeModelName(extracted)
+		if match := modelTagRe.FindStringSubmatch(content); len(match) > 0 {
+			for i := 1; i < len(match); i++ {
+				if match[i] != "" {
+					extracted := strings.TrimSpace(match[i])
+					if norm := normalizeModelName(extracted); norm != "" {
+						return norm
+					}
+				}
 			}
 		}
 	}
@@ -276,6 +385,9 @@ func extractModelFromRow(m map[string]interface{}) string {
 
 func normalizeModelName(raw string) string {
 	raw = strings.TrimSpace(raw)
+	if models.IsJunkModel(raw) {
+		return ""
+	}
 	lower := strings.ToLower(raw)
 
 	// Clean trailing annotations like "(Medium)" or "(Default)"
@@ -309,6 +421,9 @@ func normalizeModelName(raw string) string {
 	default:
 		// Slugify human readable string: "Gemini Pro" -> "gemini-pro"
 		slug := strings.ReplaceAll(lower, " ", "-")
+		if models.IsJunkModel(slug) {
+			return ""
+		}
 		return slug
 	}
 }
@@ -382,6 +497,24 @@ func detectAgentFromPath(p string) string {
 		return "Sweep"
 	default:
 		return "Coding Agent"
+	}
+}
+
+func detectAgentDefaultModel(agentName string) string {
+	lower := strings.ToLower(agentName)
+	switch {
+	case strings.Contains(lower, "antigravity") || strings.Contains(lower, "gemini"):
+		return "gemini-3.7-flash"
+	case strings.Contains(lower, "claude"):
+		return "claude-3-7-sonnet"
+	case strings.Contains(lower, "aider"):
+		return "gpt-4o"
+	case strings.Contains(lower, "cline") || strings.Contains(lower, "roo"):
+		return "claude-3-7-sonnet"
+	case strings.Contains(lower, "cursor") || strings.Contains(lower, "windsurf") || strings.Contains(lower, "trae") || strings.Contains(lower, "wrongstack"):
+		return "claude-3-7-sonnet"
+	default:
+		return "claude-3-7-sonnet"
 	}
 }
 

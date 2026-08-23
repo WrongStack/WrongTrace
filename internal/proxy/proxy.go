@@ -39,6 +39,8 @@ type ProxyTrafficRecord struct {
 	Model            string            `json:"model"`
 	AgentName        string            `json:"agent_name"`
 	TaskID           string            `json:"task_id"`
+	RunID            string            `json:"run_id,omitempty"`
+	SessionKey       string            `json:"session_key,omitempty"`
 	ProjectID        string            `json:"project_id,omitempty"`
 	ProjectSlug      string            `json:"project_slug,omitempty"`
 	StatusCode       int               `json:"status_code"`
@@ -71,6 +73,15 @@ type Config struct {
 	OnTraffic       func(rec ProxyTrafficRecord)
 }
 
+type proxySessionTracker struct {
+	runID            string
+	promptTokens     int64
+	completionTokens int64
+	costUSD          float64
+	lastSeen         time.Time
+	createdAt        time.Time
+}
+
 // GatewayProxy intercepts LLM API traffic, collects token usage, and forwards to providers.
 type GatewayProxy struct {
 	cfg        Config
@@ -82,6 +93,8 @@ type GatewayProxy struct {
 	trafficMu  sync.RWMutex
 	trafficLog []ProxyTrafficRecord
 	maxTraffic int
+	sessionMu  sync.Mutex
+	sessions   map[string]*proxySessionTracker
 }
 
 // NewGatewayProxy creates a new GatewayProxy instance with standard provider registries, route manager, cache, and quota limiter.
@@ -128,6 +141,7 @@ func NewGatewayProxy(cfg Config) *GatewayProxy {
 		Quotas:     NewQuotaLimiter(),
 		trafficLog: make([]ProxyTrafficRecord, 0, 100),
 		maxTraffic: 200,
+		sessions:   make(map[string]*proxySessionTracker),
 	}
 }
 
@@ -494,6 +508,27 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	sessionID := r.Header.Get("X-Session-ID")
+	if sessionID == "" {
+		sessionID = r.Header.Get("X-Run-ID")
+	}
+	if sessionID == "" {
+		sessionID = r.Header.Get("X-WrongTrace-Session")
+	}
+	if sessionID == "" {
+		sessionID = r.Header.Get("X-Conversation-ID")
+	}
+
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		clientIP = r.RemoteAddr
+	}
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		clientIP = strings.TrimSpace(strings.Split(fwd, ",")[0])
+	}
+
+	sessionKey := fmt.Sprintf("%s|%s|%s|%s", clientIP, agentName, projectSlug, modelName)
+
 	// 2. Token Budget & Cost Quota Guardrail Check
 	quotaKey := projectSlug
 	if quotaKey == "" {
@@ -536,6 +571,8 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Model:           modelName,
 				AgentName:       agentName,
 				TaskID:          taskID,
+				RunID:           sessionID,
+				SessionKey:      sessionKey,
 				ProjectID:       projectID,
 				ProjectSlug:     projectSlug,
 				StatusCode:      cached.StatusCode,
@@ -640,20 +677,22 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	respHeaders := maskHeaders(resp.Header)
 
 	baseRecord := ProxyTrafficRecord{
-		ID:              randomID("traffic"),
-		Timestamp:       start,
-		DurationMs:      duration,
-		Method:          r.Method,
-		IncomingPath:    r.URL.Path,
-		TargetURL:       safeTargetURL,
-		Provider:        provider,
-		Model:           modelName,
-		AgentName:       agentName,
-		TaskID:          taskID,
-		ProjectID:       projectID,
-		ProjectSlug:     projectSlug,
-		StatusCode:      resp.StatusCode,
-		RequestHeaders:  reqHeaders,
+		ID:             randomID("traffic"),
+		Timestamp:      start,
+		DurationMs:     duration,
+		Method:         r.Method,
+		IncomingPath:   r.URL.Path,
+		TargetURL:      safeTargetURL,
+		Provider:       provider,
+		Model:          modelName,
+		AgentName:      agentName,
+		TaskID:         taskID,
+		RunID:          sessionID,
+		SessionKey:     sessionKey,
+		ProjectID:      projectID,
+		ProjectSlug:    projectSlug,
+		StatusCode:     resp.StatusCode,
+		RequestHeaders: reqHeaders,
 		// Raw on purpose: analysis in the handlers runs on rec.RequestBody/
 		// respBytes; recordTraffic() is the single sanitizing choke point.
 		RequestBody:     string(reqBody),
@@ -753,13 +792,21 @@ func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader,
 		rec.ID = analysis.WireID
 	}
 
+	if analysis.CachedTokens > 0 && promptTokens < analysis.CachedTokens {
+		promptTokens += analysis.CachedTokens
+	}
+
 	rec.PromptTokens = promptTokens
 	rec.CompletionTokens = completionTokens
 	rec.TotalTokens = promptTokens + completionTokens
 	rec.CachedTokens = analysis.CachedTokens
 	rec.ReasoningTokens = analysis.ReasoningTokens
 	if promptTokens > 0 && analysis.CachedTokens > 0 {
-		rec.CacheHitRate = (float64(analysis.CachedTokens) / float64(promptTokens)) * 100
+		rate := (float64(analysis.CachedTokens) / float64(promptTokens)) * 100
+		if rate > 100.0 {
+			rate = 100.0
+		}
+		rec.CacheHitRate = rate
 	}
 
 	costUSD, cacheSavingsUSD := models.Global.CalculateCostDetailed(rec.Provider, rec.Model, promptTokens, completionTokens, analysis.CachedTokens)
@@ -782,8 +829,19 @@ func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader,
 		}
 	}
 
-	p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, promptTokens, completionTokens, intent)
+	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, intent)
+	if runID != "" {
+		rec.RunID = runID
+	}
 	p.recordTraffic(rec)
+
+	if p.Quotas != nil && rec.CostUSD > 0 {
+		quotaKey := rec.ProjectSlug
+		if quotaKey == "" {
+			quotaKey = rec.AgentName
+		}
+		p.Quotas.RecordSpend(quotaKey, rec.CostUSD)
+	}
 
 	// Save to response cache if successful
 	if rec.StatusCode == http.StatusOK && p.Cache != nil && len(respBytes) > 0 {
@@ -863,10 +921,15 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 		promptTokens = EstimatePromptTokens([]byte(rec.RequestBody))
 	}
 	if completionTokens == 0 {
-		completionTokens = int64(float64(len(fullSSE)) / 4.0)
-		if completionTokens < 1 {
+		if analysis.CompletionTokens > 0 {
+			completionTokens = analysis.CompletionTokens
+		} else {
 			completionTokens = 1
 		}
+	}
+
+	if analysis.CachedTokens > 0 && promptTokens < analysis.CachedTokens {
+		promptTokens += analysis.CachedTokens
 	}
 
 	rec.ResponseBody = fullSSE
@@ -876,7 +939,11 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 	rec.CachedTokens = analysis.CachedTokens
 	rec.ReasoningTokens = analysis.ReasoningTokens
 	if promptTokens > 0 && analysis.CachedTokens > 0 {
-		rec.CacheHitRate = (float64(analysis.CachedTokens) / float64(promptTokens)) * 100
+		rate := (float64(analysis.CachedTokens) / float64(promptTokens)) * 100
+		if rate > 100.0 {
+			rate = 100.0
+		}
+		rec.CacheHitRate = rate
 	}
 
 	costUSD, cacheSavingsUSD := models.Global.CalculateCostDetailed(rec.Provider, rec.Model, promptTokens, completionTokens, analysis.CachedTokens)
@@ -899,8 +966,19 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 		}
 	}
 
-	p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, promptTokens, completionTokens, intent)
+	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, intent)
+	if runID != "" {
+		rec.RunID = runID
+	}
 	p.recordTraffic(rec)
+
+	if p.Quotas != nil && rec.CostUSD > 0 {
+		quotaKey := rec.ProjectSlug
+		if quotaKey == "" {
+			quotaKey = rec.AgentName
+		}
+		p.Quotas.RecordSpend(quotaKey, rec.CostUSD)
+	}
 
 	// Save to response cache if successful
 	if rec.StatusCode == http.StatusOK && p.Cache != nil && len(fullSSE) > 0 {
@@ -965,7 +1043,7 @@ func scrubErrorString(s string) string {
 // (prompt/completion content) are truncated head+tail so the inspector still
 // shows structure and beginnings; the whole stored body is capped.
 const (
-	maxRecordStringLen = 512  // per JSON string value: 384 head + 128 tail
+	maxRecordStringLen = 512       // per JSON string value: 384 head + 128 tail
 	maxRecordBodyLen   = 64 * 1024 // total stored body cap (JSON or SSE)
 )
 
@@ -1148,13 +1226,61 @@ func sanitizeURLForRecord(rawURL string) string {
 	return u.String()
 }
 
-func (p *GatewayProxy) recordRun(modelName, provider, agentName, taskID, projectID, projectSlug string, promptTokens, completionTokens int64, intent string) {
+func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, promptTokens, completionTokens int64, costUSD float64) (string, int64, int64, float64) {
+	p.sessionMu.Lock()
+	defer p.sessionMu.Unlock()
+
+	if p.sessions == nil {
+		p.sessions = make(map[string]*proxySessionTracker)
+	}
+
+	now := time.Now()
+	// Periodic cleanup of sessions inactive for more than 15 minutes
+	if len(p.sessions) > 50 {
+		for k, s := range p.sessions {
+			if now.Sub(s.lastSeen) > 15*time.Minute {
+				delete(p.sessions, k)
+			}
+		}
+	}
+
+	lookupKey := explicitSessionID
+	if lookupKey == "" {
+		lookupKey = sessionKey
+	}
+
+	if sess, ok := p.sessions[lookupKey]; ok && now.Sub(sess.lastSeen) <= 10*time.Minute {
+		sess.promptTokens += promptTokens
+		sess.completionTokens += completionTokens
+		sess.costUSD += costUSD
+		sess.lastSeen = now
+		return sess.runID, sess.promptTokens, sess.completionTokens, sess.costUSD
+	}
+
+	runID := explicitSessionID
+	if runID == "" {
+		runID = randomID("proxy-run")
+	}
+
+	p.sessions[lookupKey] = &proxySessionTracker{
+		runID:            runID,
+		promptTokens:     promptTokens,
+		completionTokens: completionTokens,
+		costUSD:          costUSD,
+		lastSeen:         now,
+		createdAt:        now,
+	}
+
+	return runID, promptTokens, completionTokens, costUSD
+}
+
+func (p *GatewayProxy) recordRun(modelName, provider, agentName, taskID, projectID, projectSlug, explicitRunID, sessionKey string, promptTokens, completionTokens int64, intent string) string {
 	if p.cfg.Reporter == nil {
-		return
+		return ""
 	}
 
 	cost := models.Global.CalculateCostWithProvider(provider, modelName, promptTokens, completionTokens)
-	runID := randomID("proxy-run")
+	runID, totalPrompt, totalCompletion, totalCost := p.getOrCreateSession(explicitRunID, sessionKey, promptTokens, completionTokens, cost)
 
 	_ = p.cfg.Reporter.ReportRun(ipc.TelemetryReport{
 		RunID:            runID,
@@ -1164,11 +1290,13 @@ func (p *GatewayProxy) recordRun(modelName, provider, agentName, taskID, project
 		AgentName:        agentName,
 		ModelName:        modelName,
 		Provider:         provider,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		CostUSD:          cost,
+		PromptTokens:     totalPrompt,
+		CompletionTokens: totalCompletion,
+		CostUSD:          totalCost,
 		Intent:           intent,
 	})
+
+	return runID
 }
 
 // copyProxyHeaders forwards client headers onto the outgoing upstream request,

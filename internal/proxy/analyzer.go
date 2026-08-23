@@ -386,11 +386,51 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 }
 
 func (pa *PayloadAnalysis) extractUsage(usageMap map[string]interface{}) {
+	var cacheRead, cacheCreate int64
+
+	// OpenAI / GLM / DeepSeek / MiniMax prompt_tokens_details
+	if ptd, ok := usageMap["prompt_tokens_details"].(map[string]interface{}); ok {
+		if cached, ok := ptd["cached_tokens"].(float64); ok && cached > 0 {
+			cacheRead = int64(cached)
+		} else if cached, ok := ptd["cache_read_tokens"].(float64); ok && cached > 0 {
+			cacheRead = int64(cached)
+		}
+	}
+
+	// Anthropic / MiniMax / Kimi direct cache fields
+	if cacheRead == 0 {
+		if cached, ok := usageMap["cache_read_input_tokens"].(float64); ok && cached > 0 {
+			cacheRead = int64(cached)
+		} else if cached, ok := usageMap["prompt_cache_hit_tokens"].(float64); ok && cached > 0 {
+			cacheRead = int64(cached)
+		} else if cached, ok := usageMap["cachedContentTokenCount"].(float64); ok && cached > 0 {
+			cacheRead = int64(cached)
+		} else if cached, ok := usageMap["cache_tokens"].(float64); ok && cached > 0 {
+			cacheRead = int64(cached)
+		} else if cached, ok := usageMap["cached_tokens"].(float64); ok && cached > 0 {
+			cacheRead = int64(cached)
+		}
+	}
+
+	if created, ok := usageMap["cache_creation_input_tokens"].(float64); ok && created > 0 {
+		cacheCreate = int64(created)
+	}
+
+	if cacheRead > 0 {
+		pa.CachedTokens = cacheRead
+	}
+
 	// Prompt / Input Tokens
-	if pt, ok := usageMap["prompt_tokens"].(float64); ok && pt > 0 {
+	if pt, ok := usageMap["input_tokens"].(float64); ok && pt > 0 {
+		// In Anthropic/MiniMax API specs, input_tokens is NON-cached delta.
+		// Total actual prompt context sent to model is input_tokens + cache_read + cache_creation.
+		pa.PromptTokens = int64(pt) + cacheRead + cacheCreate
+	} else if pt, ok := usageMap["prompt_tokens"].(float64); ok && pt > 0 {
 		pa.PromptTokens = int64(pt)
-	} else if pt, ok := usageMap["input_tokens"].(float64); ok && pt > 0 {
-		pa.PromptTokens = int64(pt)
+		if pa.CachedTokens > pa.PromptTokens {
+			// Some providers report non-cached delta as prompt_tokens while returning large cache_read
+			pa.PromptTokens += pa.CachedTokens
+		}
 	} else if pt, ok := usageMap["promptTokenCount"].(float64); ok && pt > 0 {
 		pa.PromptTokens = int64(pt)
 	}
@@ -410,22 +450,8 @@ func (pa *PayloadAnalysis) extractUsage(usageMap map[string]interface{}) {
 	} else if tt, ok := usageMap["totalTokenCount"].(float64); ok && tt > 0 {
 		pa.TotalTokens = int64(tt)
 	}
-
-	// OpenAI / GLM / DeepSeek prompt_tokens_details
-	if ptd, ok := usageMap["prompt_tokens_details"].(map[string]interface{}); ok {
-		if cached, ok := ptd["cached_tokens"].(float64); ok {
-			pa.CachedTokens = int64(cached)
-		}
-	}
-
-	// Anthropic prompt cache tokens
-	if cached, ok := usageMap["cache_read_input_tokens"].(float64); ok {
-		pa.CachedTokens = int64(cached)
-	}
-
-	// Gemini cachedContentTokenCount
-	if cached, ok := usageMap["cachedContentTokenCount"].(float64); ok {
-		pa.CachedTokens = int64(cached)
+	if pa.TotalTokens < pa.PromptTokens+pa.CompletionTokens {
+		pa.TotalTokens = pa.PromptTokens + pa.CompletionTokens
 	}
 
 	// Completion reasoning tokens

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 )
 
@@ -25,7 +26,11 @@ type fakeSink struct {
 	gotPrompt, gotCompletion                    int64
 	gotCost                                     float64
 	gotPath                                     string
-	reportCalls, healthCalls                    int
+	reportCalls, healthCalls, readCalls         int
+	readErr                                     error
+	readStatsErr                                error
+	readStats                                   db.FileReadStats
+	lastReadRecord                              db.FileReadRecord
 }
 
 func (f *fakeSink) ReportRunMCP(model, provider, taskID, intent string, promptTokens, completionTokens int64, cost float64) (string, error) {
@@ -39,6 +44,32 @@ func (f *fakeSink) FileHealth(path string) (ipc.FileHealthReply, error) {
 	f.healthCalls++
 	f.gotPath = path
 	return f.health, f.healthErr
+}
+
+func (f *fakeSink) RecordReadEvent(rec db.FileReadRecord) error {
+	f.readCalls++
+	f.lastReadRecord = rec
+	return f.readErr
+}
+
+func (f *fakeSink) GetFileReadStats(filePath string) (db.FileReadStats, error) {
+	f.gotPath = filePath
+	return f.readStats, f.readStatsErr
+}
+
+func (f *fakeSink) GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error) {
+	return []db.EventRecord{
+		{
+			EventID:      "ev-1",
+			FilePath:     f.gotPath,
+			Signature:    "function:auth.go::Login",
+			NodeType:     "function",
+			Action:       "MODIFIED",
+			AddedLines:   3,
+			DeletedLines: 1,
+			DiffSnippet:  "+ login_v2\n- login_v1",
+		},
+	}, nil
 }
 
 func params(t *testing.T, raw string) map[string]interface{} {
@@ -114,8 +145,8 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 	}
 	res := wireResult(t, resp)
 	tools, ok := res["tools"].([]interface{})
-	if !ok || len(tools) != 5 {
-		t.Fatalf("want 5 tools, got %#v", res["tools"])
+	if !ok || len(tools) != 8 {
+		t.Fatalf("want 8 tools, got %#v", res["tools"])
 	}
 
 	byName := map[string]map[string]interface{}{}
@@ -135,6 +166,15 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 	}
 	if _, ok := byName["check_guardrail"]; !ok {
 		t.Fatalf("check_guardrail missing: %v", byName)
+	}
+	if _, ok := byName["report_file_read"]; !ok {
+		t.Fatalf("report_file_read missing: %v", byName)
+	}
+	if _, ok := byName["get_file_read_stats"]; !ok {
+		t.Fatalf("get_file_read_stats missing: %v", byName)
+	}
+	if _, ok := byName["get_file_diff_history"]; !ok {
+		t.Fatalf("get_file_diff_history missing: %v", byName)
 	}
 
 	for name, tl := range byName {
@@ -507,3 +547,39 @@ func TestNumberCoercion(t *testing.T) {
 		}
 	}
 }
+
+func TestCallTool_ReadTools(t *testing.T) {
+	sink := &fakeSink{
+		readStats: db.FileReadStats{
+			FilePath:       "test.go",
+			TotalReads:     5,
+			TotalLinesRead: 250,
+			TotalCostUSD:   0.015,
+			UniqueModels:   2,
+		},
+	}
+
+	// 1. Test report_file_read
+	req := toolCallReq(1, "report_file_read", `{"file_path":"test.go","model":"claude-3-7-sonnet","start_line":10,"end_line":50,"prompt_tokens":1500,"cost":0.005}`)
+	resp := dispatch(sink, req)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %+v", resp.Error)
+	}
+	if sink.readCalls != 1 {
+		t.Errorf("expected 1 read call, got %d", sink.readCalls)
+	}
+	if sink.lastReadRecord.FilePath != "test.go" || sink.lastReadRecord.StartLine != 10 || sink.lastReadRecord.EndLine != 50 {
+		t.Errorf("unexpected read record: %+v", sink.lastReadRecord)
+	}
+
+	// 2. Test get_file_read_stats
+	req = toolCallReq(2, "get_file_read_stats", `{"file_path":"test.go"}`)
+	resp = dispatch(sink, req)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %+v", resp.Error)
+	}
+	if sink.gotPath != "test.go" {
+		t.Errorf("expected path test.go, got %s", sink.gotPath)
+	}
+}
+

@@ -9,6 +9,7 @@ import (
 
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
+	"github.com/wrongstack/wrongtrace/internal/models"
 )
 
 // ReportData holds the complete metrics and profiler dataset for report generation.
@@ -40,12 +41,18 @@ func GenerateMarkdownReport(data ReportData) string {
 
 	// 2. Model Leaderboard
 	b.WriteString("## 🏆 AI Model Survival & Cost Leaderboard\n\n")
-	if len(snap.Models) == 0 {
+	var validModels []db.ModelRow
+	for _, m := range snap.Models {
+		if !models.IsJunkModel(m.Model) {
+			validModels = append(validModels, m)
+		}
+	}
+	if len(validModels) == 0 {
 		b.WriteString("_No model telemetry recorded yet._\n\n")
 	} else {
 		b.WriteString("| Model | Survival Rate | Survived Nodes | Total Cost | Cost / Survived Node |\n")
 		b.WriteString("| :--- | :---: | :---: | :---: | :---: |\n")
-		for _, m := range snap.Models {
+		for _, m := range validModels {
 			costStr := fmt.Sprintf("$%.4f", m.CostPerSurvNode)
 			if m.TotalSurvivedNodes == 0 {
 				costStr = "—"
@@ -109,10 +116,17 @@ func GenerateMarkdownReport(data ReportData) string {
 func GenerateHTMLReport(data ReportData) string {
 	snap := data.Snapshot
 
+	var validModels []db.ModelRow
+	for _, m := range snap.Models {
+		if !models.IsJunkModel(m.Model) {
+			validModels = append(validModels, m)
+		}
+	}
+
 	var modelsTable strings.Builder
-	if len(snap.Models) > 0 {
+	if len(validModels) > 0 {
 		modelsTable.WriteString("<table><thead><tr><th>Model</th><th>Survival Rate</th><th>Survived Nodes</th><th>Total Cost</th><th>Cost / Survived Node</th></tr></thead><tbody>")
-		for _, m := range snap.Models {
+		for _, m := range validModels {
 			costStr := fmt.Sprintf("$%.4f", m.CostPerSurvNode)
 			if m.TotalSurvivedNodes == 0 {
 				costStr = "—"

@@ -134,21 +134,42 @@ func TestAnalyzeWirePayloads_GLMRealStreamChunk(t *testing.T) {
 
 func TestAnalyzeWirePayloads_AnthropicStreamUsage(t *testing.T) {
 	req := `{"model":"claude-3-7-sonnet","messages":[{"role":"user","content":"Hello"}]}`
-	stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-3-7-sonnet\",\"usage\":{\"input_tokens\":5200,\"cache_read_input_tokens\":4100}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":140}}\n\n"
+	stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-3-7-sonnet\",\"usage\":{\"input_tokens\":1100,\"cache_read_input_tokens\":4100}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":140}}\n\n"
 
 	analysis := AnalyzeWirePayloads([]byte(req), []byte(stream), true)
 
 	if analysis.WireID != "msg_123" {
 		t.Errorf("wire id = %q, want msg_123", analysis.WireID)
 	}
-	if analysis.PromptTokens != 5200 {
-		t.Errorf("prompt tokens = %d, want 5200", analysis.PromptTokens)
+	if analysis.PromptTokens != 5200 { // 1100 + 4100
+		t.Errorf("prompt tokens = %d, want 5200 (1100 non-cached + 4100 cached)", analysis.PromptTokens)
 	}
 	if analysis.CachedTokens != 4100 {
 		t.Errorf("cached tokens = %d, want 4100", analysis.CachedTokens)
 	}
 	if analysis.CompletionTokens != 140 {
 		t.Errorf("completion tokens = %d, want 140", analysis.CompletionTokens)
+	}
+}
+
+func TestAnalyzeWirePayloads_MiniMaxAnthropicDeltaUsage(t *testing.T) {
+	req := `{"model":"minimax-text-01","messages":[{"role":"user","content":"Run codebase search"}]}`
+	stream := "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"},\"type\":\"message_delta\",\"usage\":{\"cache_read_input_tokens\":134543,\"input_tokens\":1353,\"output_tokens\":708,\"service_tier\":\"standard\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n"
+
+	analysis := AnalyzeWirePayloads([]byte(req), []byte(stream), true)
+
+	expectedPrompt := int64(1353 + 134543) // 135,896 total context tokens
+	if analysis.PromptTokens != expectedPrompt {
+		t.Errorf("prompt tokens = %d, want %d", analysis.PromptTokens, expectedPrompt)
+	}
+	if analysis.CachedTokens != 134543 {
+		t.Errorf("cached tokens = %d, want 134543", analysis.CachedTokens)
+	}
+	if analysis.CompletionTokens != 708 {
+		t.Errorf("completion tokens = %d, want 708", analysis.CompletionTokens)
+	}
+	if analysis.FinishReason != "tool_use" {
+		t.Errorf("finish reason = %q, want tool_use", analysis.FinishReason)
 	}
 }
 

@@ -13,6 +13,7 @@ import {
 } from 'recharts';
 import { Trophy, TrendingUp, DollarSign, Award, Layers } from 'lucide-react';
 import type { ModelRow } from '../types';
+import { isJunkModel } from '../types';
 
 interface ModelLeaderboardProps {
   models: ModelRow[];
@@ -22,7 +23,8 @@ interface ModelLeaderboardProps {
 export function ModelLeaderboard({ models, loading }: ModelLeaderboardProps) {
   const [viewMetric, setViewMetric] = useState<'survival' | 'roi' | 'multi'>('multi');
 
-  const sortedModels = [...models].sort((a, b) => b.survival_rate_pct - a.survival_rate_pct);
+  const validModels = models.filter((m) => !isJunkModel(m.model));
+  const sortedModels = [...validModels].sort((a, b) => b.survival_rate_pct - a.survival_rate_pct);
 
   const data = sortedModels.map((m) => ({
     model: m.model.length > 18 ? `${m.model.slice(0, 16)}…` : m.model,

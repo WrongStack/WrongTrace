@@ -43,9 +43,11 @@ type Node struct {
 // FileSnapshot captures the parsed state of a single file at one point in time.
 // The Engine holds the previous snapshot per file to compute semantic diffs.
 type FileSnapshot struct {
-	Path  string
-	Nodes map[string]Node // keyed by signature
-	Hash  string          // SHA256 of the file's full text
+	Path       string
+	Nodes      map[string]Node // keyed by signature
+	Hash       string          // SHA256 of the file's full text
+	RawContent string          // raw source content for whole-file line diffs
+	LOC        int             // total lines of code
 }
 
 // Engine owns the Tree-sitter parser pool and the snapshot cache. All
@@ -154,10 +156,13 @@ func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
 	defer tree.Close()
 
 	root := tree.RootNode()
+	raw := string(src)
 	snap := &FileSnapshot{
-		Path:  path,
-		Nodes: map[string]Node{},
-		Hash:  hashBytes(src),
+		Path:       path,
+		Nodes:      map[string]Node{},
+		Hash:       hashBytes(src),
+		RawContent: raw,
+		LOC:        len(strings.Split(raw, "\n")),
 	}
 	collectNodes(root, src, lang, filepath.Base(path), snap)
 	return snap, nil
@@ -165,13 +170,16 @@ func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
 
 // parseGenericSource extracts declarations using robust pattern matching for languages without a compiled Tree-sitter grammar.
 func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
-	snap := &FileSnapshot{
-		Path:  path,
-		Nodes: map[string]Node{},
-		Hash:  hashBytes(src),
-	}
+	raw := string(src)
+	lines := strings.Split(raw, "\n")
 	base := filepath.Base(path)
-	lines := strings.Split(string(src), "\n")
+	snap := &FileSnapshot{
+		Path:       path,
+		Nodes:      map[string]Node{},
+		Hash:       hashBytes(src),
+		RawContent: raw,
+		LOC:        len(lines),
+	}
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -239,12 +247,12 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 			bodyLines = append(bodyLines, line)
 
 			if strings.Contains(line, "{") {
-				braceCount := strings.Count(line, "{") - strings.Count(line, "}")
+				braceCount := countCodeBraces(line)
 				j := i + 1
 				for ; j < len(lines) && braceCount > 0; j++ {
 					l := lines[j]
 					bodyLines = append(bodyLines, l)
-					braceCount += strings.Count(l, "{") - strings.Count(l, "}")
+					braceCount += countCodeBraces(l)
 				}
 				endLine = j
 			}
@@ -266,6 +274,68 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 	}
 
 	return snap
+}
+
+// countCodeBraces returns the net delta of '{' minus '}', safely ignoring braces inside strings and comments.
+func countCodeBraces(s string) int {
+	net := 0
+	inString := byte(0)
+	inLineComment := false
+	inBlockComment := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inLineComment {
+			if c == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if c == '*' && i+1 < len(s) && s[i+1] == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+		if inString != 0 {
+			if c == inString {
+				backslashes := 0
+				for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+					backslashes++
+				}
+				if backslashes%2 == 0 {
+					inString = 0
+				}
+			}
+			continue
+		}
+
+		switch c {
+		case '/':
+			if i+1 < len(s) && s[i+1] == '/' {
+				inLineComment = true
+				i++
+				continue
+			}
+			if i+1 < len(s) && s[i+1] == '*' {
+				inBlockComment = true
+				i++
+				continue
+			}
+		case '#':
+			inLineComment = true
+			continue
+		case '"', '\'', '`':
+			inString = c
+			continue
+		case '{':
+			net++
+		case '}':
+			net--
+		}
+	}
+	return net
 }
 
 

@@ -241,3 +241,94 @@ func TestHelpers(t *testing.T) {
 		t.Error("toFloat helper failed")
 	}
 }
+
+func TestFileReadEventsAndStats(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+
+	// Insert reads
+	err := s.InsertReadEvent(FileReadRecord{
+		ReadID:         "read-1",
+		RunID:          "run-1",
+		RepoName:       "test-repo",
+		FilePath:       "internal/core/engine.go",
+		AgentName:      "Antigravity",
+		ModelName:      "gemini-3.7-flash",
+		Provider:       "google",
+		ToolName:       "view_file",
+		StartLine:      1,
+		EndLine:        100,
+		LinesReadCount: 100,
+		PromptTokens:   1200,
+		CostUSD:        0.002,
+		Intent:         "Inspect engine implementation",
+		ReadTime:       now.Add(-10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("InsertReadEvent 1 failed: %v", err)
+	}
+
+	err = s.InsertReadEvent(FileReadRecord{
+		ReadID:         "read-2",
+		RunID:          "run-2",
+		RepoName:       "test-repo",
+		FilePath:       "internal/core/engine.go",
+		AgentName:      "Cursor",
+		ModelName:      "claude-3-7-sonnet",
+		Provider:       "anthropic",
+		ToolName:       "read_file",
+		StartLine:      50,
+		EndLine:        150,
+		LinesReadCount: 101,
+		PromptTokens:   2500,
+		CostUSD:        0.008,
+		Intent:         "Check correlation window",
+		ReadTime:       now.Add(-2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("InsertReadEvent 2 failed: %v", err)
+	}
+
+	// 1. Test GetRecentFileReads
+	recent, err := s.GetRecentFileReads(10)
+	if err != nil {
+		t.Fatalf("GetRecentFileReads failed: %v", err)
+	}
+	if len(recent) != 2 {
+		t.Fatalf("expected 2 recent reads, got %d", len(recent))
+	}
+	if recent[0].ReadID != "read-2" {
+		t.Errorf("expected most recent read-2 first, got %s", recent[0].ReadID)
+	}
+
+	// 2. Test GetFileReadStats
+	stats, err := s.GetFileReadStats("internal/core/engine.go")
+	if err != nil {
+		t.Fatalf("GetFileReadStats failed: %v", err)
+	}
+	if stats.TotalReads != 2 {
+		t.Errorf("expected 2 total reads, got %d", stats.TotalReads)
+	}
+	if stats.TotalLinesRead != 201 {
+		t.Errorf("expected 201 total lines read, got %d", stats.TotalLinesRead)
+	}
+	if stats.UniqueModels != 2 {
+		t.Errorf("expected 2 unique models, got %d", stats.UniqueModels)
+	}
+	if stats.ModelBreakdown["gemini-3.7-flash"] != 1 || stats.ModelBreakdown["claude-3-7-sonnet"] != 1 {
+		t.Errorf("unexpected model breakdown: %+v", stats.ModelBreakdown)
+	}
+	if stats.ProviderBreakdown["google"] != 1 || stats.ProviderBreakdown["anthropic"] != 1 {
+		t.Errorf("unexpected provider breakdown: %+v", stats.ProviderBreakdown)
+	}
+
+	// 3. Test GetFileReadHeatmap
+	heatmap, err := s.GetFileReadHeatmap("internal/core/engine.go")
+	if err != nil {
+		t.Fatalf("GetFileReadHeatmap failed: %v", err)
+	}
+	if len(heatmap) != 2 {
+		t.Fatalf("expected 2 heatmap slices, got %d", len(heatmap))
+	}
+}
+

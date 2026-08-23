@@ -92,8 +92,10 @@ func (r *Registry) seedDefaults() {
 		{ID: "qwen/qwen-2.5-coder-32b", ModelID: "qwen-2-5-coder-32b", Name: "Qwen 2.5 Coder 32B", Provider: "Alibaba Cloud", ProviderID: "alibaba", InputPricePerM: 0.20, OutputPricePerM: 0.60, CacheReadPricePerM: 0.05, ContextWindow: 128000, IsCanonical: true},
 
 		// MiniMax
-		{ID: "minimax/minimax-text-01", ModelID: "minimax-text-01", Name: "MiniMax Text-01", Provider: "MiniMax", ProviderID: "minimax", InputPricePerM: 0.20, OutputPricePerM: 1.10, CacheReadPricePerM: 0.05, ContextWindow: 1000000, IsCanonical: true},
-		{ID: "minimax/abab6.5s", ModelID: "abab6-5s", Name: "MiniMax abab 6.5s", Provider: "MiniMax", ProviderID: "minimax", InputPricePerM: 0.14, OutputPricePerM: 0.28, CacheReadPricePerM: 0.035, ContextWindow: 245000, IsCanonical: true},
+		{ID: "minimax/minimax-text-01", ModelID: "minimax-text-01", Name: "MiniMax Text-01", Provider: "MiniMax", ProviderID: "minimax", InputPricePerM: 0.20, OutputPricePerM: 1.10, CacheReadPricePerM: 0.02, ContextWindow: 1000000, IsCanonical: true},
+		{ID: "minimax/minimax-01", ModelID: "minimax-01", Name: "MiniMax-01", Provider: "MiniMax", ProviderID: "minimax", InputPricePerM: 0.20, OutputPricePerM: 1.10, CacheReadPricePerM: 0.02, ContextWindow: 1000000, IsCanonical: false},
+		{ID: "minimax/abab6.5s", ModelID: "abab6-5s", Name: "MiniMax abab 6.5s", Provider: "MiniMax", ProviderID: "minimax", InputPricePerM: 0.14, OutputPricePerM: 0.28, CacheReadPricePerM: 0.02, ContextWindow: 245000, IsCanonical: true},
+		{ID: "minimax/abab7-chat-preview", ModelID: "abab7-chat-preview", Name: "MiniMax abab 7 Preview", Provider: "MiniMax", ProviderID: "minimax", InputPricePerM: 0.20, OutputPricePerM: 1.10, CacheReadPricePerM: 0.02, ContextWindow: 1000000, IsCanonical: false},
 
 		// Kimi / Moonshot AI
 		{ID: "moonshot/kimi-k2", ModelID: "kimi-k2", Name: "Kimi K2 Coding", Provider: "Moonshot", ProviderID: "moonshot", InputPricePerM: 0.30, OutputPricePerM: 1.20, CacheReadPricePerM: 0.075, ContextWindow: 200000, IsCanonical: true},
@@ -420,6 +422,49 @@ type modelsDevProvider struct {
 	Models map[string]modelsDevModel `json:"models"`
 }
 
+// IsJunkModel reports whether a model name is an artifact of schema typing, code variables, or placeholders.
+func IsJunkModel(s string) bool {
+	raw := strings.TrimSpace(strings.ToLower(s))
+	if raw == "" || len(raw) < 2 || len(raw) > 80 {
+		return true
+	}
+	switch raw {
+	case "unknown-model", "unknown_model", "unknown-model-detected", "unknown-provider",
+		"omit", "inherit", "none", "null", "undefined", "default", "custom", "agent", "model",
+		"string", "boolean", "number", "integer", "object", "array", "any", "void", "function",
+		"this.meta.model", "this.model", "self.model", "meta.model", "process.env.model",
+		"t.model", "row.model", "m.model", "item.model", "data.model", "obj.model", "props.model",
+		"state.model", "req.model", "res.model", "msg.model", "record.model", "entry.model",
+		"livemodel", "mock", "mock-model", "test", "dummy", "placeholder", "n/a":
+		return true
+	}
+	if strings.Contains(raw, "this.") || strings.Contains(raw, "self.") || strings.Contains(raw, "process.env") ||
+		strings.Contains(raw, "{") || strings.Contains(raw, "}") || strings.Contains(raw, "(") || strings.Contains(raw, ")") ||
+		strings.Contains(raw, "=") || strings.Contains(raw, ";") || strings.Contains(raw, "$") || strings.Contains(raw, "<") ||
+		strings.Contains(raw, ">") || strings.Contains(raw, "[") || strings.Contains(raw, "]") || strings.HasPrefix(raw, ".") ||
+		strings.HasSuffix(raw, ".model") || strings.HasSuffix(raw, ".ts") || strings.HasSuffix(raw, ".tsx") ||
+		strings.HasSuffix(raw, ".js") || strings.HasSuffix(raw, ".go") || strings.HasSuffix(raw, ".py") ||
+		strings.HasSuffix(raw, ".json") || strings.HasSuffix(raw, ".md") {
+		return true
+	}
+
+	// Reject property expressions like "t.model", "a.b" unless it's a numeric version like "gpt-4.5" or "claude-3.5"
+	if strings.Contains(raw, ".") {
+		parts := strings.Split(raw, ".")
+		if len(parts) == 2 {
+			// If neither part is numeric or part of a recognized version prefix, it's code property access
+			if parts[1] == "model" || parts[1] == "name" || parts[1] == "id" || parts[1] == "type" || parts[1] == "value" {
+				return true
+			}
+			if len(parts[0]) <= 2 && !strings.ContainsAny(parts[0], "0123456789") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // ImportModelsDevJSON parses the provider→models catalog published at https://models.dev/api.json
 // and populates all providers and their respective model pricings into the registry.
 func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
@@ -458,9 +503,12 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 		provModels := make([]ModelInfo, 0, len(modelKeys))
 
 		for _, mk := range modelKeys {
+			if IsJunkModel(mk) {
+				continue
+			}
 			m := p.Models[mk]
 			normModel := normalizeModelID(mk)
-			if normModel == "" {
+			if normModel == "" || IsJunkModel(normModel) {
 				continue
 			}
 			// Skip junk entries carrying no cost and no context window

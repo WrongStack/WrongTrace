@@ -7,13 +7,14 @@ import (
 
 var (
 	// Secret patterns to prevent accidental leaks in LLM prompts
-	awsKeyRe       = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
-	githubTokenRe  = regexp.MustCompile(`\b(?:ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82})\b`)
-	openAIKeyRe    = regexp.MustCompile(`\bsk-[a-zA-Z0-9_\-]{20,}\b`)
-	anthropicKeyRe = regexp.MustCompile(`\bsk-ant-[a-zA-Z0-9_\-]{20,}\b`)
-	privateKeyRe   = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[a-zA-Z0-9/+= \r\n]+-----END [A-Z ]*PRIVATE KEY-----`)
-	dbURLRe        = regexp.MustCompile(`\b(?:postgres|postgresql|mysql|mongodb|redis)://([^:\s]+):([^@\s]+)@`)
-	genericSecretRe= regexp.MustCompile(`(?i)\b(?:password|passwd|api_secret|client_secret|auth_token)\s*[:=]\s*["']?([a-zA-Z0-9!@#$%^&*()_+\-={}\[\]]{8,})["']?`)
+	awsKeyRe        = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
+	githubTokenRe   = regexp.MustCompile(`\b(?:ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82})\b`)
+	openAIKeyRe     = regexp.MustCompile(`\bsk-[a-zA-Z0-9_\-]{20,}\b`)
+	anthropicKeyRe  = regexp.MustCompile(`\bsk-ant-[a-zA-Z0-9_\-]{20,}\b`)
+	googleKeyRe     = regexp.MustCompile(`\bAIzaSy[a-zA-Z0-9_\-]{33}\b`)
+	privateKeyRe    = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[a-zA-Z0-9/+= \r\n]+-----END [A-Z ]*PRIVATE KEY-----`)
+	dbURLRe         = regexp.MustCompile(`\b((?:postgres|postgresql|mysql|mongodb|redis)://[^:\s]+):([^@\s]+)@`)
+	genericSecretRe = regexp.MustCompile(`(?i)\b(?:password|passwd|api_secret|client_secret|auth_token)\s*[:=]\s*["']?([a-zA-Z0-9!@#$%^&*()_+\-={}\[\]]{8,})["']?`)
 )
 
 // ScanAndRedactSecrets inspects request payloads for confidential secrets and masks them before sending to LLMs.
@@ -43,13 +44,17 @@ func ScanAndRedactSecrets(body []byte) ([]byte, int) {
 		redactionCount++
 	}
 
-	// 4. Redact OpenAI / Anthropic Keys inside prompts
+	// 4. Redact OpenAI / Anthropic / Google Keys inside prompts
 	if anthropicKeyRe.MatchString(text) {
 		text = anthropicKeyRe.ReplaceAllString(text, "[REDACTED_ANTHROPIC_KEY]")
 		redactionCount++
 	}
 	if openAIKeyRe.MatchString(text) {
 		text = openAIKeyRe.ReplaceAllString(text, "[REDACTED_OPENAI_KEY]")
+		redactionCount++
+	}
+	if googleKeyRe.MatchString(text) {
+		text = googleKeyRe.ReplaceAllString(text, "[REDACTED_GOOGLE_KEY]")
 		redactionCount++
 	}
 

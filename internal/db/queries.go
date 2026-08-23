@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/wrongstack/wrongtrace/internal/models"
 )
 
 // dbTimeLayouts lists the layouts we accept when reading datetime values back
@@ -149,20 +151,44 @@ func (s *Store) InsertEvent(e EventRecord) error {
 	return nil
 }
 
-// RecentEvents returns the N most recent events for the live feed.
-func (s *Store) RecentEvents(limit int) ([]EventRecord, error) {
+// RecentEvents returns the N most recent events for the live feed, optionally filtered by repo_name.
+func (s *Store) RecentEvents(limit int, repoFilter ...string) ([]EventRecord, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
-		       action, ast_content_hash, lines_of_code,
-		       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
-		       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
-		FROM code_node_events
-		ORDER BY event_time DESC
-		LIMIT ?
-	`, limit)
+	var repo string
+	if len(repoFilter) > 0 {
+		repo = repoFilter[0]
+	}
+
+	var query string
+	var args []any
+	if repo == "" {
+		query = `
+			SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
+			       action, ast_content_hash, lines_of_code,
+			       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
+			       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
+			FROM code_node_events
+			ORDER BY event_time DESC
+			LIMIT ?
+		`
+		args = []any{limit}
+	} else {
+		query = `
+			SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
+			       action, ast_content_hash, lines_of_code,
+			       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
+			       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
+			FROM code_node_events
+			WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL)
+			ORDER BY event_time DESC
+			LIMIT ?
+		`
+		args = []any{repo, limit}
+	}
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("recent events: %w", err)
 	}
@@ -198,26 +224,48 @@ type ThrashingRow struct {
 }
 
 // Thrashing finds (file, node) pairs edited at least minEdits times within a
-// rolling 24-hour window, looking back lookbackDays. The hour span is computed
-// in Go because SQLite lacks DATE_DIFF; this keeps the SQL portable.
-func (s *Store) Thrashing(minEdits int, lookbackDays int) ([]ThrashingRow, error) {
+// rolling 24-hour window, looking back lookbackDays, optionally filtered by repo_name.
+func (s *Store) Thrashing(minEdits int, lookbackDays int, repoFilter ...string) ([]ThrashingRow, error) {
 	if minEdits <= 0 {
 		minEdits = 3
 	}
 	if lookbackDays <= 0 {
 		lookbackDays = 7
 	}
+	var repo string
+	if len(repoFilter) > 0 {
+		repo = repoFilter[0]
+	}
 
-	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT file_path, node_signature, COUNT(*) AS edit_count,
-		       MIN(event_time) AS first_event, MAX(event_time) AS last_event
-		FROM code_node_events
-		WHERE event_time >= datetime('now', ?)
-		GROUP BY file_path, node_signature
-		HAVING edit_count >= ? AND (julianday(MAX(event_time)) - julianday(MIN(event_time))) <= 1.0
-		ORDER BY edit_count DESC
-		LIMIT 100
-	`, fmt.Sprintf("-%d days", lookbackDays), minEdits)
+	var query string
+	var args []any
+	if repo == "" {
+		query = `
+			SELECT file_path, node_signature, COUNT(*) AS edit_count,
+			       MIN(event_time) AS first_event, MAX(event_time) AS last_event
+			FROM code_node_events
+			WHERE event_time >= datetime('now', ?)
+			GROUP BY file_path, node_signature
+			HAVING edit_count >= ? AND (julianday(MAX(event_time)) - julianday(MIN(event_time))) <= 1.0
+			ORDER BY edit_count DESC
+			LIMIT 100
+		`
+		args = []any{fmt.Sprintf("-%d days", lookbackDays), minEdits}
+	} else {
+		query = `
+			SELECT file_path, node_signature, COUNT(*) AS edit_count,
+			       MIN(event_time) AS first_event, MAX(event_time) AS last_event
+			FROM code_node_events
+			WHERE event_time >= datetime('now', ?) AND (repo_name = ? OR repo_name = '' OR repo_name IS NULL)
+			GROUP BY file_path, node_signature
+			HAVING edit_count >= ? AND (julianday(MAX(event_time)) - julianday(MIN(event_time))) <= 1.0
+			ORDER BY edit_count DESC
+			LIMIT 100
+		`
+		args = []any{fmt.Sprintf("-%d days", lookbackDays), repo, minEdits}
+	}
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("thrashing query: %w", err)
 	}
@@ -262,13 +310,17 @@ type ModelRow struct {
 }
 
 // ModelComparison computes per-model survival and ROI for every model the
-// daemon has ever seen — i.e. the union of models in agent_runs and models
-// credited with code_node_events. Driving from this universe (rather than
-// from events alone) means reported spend is visible immediately, before any
-// code churn has been correlated. Total cost always sums agent_runs; ROI
-// (cost per survived node) stays undefined until a node survives 14+ days.
-func (s *Store) ModelComparison() ([]ModelRow, error) {
-	rows, err := s.db.QueryContext(context.Background(), `
+// daemon has ever seen, optionally filtered by repo_name.
+func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
+	var repo string
+	if len(repoFilter) > 0 {
+		repo = repoFilter[0]
+	}
+
+	var query string
+	var args []any
+	if repo == "" {
+		query = `
 		WITH lifecycle AS (
 			SELECT e.node_signature,
 			       COALESCE(r.model_name, 'unknown') AS model_name,
@@ -321,7 +373,74 @@ func (s *Store) ModelComparison() ([]ModelRow, error) {
 		LEFT JOIN roi   ON roi.model_name   = m.model_name
 		LEFT JOIN spend ON spend.model_name = m.model_name
 		ORDER BY m.model_name
-	`)
+		`
+		args = []any{}
+	} else {
+		query = `
+		WITH lifecycle AS (
+			SELECT e.node_signature,
+			       COALESCE(r.model_name, 'unknown') AS model_name,
+			       MIN(e.event_time) AS birth_time,
+			       MAX(CASE WHEN e.action = 'DELETED' THEN e.event_time END) AS death_time
+			FROM code_node_events e
+			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+			WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
+			GROUP BY e.node_signature, COALESCE(r.model_name, 'unknown')
+		),
+		lc AS (
+			SELECT model_name,
+			       COUNT(*) AS total_nodes,
+			       SUM(CASE WHEN death_time IS NULL THEN 1 ELSE 0 END) AS active_nodes,
+			       AVG(julianday(COALESCE(death_time, CURRENT_TIMESTAMP)) - julianday(birth_time)) AS avg_longevity
+			FROM lifecycle
+			GROUP BY model_name
+		),
+		roi AS (
+			SELECT COALESCE(r.model_name, 'unknown') AS model_name,
+			       COUNT(DISTINCT e.node_signature) AS survived_count
+			FROM code_node_events e
+			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+			WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
+			  AND e.action = 'ADDED'
+			  AND e.event_time <= datetime('now', '-14 days')
+			  AND e.node_signature NOT IN (SELECT node_signature FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND action = 'DELETED')
+			GROUP BY COALESCE(r.model_name, 'unknown')
+		),
+		spend AS (
+			SELECT model_name,
+			       SUM(COALESCE(cost_usd, 0)) AS total_cost,
+			       COUNT(*)                  AS run_count
+			FROM agent_runs r
+			WHERE model_name IS NOT NULL AND model_name <> ''
+			  AND (r.run_id IN (
+				SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+				UNION
+				SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+			  ) OR NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL))
+			GROUP BY model_name
+		),
+		models AS (
+			SELECT model_name FROM lc
+			UNION
+			SELECT model_name FROM spend
+		)
+		SELECT m.model_name,
+		       COALESCE(lc.total_nodes, 0),
+		       COALESCE(lc.active_nodes, 0),
+		       COALESCE(lc.avg_longevity, 0),
+		       COALESCE(spend.total_cost, 0),
+		       COALESCE(roi.survived_count, 0),
+		       COALESCE(spend.run_count, 0)
+		FROM models m
+		LEFT JOIN lc    ON lc.model_name    = m.model_name
+		LEFT JOIN roi   ON roi.model_name   = m.model_name
+		LEFT JOIN spend ON spend.model_name = m.model_name
+		ORDER BY m.model_name
+		`
+		args = []any{repo, repo, repo, repo, repo, repo}
+	}
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("model comparison: %w", err)
 	}
@@ -336,6 +455,9 @@ func (s *Store) ModelComparison() ([]ModelRow, error) {
 		)
 		if err := rows.Scan(&r.Model, &r.TotalNodes, &active, &lon, &r.TotalCostUSD, &r.TotalSurvivedNodes, &r.RunCount); err != nil {
 			return nil, fmt.Errorf("scan model row: %w", err)
+		}
+		if models.IsJunkModel(r.Model) {
+			continue
 		}
 		r.ActiveNodes = toInt(active)
 		r.AvgLongevityDays = toFloat(lon)
@@ -371,7 +493,7 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 	row := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*), COUNT(DISTINCT node_signature)
 		FROM code_node_events
-		WHERE (file_path = ? OR file_path = ? OR file_path = ? OR file_path LIKE '%' || ? OR file_path LIKE '%' || ?)
+		WHERE (file_path = ? OR file_path = ? OR file_path = ? OR file_path LIKE '%/' || ? OR file_path LIKE '%\' || ?)
 		  AND event_time >= datetime('now', '-1 day')
 	`, filePath, normSlash, normBackslash, normSlash, normBackslash)
 	if err := row.Scan(&edits, &sigs); err != nil {
@@ -394,15 +516,35 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 	return out, nil
 }
 
-// AllFilesHealth queries health scores for all churned files in a single fast query.
-func (s *Store) AllFilesHealth() (map[string]FileHealth, error) {
+// AllFilesHealth queries health scores for all churned files, optionally filtered by repo_name.
+func (s *Store) AllFilesHealth(repoFilter ...string) (map[string]FileHealth, error) {
+	var repo string
+	if len(repoFilter) > 0 {
+		repo = repoFilter[0]
+	}
+
+	var query string
+	var args []any
+	if repo == "" {
+		query = `
+			SELECT file_path, COUNT(*), COUNT(DISTINCT node_signature)
+			FROM code_node_events
+			WHERE event_time >= datetime('now', '-1 day')
+			GROUP BY file_path
+		`
+		args = []any{}
+	} else {
+		query = `
+			SELECT file_path, COUNT(*), COUNT(DISTINCT node_signature)
+			FROM code_node_events
+			WHERE event_time >= datetime('now', '-1 day') AND (repo_name = ? OR repo_name = '' OR repo_name IS NULL)
+			GROUP BY file_path
+		`
+		args = []any{repo}
+	}
+
 	out := make(map[string]FileHealth)
-	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT file_path, COUNT(*), COUNT(DISTINCT node_signature)
-		FROM code_node_events
-		WHERE event_time >= datetime('now', '-1 day')
-		GROUP BY file_path
-	`)
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		return out, err
 	}
@@ -445,16 +587,39 @@ type NodeStat struct {
 	LastEventAt time.Time `json:"last_event_time"`
 }
 
-// AllNodeStats queries aggregate metrics for every known AST node signature.
-func (s *Store) AllNodeStats() (map[string]NodeStat, error) {
-	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT e.node_signature, e.file_path, COUNT(*) as edit_count,
-		       COALESCE((SELECT action FROM code_node_events WHERE node_signature = e.node_signature ORDER BY event_time DESC LIMIT 1), 'ACTIVE') as last_action,
-		       COALESCE((SELECT r.model_name FROM code_node_events c LEFT JOIN agent_runs r ON c.run_id = r.run_id WHERE c.node_signature = e.node_signature AND r.model_name IS NOT NULL ORDER BY c.event_time DESC LIMIT 1), 'unknown') as last_model,
-		       MAX(e.event_time) as last_event_time
-		FROM code_node_events e
-		GROUP BY e.node_signature, e.file_path
-	`)
+// AllNodeStats queries aggregate metrics for every known AST node signature, optionally filtered by repo_name.
+func (s *Store) AllNodeStats(repoFilter ...string) (map[string]NodeStat, error) {
+	var repo string
+	if len(repoFilter) > 0 {
+		repo = repoFilter[0]
+	}
+
+	var query string
+	var args []any
+	if repo == "" {
+		query = `
+			SELECT e.node_signature, e.file_path, COUNT(*) as edit_count,
+			       COALESCE((SELECT action FROM code_node_events WHERE node_signature = e.node_signature ORDER BY event_time DESC LIMIT 1), 'ACTIVE') as last_action,
+			       COALESCE((SELECT r.model_name FROM code_node_events c LEFT JOIN agent_runs r ON c.run_id = r.run_id WHERE c.node_signature = e.node_signature AND r.model_name IS NOT NULL ORDER BY c.event_time DESC LIMIT 1), 'unknown') as last_model,
+			       MAX(e.event_time) as last_event_time
+			FROM code_node_events e
+			GROUP BY e.node_signature, e.file_path
+		`
+		args = []any{}
+	} else {
+		query = `
+			SELECT e.node_signature, e.file_path, COUNT(*) as edit_count,
+			       COALESCE((SELECT action FROM code_node_events WHERE node_signature = e.node_signature AND (repo_name = ? OR repo_name = '' OR repo_name IS NULL) ORDER BY event_time DESC LIMIT 1), 'ACTIVE') as last_action,
+			       COALESCE((SELECT r.model_name FROM code_node_events c LEFT JOIN agent_runs r ON c.run_id = r.run_id WHERE c.node_signature = e.node_signature AND (c.repo_name = ? OR c.repo_name = '' OR c.repo_name IS NULL) AND r.model_name IS NOT NULL ORDER BY c.event_time DESC LIMIT 1), 'unknown') as last_model,
+			       MAX(e.event_time) as last_event_time
+			FROM code_node_events e
+			WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
+			GROUP BY e.node_signature, e.file_path
+		`
+		args = []any{repo, repo, repo}
+	}
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("node stats query: %w", err)
 	}
@@ -673,4 +838,287 @@ func (s *Store) ProfilerOverview() (ProfilerOverviewRow, error) {
 	}
 	return o, nil
 }
+
+// FileReadRecord is the persisted form of a file read event.
+type FileReadRecord struct {
+	ReadID         string    `json:"read_id"`
+	RunID          string    `json:"run_id,omitempty"`
+	SessionID      string    `json:"session_id,omitempty"`
+	RepoName       string    `json:"repo_name"`
+	FilePath       string    `json:"file_path"`
+	AgentName      string    `json:"agent_name"`
+	ModelName      string    `json:"model_name"`
+	Provider       string    `json:"provider"`
+	ToolName       string    `json:"tool_name"`
+	StartLine      int       `json:"start_line"`
+	EndLine        int       `json:"end_line"`
+	LinesReadCount int       `json:"lines_read_count"`
+	PromptTokens   int64     `json:"prompt_tokens"`
+	CachedTokens   int64     `json:"cached_tokens"`
+	CostUSD        float64   `json:"cost_usd"`
+	Intent         string    `json:"intent,omitempty"`
+	ReadTime       time.Time `json:"read_time"`
+}
+
+// LineReadHeatmap represents aggregated read activity for a slice or line range.
+type LineReadHeatmap struct {
+	StartLine int `json:"start_line"`
+	EndLine   int `json:"end_line"`
+	ReadCount int `json:"read_count"`
+}
+
+// FileReadStats summarizes all read telemetry for a given file.
+type FileReadStats struct {
+	FilePath          string           `json:"file_path"`
+	TotalReads        int              `json:"total_reads"`
+	TotalLinesRead    int              `json:"total_lines_read"`
+	TotalCostUSD      float64          `json:"total_cost_usd"`
+	TotalPromptTokens int64            `json:"total_prompt_tokens"`
+	TotalCachedTokens int64            `json:"total_cached_tokens"`
+	UniqueModels      int              `json:"unique_models"`
+	ModelBreakdown    map[string]int   `json:"model_breakdown"`
+	ProviderBreakdown map[string]int   `json:"provider_breakdown"`
+	RecentReads       []FileReadRecord `json:"recent_reads"`
+}
+
+// InsertReadEvent records a file read event into file_read_events.
+func (s *Store) InsertReadEvent(r FileReadRecord) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	if r.StartLine <= 0 {
+		r.StartLine = 1
+	}
+	if r.LinesReadCount <= 0 && r.EndLine >= r.StartLine {
+		r.LinesReadCount = r.EndLine - r.StartLine + 1
+	}
+
+	const q = `
+		INSERT INTO file_read_events (
+			read_id, run_id, session_id, repo_name, file_path, agent_name,
+			model_name, provider, tool_name, start_line, end_line,
+			lines_read_count, prompt_tokens, cached_tokens, cost_usd,
+			intent, read_time
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+		ON CONFLICT(read_id) DO NOTHING
+	`
+	_, err := s.db.ExecContext(ctx, q,
+		r.ReadID, r.RunID, r.SessionID, r.RepoName, r.FilePath, r.AgentName,
+		r.ModelName, r.Provider, r.ToolName, r.StartLine, r.EndLine,
+		r.LinesReadCount, r.PromptTokens, r.CachedTokens, r.CostUSD,
+		r.Intent, fmtDBTime(r.ReadTime),
+	)
+	return err
+}
+
+// GetRecentFileReads returns the most recent file read events, optionally filtered by repo_name.
+func (s *Store) GetRecentFileReads(limit int, repoFilter ...string) ([]FileReadRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var repo string
+	if len(repoFilter) > 0 {
+		repo = repoFilter[0]
+	}
+
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	var query string
+	var args []any
+	if repo == "" {
+		query = `
+			SELECT read_id, COALESCE(run_id, ''), COALESCE(session_id, ''), repo_name, file_path,
+			       agent_name, model_name, provider, tool_name, start_line, end_line,
+			       lines_read_count, prompt_tokens, cached_tokens, cost_usd, COALESCE(intent, ''),
+			       COALESCE(read_time, CURRENT_TIMESTAMP)
+			FROM file_read_events
+			ORDER BY read_time DESC
+			LIMIT ?
+		`
+		args = []any{limit}
+	} else {
+		query = `
+			SELECT read_id, COALESCE(run_id, ''), COALESCE(session_id, ''), repo_name, file_path,
+			       agent_name, model_name, provider, tool_name, start_line, end_line,
+			       lines_read_count, prompt_tokens, cached_tokens, cost_usd, COALESCE(intent, ''),
+			       COALESCE(read_time, CURRENT_TIMESTAMP)
+			FROM file_read_events
+			WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL)
+			ORDER BY read_time DESC
+			LIMIT ?
+		`
+		args = []any{repo, limit}
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query recent reads: %w", err)
+	}
+	defer rows.Close()
+
+	var out []FileReadRecord
+	for rows.Next() {
+		var (
+			rec FileReadRecord
+			ts  string
+		)
+		if err := rows.Scan(
+			&rec.ReadID, &rec.RunID, &rec.SessionID, &rec.RepoName, &rec.FilePath,
+			&rec.AgentName, &rec.ModelName, &rec.Provider, &rec.ToolName,
+			&rec.StartLine, &rec.EndLine, &rec.LinesReadCount,
+			&rec.PromptTokens, &rec.CachedTokens, &rec.CostUSD,
+			&rec.Intent, &ts,
+		); err != nil {
+			return nil, fmt.Errorf("scan read event: %w", err)
+		}
+		rec.ReadTime = parseDBTime(ts)
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// GetFileReadStats returns detailed read counts, model breakdown, and recent reads for a single file.
+func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	stats := FileReadStats{
+		FilePath:          filePath,
+		ModelBreakdown:    make(map[string]int),
+		ProviderBreakdown: make(map[string]int),
+		RecentReads:       make([]FileReadRecord, 0),
+	}
+
+	normPath := strings.ReplaceAll(filePath, "\\", "/")
+
+	// 1. Overall Aggregates
+	row := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(SUM(lines_read_count), 0),
+		       COALESCE(SUM(cost_usd), 0.0),
+		       COALESCE(SUM(prompt_tokens), 0),
+		       COALESCE(SUM(cached_tokens), 0),
+		       COUNT(DISTINCT model_name)
+		FROM file_read_events
+		WHERE file_path = ? OR file_path LIKE ? OR REPLACE(file_path, '\', '/') LIKE ?
+	`, filePath, "%"+normPath, "%"+normPath)
+
+	if err := row.Scan(
+		&stats.TotalReads,
+		&stats.TotalLinesRead,
+		&stats.TotalCostUSD,
+		&stats.TotalPromptTokens,
+		&stats.TotalCachedTokens,
+		&stats.UniqueModels,
+	); err != nil {
+		return stats, fmt.Errorf("scan read stats: %w", err)
+	}
+
+	// 2. Model Breakdown
+	mRows, err := s.db.QueryContext(ctx, `
+		SELECT model_name, COUNT(*)
+		FROM file_read_events
+		WHERE file_path = ? OR file_path LIKE ? OR REPLACE(file_path, '\', '/') LIKE ?
+		GROUP BY model_name
+		ORDER BY COUNT(*) DESC
+	`, filePath, "%"+normPath, "%"+normPath)
+	if err == nil {
+		defer mRows.Close()
+		for mRows.Next() {
+			var model string
+			var count int
+			if err := mRows.Scan(&model, &count); err == nil && model != "" {
+				stats.ModelBreakdown[model] = count
+			}
+		}
+	}
+
+	// 3. Provider Breakdown
+	pRows, err := s.db.QueryContext(ctx, `
+		SELECT provider, COUNT(*)
+		FROM file_read_events
+		WHERE file_path = ? OR file_path LIKE ? OR REPLACE(file_path, '\', '/') LIKE ?
+		GROUP BY provider
+		ORDER BY COUNT(*) DESC
+	`, filePath, "%"+normPath, "%"+normPath)
+	if err == nil {
+		defer pRows.Close()
+		for pRows.Next() {
+			var prov string
+			var count int
+			if err := pRows.Scan(&prov, &count); err == nil && prov != "" {
+				stats.ProviderBreakdown[prov] = count
+			}
+		}
+	}
+
+	// 4. Recent Reads
+	rRows, err := s.db.QueryContext(ctx, `
+		SELECT read_id, COALESCE(run_id, ''), COALESCE(session_id, ''), repo_name, file_path,
+		       agent_name, model_name, provider, tool_name, start_line, end_line,
+		       lines_read_count, prompt_tokens, cached_tokens, cost_usd, COALESCE(intent, ''),
+		       COALESCE(read_time, CURRENT_TIMESTAMP)
+		FROM file_read_events
+		WHERE file_path = ? OR file_path LIKE ? OR REPLACE(file_path, '\', '/') LIKE ?
+		ORDER BY read_time DESC
+		LIMIT 20
+	`, filePath, "%"+normPath, "%"+normPath)
+	if err == nil {
+		defer rRows.Close()
+		for rRows.Next() {
+			var (
+				rec FileReadRecord
+				ts  string
+			)
+			if err := rRows.Scan(
+				&rec.ReadID, &rec.RunID, &rec.SessionID, &rec.RepoName, &rec.FilePath,
+				&rec.AgentName, &rec.ModelName, &rec.Provider, &rec.ToolName,
+				&rec.StartLine, &rec.EndLine, &rec.LinesReadCount,
+				&rec.PromptTokens, &rec.CachedTokens, &rec.CostUSD,
+				&rec.Intent, &ts,
+			); err == nil {
+				rec.ReadTime = parseDBTime(ts)
+				stats.RecentReads = append(stats.RecentReads, rec)
+			}
+		}
+	}
+
+	return stats, nil
+}
+
+// GetFileReadHeatmap computes line-range frequencies for inspecting hot read regions.
+func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	normPath := strings.ReplaceAll(filePath, "\\", "/")
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT start_line, end_line, COUNT(*)
+		FROM file_read_events
+		WHERE (file_path = ? OR file_path LIKE ? OR REPLACE(file_path, '\', '/') LIKE ?)
+		  AND (start_line > 0 OR end_line > 0)
+		GROUP BY start_line, end_line
+		ORDER BY COUNT(*) DESC
+		LIMIT 50
+	`, filePath, "%"+normPath, "%"+normPath)
+	if err != nil {
+		return nil, fmt.Errorf("read heatmap query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []LineReadHeatmap
+	for rows.Next() {
+		var hm LineReadHeatmap
+		if err := rows.Scan(&hm.StartLine, &hm.EndLine, &hm.ReadCount); err != nil {
+			return nil, fmt.Errorf("scan read heatmap: %w", err)
+		}
+		out = append(out, hm)
+	}
+	return out, rows.Err()
+}
+
 

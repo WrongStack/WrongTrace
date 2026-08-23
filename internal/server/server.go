@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
+	"github.com/wrongstack/wrongtrace/internal/ingest"
 	"github.com/wrongstack/wrongtrace/internal/models"
 	"github.com/wrongstack/wrongtrace/internal/profiler"
 	"github.com/wrongstack/wrongtrace/internal/proxy"
@@ -27,8 +29,8 @@ import (
 // EngineAPI is the slice of *core.Engine the HTTP layer needs. Declared as an
 // interface so handlers can be exercised with a fake in tests.
 type EngineAPI interface {
-	Metrics() (core.MetricsSnapshot, error)
-	Atlas() (core.AtlasSnapshot, error)
+	Metrics(repoFilter ...string) (core.MetricsSnapshot, error)
+	Atlas(repoFilter ...string) (core.AtlasSnapshot, error)
 	FileHealth(path string) (core.IPCHealth, error)
 	CheckGuardrail(path string) (core.GuardrailResult, error)
 	LockFile(path, reason string)
@@ -46,11 +48,17 @@ type EngineAPI interface {
 	ImportFromWrongStack(roots []string) (core.ImportFromWrongStackResult, error)
 	UpdateProject(p core.ProjectProfile) (core.ProjectProfile, error)
 	SwitchActiveProject(id string) (*core.ProjectProfile, error)
+	RescanProject(id string) (*core.ProjectProfile, error)
+	RescanAllProjects() []core.ProjectProfile
 	RemoveProject(id string) error
 	GetSettings() core.AppSettings
 	UpdateSettings(s core.AppSettings) core.AppSettings
 	VacuumDB() error
 	ClearStale(days int) (int64, error)
+	GetFileReadStats(filePath string) (db.FileReadStats, error)
+	GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileReadRecord, error)
+	GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, error)
+	IndexStatus() core.IndexProgress
 	Hub() *core.Hub
 	Store() *db.Store
 	Repo() string
@@ -169,11 +177,39 @@ func (s *Server) buildRouter() chi.Router {
 		Proxy: proxy.NewGatewayProxy(proxy.Config{
 			Reporter: s.cfg.Engine,
 			OnTraffic: func(rec proxy.ProxyTrafficRecord) {
-				if s.cfg.Engine != nil && s.cfg.Engine.Hub() != nil {
-					s.cfg.Engine.Hub().Broadcast(core.WSEvent{
-						Type:    "proxy_traffic",
-						Payload: rec,
-					})
+				if s.cfg.Engine != nil {
+					for _, tc := range rec.ToolCalls {
+						if tc.TargetFile != "" && ingest.IsFileReadingTool(tc.Name) {
+							var args map[string]interface{}
+							_ = json.Unmarshal([]byte(tc.Arguments), &args)
+							sLine, eLine, lCount := ingest.ExtractLineRange(args)
+							_ = s.cfg.Engine.RecordReadEvent(db.FileReadRecord{
+								ReadID:         fmt.Sprintf("gw-read-%s-%s", rec.ID, tc.ID),
+								SessionID:      rec.RunID,
+								RunID:          rec.RunID,
+								RepoName:       rec.ProjectSlug,
+								FilePath:       tc.TargetFile,
+								AgentName:      rec.AgentName,
+								ModelName:      rec.Model,
+								Provider:       rec.Provider,
+								ToolName:       tc.Name,
+								StartLine:      sLine,
+								EndLine:        eLine,
+								LinesReadCount: lCount,
+								PromptTokens:   rec.PromptTokens,
+								CachedTokens:   rec.CachedTokens,
+								CostUSD:        rec.CostUSD,
+								Intent:         rec.AssistantReply,
+								ReadTime:       rec.Timestamp,
+							})
+						}
+					}
+					if s.cfg.Engine.Hub() != nil {
+						s.cfg.Engine.Hub().Broadcast(core.WSEvent{
+							Type:    "proxy_traffic",
+							Payload: rec,
+						})
+					}
 				}
 			},
 		}),
@@ -185,10 +221,16 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/metrics/models", h.Models)
 		r.Get("/metrics/recent", h.RecentEvents)
 		r.Get("/atlas", h.Atlas)
+		r.Get("/atlas/status", h.AtlasStatus)
 		r.Get("/file/health", h.FileHealth)
 		r.Get("/guardrail/check", h.CheckGuardrail)
 		r.Post("/guardrail/lock", h.LockFile)
 		r.Post("/guardrail/unlock", h.UnlockFile)
+
+		// File Read Tracing & Context Hotspots
+		r.Get("/reads/recent", h.GetRecentReads)
+		r.Get("/files/reads", h.GetFileReadStats)
+		r.Get("/files/heatmap", h.GetFileReadHeatmap)
 
 		r.Get("/proxy/routes", h.ListProxyRoutes)
 		r.Post("/proxy/routes", h.UpsertProxyRoute)
@@ -200,9 +242,11 @@ func (s *Server) buildRouter() chi.Router {
 		r.Post("/projects", h.AddProject)
 		r.Get("/projects/import/wrongstack", h.PreviewFromWrongStack)
 		r.Post("/projects/import/wrongstack", h.ImportFromWrongStack)
+		r.Post("/projects/rescan", h.RescanAllProjects)
 		r.Get("/projects/{id}", h.GetProject)
 		r.Put("/projects/{id}", h.UpdateProject)
 		r.Post("/projects/{id}/activate", h.SwitchActiveProject)
+		r.Post("/projects/{id}/rescan", h.RescanProject)
 		r.Delete("/projects/{id}", h.RemoveProject)
 
 		r.Get("/settings", h.GetSettings)

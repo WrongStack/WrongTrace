@@ -1,6 +1,7 @@
 package core
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -10,6 +11,20 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/ast"
 	"github.com/wrongstack/wrongtrace/internal/db"
 )
+
+// IndexProgress represents the realtime or final indexing completeness of the workspace AST cache.
+type IndexProgress struct {
+	IsIndexing      bool      `json:"is_indexing"`
+	TotalDiscovered int       `json:"total_discovered"`
+	EligibleFiles   int       `json:"eligible_files"`
+	IndexedFiles    int       `json:"indexed_files"`
+	SkippedFiles    int       `json:"skipped_files"`
+	FailedFiles     int       `json:"failed_files"`
+	Percentage      float64   `json:"percentage"`
+	CurrentFile     string    `json:"current_file,omitempty"`
+	DurationMs      int64     `json:"duration_ms"`
+	LastIndexedAt   time.Time `json:"last_indexed_at"`
+}
 
 // AtlasSnapshot represents the entire repository's structure:
 // Packages -> Files -> Symbols with their health and churn metrics.
@@ -22,12 +37,13 @@ type AtlasSnapshot struct {
 	TotalFiles  int            `json:"total_files"`
 	TotalLOC    int            `json:"total_loc"`
 	TotalNodes  int            `json:"total_nodes"`
+	IndexStatus IndexProgress  `json:"index_status"`
 }
 
 // AtlasPackage groups files belonging to a specific directory or package module.
 type AtlasPackage struct {
-	Path      string      `json:"path"` // e.g. "internal/ast", "web/src/components", "."
-	Name      string      `json:"name"` // e.g. "ast", "components", "root"
+	Path      string      `json:"path"`                // e.g. "internal/ast", "web/src/components", "."
+	Name      string      `json:"name"`                // e.g. "ast", "components", "root"
 	Workspace string      `json:"workspace,omitempty"` // Monorepo scope e.g. "apps/web", "packages/core", "internal"
 	Files     []AtlasFile `json:"files"`
 	TotalLOC  int         `json:"total_loc"`
@@ -64,9 +80,19 @@ type AtlasSymbol struct {
 
 // PrimeDirectory recursively parses all supported files in dir so they are immediately available in the AST cache without generating diff events.
 func (e *Engine) PrimeDirectory(dir string) {
-	if e.cfg.AST == nil {
+	if e.cfg.AST == nil || dir == "" {
 		return
 	}
+	start := time.Now()
+
+	e.indexMu.Lock()
+	e.indexStatus = IndexProgress{
+		IsIndexing: true,
+	}
+	e.indexMu.Unlock()
+
+	var discovered, eligible, indexed, skipped, failed int
+
 	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info == nil {
 			return nil
@@ -80,32 +106,93 @@ func (e *Engine) PrimeDirectory(dir string) {
 			}
 			return nil
 		}
-		if e.parseEligible(path) {
-			src, rerr := os.ReadFile(path)
-			if rerr == nil {
-				snap, perr := e.cfg.AST.Parse(path, src)
-				if perr == nil && snap != nil {
-					e.cfg.AST.SetSnapshot(snap)
-				}
-			}
+
+		discovered++
+		if !e.parseEligible(path) {
+			skipped++
+			return nil
 		}
+
+		eligible++
+		e.indexMu.Lock()
+		e.indexStatus.TotalDiscovered = discovered
+		e.indexStatus.EligibleFiles = eligible
+		e.indexStatus.CurrentFile = filepath.Base(path)
+		e.indexMu.Unlock()
+
+		src, rerr := os.ReadFile(path)
+		if rerr != nil {
+			failed++
+			return nil
+		}
+		snap, perr := e.cfg.AST.Parse(path, src)
+		if perr != nil || snap == nil {
+			failed++
+			return nil
+		}
+		e.cfg.AST.SetSnapshot(snap)
+		indexed++
+
+		e.indexMu.Lock()
+		e.indexStatus.IndexedFiles = indexed
+		e.indexStatus.SkippedFiles = skipped
+		e.indexStatus.FailedFiles = failed
+		if eligible > 0 {
+			e.indexStatus.Percentage = math.Round((float64(indexed)/float64(eligible))*10000) / 100
+		}
+		e.indexMu.Unlock()
+
 		return nil
 	})
+
+	e.indexMu.Lock()
+	e.indexStatus.IsIndexing = false
+	e.indexStatus.DurationMs = time.Since(start).Milliseconds()
+	e.indexStatus.LastIndexedAt = time.Now().UTC()
+	e.indexStatus.CurrentFile = ""
+	e.indexStatus.TotalDiscovered = discovered
+	e.indexStatus.EligibleFiles = eligible
+	e.indexStatus.IndexedFiles = indexed
+	e.indexStatus.SkippedFiles = skipped
+	e.indexStatus.FailedFiles = failed
+	if eligible > 0 {
+		e.indexStatus.Percentage = math.Round((float64(indexed)/float64(eligible))*10000) / 100
+	} else if discovered > 0 {
+		e.indexStatus.Percentage = 100.0
+	}
+	e.indexMu.Unlock()
+
+	if e.hub != nil {
+		e.hub.Broadcast(WSEvent{
+			Type:    "index_progress",
+			Payload: e.IndexStatus(),
+		})
+	}
 }
 
-// Atlas aggregates the full Code Atlas graph containing packages, files, and symbols.
-func (e *Engine) Atlas() (AtlasSnapshot, error) {
+// Atlas aggregates the full Code Atlas graph containing packages, files, and symbols, optionally filtered by repo_name.
+func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
+	var filter string
+	if len(repoFilter) > 0 && repoFilter[0] != "" {
+		filter = repoFilter[0]
+	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
+		filter = active.Name
+	} else {
+		filter = e.cfg.RepoName
+	}
+
 	snap := AtlasSnapshot{
-		Repo:        e.cfg.RepoName,
+		Repo:        filter,
 		GeneratedAt: time.Now().UTC(),
 		Packages:    []AtlasPackage{},
+		IndexStatus: e.IndexStatus(),
 	}
 
 	var nodeStats map[string]db.NodeStat
 	var allHealth map[string]db.FileHealth
 	if e.cfg.Store != nil {
-		nodeStats, _ = e.cfg.Store.AllNodeStats()
-		allHealth, _ = e.cfg.Store.AllFilesHealth()
+		nodeStats, _ = e.cfg.Store.AllNodeStats(filter)
+		allHealth, _ = e.cfg.Store.AllFilesHealth(filter)
 	}
 	if nodeStats == nil {
 		nodeStats = make(map[string]db.NodeStat)
@@ -124,11 +211,20 @@ func (e *Engine) Atlas() (AtlasSnapshot, error) {
 
 	activeProj := e.GetActiveProject()
 	var activePath string
-	if activeProj != nil && activeProj.Path != "" {
+	if filter != "" {
+		for _, p := range e.ListProjects() {
+			if strings.EqualFold(p.Name, filter) || strings.EqualFold(p.ID, filter) {
+				activePath = filepath.Clean(p.Path)
+				snap.Repo = p.Name
+				break
+			}
+		}
+	}
+	if activePath == "" && activeProj != nil && activeProj.Path != "" {
 		activePath = filepath.Clean(activeProj.Path)
 	}
 
-	// Check if activePath actually matches loaded snapshots (or if running in isolated test)
+	// Check if activePath matches loaded snapshots
 	var hasActivePathMatch bool
 	if activePath != "" {
 		for p := range snapshots {

@@ -63,39 +63,61 @@ type Engine struct {
 	activeProjectID string
 	watcher         WatcherAPI
 	webhooks        *webhook.Dispatcher
+
+	indexMu     sync.RWMutex
+	indexStatus IndexProgress
 }
 
 // runMeta is the metadata kept for an active (or recently-seen) agent run —
 // just enough to back-fill run_id on subsequent AST events.
 type runMeta struct {
-	AgentName string
-	ModelName string
-	StartedAt time.Time
-	LastSeen  time.Time
-	TaskID    string
+	AgentName   string
+	ModelName   string
+	ProjectID   string
+	ProjectSlug string
+	StartedAt   time.Time
+	LastSeen    time.Time
+	TaskID      string
 }
 
 // NewEngine constructs an Engine. Pass a nil AST to skip file parsing (the MCP
 // subcommand uses this since it never touches the filesystem).
 func NewEngine(cfg Config) *Engine {
+	loadedProjects := LoadProjectsIndex()
+	settings := globalSettings
+
+	activeProjID := ""
+	for id, p := range loadedProjects {
+		if cfg.RepoName != "" && cfg.RepoName != "default" {
+			if strings.EqualFold(p.Name, cfg.RepoName) || strings.EqualFold(p.ID, cfg.RepoName) {
+				activeProjID = id
+				break
+			}
+		} else if p.IsActive {
+			activeProjID = id
+			cfg.RepoName = p.Name
+			break
+		}
+	}
 	if cfg.RepoName == "" {
 		cfg.RepoName = "default"
 	}
-	loadedProjects := LoadProjectsIndex()
-	settings := globalSettings
+
 	dispatcher := webhook.NewDispatcher(webhook.Config{
 		SlackURL:   settings.SlackWebhookURL,
 		DiscordURL: settings.DiscordWebhookURL,
 		GenericURL: settings.CustomWebhookURL,
 	})
+
 	return &Engine{
-		cfg:         cfg,
-		hub:         NewHub(),
-		activeRuns:  make(map[string]runMeta),
-		correlate:   10 * time.Minute,
-		lockedFiles: make(map[string]bool),
-		projects:    loadedProjects,
-		webhooks:    dispatcher,
+		cfg:             cfg,
+		hub:             NewHub(),
+		activeRuns:      make(map[string]runMeta),
+		correlate:       10 * time.Minute,
+		lockedFiles:     make(map[string]bool),
+		projects:        loadedProjects,
+		activeProjectID: activeProjID,
+		webhooks:        dispatcher,
 	}
 }
 
@@ -105,8 +127,16 @@ func (e *Engine) Hub() *Hub { return e.hub }
 // Store exposes the underlying analytical database store.
 func (e *Engine) Store() *db.Store { return e.cfg.Store }
 
-// Repo returns the configured repository name (used by handlers).
-func (e *Engine) Repo() string { return e.cfg.RepoName }
+// Repo returns the active repository or project name.
+func (e *Engine) Repo() string {
+	if e.cfg.RepoName != "" && e.cfg.RepoName != "default" {
+		return e.cfg.RepoName
+	}
+	if active := e.GetActiveProject(); active != nil && active.Name != "" {
+		return active.Name
+	}
+	return e.cfg.RepoName
+}
 
 // HandleFileChange is invoked by the watcher after the debounce timer fires.
 // It re-parses the file, computes the semantic diff against the cached
@@ -127,6 +157,12 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 	if info.IsDir() || e.shouldSkip(path) {
 		return
 	}
+
+	repoName := e.cfg.RepoName
+	if proj, ok := e.FindProjectForFile(path); ok && proj.Name != "" {
+		repoName = proj.Name
+	}
+
 	src, err := os.ReadFile(path)
 	if err != nil {
 		log.Printf("engine: read %s: %v", path, err)
@@ -137,7 +173,7 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 		return
 	}
 	prev, _ := e.cfg.AST.Snapshot(path)
-	res := ast.Diff(e.cfg.RepoName, prev, snap)
+	res := ast.Diff(repoName, prev, snap)
 	e.cfg.AST.SetSnapshot(snap)
 
 	if len(res.Events) == 0 {
@@ -152,12 +188,16 @@ func (e *Engine) handleFileGone(_ context.Context, path string) {
 	if e.cfg.AST == nil {
 		return
 	}
+	repoName := e.cfg.RepoName
+	if proj, ok := e.FindProjectForFile(path); ok && proj.Name != "" {
+		repoName = proj.Name
+	}
 	prev, ok := e.cfg.AST.Snapshot(path)
 	if !ok || prev == nil {
 		return
 	}
 	e.cfg.AST.Forget(path)
-	res := ast.Diff(e.cfg.RepoName, prev, nil)
+	res := ast.Diff(repoName, prev, nil)
 	e.persistAndBroadcast(res)
 }
 
@@ -170,10 +210,17 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 		if runID != "" && ev.RunID == "" {
 			ev.RunID = runID
 		}
+		repo := ev.RepoName
+		if repo == "" {
+			repo = e.cfg.RepoName
+		}
+		if p, ok := e.FindProjectForFile(ev.FilePath); ok && p.Name != "" {
+			repo = p.Name
+		}
 		rec := db.EventRecord{
 			EventID:      newID(),
 			RunID:        ev.RunID,
-			RepoName:     ev.RepoName,
+			RepoName:     repo,
 			FilePath:     ev.FilePath,
 			Signature:    ev.Signature,
 			NodeType:     string(ev.NodeType),
@@ -230,9 +277,29 @@ func (e *Engine) shouldSkip(path string) bool {
 	return ignoredPathSegment(path) || !e.parseEligible(path)
 }
 
-// Run parks until ctx is done. Reserved for future background work.
+// Run periodically prunes expired active runs until ctx is done.
 func (e *Engine) Run(ctx context.Context) {
-	<-ctx.Done()
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.pruneActiveRuns()
+		}
+	}
+}
+
+func (e *Engine) pruneActiveRuns() {
+	e.runMu.Lock()
+	defer e.runMu.Unlock()
+	cutoff := time.Now().Add(-e.correlate)
+	for id, meta := range e.activeRuns {
+		if meta.LastSeen.Before(cutoff) {
+			delete(e.activeRuns, id)
+		}
+	}
 }
 
 // ----------------------------------------------------
@@ -252,6 +319,24 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 			p.AgentName = "WrongStack"
 		} else {
 			p.AgentName = "Agent"
+		}
+	}
+
+	if p.ModelName == "" || models.IsJunkModel(p.ModelName) {
+		lowerAgent := strings.ToLower(p.AgentName)
+		switch {
+		case strings.Contains(lowerAgent, "antigravity") || strings.Contains(lowerAgent, "gemini"):
+			p.ModelName = "gemini-3.7-flash"
+		case strings.Contains(lowerAgent, "claude"):
+			p.ModelName = "claude-3-7-sonnet"
+		case strings.Contains(lowerAgent, "aider"):
+			p.ModelName = "gpt-4o"
+		case strings.Contains(lowerAgent, "cline") || strings.Contains(lowerAgent, "roo"):
+			p.ModelName = "claude-3-7-sonnet"
+		case strings.Contains(lowerAgent, "cursor") || strings.Contains(lowerAgent, "windsurf") || strings.Contains(lowerAgent, "trae") || strings.Contains(lowerAgent, "wrongstack"):
+			p.ModelName = "claude-3-7-sonnet"
+		default:
+			p.ModelName = "claude-3-7-sonnet"
 		}
 	}
 
@@ -276,12 +361,19 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 		return fmt.Errorf("upsert run: %w", err)
 	}
 	e.runMu.Lock()
+	existing, exists := e.activeRuns[p.RunID]
+	startedAt := rec.CreatedAt
+	if exists && !existing.StartedAt.IsZero() {
+		startedAt = existing.StartedAt
+	}
 	e.activeRuns[p.RunID] = runMeta{
-		AgentName: p.AgentName,
-		ModelName: p.ModelName,
-		StartedAt: rec.CreatedAt,
-		LastSeen:  rec.CreatedAt,
-		TaskID:    p.TaskID,
+		AgentName:   p.AgentName,
+		ModelName:   p.ModelName,
+		ProjectID:   p.ProjectID,
+		ProjectSlug: p.ProjectSlug,
+		StartedAt:   startedAt,
+		LastSeen:    rec.CreatedAt,
+		TaskID:      p.TaskID,
 	}
 	e.runMu.Unlock()
 	e.hub.Broadcast(WSEvent{Type: "run_reported", Payload: rec})
@@ -362,6 +454,79 @@ func (e *Engine) FileHealth(path string) (IPCHealth, error) {
 
 // Ping verifies the daemon is alive.
 func (e *Engine) Ping() error { return nil }
+
+// RecordReadEvent writes a file read/inspection event into analytical storage and broadcasts it.
+func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
+	if rec.FilePath == "" {
+		return nil
+	}
+	if rec.ReadID == "" {
+		rec.ReadID = newID()
+	}
+	if rec.RepoName == "" {
+		rec.RepoName = e.cfg.RepoName
+		if proj, ok := e.FindProjectForFile(rec.FilePath); ok {
+			rec.RepoName = proj.Name
+		}
+	}
+	if rec.ModelName == "" || models.IsJunkModel(rec.ModelName) {
+		rec.ModelName = "claude-3-7-sonnet"
+	}
+	if rec.CostUSD <= 0 && rec.PromptTokens > 0 {
+		rec.CostUSD = models.Global.CalculateCost(rec.ModelName, rec.PromptTokens, 0)
+	}
+	if rec.ReadTime.IsZero() {
+		rec.ReadTime = time.Now().UTC()
+	}
+	if rec.RunID == "" {
+		rec.RunID = e.recentRunID()
+	}
+
+	if err := e.cfg.Store.InsertReadEvent(rec); err != nil {
+		return fmt.Errorf("insert read event: %w", err)
+	}
+	e.hub.Broadcast(WSEvent{Type: "file_read_event", Payload: rec, EventID: rec.ReadID})
+	return nil
+}
+
+// GetFileReadStats returns aggregated read metrics for a given file.
+func (e *Engine) GetFileReadStats(filePath string) (db.FileReadStats, error) {
+	return e.cfg.Store.GetFileReadStats(filePath)
+}
+
+// GetRecentEvents returns the most recent code mutation and diff events.
+func (e *Engine) GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error) {
+	var filter string
+	if len(repoFilter) > 0 && repoFilter[0] != "" {
+		filter = repoFilter[0]
+	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
+		filter = active.Name
+	}
+	return e.cfg.Store.RecentEvents(limit, filter)
+}
+
+// GetRecentFileReads returns the most recent read records across the system, optionally filtered by repo_name.
+func (e *Engine) GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileReadRecord, error) {
+	var filter string
+	if len(repoFilter) > 0 && repoFilter[0] != "" {
+		filter = repoFilter[0]
+	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
+		filter = active.Name
+	}
+	return e.cfg.Store.GetRecentFileReads(limit, filter)
+}
+
+// GetFileReadHeatmap returns line range frequencies for a file.
+func (e *Engine) GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, error) {
+	return e.cfg.Store.GetFileReadHeatmap(filePath)
+}
+
+// IndexStatus returns the current codebase indexing progress and stats.
+func (e *Engine) IndexStatus() IndexProgress {
+	e.indexMu.RLock()
+	defer e.indexMu.RUnlock()
+	return e.indexStatus
+}
 
 // recentRunID returns the most recently seen run_id within the correlation
 // window. "Last-seen wins" is the right heuristic: watcher events arrive

@@ -17,14 +17,16 @@ import {
   Bot,
 } from 'lucide-react';
 import { RichDiffViewer } from './RichDiffViewer';
-import type { EventRecord } from '../types';
+import { FileReadDetails } from './FileReadDetails';
+import type { EventRecord, Project } from '../types';
 
 interface DiffInspectorViewProps {
   events: EventRecord[];
   loading: boolean;
+  currentProject?: Project | null;
 }
 
-export function DiffInspectorView({ events, loading }: DiffInspectorViewProps) {
+export function DiffInspectorView({ events, loading, currentProject }: DiffInspectorViewProps) {
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [selectedAction, setSelectedAction] = useState<string>('ALL');
@@ -44,6 +46,11 @@ export function DiffInspectorView({ events, loading }: DiffInspectorViewProps) {
   const filteredEvents = useMemo(() => {
     const q = search.toLowerCase().trim();
     return events.filter((e) => {
+      if (currentProject && e.repo_name) {
+        const repo = e.repo_name.toLowerCase();
+        const proj = currentProject.name.toLowerCase();
+        if (!repo.includes(proj) && !proj.includes(repo)) return false;
+      }
       if (selectedAction !== 'ALL' && e.action !== selectedAction) return false;
       if (selectedFile !== 'ALL' && e.file_path !== selectedFile) return false;
       if (q && !e.file_path.toLowerCase().includes(q) && !e.node_signature.toLowerCase().includes(q)) {
@@ -51,7 +58,7 @@ export function DiffInspectorView({ events, loading }: DiffInspectorViewProps) {
       }
       return true;
     });
-  }, [events, search, selectedAction, selectedFile]);
+  }, [events, search, selectedAction, selectedFile, currentProject]);
 
   // Selected event for detail pane
   const currentEvent = useMemo(() => {
@@ -299,7 +306,7 @@ export function DiffInspectorView({ events, loading }: DiffInspectorViewProps) {
               </div>
 
               {/* Rich Diff Body Content */}
-              <div className="p-3 flex-1 overflow-auto">
+              <div className="p-3 flex-1 overflow-auto space-y-4">
                 <RichDiffViewer
                   diff={currentEvent.diff_snippet}
                   filePath={currentEvent.file_path}
@@ -307,8 +314,11 @@ export function DiffInspectorView({ events, loading }: DiffInspectorViewProps) {
                   action={currentEvent.action}
                   startLine={currentEvent.start_line}
                   endLine={currentEvent.end_line}
-                  maxHeight="520px"
+                  maxHeight="420px"
                 />
+
+                {/* File Read & Context Analytics */}
+                <FileReadDetails filePath={currentEvent.file_path} />
               </div>
 
               {/* Metadata Footer */}

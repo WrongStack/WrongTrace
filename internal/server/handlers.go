@@ -13,6 +13,7 @@ import (
 	"io"
 
 	"github.com/wrongstack/wrongtrace/internal/core"
+	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/models"
 	"github.com/wrongstack/wrongtrace/internal/profiler"
 	"github.com/wrongstack/wrongtrace/internal/proxy"
@@ -54,10 +55,22 @@ func (h *Handlers) Health(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (h *Handlers) getProjectFilter(r *http.Request) string {
+	if repo := r.URL.Query().Get("repo"); repo != "" {
+		return repo
+	}
+	if pid := r.URL.Query().Get("project_id"); pid != "" {
+		if p, err := h.Engine.GetProject(pid); err == nil && p.Name != "" {
+			return p.Name
+		}
+	}
+	return ""
+}
+
 // Overview returns the full MetricsSnapshot — the dashboard hits this on
 // first render to populate every widget in one round trip.
-func (h *Handlers) Overview(w http.ResponseWriter, _ *http.Request) {
-	snap, err := h.Engine.Metrics()
+func (h *Handlers) Overview(w http.ResponseWriter, r *http.Request) {
+	snap, err := h.Engine.Metrics(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -67,8 +80,8 @@ func (h *Handlers) Overview(w http.ResponseWriter, _ *http.Request) {
 
 // Thrashing returns the thrashing panel standalone for tooling that wants
 // just the fragile-node list.
-func (h *Handlers) Thrashing(w http.ResponseWriter, _ *http.Request) {
-	snap, err := h.Engine.Metrics()
+func (h *Handlers) Thrashing(w http.ResponseWriter, r *http.Request) {
+	snap, err := h.Engine.Metrics(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -77,8 +90,8 @@ func (h *Handlers) Thrashing(w http.ResponseWriter, _ *http.Request) {
 }
 
 // Models returns the per-model survival and ROI comparison.
-func (h *Handlers) Models(w http.ResponseWriter, _ *http.Request) {
-	snap, err := h.Engine.Metrics()
+func (h *Handlers) Models(w http.ResponseWriter, r *http.Request) {
+	snap, err := h.Engine.Metrics(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -87,8 +100,8 @@ func (h *Handlers) Models(w http.ResponseWriter, _ *http.Request) {
 }
 
 // RecentEvents returns the most recent AST events for the live feed.
-func (h *Handlers) RecentEvents(w http.ResponseWriter, _ *http.Request) {
-	snap, err := h.Engine.Metrics()
+func (h *Handlers) RecentEvents(w http.ResponseWriter, r *http.Request) {
+	snap, err := h.Engine.Metrics(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -97,13 +110,19 @@ func (h *Handlers) RecentEvents(w http.ResponseWriter, _ *http.Request) {
 }
 
 // Atlas returns the full repository Code Atlas graph (packages, files, symbols).
-func (h *Handlers) Atlas(w http.ResponseWriter, _ *http.Request) {
-	atlas, err := h.Engine.Atlas()
+func (h *Handlers) Atlas(w http.ResponseWriter, r *http.Request) {
+	atlas, err := h.Engine.Atlas(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, atlas)
+}
+
+// AtlasStatus returns the percentage and live progress of codebase indexing.
+func (h *Handlers) AtlasStatus(w http.ResponseWriter, _ *http.Request) {
+	status := h.Engine.IndexStatus()
+	writeJSON(w, http.StatusOK, status)
 }
 
 // FileHealth is the agent-facing guardrail endpoint (mirrors the MCP tool).
@@ -464,6 +483,27 @@ func (h *Handlers) ActivateProject(w http.ResponseWriter, r *http.Request) {
 	h.SwitchActiveProject(w, r)
 }
 
+// RescanProject triggers session rediscovery for a specific project.
+func (h *Handlers) RescanProject(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "project id is required")
+		return
+	}
+	p, err := h.Engine.RescanProject(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// RescanAllProjects triggers session rediscovery across all projects.
+func (h *Handlers) RescanAllProjects(w http.ResponseWriter, _ *http.Request) {
+	projs := h.Engine.RescanAllProjects()
+	writeJSON(w, http.StatusOK, projs)
+}
+
 // RemoveProject stops monitoring a workspace.
 func (h *Handlers) RemoveProject(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -653,5 +693,58 @@ func (h *Handlers) GetProfilerOverview(w http.ResponseWriter, _ *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, ov)
 }
+
+// GetRecentReads returns recent file reading events.
+func (h *Handlers) GetRecentReads(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	reads, err := h.Engine.GetRecentFileReads(limit, h.getProjectFilter(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if reads == nil {
+		reads = []db.FileReadRecord{}
+	}
+	writeJSON(w, http.StatusOK, reads)
+}
+
+// GetFileReadStats returns aggregated read metrics, model breakdown, and recent reads for a single file.
+func (h *Handlers) GetFileReadStats(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeError(w, http.StatusBadRequest, "path query parameter is required")
+		return
+	}
+	stats, err := h.Engine.GetFileReadStats(path)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// GetFileReadHeatmap returns line-range read frequencies for hot code region visualization.
+func (h *Handlers) GetFileReadHeatmap(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeError(w, http.StatusBadRequest, "path query parameter is required")
+		return
+	}
+	heatmap, err := h.Engine.GetFileReadHeatmap(path)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if heatmap == nil {
+		heatmap = []db.LineReadHeatmap{}
+	}
+	writeJSON(w, http.StatusOK, heatmap)
+}
+
 
 

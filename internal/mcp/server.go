@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 )
 
@@ -19,6 +21,9 @@ import (
 type EngineSink interface {
 	ReportRunMCP(model, provider, taskID, intent string, promptTokens, completionTokens int64, cost float64) (string, error)
 	FileHealth(path string) (ipc.FileHealthReply, error)
+	RecordReadEvent(rec db.FileReadRecord) error
+	GetFileReadStats(filePath string) (db.FileReadStats, error)
+	GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error)
 }
 
 // jsonRPCRequest is the MCP wire format. Notifications (no id) are valid.
@@ -189,6 +194,48 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 						"required": []string{"file_path"},
 					},
 				},
+				{
+					"name":        "report_file_read",
+					"description": "Record a file read/inspection tool event executed by an AI agent.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"file_path":     map[string]string{"type": "string"},
+							"model":         map[string]string{"type": "string"},
+							"provider":      map[string]string{"type": "string"},
+							"tool_name":     map[string]string{"type": "string"},
+							"start_line":    map[string]string{"type": "integer"},
+							"end_line":      map[string]string{"type": "integer"},
+							"prompt_tokens": map[string]string{"type": "integer"},
+							"cost":          map[string]string{"type": "number"},
+							"intent":        map[string]string{"type": "string"},
+						},
+						"required": []string{"file_path", "model"},
+					},
+				},
+				{
+					"name":        "get_file_read_stats",
+					"description": "Get file read counts, model breakdown, and recent inspection history.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"file_path": map[string]string{"type": "string"},
+						},
+						"required": []string{"file_path"},
+					},
+				},
+				{
+					"name":        "get_file_diff_history",
+					"description": "Inspect recent line-by-line diffs, AST mutations, and churn for a file or entire codebase.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"file_path": map[string]string{"type": "string"},
+							"limit":     map[string]string{"type": "integer"},
+						},
+						"required": []string{"file_path"},
+					},
+				},
 			},
 		}
 	case "tools/call":
@@ -314,6 +361,91 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			"content": []map[string]interface{}{
 				{"type": "text", "text": fmt.Sprintf("File %s unlocked successfully.", path)},
 			},
+		}
+	case "report_file_read":
+		path, _ := args["file_path"].(string)
+		model, _ := args["model"].(string)
+		provider, _ := args["provider"].(string)
+		toolName, _ := args["tool_name"].(string)
+		intent, _ := args["intent"].(string)
+		if toolName == "" {
+			toolName = "mcp_read"
+		}
+		startLine := int(toInt64(args["start_line"]))
+		endLine := int(toInt64(args["end_line"]))
+		promptTokens := toInt64(args["prompt_tokens"])
+		cost := toFloat(args["cost"])
+
+		if path == "" || model == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "file_path and model are required"}
+			return resp
+		}
+
+		err := sink.RecordReadEvent(db.FileReadRecord{
+			FilePath:     path,
+			AgentName:    "MCP",
+			ModelName:    model,
+			Provider:     provider,
+			ToolName:     toolName,
+			StartLine:    startLine,
+			EndLine:      endLine,
+			PromptTokens: promptTokens,
+			CostUSD:      cost,
+			Intent:       intent,
+			ReadTime:     time.Now().UTC(),
+		})
+		if err != nil {
+			resp.Error = &rpcError{Code: -32012, Message: err.Error()}
+			return resp
+		}
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Read event recorded for %s (model: %s).", path, model)},
+			},
+		}
+	case "get_file_read_stats":
+		path, _ := args["file_path"].(string)
+		if path == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
+			return resp
+		}
+		stats, err := sink.GetFileReadStats(path)
+		if err != nil {
+			resp.Error = &rpcError{Code: -32013, Message: err.Error()}
+			return resp
+		}
+		summary := fmt.Sprintf("file=%s total_reads=%d total_lines_read=%d total_cost=$%.4f unique_models=%d",
+			stats.FilePath, stats.TotalReads, stats.TotalLinesRead, stats.TotalCostUSD, stats.UniqueModels)
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": summary},
+			},
+			"data": stats,
+		}
+	case "get_file_diff_history":
+		path, _ := args["file_path"].(string)
+		limit := 20
+		if l := int(toInt64(args["limit"])); l > 0 {
+			limit = l
+		}
+		events, err := sink.GetRecentEvents(limit)
+		if err != nil {
+			resp.Error = &rpcError{Code: -32014, Message: err.Error()}
+			return resp
+		}
+		var filtered []db.EventRecord
+		normPath := strings.ReplaceAll(path, "\\", "/")
+		for _, e := range events {
+			if path == "" || e.FilePath == path || strings.Contains(strings.ReplaceAll(e.FilePath, "\\", "/"), normPath) {
+				filtered = append(filtered, e)
+			}
+		}
+		summary := fmt.Sprintf("Found %d diff events for file filter %q.", len(filtered), path)
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": summary},
+			},
+			"data": filtered,
 		}
 	default:
 		resp.Error = &rpcError{Code: -32601, Message: "unknown tool: " + name}

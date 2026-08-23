@@ -59,3 +59,28 @@ CREATE INDEX IF NOT EXISTS idx_trace_sig   ON runtime_traces(file_path, node_sig
 CREATE INDEX IF NOT EXISTS idx_trace_time  ON runtime_traces(timestamp);
 CREATE INDEX IF NOT EXISTS idx_trace_type  ON runtime_traces(profiler_type);
 
+CREATE TABLE IF NOT EXISTS file_read_events (
+    read_id          VARCHAR PRIMARY KEY,
+    run_id           VARCHAR,
+    session_id       VARCHAR,
+    repo_name        VARCHAR NOT NULL,
+    file_path        VARCHAR NOT NULL,
+    agent_name       VARCHAR NOT NULL,
+    model_name       VARCHAR NOT NULL,
+    provider         VARCHAR NOT NULL,
+    tool_name        VARCHAR NOT NULL,
+    start_line       INTEGER DEFAULT 1,
+    end_line         INTEGER DEFAULT 0,
+    lines_read_count INTEGER DEFAULT 0,
+    prompt_tokens    BIGINT DEFAULT 0,
+    cached_tokens    BIGINT DEFAULT 0,
+    cost_usd         DOUBLE DEFAULT 0.0,
+    intent           TEXT DEFAULT '',
+    read_time        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_read_file_model ON file_read_events(file_path, model_name);
+CREATE INDEX IF NOT EXISTS idx_read_time       ON file_read_events(read_time);
+CREATE INDEX IF NOT EXISTS idx_read_repo       ON file_read_events(repo_name);
+CREATE INDEX IF NOT EXISTS idx_read_lines      ON file_read_events(file_path, start_line, end_line);
+

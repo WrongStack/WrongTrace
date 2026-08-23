@@ -40,7 +40,6 @@ type Config struct {
 // Dispatcher broadcasts security and thrashing alerts asynchronously.
 type Dispatcher struct {
 	cfg        Config
-	client     *http.Server
 	httpClient *http.Client
 	mu         sync.RWMutex
 }

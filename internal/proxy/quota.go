@@ -8,18 +8,18 @@ import (
 
 // QuotaLimiter tracks and enforces daily spending budgets per project or agent.
 type QuotaLimiter struct {
-	mu           sync.RWMutex
-	dailyBudgets map[string]float64 // key -> daily limit in USD (0 = unlimited)
-	dailySpend   map[string]float64 // key -> accumulated USD spend today
-	lastResetDay int
+	mu            sync.RWMutex
+	dailyBudgets  map[string]float64 // key -> daily limit in USD (0 = unlimited)
+	dailySpend    map[string]float64 // key -> accumulated USD spend today
+	lastResetDate string
 }
 
 // NewQuotaLimiter creates a new QuotaLimiter instance.
 func NewQuotaLimiter() *QuotaLimiter {
 	return &QuotaLimiter{
-		dailyBudgets: make(map[string]float64),
-		dailySpend:   make(map[string]float64),
-		lastResetDay: time.Now().UTC().Day(),
+		dailyBudgets:  make(map[string]float64),
+		dailySpend:    make(map[string]float64),
+		lastResetDate: time.Now().UTC().Format("2006-01-02"),
 	}
 }
 
@@ -30,16 +30,21 @@ func (q *QuotaLimiter) SetBudget(key string, limitUSD float64) {
 	q.dailyBudgets[key] = limitUSD
 }
 
+// checkResetDayLocked checks if the day has rolled over in UTC and resets daily spend if so.
+func (q *QuotaLimiter) checkResetDayLocked() {
+	today := time.Now().UTC().Format("2006-01-02")
+	if today != q.lastResetDate {
+		q.dailySpend = make(map[string]float64)
+		q.lastResetDate = today
+	}
+}
+
 // CheckAndRecordSpend verifies if adding the cost is within budget.
 func (q *QuotaLimiter) CheckAndRecordSpend(key string, estimatedCostUSD float64) (allowed bool, remainingUSD float64, warning string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	currentDay := time.Now().UTC().Day()
-	if currentDay != q.lastResetDay {
-		q.dailySpend = make(map[string]float64)
-		q.lastResetDay = currentDay
-	}
+	q.checkResetDayLocked()
 
 	limit, hasLimit := q.dailyBudgets[key]
 	if !hasLimit {
@@ -60,6 +65,17 @@ func (q *QuotaLimiter) CheckAndRecordSpend(key string, estimatedCostUSD float64)
 
 	q.dailySpend[key] += estimatedCostUSD
 	return true, limit - q.dailySpend[key], ""
+}
+
+// RecordSpend records actual completed spend after an LLM request completes.
+func (q *QuotaLimiter) RecordSpend(key string, costUSD float64) {
+	if costUSD <= 0 {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.checkResetDayLocked()
+	q.dailySpend[key] += costUSD
 }
 
 // GetSpend returns today's spend for a given key.

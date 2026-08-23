@@ -11,34 +11,38 @@ async function jget<T>(url: string, init?: RequestInit): Promise<T> {
   return (await r.json()) as T;
 }
 
-export function useOverview() {
+export function useOverview(projectId?: string | null) {
+  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<MetricsSnapshot>({
-    queryKey: ['overview'],
-    queryFn: () => jget<MetricsSnapshot>(`${base}/metrics/overview`),
+    queryKey: ['overview', projectId || 'active'],
+    queryFn: () => jget<MetricsSnapshot>(`${base}/metrics/overview${q}`),
     refetchInterval: 10_000,
   });
 }
 
-export function useThrashing() {
+export function useThrashing(projectId?: string | null) {
+  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<ThrashingRow[]>({
-    queryKey: ['thrashing'],
-    queryFn: () => jget<ThrashingRow[]>(`${base}/metrics/thrashing`),
+    queryKey: ['thrashing', projectId || 'active'],
+    queryFn: () => jget<ThrashingRow[]>(`${base}/metrics/thrashing${q}`),
     refetchInterval: 10_000,
   });
 }
 
-export function useModels() {
+export function useModels(projectId?: string | null) {
+  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<ModelRow[]>({
-    queryKey: ['models'],
-    queryFn: () => jget<ModelRow[]>(`${base}/metrics/models`),
+    queryKey: ['models', projectId || 'active'],
+    queryFn: () => jget<ModelRow[]>(`${base}/metrics/models${q}`),
     refetchInterval: 15_000,
   });
 }
 
-export function useRecentEvents() {
+export function useRecentEvents(projectId?: string | null) {
+  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<EventRecord[]>({
-    queryKey: ['recent'],
-    queryFn: () => jget<EventRecord[]>(`${base}/metrics/recent`),
+    queryKey: ['recent', projectId || 'active'],
+    queryFn: () => jget<EventRecord[]>(`${base}/metrics/recent${q}`),
     refetchInterval: 5_000,
   });
 }
@@ -63,10 +67,11 @@ export function useFileHealth(path: string | null) {
   });
 }
 
-export function useAtlas() {
+export function useAtlas(projectId?: string | null) {
+  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<AtlasSnapshot>({
-    queryKey: ['atlas'],
-    queryFn: () => jget<AtlasSnapshot>(`${base}/atlas`),
+    queryKey: ['atlas', projectId || 'active'],
+    queryFn: () => jget<AtlasSnapshot>(`${base}/atlas${q}`),
     refetchInterval: 10_000,
   });
 }
@@ -103,10 +108,11 @@ export function useProjects() {
   });
 }
 
-export function useProxyTraffic() {
+export function useProxyTraffic(projectId?: string | null) {
+  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<import('../types').ProxyTrafficRecord[]>({
-    queryKey: ['proxy_traffic'],
-    queryFn: () => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic`),
+    queryKey: ['proxy_traffic', projectId || 'active'],
+    queryFn: () => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic${q}`),
     refetchInterval: 3_000,
   });
 }
@@ -119,10 +125,11 @@ export function useSettings() {
   });
 }
 
-export function useProfilerTraces(limit: number = 50) {
+export function useProfilerTraces(limit: number = 50, projectId?: string | null) {
+  const pParam = projectId ? `&project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<import('../types').RuntimeTrace[]>({
-    queryKey: ['profiler_traces', limit],
-    queryFn: () => jget<import('../types').RuntimeTrace[]>(`${base}/profiler/traces?limit=${limit}`),
+    queryKey: ['profiler_traces', limit, projectId || 'active'],
+    queryFn: () => jget<import('../types').RuntimeTrace[]>(`${base}/profiler/traces?limit=${limit}${pParam}`),
     refetchInterval: 5_000,
   });
 }
@@ -142,4 +149,41 @@ export function useProfilerOverview() {
     refetchInterval: 10_000,
   });
 }
+
+export function useAtlasStatus(projectId?: string | null) {
+  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+  return useQuery<import('../types').IndexProgress>({
+    queryKey: ['atlas_status', projectId || 'active'],
+    queryFn: () => jget<import('../types').IndexProgress>(`${base}/atlas/status${q}`),
+    refetchInterval: 3_000,
+  });
+}
+
+export function useRecentReads(limit: number = 50, projectId?: string | null) {
+  const pParam = projectId ? `&project_id=${encodeURIComponent(projectId)}` : '';
+  return useQuery<import('../types').FileReadRecord[]>({
+    queryKey: ['recent_reads', limit, projectId || 'active'],
+    queryFn: () => jget<import('../types').FileReadRecord[]>(`${base}/reads/recent?limit=${limit}${pParam}`),
+    refetchInterval: 5_000,
+  });
+}
+
+export function useFileReadStats(path: string | null) {
+  return useQuery<import('../types').FileReadStats>({
+    queryKey: ['file_read_stats', path],
+    queryFn: () => jget<import('../types').FileReadStats>(`${base}/files/reads?path=${encodeURIComponent(path ?? '')}`),
+    enabled: !!path,
+    refetchInterval: 10_000,
+  });
+}
+
+export function useFileReadHeatmap(path: string | null) {
+  return useQuery<import('../types').LineReadHeatmap[]>({
+    queryKey: ['file_read_heatmap', path],
+    queryFn: () => jget<import('../types').LineReadHeatmap[]>(`${base}/files/heatmap?path=${encodeURIComponent(path ?? '')}`),
+    enabled: !!path,
+    refetchInterval: 10_000,
+  });
+}
+
 

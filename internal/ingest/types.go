@@ -51,3 +51,61 @@ func IsFileModifyingTool(name string) bool {
 		strings.Contains(norm, "patch") ||
 		strings.Contains(norm, "create")
 }
+
+// FileReadEvent captures a file read/inspection tool call executed by an AI agent.
+type FileReadEvent struct {
+	ReadID         string    `json:"read_id"`
+	SessionID      string    `json:"session_id"`
+	RunID          string    `json:"run_id"`
+	RepoName       string    `json:"repo_name"`
+	FilePath       string    `json:"file_path"`
+	AgentName      string    `json:"agent_name"`
+	ModelName      string    `json:"model_name"`
+	Provider       string    `json:"provider"`
+	ToolName       string    `json:"tool_name"`
+	StartLine      int       `json:"start_line"`
+	EndLine        int       `json:"end_line"`
+	LinesReadCount int       `json:"lines_read_count"`
+	PromptTokens   int64     `json:"prompt_tokens"`
+	CachedTokens   int64     `json:"cached_tokens"`
+	CostUSD        float64   `json:"cost_usd"`
+	Intent         string    `json:"intent"`
+	OccurredAt     time.Time `json:"occurred_at"`
+}
+
+// KnownFileReadingTools lists standard tool/function call names used by AI agents to read files.
+var KnownFileReadingTools = map[string]bool{
+	"view_file":            true,
+	"read_file":            true,
+	"read_file_range":      true,
+	"get_file_contents":    true,
+	"read":                 true,
+	"view":                 true,
+	"cat":                  true,
+	"head":                 true,
+	"tail":                 true,
+	"show_file":            true,
+	"open_file":            true,
+	"inspect_file":         true,
+	"load_file":            true,
+	"get_file_tree":        true,
+	"grep_search":          true,
+	"find_by_name":         true,
+}
+
+// IsFileReadingTool returns true if the tool name indicates a file system read/inspection operation.
+func IsFileReadingTool(name string) bool {
+	norm := strings.ToLower(strings.TrimSpace(name))
+	if KnownFileReadingTools[norm] {
+		return true
+	}
+	// Avoid false positive on write tools
+	if IsFileModifyingTool(norm) {
+		return false
+	}
+	return strings.Contains(norm, "read") ||
+		strings.Contains(norm, "view") ||
+		strings.Contains(norm, "inspect") ||
+		strings.Contains(norm, "cat")
+}
+
