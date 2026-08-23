@@ -13,6 +13,7 @@ import (
 
 func TestAtlas_EmptyAndWithData(t *testing.T) {
 	tempDir := t.TempDir()
+	t.Setenv("WRONGTRACE_HOME", tempDir)
 	store, err := db.Open(filepath.Join(tempDir, "atlas.db"))
 	if err != nil {
 		t.Fatalf("db open: %v", err)

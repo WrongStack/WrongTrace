@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.2.0] - 2026-08-23
 
 ### Added
 - **Flagship Ecosystem Integration**: Native deep telemetry, project auto-discovery, and IPC link for **[WrongStack](https://github.com/wrongstack/wrongstack)**.
@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - GitHub Copilot
   - Aider
   - Continue.dev
+- **Multi-Project Workspace Support**: Multi-workspace management with project auto-detection, isolated SQLite databases (`projects.json`), and instant workspace switching in the dashboard.
+- **Interactive Code Atlas**: Graph visualization for packages, modules, and file health scores powered by React Flow.
+- **Transparent AI Gateway**: Reverse proxy on port `8081` with live token composition tracking, reasoning token (`<think>`) parsing, and prompt cache savings calculation.
+- **OpenTelemetry (OTLP) Ingest**: Support for OTLP traces on `/v1/traces`, calculating P50, P90, P99 runtime latency and memory metrics.
+- **File Read Heatmap & Token Telemetry**: Line-level file read tracking correlating agent file reads with token spend and cache hit ratios.
 - **One-Command Setup CLI (`wrongtrace init`)**:
   - Automatically provisions `.mcp.json`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.git/hooks/post-commit`.
 - **Enhanced Model Context Protocol (MCP) Server**:
@@ -48,16 +53,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Thrashing Window Filter**: Enforced SQL-level 24-hour window filter (`julianday(MAX) - julianday(MIN) <= 1.0`) in `HAVING` clause, preventing old historical churn from starving recent thrash events out of the dashboard.
 - **Code Atlas Path Matching**: Added multi-format path matching fallback (`relPath`, `cleanPath`, slash-normalized) for Windows backslash compatibility.
 - **CORS Middleware**: Added `PUT` and `DELETE` HTTP methods to server CORS configuration.
+- **Daemon Memory Footprint**: Set 256MB memory limit ceiling with automated 2-minute GC recycler for lean long-running daemon execution.
 
 ---
 
-## [0.9.0] - 2026-08-20
+## [0.1.4] - 2026-08-22
+
+### Changed
+- Migrated frontend toolchain to TypeScript 7.0.2.
+- Strengthened file watcher debouncing tests under race condition load.
+- Verified executable bits and POSIX runner scripts (`dev.sh`).
+
+---
+
+## [0.1.3] - 2026-08-21
+
+### Changed
+- Upgraded dashboard bundler to Vite 8 / Rolldown and Tailwind v4.
+- Added cross-platform developer runners (`dev.ps1`, `dev.sh`).
+
+---
+
+## [0.1.2] - 2026-08-20
+
+### Changed
+- Upgraded dashboard frontend to React 19.
+
+---
+
+## [0.1.1] - 2026-08-15
 
 ### Added
-- **Interactive Code Atlas**: Integrated React Flow graph visualization for packages, modules, and file health scores.
-- **OpenTelemetry (OTLP) Ingest**: Support for OTLP traces on `/v1/traces`, calculating P50, P90, P99 runtime latency.
-- **Transparent AI Gateway**: Reverse proxy on port `8081` with live token composition tracking, reasoning token (`<think>`) parsing, and prompt cache savings calculation.
-- **Universal AST Parser**: Support for 9+ languages (Go, TypeScript/JavaScript, Python, Rust, C/C++, Java, C#, PHP, Ruby) using Tree-sitter.
+- Multi-platform cross-compilation release workflow on GitHub Actions (Linux, Windows, macOS amd64/arm64).
 
 ---
 
@@ -67,6 +94,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release of WrongTrace single-binary daemon.
 - File system watcher (`fsnotify`) with AST semantic diffing.
 - Embedded SQLite analytical database with WAL mode.
-- Embedded Vite + React 19 + Tailwind v4 + Recharts dashboard via `//go:embed`.
+- Embedded React dashboard via `//go:embed`.
 - Windows Named Pipe and Unix Domain Socket IPC listeners.
 - Initial MCP stdio server.

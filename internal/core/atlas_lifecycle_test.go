@@ -20,6 +20,7 @@ import (
 // parser to exercise PrimeDirectory / HandleFileChange / handleFileGone.
 func newAtlasTestEngine(t *testing.T) (*Engine, *db.Store, *ast.Engine) {
 	t.Helper()
+	t.Setenv("WRONGTRACE_HOME", t.TempDir())
 	store, err := db.Open(filepath.Join(t.TempDir(), "atlas.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)

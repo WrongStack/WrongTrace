@@ -16,6 +16,7 @@ import (
 // dir. AST is nil: none of the correlation/telemetry paths touch it.
 func newTestEngine(t *testing.T) (*Engine, *db.Store) {
 	t.Helper()
+	t.Setenv("WRONGTRACE_HOME", t.TempDir())
 	store, err := db.Open(filepath.Join(t.TempDir(), "core.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
