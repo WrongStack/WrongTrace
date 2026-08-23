@@ -30,22 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Aider
   - Continue.dev
 - **Multi-Project Workspace Support**: Multi-workspace management with project auto-detection, isolated SQLite databases (`projects.json`), and instant workspace switching in the dashboard.
-- **Interactive Code Atlas**: Graph visualization for packages, modules, and file health scores powered by React Flow.
-- **Transparent AI Gateway**: Reverse proxy on port `8081` with live token composition tracking, reasoning token (`<think>`) parsing, and prompt cache savings calculation.
+- **Interactive Code Atlas**: Graph visualization for packages, modules, and file health scores.
+- **Transparent AI Gateway**: Reverse proxy with live token composition tracking, reasoning token (`<think>`) parsing, prompt cache savings calculation, and boundary-safe route matching.
 - **OpenTelemetry (OTLP) Ingest**: Support for OTLP traces on `/v1/traces`, calculating P50, P90, P99 runtime latency and memory metrics.
-- **File Read Heatmap & Token Telemetry**: Line-level file read tracking correlating agent file reads with token spend and cache hit ratios.
+- **File Read Heatmap & Token Telemetry**: Line-level file read tracking correlating agent file reads with token spend and cache hit ratios (`report_file_read`, `get_file_read_stats`).
 - **One-Command Setup CLI (`wrongtrace init`)**:
   - Automatically provisions `.mcp.json`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.git/hooks/post-commit`.
 - **Enhanced Model Context Protocol (MCP) Server**:
-  - Implemented `check_guardrail` tool returning `allowed`, `health_score`, `is_fragile`, and actionable recommendation.
-  - Implemented `lock_file` and `unlock_file` for collaborative multi-agent safety.
-  - Implemented `get_file_health_score` and `report_telemetry`.
+  - Implemented `check_guardrail` tool enforcing file locks, health scores, fragility checks, and recommendations.
+  - Implemented `lock_file` and `unlock_file` for collaborative multi-agent safety with case-insensitive and suffix-matched path normalization.
+  - Implemented `get_file_health_score`, `report_telemetry`, `report_file_read`, and `get_file_read_stats`.
 - **Dynamic Real Model Name Extraction**:
   - Replaced hardcoded fallback model assumptions with dynamic regex and JSON extraction from Antigravity `<USER_SETTINGS_CHANGE>`, subagent tool arguments (`invoke_subagent`), and prompt headers.
 - **Live 2025/2026 Model Registry & Pricing Seed**:
   - Synced pricing and context windows for Gemini 3.7 Flash, Gemini 2.5 Pro, Claude 3.7 Sonnet, DeepSeek R1, GPT-4.5 Preview, o3-mini, MiniMax Text-01, Kimi K2, and Qwen 2.5 Coder.
 - **Comprehensive HTML Observability Report**:
   - Added standalone dark-themed HTML tables for Model ROI Leaderboard, Latency Hotspots, and Thrashing Nodes via `wrongtrace report --format=html`.
+
+### Fixed
+- **MCP Guardrail Lock Enforcement**: Integrated file lock checks directly into MCP `check_guardrail` handler so locked files are blocked for agents using MCP.
+- **Dynamic Proxy Route Boundary Matching**: Fixed `MatchRoute` prefix matching to enforce strict path boundaries, preventing false prefix matches like `/proxy/zaix` against `/proxy/zai`.
+- **Active Node Resurrection Status**: Fixed SQL queries to accurately compute active node lifecycles when code nodes are deleted and subsequently restored.
+- **Wasted Spend Zero-Division Guard**: Safeguarded dashboard metrics against negative or miscalculated wasted spend for read-only / inspection models.
 
 ### Changed
 - **License**: Transitioned to **Business Source License 1.1 (BUSL-1.1)** — free for personal, internal development, and organizational observability, while reserving commercial hosted SaaS rights for WrongStack.

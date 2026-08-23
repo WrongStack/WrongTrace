@@ -20,12 +20,12 @@ Watches your code with Tree-sitter, correlates AST-level edits with the agent ru
 
 ## 💡 Key Capabilities
 
-1. **Semantic AST Churn & Code Survival** — Tracks the granular lifecycle of functions, methods, classes, and structs via Tree-sitter AST diffing across 9+ languages rather than naive line counters.
+1. **Semantic AST Churn & Code Survival** — Tracks the granular lifecycle of functions, methods, classes, and structs via Tree-sitter AST diffing across 11+ languages rather than naive line counters.
 2. **Detect Agent Thrashing & Regressions** — Flags code nodes repeatedly rewritten, broken, or deleted $\ge 3\times$ in a 24-hour sliding window.
 3. **True Token ROI ($ / survived node)** — Measures model cost efficiency by calculating dollars spent per surviving AST node after a 14-day maturity window versus discarded churn.
-4. **Auto-Discovery for 20+ Coding Agents** — Zero-config transcript ingestion for Antigravity, Claude Code, Cursor, Windsurf, Cline/Roo, MiniMax Code, Kimi Code (Moonshot), Pi.dev, OpenAI Codex, ZCode, Devin, Trae, Goose, OpenHands, GitHub Copilot, Aider, Continue, and more.
-5. **Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, and `unlock_file`.
-6. **Transparent AI Gateway & Wire Telemetry** — Intercepts and analyzes raw LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens and cache savings.
+4. **Auto-Discovery for 20+ Coding Agents** — Zero-config transcript ingestion for WrongStack, Antigravity, Claude Code, Cursor, Windsurf, Cline/Roo, MiniMax Code, Kimi Code (Moonshot), ZCode, Devin, Trae, Goose, OpenHands, GitHub Copilot, Aider, Continue, and more.
+5. **Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, `unlock_file`, `report_file_read`, and `get_file_read_stats`.
+6. **Transparent AI Gateway & Wire Telemetry** — Intercepts and analyzes raw LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens, budget quotas, and prompt cache savings.
 7. **Universal Profiler & Runtime Traces** — Correlates runtime performance and latency hotspots (via OpenTelemetry OTLP, pprof, test runners) directly with AI code modifications.
 
 ---
@@ -66,7 +66,7 @@ wrongtrace doctor
 > ### 👑 [WrongStack](https://github.com/wrongstack/wrongstack) — The Native Autonomous Multi-Agent Developer Stack
 > WrongTrace is natively built as the deep observability engine for **[WrongStack](https://github.com/wrongstack/wrongstack)** — the high-performance autonomous multi-agent developer platform.
 > * **Zero-Overhead Native Lineage**: Auto-detects WrongStack workspaces, projects (`~/.wrongstack/projects.json`), and hierarchical multi-agent date/session trees.
-> * **Direct IPC & Memory Bus**: Direct high-speed named pipe telemetry streams between WrongStack orchestrators and WrongTrace Tree-sitter AST inspectors.
+> * **Direct IPC & Memory Bus**: Direct high-speed named pipe / domain socket telemetry streams between WrongStack orchestrators and WrongTrace Tree-sitter AST inspectors.
 > * **Holistic Fleet Governance**: Monitor multi-agent swarm deployments, subagent delegations, and model efficiency at scale across entire software teams.
 
 ---
@@ -104,12 +104,12 @@ WrongTrace automatically detects, monitors, and analyzes telemetry from all majo
 |:---|:---|
 | **📊 Overview** | Churn timeline, Net LOC delta, Spend vs. Waste KPI, Thrashing Alerts, Live Event Stream. |
 | **🏆 Model Leaderboard** | Model survival rate %, Cost per survived AST node, True Token ROI, and rank badges. |
-| **🗺️ Code Atlas** | Interactive React Flow AST graph with symbol-level health scores and churn heatmaps. |
+| **🗺️ Code Atlas** | Interactive AST graph with symbol-level health scores, churn heatmaps, and monorepo workspace scopes. |
 | **🔍 Diffs & Changes** | Unified diff viewer with syntax highlighting and added/deleted line statistics. |
 | **🤖 Agent Sessions & Catalog** | Multi-agent session monitor, live 2025/2026 model pricing registry, and interactive cost simulator. |
 | **⚡ Profiler & Runtime Traces** | OpenTelemetry (OTLP) ingest, P50/P90/P99 latency percentiles, and latency hotspot analysis. |
-| **🌐 AI Gateway & Wire Traffic** | Transparent proxy for LLM APIs, token composition analysis, and cache savings breakdown. |
-| **⚙️ Settings & Governance** | SQLite vacuuming, retention pruning, guardrail file locking, and Webhook dispatchers. |
+| **🌐 AI Gateway & Wire Traffic** | Transparent proxy for LLM APIs, token composition analysis, budget quotas, and cache savings breakdown. |
+| **⚙️ Settings & Governance** | Multi-project workspace management, SQLite vacuuming, retention pruning, guardrail file locking, and Webhooks. |
 
 ---
 
@@ -149,11 +149,13 @@ Add WrongTrace to your favorite MCP client (`~/.claude.json`, `.cursor/mcp.json`
 ```
 
 ### Available MCP Tools:
-- **`check_guardrail`**: Check if a file is safe to modify before performing automated AI refactoring.
+- **`check_guardrail`**: Check if a file is safe to modify before performing automated AI refactoring (enforces file locks).
 - **`get_file_health_score`**: Get 0-100 health score, fragility status, and recent thrash events.
 - **`report_telemetry`**: Record run intent, model name, token usage, and cost.
 - **`lock_file`**: Lock fragile files against concurrent AI rewrites.
 - **`unlock_file`**: Release locked files upon completion.
+- **`report_file_read`**: Record file reading activity with line range and token consumption.
+- **`get_file_read_stats`**: Query aggregate read counts, unique models, and cost per file.
 
 ---
 
@@ -183,4 +185,5 @@ WrongTrace is licensed under the **[Business Source License 1.1 (BUSL-1.1)](LICE
 * **Automatic Open Source Conversion**: Converts automatically to standard **Apache License, Version 2.0** on `2030-01-01`.
 
 For enterprise licensing and hosted deployment inquiries, visit **[github.com/wrongstack](https://github.com/wrongstack)**.
+
 
