@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -128,6 +129,15 @@ func runStart(cmd *cobra.Command, _ []string) error {
 			log.Printf("FATAL PANIC in runStart: %v\n%s", r, debug.Stack())
 		}
 	}()
+
+	// Ensure userhome .wrongtrace directory exists and write daemon logs there
+	dataDir := defaultDataDir()
+	_ = os.MkdirAll(dataDir, 0o755)
+	logFilePath := filepath.Join(dataDir, "daemon.log")
+	if logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+		defer logFile.Close()
+	}
 
 	// Soft memory limit to keep Go GC and virtual memory footprint lean (< 256MB)
 	debug.SetMemoryLimit(256 * 1024 * 1024)

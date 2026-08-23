@@ -58,8 +58,10 @@ if (-not $NoUI -and -not (Test-Path (Join-Path $Root 'web\node_modules'))) {
 
 $daemon = $null
 $vite = $null
-$daemonLog = Join-Path $Root 'dev-daemon.log'
-$daemonOut = Join-Path $Root 'dev-daemon-out.log'
+$wrongtraceHome = if ($env:WRONGTRACE_HOME) { $env:WRONGTRACE_HOME } else { Join-Path $HOME '.wrongtrace' }
+New-Item -ItemType Directory -Force $wrongtraceHome | Out-Null
+$daemonLog = Join-Path $wrongtraceHome 'daemon.log'
+$daemonOut = Join-Path $wrongtraceHome 'daemon-out.log'
 
 try {
     Write-Host "==> starting daemon on :$Port (multi-project workspace hub)" -ForegroundColor Cyan
