@@ -48,7 +48,7 @@ jobs:
             goarch: arm64
             runner: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # mingw cross-compiler for the windows leg (built on ubuntu). Debian
       # package name is hyphenated (gcc-mingw-w64-x86-64); the compiler
@@ -59,12 +59,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-mingw-w64-x86-64
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
@@ -97,7 +97,7 @@ jobs:
             ./cmd/wrongtrace
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: wrongtrace-${{ matrix.goos }}-${{ matrix.goarch }}
           path: release/*
@@ -111,12 +111,12 @@ jobs:
     steps:
       # Full history so the annotated tag object (and its message) is
       # available for release notes.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Download all platform binaries
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: release
           merge-multiple: true
