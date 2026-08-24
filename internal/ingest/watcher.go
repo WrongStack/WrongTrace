@@ -98,16 +98,7 @@ func (sw *SessionWatcher) DiscoverGlobalAgentDirs() {
 		filepath.Join(home, ".claude", "projects"),
 		filepath.Join(home, ".claude", "logs"),
 
-		// 4. Cursor (Anysphere)
-		filepath.Join(appData, "Cursor", "User", "workspaceStorage"),
-
-		// 5. Windsurf (Codeium)
-		filepath.Join(appData, "Windsurf", "User", "workspaceStorage"),
-
-		// 6. ByteDance Trae IDE
-		filepath.Join(appData, "Trae", "User", "workspaceStorage"),
-
-		// 7. GitHub Copilot
+		// 4. GitHub Copilot
 		filepath.Join(appData, "Code", "User", "globalStorage", "github.copilot-chat"),
 		filepath.Join(localAppData, "github-copilot"),
 		filepath.Join(home, ".copilot", "logs"),
