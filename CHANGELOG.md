@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Ingest: read events silently dropped** — `ReadID` was derived from a per-batch counter over a base-name-only session ID, so every poll after the first (and every session sharing the file name `transcript.jsonl`) collided on the `file_read_events` primary key and was discarded via `ON CONFLICT DO NOTHING`. IDs are now derived from the session directory + line byte offset (stable across re-reads, unique per session), and session IDs include the parent directory so distinct agent sessions no longer merge into one `agent_runs` row.
+- **Ingest: events lost on mid-write polls** — the incremental JSONL parser committed its offset past an unterminated (partially written) trailing line, permanently losing every event on it. The parser now only advances the committed offset through the last newline; an unterminated tail is parsed best-effort but re-read on the next poll once complete.
+- **Proxy: response cache never hit for streaming traffic** — the cache lookup key was computed before `stream_options.include_usage` was injected into the request body, while the store key was computed after (and with the analysis-rewritten model), so stored entries were unreachable. The key is now computed once on the final forwarded body and reused for both lookup and store.
+- **Proxy: oversized bodies silently truncated** — request bodies over 32 MiB were truncated by `io.LimitReader` and forwarded upstream as corrupt JSON; they are now rejected with `413 Request Entity Too Large`.
+- **Server: daemon bound all interfaces with `*` CORS and unrestricted WebSocket origins** — an unauthenticated, single-user daemon was readable from any webpage (telemetry exfiltration) and from the LAN. It now binds `127.0.0.1` by default (`--bind 0.0.0.0` restores the old behavior), CORS is limited to loopback origins, and WebSocket upgrades reject non-loopback origins. The WebSocket greeting write also gained the deadline every other write already had, so a stalled client cannot pin the handler goroutine.
+- **Lock: single-instance enforcement was check-then-act only** — no OS-level lock was ever taken, so two daemons started concurrently (or on different ports) both ran, corrupting PID files and double-ingesting. `daemon.lock` is now held via `LockFileEx` (Windows) / `flock` (POSIX), released automatically on crash; the lock file is no longer unlinked on release (inode race).
+- **Core: data race on active repo name** — `Engine.cfg.RepoName` was written under `lockMu` during project switches but read unlocked on watcher/ingest/HTTP paths; all reads now snapshot it under the same mutex.
+- **Core: project operations held `lockMu` across filesystem scans** — `UpdateProject`/`RescanProject`/`RescanAllProjects` walked agent session directories (seconds on Windows) while holding the lock that synchronous IPC guardrail checks need; scans now run outside the lock.
+- **Core: concurrent `AddProject` both marked active** — the `isFirst` decision moved under `lockMu`.
+- **DB: `Migrate` swallowed real schema errors** — `ALTER TABLE`/`CREATE INDEX` failures (locked DB, full disk) returned success and surfaced later on every insert; only the expected "duplicate column"/"already exists" no-ops are tolerated now.
+- **DB: `ClearStale` pruned partially on failure** — the four per-table DELETEs now run in a single transaction.
+- **Profiler: 32-bit trace IDs collided on the primary key** — IDs widened to 128 bits; swallowed `InsertTrace` errors are now logged.
+- **CLI: `trace` ignored `WRONGTRACE_PORT`/`PORT`** — port resolution now matches `start`, so traces reach the running daemon instead of silently writing to the default database.
+
+### Changed
+- `go.mod`: direct dependencies are no longer mislabeled `// indirect` (ran `go mod tidy`).
+
+---
+
 ## [0.3.4] - 2026-08-25
 
 ### Fixed & Hardened (Full-Stack Concurrency, Memory & Performance)

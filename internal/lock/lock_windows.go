@@ -3,10 +3,13 @@
 package lock
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -26,10 +29,10 @@ const (
 // the handle closes — including on process crash — which also removes the
 // stale-PID / recycled-PID ambiguity the pre-checks alone cannot solve.
 func tryLock(f *os.File) error {
-	const flags = syscall.LOCKFILE_EXCLUSIVE_LOCK | syscall.LOCKFILE_FAIL_IMMEDIATELY
-	var overlapped syscall.Overlapped
-	if err := syscall.LockFileEx(syscall.Handle(f.Fd()), flags, 0, 1, 0, &overlapped); err != nil {
-		if errno, ok := err.(syscall.Errno); ok && errno == syscall.ERROR_LOCK_VIOLATION {
+	const flags = windows.LOCKFILE_EXCLUSIVE_LOCK | windows.LOCKFILE_FAIL_IMMEDIATELY
+	var overlapped windows.Overlapped
+	if err := windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, 1, 0, &overlapped); err != nil {
+		if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
 			return ErrAlreadyRunning
 		}
 		return fmt.Errorf("lock daemon.lock: %w", err)

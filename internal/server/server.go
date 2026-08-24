@@ -22,7 +22,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
 
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
@@ -149,6 +148,38 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return hs.Shutdown(ctx)
 }
 
+// loopbackCORS answers preflights and marks responses readable only for
+// loopback origins (any port). Cross-origin reads are never legitimate for
+// this daemon: the dashboard is served same-origin and the vite dev server
+// proxies API calls server-side.
+func loopbackCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" && isLoopbackOrigin(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "300")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLoopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
 // setHS/currentHS guard the *http.Server handoff between Start (writer) and
 // Shutdown (reader). The unsynchronized field access was a genuine data race
 // surfaced by -race on the CI runner (Start writing s.hs at the same moment
@@ -171,28 +202,12 @@ func (s *Server) buildRouter() chi.Router {
 	r.Use(middleware.RealIP)
 	r.Use(requestLogger)
 	r.Use(middleware.Recoverer)
-	r.Use(cors.Handler(cors.Options{
-		// Loopback origins only (any port): the dashboard is served
-		// same-origin and the vite dev server proxies from localhost:<port>.
-		// A "*" policy would let any webpage the developer opens read the
-		// unauthenticated API (telemetry, traffic records, cost data) and
-		// drive destructive endpoints.
-		AllowedOriginsFunc: func(origin string) bool {
-			u, err := url.Parse(origin)
-			if err != nil {
-				return false
-			}
-			switch u.Hostname() {
-			case "localhost", "127.0.0.1", "::1":
-				return true
-			}
-			return false
-		},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
-		AllowCredentials: false,
-		MaxAge:           300,
-	}))
+	// Loopback CORS only. The dashboard is served same-origin and the vite
+	// dev server proxies API calls server-side, so no cross-origin reads are
+	// ever legitimate; a "*" policy would let any webpage the developer
+	// opens read the unauthenticated API (telemetry, traffic records, cost
+	// data) and drive destructive endpoints.
+	r.Use(loopbackCORS)
 
 	var store *db.Store
 	if s.cfg.Engine != nil {

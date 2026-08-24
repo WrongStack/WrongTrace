@@ -138,18 +138,17 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 		readLen := int64(len(lineBytes))
 		currentOffset += readLen
 
-		if err == nil {
-			// Complete line: safe to parse and to advance the committed offset.
+		complete := err == nil
+		if complete {
 			committed = currentOffset
-		} else if err == io.EOF {
-			// Unterminated tail: the writer may still be mid-line. Neither
-			// parse it nor commit past it — the next poll re-reads the line
-			// once its terminating newline lands. Committing here would
-			// permanently lose every event on that line.
-			break
-		} else {
+		} else if err != io.EOF {
 			return modEvents, readEvents, committed, err
 		}
+		// An unterminated tail (io.EOF) falls through to best-effort parsing
+		// below but is NOT committed: the writer may still be mid-line, and
+		// committing past it would permanently lose every event on that line.
+		// Once the newline lands, the next poll re-reads it; read events
+		// dedup naturally because ReadID is derived from lineStart.
 
 		trimmed := bytes.TrimSpace(lineBytes)
 		if len(trimmed) > 0 {
@@ -257,6 +256,10 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 					}
 				}
 			}
+		}
+		if !complete {
+			// Unterminated tail reached EOF: stop after best-effort parsing.
+			break
 		}
 	}
 

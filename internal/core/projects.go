@@ -176,12 +176,14 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 			e.cfg.Store = newStore
 			e.lockMu.Unlock()
 			if oldStore != nil && oldStore != newStore {
-				// Callers fetch Store() per call and may already hold the
-				// retired pointer; closing it immediately fails those
-				// in-flight queries with "database is closed". Give them a
-				// drain window instead — sql.DB.Close does not cancel
-				// running queries, so a straggler still finishes cleanly.
-				time.AfterFunc(10*time.Second, func() { _ = oldStore.Close() })
+				// Close now, not on a timer: a lingering handle keeps the
+				// old SQLite file locked on Windows (breaks backup/delete of
+				// the project dir right after a switch). sql.DB.Close does
+				// not cancel queries already running, so only a caller that
+				// fetched Store() microseconds ago and has not started its
+				// query yet can observe "database is closed" — accepted as
+				// the cheaper side of the trade-off.
+				_ = oldStore.Close()
 			}
 		}
 	}

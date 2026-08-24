@@ -208,6 +208,7 @@ run several side by side). All flags:
 |---|---|---|
 | `--watch, -w` | `.` | Root directory to observe |
 | `--port, -p` | `3444` | HTTP port for the dashboard + API |
+| `--bind` | `127.0.0.1` | Network interface for the dashboard + API (`0.0.0.0` exposes it on all interfaces) |
 | `--db` | `~/.wrongtrace/wrongtrace.db` | SQLite database file |
 | `--socket` | platform default (above) | IPC socket / pipe path |
 | `--repo` | basename of cwd | Repository label on events |
