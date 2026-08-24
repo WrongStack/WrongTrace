@@ -4,15 +4,15 @@
 
 **Universal AI Observability, AST Churn Intelligence, and Model Telemetry Hub for Autonomous Coding Agents.**
 
-Watches your code with Tree-sitter, correlates AST-level edits with the agent runs that produced them, ingests OpenTelemetry/profiler runtime traces, provides a transparent AI Gateway, auto-discovers 20+ coding agents, and serves an interactive React dashboard with rich telemetry charts — all from one Go binary with the UI embedded via `//go:embed`.
+Watches your code with Tree-sitter, correlates AST-level edits with the agent runs that produced them, ingests OpenTelemetry/profiler runtime traces, tracks inter-agent code collisions ("Who Broke Whose Code?"), provides an interactive Code Atlas with full-screen graph visualization, serves an embedded React dashboard, and operates a transparent AI Gateway — all from a single, high-performance Go binary.
 
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat)](CHANGELOG.md)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
-[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-purple.svg)](LICENSE)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat&logo=react)](https://react.dev)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.5+-3178C6?style=flat&logo=typescript)](https://www.typescriptlang.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-7.0-3178C6?style=flat&logo=typescript)](https://www.typescriptlang.org)
 [![Vite](https://img.shields.io/badge/Vite-8-646CFF?style=flat&logo=vite)](https://vitejs.dev)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-4-38B2AC?style=flat&logo=tailwind-css)](https://tailwindcss.com)
-[![Recharts](https://img.shields.io/badge/Recharts-3-22c55e?style=flat)](https://recharts.org)
 
 </div>
 
@@ -20,13 +20,15 @@ Watches your code with Tree-sitter, correlates AST-level edits with the agent ru
 
 ## 💡 Key Capabilities
 
-1. **Semantic AST Churn & Code Survival** — Tracks the granular lifecycle of functions, methods, classes, and structs via Tree-sitter AST diffing across 11+ languages rather than naive line counters.
-2. **Detect Agent Thrashing & Regressions** — Flags code nodes repeatedly rewritten, broken, or deleted $\ge 3\times$ in a 24-hour sliding window.
-3. **True Token ROI ($ / survived node)** — Measures model cost efficiency by calculating dollars spent per surviving AST node after a 14-day maturity window versus discarded churn.
-4. **Auto-Discovery for 20+ Coding Agents** — Zero-config transcript ingestion for WrongStack, Antigravity, Claude Code, Cursor, Windsurf, Cline/Roo, MiniMax Code, Kimi Code (Moonshot), ZCode, Devin, Trae, Goose, OpenHands, GitHub Copilot, Aider, Continue, and more.
-5. **Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, `unlock_file`, `report_file_read`, and `get_file_read_stats`.
-6. **Transparent AI Gateway & Wire Telemetry** — Intercepts and analyzes raw LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens, budget quotas, and prompt cache savings.
-7. **Universal Profiler & Runtime Traces** — Correlates runtime performance and latency hotspots (via OpenTelemetry OTLP, pprof, test runners) directly with AI code modifications.
+1. **🕸️ Inter-Agent Friction & Cross-Thrashing Matrix ("Who Broke Whose Code?")** — Uncovers multi-agent code collisions and friction. Tracks which AI model originally authored an AST node and which subsequent model rewrote or deleted it, complete with time-delta durations ($\Delta T$) and inline syntax-highlighted diffs.
+2. **🗺️ Interactive Next-Gen Code Atlas** — Full-screen interactive architectural map with Orbital Radial, Hierarchical Tree, and Grid layout algorithms. Features intelligent smooth auto-centering (`FlowAutoArranger`), Health Score heatmaps, Churn Velocity modes, and multi-tab symbol lineage drawers.
+3. **📜 AST Symbol Evolution & Lineage History** — Chronological lifecycle tracking for every function, method, class, and struct. Inspect exact revisions, model attributions, and localized diffs across the entire history of the symbol.
+4. **🧠 Model Intelligence & True Token ROI Matrix** — Grades AI models into Quality Tiers (S/A/B/C) based on 14-day code survival rate %, dollar expenditure per surviving node ($/node), context read-to-write ratio, and longevity.
+5. **🔍 Semantic AST Churn & Accurate Multi-Line Diffing** — Tracks code transformations via Tree-sitter AST diffing across 11+ languages with exact `+AddedLines / -DeletedLines` granularity, filtering out cosmetic formatting churn.
+6. **🤖 Universal Auto-Discovery for 20+ Coding Agents** — Zero-config transcript ingestion for WrongStack, Antigravity, Claude Code, Cursor, Windsurf, Cline/Roo, MiniMax Code, Kimi Code (Moonshot), ZCode, Devin, Trae, Goose, OpenHands, GitHub Copilot, Aider, Continue, and more.
+7. **🛡️ Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, `unlock_file`, `report_file_read`, and `get_file_read_stats`.
+8. **🌐 Transparent AI Gateway & Wire Telemetry** — Intercepts and analyzes raw LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens, budget quotas, and prompt cache savings.
+9. **⚡ Universal Profiler & Runtime Traces** — Ingests OpenTelemetry (OTLP) traces, pprof profiles, and test execution latencies, correlating runtime hotspots directly with AI code changes.
 
 ---
 
@@ -40,13 +42,13 @@ Run in any workspace to generate agent rules (`AGENTS.md`, `CLAUDE.md`, `.cursor
 wrongtrace init
 ```
 
-### 2. Start the Daemon
+### 2. Start the Observer Daemon
 
 ```bash
-# Start observer daemon on port 8000 watching current repo:
+# Start daemon on port 8000 watching current workspace:
 wrongtrace start
 
-# Or with custom port and target workspace:
+# Or with custom port and target directory:
 wrongtrace start --watch /path/to/project --port 8000
 ```
 
@@ -66,18 +68,18 @@ wrongtrace doctor
 > ### 👑 [WrongStack](https://github.com/wrongstack/wrongstack) — The Native Autonomous Multi-Agent Developer Stack
 > WrongTrace is natively built as the deep observability engine for **[WrongStack](https://github.com/wrongstack/wrongstack)** — the high-performance autonomous multi-agent developer platform.
 > * **Zero-Overhead Native Lineage**: Auto-detects WrongStack workspaces, projects (`~/.wrongstack/projects.json`), and hierarchical multi-agent date/session trees.
-> * **Direct IPC & Memory Bus**: Direct high-speed named pipe / domain socket telemetry streams between WrongStack orchestrators and WrongTrace Tree-sitter AST inspectors.
+> * **Direct IPC & Memory Bus**: High-speed named pipe / domain socket telemetry streams between WrongStack orchestrators and WrongTrace Tree-sitter AST inspectors.
 > * **Holistic Fleet Governance**: Monitor multi-agent swarm deployments, subagent delegations, and model efficiency at scale across entire software teams.
 
 ---
 
 ## 🤖 Supported Coding Agents
 
-WrongTrace automatically detects, monitors, and analyzes telemetry from all major autonomous coding environments (WrongStack native + multi-vendor agents):
+WrongTrace automatically detects, monitors, and analyzes telemetry from all major autonomous coding environments:
 
 | Coding Agent | Developer / Provider | Ingestion Source | Key Capabilities |
 |:---|:---|:---|:---|
-| **⚡ WrongStack** | **[WrongStack](https://github.com/wrongstack/wrongstack)** | `~/.wrongstack/projects/`, `.wrongstack/` | **Native Flagship**: Zero-config project discovery, multi-agent session lineage, IPC bus |
+| **⚡ WrongStack** | **[WrongStack](https://github.com/wrongstack/wrongstack)** | `~/.wrongstack/projects/`, `.wrongstack/` | **Native Flagship**: Zero-config discovery, multi-agent session lineage, high-speed IPC bus |
 | **Google Antigravity** | Google DeepMind | `~/.gemini/antigravity-cli/brain` | Dynamic model extraction (`gemini-3.7-flash`, `gemini-2.5-pro`), subagent tracking |
 | **Claude Code** | Anthropic | `~/.claude/logs`, `.mcp.json` | Tool calls, thinking blocks, prompt cache savings |
 | **Cursor** | Anysphere | `~/.cursor`, `AppData/Roaming/Cursor` | File edits, multi-file diffs, agent mode telemetry |
@@ -102,10 +104,12 @@ WrongTrace automatically detects, monitors, and analyzes telemetry from all majo
 
 | View | Description |
 |:---|:---|
-| **📊 Overview** | Churn timeline, Net LOC delta, Spend vs. Waste KPI, Thrashing Alerts, Live Event Stream. |
-| **🏆 Model Leaderboard** | Model survival rate %, Cost per survived AST node, True Token ROI, and rank badges. |
-| **🗺️ Code Atlas** | Interactive AST graph with symbol-level health scores, churn heatmaps, and monorepo workspace scopes. |
-| **🔍 Diffs & Changes** | Unified diff viewer with syntax highlighting and added/deleted line statistics. |
+| **📊 Overview** | Churn timeline, Net LOC delta, Spend vs. Waste KPI, Thrashing alerts, Live event stream. |
+| **⚔️ Inter-Agent Friction** | Collision Heatmap Grid, "Who Broke Whose Code?" timeline, $\Delta T$ duration, and overwrite diffs. |
+| **🧠 Model Intelligence** | S/A/B/C Quality Tiers, 14-day code survival rate %, True Token ROI ($/node), and Context Read matrix. |
+| **🗺️ Code Atlas** | Full-screen interactive AST graph with smooth auto-centering, Orbit/Tree/Grid layouts, and lineage drawer. |
+| **🔍 Diffs & Changes** | Full-page rich diff inspector with syntax highlighting and added/deleted line statistics. |
+| **📜 Symbol Lineage** | Chronological revision timeline for any AST node with author model attribution and historical diffs. |
 | **🤖 Agent Sessions & Catalog** | Multi-agent session monitor, live 2025/2026 model pricing registry, and interactive cost simulator. |
 | **⚡ Profiler & Runtime Traces** | OpenTelemetry (OTLP) ingest, P50/P90/P99 latency percentiles, and latency hotspot analysis. |
 | **🌐 AI Gateway & Wire Traffic** | Transparent proxy for LLM APIs, token composition analysis, budget quotas, and cache savings breakdown. |
