@@ -5,7 +5,7 @@ BIN_DIR       ?= bin
 BINARY        ?= $(BIN_DIR)/wrongtrace
 PKG           ?= ./cmd/wrongtrace
 LDFLAGS       ?= -s -w -X main.version=dev
-PORT          ?= 8000
+PORT          ?= 3444
 WATCH_DIR     ?= .
 REPO_NAME     ?= $(notdir $(CURDIR))
 WRONGTRACE_HOME ?= $(HOME)/.wrongtrace
