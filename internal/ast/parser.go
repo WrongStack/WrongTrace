@@ -391,11 +391,14 @@ func collectNodes(root *sitter.Node, src []byte, lang Language, file string, out
 	cursor := sitter.NewTreeCursor(root)
 	defer cursor.Close()
 
-	walk(cursor, src, lang, file, out)
+	walk(cursor, src, lang, file, out, 0)
 }
 
-// walk is an explicit-stack traversal that keeps allocations minimal.
-func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out *FileSnapshot) {
+// walk is an explicit-stack traversal that keeps allocations minimal with a depth bound.
+func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out *FileSnapshot, depth int) {
+	if depth > 250 {
+		return
+	}
 	node := cursor.CurrentNode()
 	kindStr := node.Type()
 	kind, ok := classifyNode(lang, kindStr, node)
@@ -418,7 +421,7 @@ func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out
 	// Recurse into children.
 	if cursor.GoToFirstChild() {
 		for {
-			walk(cursor, src, lang, file, out)
+			walk(cursor, src, lang, file, out, depth+1)
 			if !cursor.GoToNextSibling() {
 				cursor.GoToParent()
 				return
