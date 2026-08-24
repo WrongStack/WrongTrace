@@ -310,15 +310,12 @@ func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 	content := string(data)
 	var events []ToolCallEvent
 
-	modelRe := regexp.MustCompile(`(?i)Model:\s*([\w\.\-]+)`)
-	fileRe := regexp.MustCompile(`(?i)(?:Applied edit to|Updated|Created|Modified)\s*([\w\.\/\\]+)`)
-
 	model := "unknown-model"
-	if match := modelRe.FindStringSubmatch(content); len(match) > 1 {
+	if match := aiderModelRe.FindStringSubmatch(content); len(match) > 1 {
 		model = match[1]
 	}
 
-	fileMatches := fileRe.FindAllStringSubmatch(content, -1)
+	fileMatches := aiderFileRe.FindAllStringSubmatch(content, -1)
 	for _, fm := range fileMatches {
 		if len(fm) > 1 {
 			events = append(events, ToolCallEvent{
@@ -337,6 +334,8 @@ func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 }
 
 var (
+	aiderModelRe     = regexp.MustCompile(`(?i)Model:\s*([\w\.\-]+)`)
+	aiderFileRe      = regexp.MustCompile(`(?i)(?:Applied edit to|Updated|Created|Modified)\s*([\w\.\/\\]+)`)
 	modelSelectionRe = regexp.MustCompile(`(?i)(?:Model Selection|Active Model)[\x60'\s:]+(?:from\s+[^\n]+?\s+)?to\s+([A-Za-z0-9\.\-_ ]+?)(?:\s*\(|\n|$)`)
 	modelTagRe       = regexp.MustCompile(`(?i)<(?:model|model_name)>([^<]+)</(?:model|model_name)>|<!--\s*model:\s*([a-zA-Z0-9\.\-_/]+)\s*-->`)
 )

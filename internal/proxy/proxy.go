@@ -138,7 +138,7 @@ func NewGatewayProxy(cfg Config) *GatewayProxy {
 		},
 		providers:  providers,
 		Routes:     NewRouteManager(),
-		Cache:      NewResponseCache(2000, 24*time.Hour),
+		Cache:      NewResponseCache(500, 24*time.Hour),
 		Quotas:     NewQuotaLimiter(),
 		trafficLog: make([]ProxyTrafficRecord, 0, 100),
 		maxTraffic: 200,
@@ -459,8 +459,8 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	reqID := randomID("px")
 
-	// Read request body to extract model and intent
-	reqBody, err := io.ReadAll(r.Body)
+	// Read request body to extract model and intent (capped at 32MB to prevent OOM)
+	reqBody, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024))
 	if err != nil {
 		http.Error(w, "cannot read request body", http.StatusBadRequest)
 		return
@@ -870,6 +870,7 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 
 	var promptTokens, completionTokens int64
 	var capturedBuffer strings.Builder
+	const maxCapturedBytes = 1024 * 1024 // 1MB cap for in-memory analysis buffer
 
 	for {
 		n, err := body.Read(buf)
@@ -878,7 +879,9 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 			if isFlusher {
 				flusher.Flush()
 			}
-			capturedBuffer.Write(buf[:n])
+			if capturedBuffer.Len()+n <= maxCapturedBytes {
+				capturedBuffer.Write(buf[:n])
+			}
 		}
 		if err != nil {
 			break
@@ -1243,11 +1246,25 @@ func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, 
 	}
 
 	now := time.Now()
-	// Periodic cleanup of sessions inactive for more than 15 minutes
-	if len(p.sessions) > 50 {
+	// Periodic cleanup of sessions inactive for more than 15 minutes or when exceeding capacity
+	if len(p.sessions) > 250 {
 		for k, s := range p.sessions {
 			if now.Sub(s.lastSeen) > 15*time.Minute {
 				delete(p.sessions, k)
+			}
+		}
+		// If still exceeding cap, evict oldest
+		if len(p.sessions) > 250 {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, s := range p.sessions {
+				if oldestTime.IsZero() || s.lastSeen.Before(oldestTime) {
+					oldestTime = s.lastSeen
+					oldestKey = k
+				}
+			}
+			if oldestKey != "" {
+				delete(p.sessions, oldestKey)
 			}
 		}
 	}
@@ -1257,12 +1274,14 @@ func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, 
 		lookupKey = sessionKey
 	}
 
-	if sess, ok := p.sessions[lookupKey]; ok && now.Sub(sess.lastSeen) <= 10*time.Minute {
-		sess.promptTokens += promptTokens
-		sess.completionTokens += completionTokens
-		sess.costUSD += costUSD
-		sess.lastSeen = now
-		return sess.runID, sess.promptTokens, sess.completionTokens, sess.costUSD
+	if lookupKey != "" {
+		if sess, ok := p.sessions[lookupKey]; ok && now.Sub(sess.lastSeen) <= 10*time.Minute {
+			sess.promptTokens += promptTokens
+			sess.completionTokens += completionTokens
+			sess.costUSD += costUSD
+			sess.lastSeen = now
+			return sess.runID, sess.promptTokens, sess.completionTokens, sess.costUSD
+		}
 	}
 
 	runID := explicitSessionID
@@ -1270,13 +1289,15 @@ func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, 
 		runID = randomID("proxy-run")
 	}
 
-	p.sessions[lookupKey] = &proxySessionTracker{
-		runID:            runID,
-		promptTokens:     promptTokens,
-		completionTokens: completionTokens,
-		costUSD:          costUSD,
-		lastSeen:         now,
-		createdAt:        now,
+	if lookupKey != "" {
+		p.sessions[lookupKey] = &proxySessionTracker{
+			runID:            runID,
+			promptTokens:     promptTokens,
+			completionTokens: completionTokens,
+			costUSD:          costUSD,
+			lastSeen:         now,
+			createdAt:        now,
+		}
 	}
 
 	return runID, promptTokens, completionTokens, costUSD

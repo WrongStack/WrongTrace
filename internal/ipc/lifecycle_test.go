@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -14,12 +15,15 @@ import (
 
 // testSocketPath returns a per-test socket path. On Windows this is a unique
 // pipe name; on POSIX a temp file path whose directory bindSocket creates.
+// On macOS Darwin, sockaddr_un.sun_path is capped at 104 bytes (Linux 108 bytes),
+// so we generate bounded short paths in os.TempDir().
 func testSocketPath(t *testing.T) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		return `\\.\pipe\wrongtrace-test-` + t.Name() + fmt.Sprintf("-%d", time.Now().UnixNano())
 	}
-	return filepath.Join(t.TempDir(), "ipc.sock")
+	shortName := fmt.Sprintf("wt-%d-%d.sock", os.Getpid(), time.Now().UnixNano()%1000000)
+	return filepath.Join(os.TempDir(), shortName)
 }
 
 // startLiveServer binds a real socket, starts serving, and registers cleanup.

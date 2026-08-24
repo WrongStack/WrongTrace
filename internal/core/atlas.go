@@ -200,9 +200,9 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 
 	var nodeStats map[string]db.NodeStat
 	var allHealth map[string]db.FileHealth
-	if e.cfg.Store != nil {
-		nodeStats, _ = e.cfg.Store.AllNodeStats(filter)
-		allHealth, _ = e.cfg.Store.AllFilesHealth(filter)
+	if store := e.Store(); store != nil {
+		nodeStats, _ = store.AllNodeStats(filter)
+		allHealth, _ = store.AllFilesHealth(filter)
 	}
 	if nodeStats == nil {
 		nodeStats = make(map[string]db.NodeStat)

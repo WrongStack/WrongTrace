@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.3] - 2026-08-24
+
+### Fixed & Hardened (Memory, CPU & System Stability)
+- **SQLite Memory Over-Allocation & GC Thrashing Elimination**:
+  - Tuned SQLite connection pool pragmas from excessive 64 MiB page cache per connection (`cache_size(-65536)`) and 32 connections (which allocated up to 2 GB RAM, triggering intense Go GC CPU thrashing against the 256MB soft limit) down to a lean 8 MiB per connection (`cache_size(-8192)`), bounded max connection pool (`2..8` connections), and reduced `mmap_size` (64 MiB).
+- **Regex Compilation Hoisting & Hot-Path CPU Optimization**:
+  - Hoisted all runtime `regexp.MustCompile` calls in hot request/transcript processing paths (`internal/proxy/analyzer.go` and `internal/ingest/analyzer.go`) to package-level singleton variables, eliminating per-request regex compilation overhead and heap allocations.
+- **Zero-Creep Ring Buffer Memory Management**:
+  - Replaced re-slicing with in-place `copy-shift` ring buffers for IPC traffic (`ipcTraffic`) and gateway wire traffic logs (`trafficLog`), allowing the Go Garbage Collector to immediately release old payload objects from memory.
+- **Database Hot-Swap & Project Switching Thread-Safety**:
+  - Protected all database store accesses in `Engine`, `Metrics`, `Atlas`, `FileHealth`, and telemetry recording with synchronized `e.Store()` and nil-store guards.
+  - Eliminated concurrent query collisions on SQLite during project activation (`SwitchActiveProject`).
+- **SSE Stream Wire Parser Crash Protection**:
+  - Replaced unsafe type assertions (`chunk["index"].(float64)`, `cb["id"].(string)`) in Anthropic/OpenAI wire payload analyzers (`internal/proxy/analyzer.go`) with safe comma-ok type assertions, preventing nil interface conversion panics.
+- **Unbounded Memory & Session Map Leak Prevention**:
+  - Added strict capacity ceiling (250 entries) and LRU eviction for in-memory gateway session tracking (`p.sessions`) in `GatewayProxy`.
+  - Capped maximum streamed SSE payload capture buffer (`capturedBuffer`) at 1 MB to prevent heap ballooning on massive LLM token generations.
+  - Capped proxy request body ingestion at 32 MB to guard against OOM payloads.
+- **Query Timeout Guarantees**:
+  - Enforced `s.withTimeout()` across analytical queries (`Thrashing`, `ModelComparison`, `FileHealth`, `AllFilesHealth`, `AllNodeStats`, `RecentTraces`, `ProfilerHotspots`, `ProfilerOverview`), eliminating indefinite connection lockups.
+- **Full JSON-RPC IPC Method Compatibility & POSIX Resilience**:
+  - Implemented complete method coverage and flexible parameter mapping for `telemetry/report_file_read` (`report_file_read`), `check_guardrail` (`guardrail/check`), `report_telemetry`, `lock_file` (`guardrail/lock`), `unlock_file` (`guardrail/unlock`), `list_locks`, `atlas` (`get_atlas`), `get_file_read_stats`, `get_file_diff_history`, and introspection (`rpc.discover`, `system.listMethods`), eliminating all `-32601 method not found` errors from WrongStack, MCP clients, and autonomous agent probes.
+  - Added Darwin/Linux `sockaddr_un.sun_path` length bounds (104 bytes on macOS, 108 bytes on Linux) with automatic `/tmp` fallback to prevent socket creation failures on systems with long home/temp directories.
+  - Automatically established `/tmp/wrongtrace.sock` symlinks on POSIX for seamless dual-path agent discovery (`~/.wrongtrace/wrongtrace.sock` $\leftrightarrow$ `/tmp/wrongtrace.sock`).
+
+---
+
 ## [0.3.2] - 2026-08-24
 
 ### Fixed

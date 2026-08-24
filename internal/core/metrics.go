@@ -30,19 +30,28 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 		filter = e.cfg.RepoName
 	}
 
-	overview, err := e.cfg.Store.Overview(filter)
+	store := e.Store()
+	if store == nil {
+		return MetricsSnapshot{
+			Repo:        filter,
+			GeneratedAt: time.Now().UTC(),
+			ActiveRuns:  e.ActiveRuns(),
+		}, nil
+	}
+
+	overview, err := store.Overview(filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
-	thrashing, err := e.cfg.Store.Thrashing(3, 7, filter)
+	thrashing, err := store.Thrashing(3, 7, filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
-	models, err := e.cfg.Store.ModelComparison(filter)
+	models, err := store.ModelComparison(filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
-	recent, err := e.cfg.Store.RecentEvents(50, filter)
+	recent, err := store.RecentEvents(50, filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}

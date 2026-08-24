@@ -293,7 +293,10 @@ func (s *Store) Thrashing(minEdits int, lookbackDays int, repoFilter ...string) 
 		args = []any{fmt.Sprintf("-%d days", lookbackDays), repo, minEdits}
 	}
 
-	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("thrashing query: %w", err)
 	}
@@ -470,7 +473,10 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 		args = []any{repo, repo, repo, repo, repo, repo}
 	}
 
-	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("model comparison: %w", err)
 	}
@@ -519,7 +525,10 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 
 	var edits, sigs int
 	normSlash := strings.ReplaceAll(filePath, "\\", "/")
-	row := s.db.QueryRowContext(context.Background(), `
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	row := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*), COUNT(DISTINCT node_signature)
 		FROM code_node_events
 		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%/' || ?)
@@ -573,7 +582,10 @@ func (s *Store) AllFilesHealth(repoFilter ...string) (map[string]FileHealth, err
 	}
 
 	out := make(map[string]FileHealth)
-	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return out, err
 	}
@@ -648,13 +660,16 @@ func (s *Store) AllNodeStats(repoFilter ...string) (map[string]NodeStat, error) 
 		args = []any{repo, repo, repo}
 	}
 
-	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	out := make(map[string]NodeStat)
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("node stats query: %w", err)
 	}
 	defer rows.Close()
 
-	out := make(map[string]NodeStat)
 	for rows.Next() {
 		var ns NodeStat
 		var ts string
@@ -784,7 +799,10 @@ func (s *Store) RecentTraces(limit int) ([]RuntimeTraceRecord, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(context.Background(), `
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT trace_id, COALESCE(run_id, ''), service_name, COALESCE(node_signature, ''),
 		       COALESCE(file_path, ''), duration_ms, cpu_usage_pct, memory_bytes,
 		       status_code, COALESCE(error_msg, ''), profiler_type, COALESCE(metadata_json, '{}'),
@@ -820,7 +838,10 @@ func (s *Store) ProfilerHotspots(limit int) ([]ProfilerHotspotRow, error) {
 	if limit <= 0 {
 		limit = 25
 	}
-	rows, err := s.db.QueryContext(context.Background(), `
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT node_signature, file_path, COUNT(*) AS trace_count,
 		       AVG(duration_ms) AS avg_duration, MAX(duration_ms) AS max_duration,
 		       SUM(CASE WHEN status_code >= 400 OR error_msg != '' THEN 1 ELSE 0 END) AS total_errors,
@@ -854,7 +875,10 @@ func (s *Store) ProfilerHotspots(limit int) ([]ProfilerHotspotRow, error) {
 // ProfilerOverview returns summary stats across all recorded runtime traces.
 func (s *Store) ProfilerOverview() (ProfilerOverviewRow, error) {
 	var o ProfilerOverviewRow
-	row := s.db.QueryRowContext(context.Background(), `
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	row := s.db.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN status_code >= 400 OR error_msg != '' THEN 1 ELSE 0 END), 0),

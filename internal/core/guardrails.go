@@ -6,33 +6,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wrongstack/wrongtrace/internal/ipc"
 	"github.com/wrongstack/wrongtrace/internal/webhook"
 )
 
 // LockInfo records guardrail lock metadata including ownership and expiry TTL.
-type LockInfo struct {
-	Path       string    `json:"path"`
-	Reason     string    `json:"reason"`
-	Owner      string    `json:"owner,omitempty"`
-	OwnerRunID string    `json:"owner_run_id,omitempty"`
-	LockedAt   time.Time `json:"locked_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
-}
+type LockInfo = ipc.LockInfo
 
 // GuardrailResult indicates whether an agent should proceed editing a file.
-type GuardrailResult struct {
-	Allowed              bool       `json:"allowed"`
-	HealthScore          int        `json:"health_score"`
-	RecentThrashingCount int        `json:"recent_thrashing_count"`
-	IsFragile            bool       `json:"is_fragile"`
-	IsLocked             bool       `json:"is_locked"`
-	LockReason           string     `json:"lock_reason,omitempty"`
-	LockOwner            string     `json:"lock_owner,omitempty"`
-	LockOwnerRunID       string     `json:"lock_owner_run_id,omitempty"`
-	LockExpiresAt        *time.Time `json:"lock_expires_at,omitempty"`
-	Recommendation       string     `json:"recommendation"`
-	CheckedAt            time.Time  `json:"checked_at"`
-}
+type GuardrailResult = ipc.GuardrailResult
 
 // normalizeLockPath canonicalizes a path for lock bookkeeping. Both separator
 // styles are folded to "/" explicitly rather than through filepath.ToSlash,

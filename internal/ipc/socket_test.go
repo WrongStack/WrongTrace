@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/wrongstack/wrongtrace/internal/db"
 )
 
 // fakeSink is an in-memory EngineSink used to observe dispatch side effects
@@ -27,10 +30,36 @@ func (f *fakeSink) ReportRun(r TelemetryReport) error {
 	return f.reportErr
 }
 
+func (f *fakeSink) RecordReadEvent(rec db.FileReadRecord) error {
+	return nil
+}
+
 func (f *fakeSink) FileHealth(p string) (FileHealthReply, error) {
 	f.healthCalls++
 	f.gotPath = p
 	return f.healthOut, f.healthErr
+}
+
+func (f *fakeSink) CheckGuardrail(p string) (GuardrailResult, error) {
+	return GuardrailResult{Allowed: true, HealthScore: 100}, nil
+}
+
+func (f *fakeSink) LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) LockInfo {
+	return LockInfo{Path: path, Reason: reason, Owner: owner, OwnerRunID: ownerRunID, LockedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(ttl)}
+}
+
+func (f *fakeSink) UnlockFile(path string) {}
+
+func (f *fakeSink) ListLocks() []LockInfo {
+	return []LockInfo{}
+}
+
+func (f *fakeSink) GetFileReadStats(filePath string) (db.FileReadStats, error) {
+	return db.FileReadStats{FilePath: filePath}, nil
+}
+
+func (f *fakeSink) GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error) {
+	return []db.EventRecord{}, nil
 }
 
 func (f *fakeSink) Ping() error {
@@ -331,5 +360,75 @@ func TestResponseWireShape(t *testing.T) {
 	b, _ = json.Marshal(okResp)
 	if s := string(b); !strings.Contains(s, `"result":{"status":"ok"}`) || strings.Contains(s, `"error"`) {
 		t.Errorf("success response malformed: %s", s)
+	}
+}
+
+func TestExtendedIPCMethods(t *testing.T) {
+	sink := &fakeSink{}
+	srv := newTestServer(sink)
+
+	// 1. telemetry/report_file_read
+	resp := srv.dispatch(&Request{
+		Method: "telemetry/report_file_read",
+		Params: params(t, `{"file_path":"package.json","line_count":1,"model_name":"probe-model","tokens_consumed":1}`),
+		ID:     1,
+	})
+	if resp.Error != nil {
+		t.Fatalf("report_file_read failed: %v", resp.Error)
+	}
+
+	// 2. check_guardrail
+	resp = srv.dispatch(&Request{
+		Method: "check_guardrail",
+		Params: params(t, `{"path":"package.json"}`),
+		ID:     2,
+	})
+	if resp.Error != nil {
+		t.Fatalf("check_guardrail failed: %v", resp.Error)
+	}
+
+	// 3. lock_file & unlock_file
+	resp = srv.dispatch(&Request{
+		Method: "lock_file",
+		Params: params(t, `{"path":".temp_files/test","reason":"probe","ttl_seconds":60}`),
+		ID:     3,
+	})
+	if resp.Error != nil {
+		t.Fatalf("lock_file failed: %v", resp.Error)
+	}
+
+	resp = srv.dispatch(&Request{
+		Method: "unlock_file",
+		Params: params(t, `{"path":".temp_files/test"}`),
+		ID:     4,
+	})
+	if resp.Error != nil {
+		t.Fatalf("unlock_file failed: %v", resp.Error)
+	}
+
+	// 4. list_locks
+	resp = srv.dispatch(&Request{
+		Method: "list_locks",
+		ID:     5,
+	})
+	if resp.Error != nil {
+		t.Fatalf("list_locks failed: %v", resp.Error)
+	}
+
+	// 5. rpc.discover & system.listMethods
+	resp = srv.dispatch(&Request{
+		Method: "rpc.discover",
+		ID:     6,
+	})
+	if resp.Error != nil {
+		t.Fatalf("rpc.discover failed: %v", resp.Error)
+	}
+
+	resp = srv.dispatch(&Request{
+		Method: "system.listMethods",
+		ID:     7,
+	})
+	if resp.Error != nil {
+		t.Fatalf("system.listMethods failed: %v", resp.Error)
 	}
 }

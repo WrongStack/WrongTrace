@@ -109,6 +109,20 @@ func NewEngine(cfg Config) *Engine {
 			break
 		}
 	}
+	if activeProjID != "" {
+		changed := false
+		for k, p := range loadedProjects {
+			expectedActive := (k == activeProjID)
+			if p.IsActive != expectedActive {
+				p.IsActive = expectedActive
+				loadedProjects[k] = p
+				changed = true
+			}
+		}
+		if changed {
+			SaveProjectsIndex(loadedProjects)
+		}
+	}
 	if cfg.RepoName == "" {
 		cfg.RepoName = "default"
 	}
@@ -250,9 +264,12 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 			DeletedLines: ev.DeletedLines,
 			OccurredAt:   ev.OccurredAt,
 		}
-		if err := e.cfg.Store.InsertEvent(rec); err != nil {
-			log.Printf("engine: insert event %s: %v", rec.EventID, err)
-			continue
+		store := e.Store()
+		if store != nil {
+			if err := store.InsertEvent(rec); err != nil {
+				log.Printf("engine: insert event %s: %v", rec.EventID, err)
+				continue
+			}
 		}
 		e.hub.Broadcast(WSEvent{Type: "code_event", Payload: ev, EventID: rec.EventID})
 	}
@@ -525,7 +542,11 @@ func (e *Engine) ReportRunMCP(model, provider, taskID, intent string, promptToke
 
 // FileHealth is invoked by IPC and MCP clients for the fragility guardrail.
 func (e *Engine) FileHealth(path string) (IPCHealth, error) {
-	h, err := e.cfg.Store.FileHealth(path)
+	store := e.Store()
+	if store == nil {
+		return IPCHealth{FilePath: path, HealthScore: 100}, nil
+	}
+	h, err := store.FileHealth(path)
 	if err != nil {
 		return IPCHealth{}, err
 	}
@@ -573,8 +594,11 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 		rec.RunID = e.recentRunID()
 	}
 
-	if err := e.cfg.Store.InsertReadEvent(rec); err != nil {
-		return fmt.Errorf("insert read event: %w", err)
+	store := e.Store()
+	if store != nil {
+		if err := store.InsertReadEvent(rec); err != nil {
+			return fmt.Errorf("insert read event: %w", err)
+		}
 	}
 	e.hub.Broadcast(WSEvent{Type: "file_read_event", Payload: rec, EventID: rec.ReadID})
 	return nil
@@ -582,82 +606,104 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 
 // GetFileReadStats returns aggregated read metrics for a given file.
 func (e *Engine) GetFileReadStats(filePath string) (db.FileReadStats, error) {
-	return e.cfg.Store.GetFileReadStats(filePath)
+	store := e.Store()
+	if store == nil {
+		return db.FileReadStats{FilePath: filePath}, nil
+	}
+	return store.GetFileReadStats(filePath)
 }
 
 // GetRecentEvents returns the most recent code mutation and diff events.
 func (e *Engine) GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error) {
+	store := e.Store()
+	if store == nil {
+		return nil, nil
+	}
 	var filter string
 	if len(repoFilter) > 0 && repoFilter[0] != "" {
 		filter = repoFilter[0]
 	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
 		filter = active.Name
 	}
-	return e.cfg.Store.RecentEvents(limit, filter)
+	return store.RecentEvents(limit, filter)
 }
 
 // GetRecentEventsFiltered queries recent events with flexible repository, file, and timestamp constraints.
 func (e *Engine) GetRecentEventsFiltered(limit int, repo string, filePath string, since time.Time) ([]db.EventRecord, error) {
-	if e.cfg.Store == nil {
+	store := e.Store()
+	if store == nil {
 		return nil, nil
 	}
-	return e.cfg.Store.RecentEventsFiltered(limit, repo, filePath, since)
+	return store.RecentEventsFiltered(limit, repo, filePath, since)
 }
 
 // GetRecentFileEvents returns recent diff and AST events specifically matching a file.
 func (e *Engine) GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error) {
-	if e.cfg.Store == nil {
+	store := e.Store()
+	if store == nil {
 		return nil, nil
 	}
-	return e.cfg.Store.RecentFileEvents(filePath, limit)
+	return store.RecentFileEvents(filePath, limit)
 }
 
 // GetRecentFileReads returns the most recent read records across the system, optionally filtered by repo_name.
 func (e *Engine) GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileReadRecord, error) {
+	store := e.Store()
+	if store == nil {
+		return nil, nil
+	}
 	var filter string
 	if len(repoFilter) > 0 && repoFilter[0] != "" {
 		filter = repoFilter[0]
 	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
 		filter = active.Name
 	}
-	return e.cfg.Store.GetRecentFileReads(limit, filter)
+	return store.GetRecentFileReads(limit, filter)
 }
 
 // GetFileReadHeatmap returns line range frequencies for a file.
 func (e *Engine) GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, error) {
-	return e.cfg.Store.GetFileReadHeatmap(filePath)
+	store := e.Store()
+	if store == nil {
+		return nil, nil
+	}
+	return store.GetFileReadHeatmap(filePath)
 }
 
 // GetSymbolHistory returns the chronological evolution and revision history of an AST symbol.
 func (e *Engine) GetSymbolHistory(filePath, signature string, limit int) ([]db.SymbolHistoryRecord, error) {
-	if e.cfg.Store == nil {
+	store := e.Store()
+	if store == nil {
 		return nil, nil
 	}
-	return e.cfg.Store.SymbolHistory(filePath, signature, limit)
+	return store.SymbolHistory(filePath, signature, limit)
 }
 
 // GetFileModelActivity returns per-model read vs write activity breakdown for a file.
 func (e *Engine) GetFileModelActivity(filePath string) ([]db.ModelActivitySummary, error) {
-	if e.cfg.Store == nil {
+	store := e.Store()
+	if store == nil {
 		return nil, nil
 	}
-	return e.cfg.Store.FileModelActivity(filePath)
+	return store.FileModelActivity(filePath)
 }
 
 // GetAllFileModelActivity returns aggregated model activity across all files.
 func (e *Engine) GetAllFileModelActivity(limit int) ([]db.ModelActivitySummary, error) {
-	if e.cfg.Store == nil {
+	store := e.Store()
+	if store == nil {
 		return nil, nil
 	}
-	return e.cfg.Store.AllFileModelActivity(limit)
+	return store.AllFileModelActivity(limit)
 }
 
 // GetModelFrictionReport returns inter-agent cross-thrashing and collision analytics.
 func (e *Engine) GetModelFrictionReport(limit int) (*db.InterAgentFrictionReport, error) {
-	if e.cfg.Store == nil {
+	store := e.Store()
+	if store == nil {
 		return nil, nil
 	}
-	return e.cfg.Store.ModelFrictionMatrix(limit)
+	return store.ModelFrictionMatrix(limit)
 }
 
 // IndexStatus returns the current codebase indexing progress and stats.
@@ -673,9 +719,11 @@ func (e *Engine) RecordIPCTraffic(rec ipc.IPCTrafficRecord) {
 	if e.ipcTraffic == nil {
 		e.ipcTraffic = make([]ipc.IPCTrafficRecord, 0, 100)
 	}
-	e.ipcTraffic = append(e.ipcTraffic, rec)
-	if len(e.ipcTraffic) > 100 {
-		e.ipcTraffic = e.ipcTraffic[len(e.ipcTraffic)-100:]
+	if len(e.ipcTraffic) >= 100 {
+		copy(e.ipcTraffic, e.ipcTraffic[1:])
+		e.ipcTraffic[len(e.ipcTraffic)-1] = rec
+	} else {
+		e.ipcTraffic = append(e.ipcTraffic, rec)
 	}
 	e.ipcMu.Unlock()
 

@@ -539,15 +539,17 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
 
       {activeSubTab === 'routes' && (
         <>
-          {/* Zero-Config Direct Passthrough Banner */}
+          {/* Zero-Config Direct Passthrough Reference Banner */}
           <div className="panel bg-gradient-to-r from-indigo-950/40 via-purple-950/30 to-slate-900/40 border-indigo-500/20 p-4 rounded-xl space-y-2">
-            <div className="flex items-center gap-2">
-              <Zap className="h-4 w-4 text-amber-400" />
-              <h3 className="text-xs font-semibold text-slate-200">Zero-Config Direct URL Passthrough</h3>
-              <span className="text-[9px] bg-emerald-500/10 text-emerald-400 px-2 py-0.2 rounded border border-emerald-500/20 font-mono">No setup required</span>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Zap className="h-4 w-4 text-amber-400" />
+                <h3 className="text-xs font-semibold text-slate-200">Zero-Config Direct URL Passthrough</h3>
+                <span className="text-[9px] bg-indigo-500/20 text-indigo-300 px-2 py-0.2 rounded border border-indigo-500/30 font-mono">Syntax Reference (Built-in)</span>
+              </div>
             </div>
             <p className="text-xs text-slate-400">
-              You can use WrongTrace as a transparent proxy without configuring routes! Simply prepend <code className="text-indigo-300 font-mono bg-white/5 px-1 py-0.5 rounded">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3444'}/proxy/</code> to ANY upstream host or URL:
+              WrongTrace supports automatic on-the-fly proxying without creating persistent routes! Simply prepend <code className="text-indigo-300 font-mono bg-white/5 px-1 py-0.5 rounded">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3444'}/proxy/</code> to ANY upstream URL (examples below):
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-mono pt-1">
               <div className="p-2 bg-slate-950/70 rounded border border-white/5 flex items-center justify-between gap-2">
@@ -557,9 +559,10 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
                 <button
                   onClick={() => handleCopy('direct-zai', `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3444'}/proxy/api.z.ai/api/coding/paas/v4`)}
                   className="text-indigo-400 hover:text-indigo-300 shrink-0 flex items-center gap-1"
+                  title="Copy example URL"
                 >
                   {copiedId === 'direct-zai' ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
-                  {copiedId === 'direct-zai' ? 'Copied' : 'Copy'}
+                  {copiedId === 'direct-zai' ? 'Copied' : 'Copy Example'}
                 </button>
               </div>
               <div className="p-2 bg-slate-950/70 rounded border border-white/5 flex items-center justify-between gap-2">
@@ -569,74 +572,94 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
                 <button
                   onClick={() => handleCopy('direct-groq', `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3444'}/proxy/api.groq.com/openai/v1`)}
                   className="text-indigo-400 hover:text-indigo-300 shrink-0 flex items-center gap-1"
+                  title="Copy example URL"
                 >
                   {copiedId === 'direct-groq' ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
-                  {copiedId === 'direct-groq' ? 'Copied' : 'Copy'}
+                  {copiedId === 'direct-groq' ? 'Copied' : 'Copy Example'}
                 </button>
               </div>
             </div>
           </div>
 
-          {/* Routes Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {routes.map((route: ProxyRoute) => {
-              const fullEndpoint = `${window.location.origin}${route.path_prefix}`;
-              return (
-                <div key={route.id} className="panel space-y-3 relative group">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="h-2 w-2 rounded-full bg-emerald-400 ring-4 ring-emerald-500/20" />
-                      <span className="font-semibold text-slate-200 text-sm">{route.name}</span>
-                    </div>
-                    <span className="text-[10px] px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-mono uppercase">
-                      {route.protocol_type}
-                    </span>
-                  </div>
-
-                  {/* Endpoint URLs */}
-                  <div className="space-y-1.5 text-xs font-mono">
-                    <div className="p-2 bg-slate-900/80 rounded border border-white/5 space-y-1">
-                      <div className="text-[10px] text-slate-500 flex items-center justify-between">
-                        <span>AGENT BASE_URL</span>
-                        <button
-                          onClick={() => handleCopy(route.id, fullEndpoint)}
-                          className="text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
-                        >
-                          {copiedId === route.id ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
-                          {copiedId === route.id ? 'Copied' : 'Copy'}
-                        </button>
+          {/* Routes Grid or Empty State */}
+          {routes.length === 0 ? (
+            <div className="panel p-8 text-center space-y-3 border-dashed border-slate-700/50 rounded-xl">
+              <Globe className="h-8 w-8 text-slate-500 mx-auto" />
+              <div className="space-y-1">
+                <h4 className="text-sm font-semibold text-slate-200">No Custom Routes Configured</h4>
+                <p className="text-xs text-slate-400 max-w-md mx-auto">
+                  You have not saved any custom alias routes yet. Click <strong>"Add Route"</strong> above to create a named alias (e.g. <code className="text-indigo-400">/proxy/my-model</code>), or use the Zero-Config URL syntax shown in the reference guide.
+                </p>
+              </div>
+              <button
+                onClick={() => setIsModalOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors shadow-lg shadow-indigo-600/20"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Add Your First Route
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              {routes.map((route: ProxyRoute) => {
+                const fullEndpoint = `${window.location.origin}${route.path_prefix}`;
+                return (
+                  <div key={route.id} className="panel space-y-3 relative group">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-emerald-400 ring-4 ring-emerald-500/20" />
+                        <span className="font-semibold text-slate-200 text-sm">{route.name}</span>
                       </div>
-                      <div className="text-slate-300 truncate" title={fullEndpoint}>
-                        {fullEndpoint}
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
-                      <ArrowRight className="h-3 w-3 text-slate-500 flex-shrink-0" />
-                      <span className="truncate text-slate-500" title={route.target_upstream}>
-                        {route.target_upstream}
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-mono uppercase">
+                        {route.protocol_type}
                       </span>
                     </div>
-                  </div>
 
-                  {/* Footer */}
-                  <div className="flex items-center justify-between pt-2 border-t border-white/5 text-xs">
-                    <div className="flex items-center gap-1.5 text-[11px] text-slate-400 font-mono">
-                      <Cpu className="h-3 w-3 text-slate-500" />
-                      <span>{route.default_model || 'Any Model'}</span>
+                    {/* Endpoint URLs */}
+                    <div className="space-y-1.5 text-xs font-mono">
+                      <div className="p-2 bg-slate-900/80 rounded border border-white/5 space-y-1">
+                        <div className="text-[10px] text-slate-500 flex items-center justify-between">
+                          <span>AGENT BASE_URL</span>
+                          <button
+                            onClick={() => handleCopy(route.id, fullEndpoint)}
+                            className="text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
+                          >
+                            {copiedId === route.id ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                            {copiedId === route.id ? 'Copied' : 'Copy'}
+                          </button>
+                        </div>
+                        <div className="text-slate-300 truncate" title={fullEndpoint}>
+                          {fullEndpoint}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
+                        <ArrowRight className="h-3 w-3 text-slate-500 flex-shrink-0" />
+                        <span className="truncate text-slate-500" title={route.target_upstream}>
+                          {route.target_upstream}
+                        </span>
+                      </div>
                     </div>
-                    <button
-                      onClick={() => handleDelete(route.id)}
-                      className="opacity-0 group-hover:opacity-100 p-1 text-rose-400 hover:bg-rose-500/10 rounded transition-all"
-                      title="Delete Route"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+
+                    {/* Footer */}
+                    <div className="flex items-center justify-between pt-2 border-t border-white/5 text-xs">
+                      <div className="flex items-center gap-1.5 text-[11px] text-slate-400 font-mono">
+                        <Cpu className="h-3 w-3 text-slate-500" />
+                        <span>{route.default_model || 'Any Model'}</span>
+                      </div>
+                      <button
+                        onClick={() => handleDelete(route.id)}
+                        className="opacity-0 group-hover:opacity-100 p-1 text-rose-400 hover:bg-rose-500/10 rounded transition-all"
+                        title="Delete Route"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </>
       )}
 

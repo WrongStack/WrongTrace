@@ -32,7 +32,10 @@ type PayloadAnalysis struct {
 	ReasoningTokens  int64
 }
 
-var thinkRegex = regexp.MustCompile(`(?s)<think>(.*?)</think>`)
+var (
+	thinkRegex      = regexp.MustCompile(`(?s)<think>(.*?)</think>`)
+	fileTargetRegex = regexp.MustCompile(`"(?:path|file|target_file|TargetFile|filePath|filename)":\s*"([^"]+)"`)
+)
 
 // AnalyzeWirePayloads extracts tool calls, reasoning/thinking blocks, assistant replies, and conversation stats.
 func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysis {
@@ -304,10 +307,15 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 			if cType == "content_block_start" {
 				if cb, ok := chunk["content_block"].(map[string]interface{}); ok {
 					if cbType, _ := cb["type"].(string); cbType == "tool_use" {
-						idx := int(chunk["index"].(float64))
+						idx := 0
+						if idxFloat, ok := chunk["index"].(float64); ok {
+							idx = int(idxFloat)
+						}
+						idStr, _ := cb["id"].(string)
+						nameStr, _ := cb["name"].(string)
 						buf := &toolBuffer{
-							id:   cb["id"].(string),
-							name: cb["name"].(string),
+							id:   idStr,
+							name: nameStr,
 						}
 						toolMap[idx] = buf
 					}
@@ -315,7 +323,10 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 			} else if cType == "content_block_delta" {
 				if delta, ok := chunk["delta"].(map[string]interface{}); ok {
 					if dType, _ := delta["type"].(string); dType == "input_json_delta" {
-						idx := int(chunk["index"].(float64))
+						idx := 0
+						if idxFloat, ok := chunk["index"].(float64); ok {
+							idx = int(idxFloat)
+						}
 						if buf, exists := toolMap[idx]; exists {
 							if pJson, ok := delta["partial_json"].(string); ok {
 								buf.args.WriteString(pJson)
@@ -522,8 +533,7 @@ func extractFileFromArgsString(args string) string {
 	}
 
 	// Fallback regex match for "path": "..." or "file": "..."
-	fileRe := regexp.MustCompile(`"(?:path|file|target_file|TargetFile|filePath|filename)":\s*"([^"]+)"`)
-	if match := fileRe.FindStringSubmatch(args); len(match) > 1 {
+	if match := fileTargetRegex.FindStringSubmatch(args); len(match) > 1 {
 		return match[1]
 	}
 	return ""

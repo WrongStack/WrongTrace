@@ -40,7 +40,7 @@ func Open(path string) (*Store, error) {
 	}
 
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-65536)&_pragma=mmap_size(268435456)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)",
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-8192)&_pragma=mmap_size(67108864)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)",
 		path,
 	)
 	conn, err := sql.Open("sqlite", dsn)
@@ -49,12 +49,13 @@ func Open(path string) (*Store, error) {
 	}
 
 	// In WAL mode, SQLite supports multiple concurrent readers alongside single-writer serialization.
-	maxConns := runtime.NumCPU() * 2
-	if maxConns < 4 {
-		maxConns = 4
+	// Cap connections to prevent unbounded cache memory consumption.
+	maxConns := runtime.NumCPU()
+	if maxConns < 2 {
+		maxConns = 2
 	}
-	if maxConns > 32 {
-		maxConns = 32
+	if maxConns > 8 {
+		maxConns = 8
 	}
 	conn.SetMaxOpenConns(maxConns)
 	conn.SetMaxIdleConns(maxConns)
