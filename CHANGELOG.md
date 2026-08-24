@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.2] - 2026-08-24
+
+### Fixed
+- **Committed Web Dist Placeholder Invariant**:
+  - Restored clean placeholder UI in `web/dist/index.html` to satisfy `TestCommittedDistIndexIsPlaceholder` and clean-clone embed guarantees without gitignored assets.
+- **CI Dependency Parity**:
+  - Synchronized `web/package-lock.json` with `web/package.json` for strict `npm ci` execution.
+
+---
+
 ## [0.3.1] - 2026-08-24
 
 ### Added
