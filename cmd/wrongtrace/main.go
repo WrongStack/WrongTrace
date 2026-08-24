@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -146,6 +147,17 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	watchDir, _ := cmd.Flags().GetString("watch")
 	port, _ := cmd.Flags().GetInt("port")
+	if !cmd.Flags().Changed("port") {
+		if envPort := os.Getenv("WRONGTRACE_PORT"); envPort != "" {
+			if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
+				port = p
+			}
+		} else if envPort := os.Getenv("PORT"); envPort != "" {
+			if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
+				port = p
+			}
+		}
+	}
 	dbPath, _ := cmd.Flags().GetString("db")
 	socketPath, _ := cmd.Flags().GetString("socket")
 	repoName, _ := cmd.Flags().GetString("repo")

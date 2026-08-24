@@ -19,16 +19,34 @@
 
 [CmdletBinding()]
 param(
-    [int]$Port = 8000,
+    [int]$Port = 0,
     [string]$WatchDir = $PSScriptRoot,
     [switch]$NoBuild,
-    [switch]$NoUI
+    [switch]$NoUI,
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $Bin = Join-Path $Root 'bin\wrongtrace.exe'
 $Socket = '\\.\pipe\wrongtrace'
+
+if ($Port -le 0) {
+    if ($env:WRONGTRACE_PORT) {
+        $Port = [int]$env:WRONGTRACE_PORT
+    } elseif ($env:PORT) {
+        $Port = [int]$env:PORT
+    } elseif (-not $NonInteractive -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        $promptVal = Read-Host "Enter port for WrongTrace dashboard [Press Enter for 8000]"
+        if ($promptVal -match '^\d+$') {
+            $Port = [int]$promptVal
+        } else {
+            $Port = 8000
+        }
+    } else {
+        $Port = 8000
+    }
+}
 
 $daemonPort = if ($NoUI) { $Port } else { $Port + 1 }
 

@@ -14,9 +14,21 @@
 #
 # Windows: use dev.ps1 (PowerShell 7). This script is for WSL / macOS / Linux.
 
-set -eu
-
-PORT="${1:-8000}"
+if [ -z "${1:-}" ]; then
+  if [ -n "${WRONGTRACE_PORT:-}" ]; then
+    PORT="$WRONGTRACE_PORT"
+  elif [ -n "${PORT:-}" ]; then
+    PORT="$PORT"
+  elif [ -t 0 ]; then
+    printf "Enter port for WrongTrace dashboard [Press Enter for 8000]: "
+    read -r input_port || true
+    PORT="${input_port:-8000}"
+  else
+    PORT=8000
+  fi
+else
+  PORT="$1"
+fi
 DAEMON_PORT=$((PORT + 1))
 WATCH_DIR="${2:-"$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"}"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
