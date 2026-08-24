@@ -334,6 +334,54 @@ func TestIgnoredDirs_NeverDeliverEvents(t *testing.T) {
 	}
 }
 
+// TestPathIgnored_AncestorsOutsideRootAreNotMatched pins the scoping
+// contract: ignore rules apply to a path RELATIVE to the watched root, never
+// to the directories above it. Matching the full absolute path meant a
+// checkout under /tmp, ~/build or C:\bin collided with the default
+// IgnoreDirs list and addRecursive hit SkipDir on the root itself, leaving
+// the watcher silently blind.
+func TestPathIgnored_AncestorsOutsideRootAreNotMatched(t *testing.T) {
+	// Every segment above the root is a default ignore name.
+	root := filepath.Join(t.TempDir(), "tmp", "build", "myproject")
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	w, err := New(Config{Dir: root})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	if w.pathIgnored(root) {
+		t.Error("the watched root itself must never be ignored")
+	}
+	if w.pathIgnored(filepath.Join(root, "src", "main.go")) {
+		t.Error("a source file must not be ignored because an ANCESTOR is named tmp/build")
+	}
+	// Ignore names inside the project still filter.
+	if !w.pathIgnored(filepath.Join(root, "dist", "app.js")) {
+		t.Error("dist inside the project must still be ignored")
+	}
+	if !w.pathIgnored(filepath.Join(root, "src", "node_modules", "x.js")) {
+		t.Error("nested node_modules must still be ignored")
+	}
+}
+
+// TestRun_RootBelowIgnoredAncestorStillDelivers is the integration half:
+// a watcher rooted inside a directory named like an ignore entry must still
+// deliver events for its own files.
+func TestRun_RootBelowIgnoredAncestorStillDelivers(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tmp", "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	_, h := startWatcher(t, root, 80*time.Millisecond, nil)
+
+	burst(t, filepath.Join(root, "hot.go"), 3, 20*time.Millisecond)
+	waitFor(t, 3*time.Second, func() bool { return h.countFor("hot.go") >= 1 },
+		"a project rooted under an ignore-named ancestor delivered no events")
+}
+
 // ---------------------------------------------------------------
 // debounce coalescing
 // ---------------------------------------------------------------
@@ -533,7 +581,7 @@ func TestRun_WithoutEngineParksQuietly(t *testing.T) {
 func TestWatcher_PathIgnoredAndClose(t *testing.T) {
 	root := t.TempDir()
 	w, err := New(Config{
-		Dir: root,
+		Dir:        root,
 		IgnoreDirs: []string{".git", "node_modules", "custom_ignored"},
 	})
 	if err != nil {

@@ -69,7 +69,11 @@ var DefaultIgnoreDirs = []string{
 
 // Watcher is a debouncing filesystem observer rooted at a single directory.
 type Watcher struct {
-	cfg      Config
+	cfg Config
+	// root is cfg.Dir made absolute and clean. Ignore rules are evaluated
+	// against paths relative to it so directories ABOVE the project never
+	// participate in matching.
+	root     string
 	fs       *fsnotify.Watcher
 	debounce time.Duration
 	patterns []string
@@ -91,6 +95,7 @@ func New(cfg Config) (*Watcher, error) {
 	}
 	w := &Watcher{
 		cfg:      cfg,
+		root:     absRoot(cfg.Dir),
 		fs:       fw,
 		debounce: cfg.Debounce,
 		patterns: loadGitIgnorePatterns(cfg.Dir),
@@ -100,6 +105,20 @@ func New(cfg Config) (*Watcher, error) {
 		return nil, err
 	}
 	return w, nil
+}
+
+// absRoot normalizes the watch root so scopedPath can relate event paths to
+// it. An unresolvable root yields "", which disables scoping and falls back
+// to whole-path matching.
+func absRoot(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(abs)
 }
 
 func loadGitIgnorePatterns(root string) []string {
@@ -178,11 +197,44 @@ func (w *Watcher) addRecursive(root string) error {
 	})
 }
 
+// scopedPath reduces p to its location relative to the watched root.
+//
+// Ignore rules must only ever see the project's own directory names. Matching
+// the full absolute path made every ancestor segment count, so a checkout
+// living under /tmp, ~/build, /opt/out or C:\bin collided with the default
+// IgnoreDirs list: addRecursive hit SkipDir on the root itself and the
+// watcher silently observed nothing at all.
+//
+// Paths that are not under the root (and relative paths supplied directly by
+// callers) fall back to whole-path matching, which is the historical
+// behavior.
+func (w *Watcher) scopedPath(p string) string {
+	if w.root == "" {
+		return p
+	}
+	rel, err := filepath.Rel(w.root, p)
+	if err != nil {
+		return p
+	}
+	if rel == "." {
+		// The watched root itself is never ignored by its own name.
+		return ""
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return p
+	}
+	return rel
+}
+
 // pathIgnored is a fast-path filter for events and directory walking.
 func (w *Watcher) pathIgnored(p string) bool {
-	norm := filepath.ToSlash(p)
+	scoped := w.scopedPath(p)
+	if scoped == "" {
+		return false
+	}
+	norm := filepath.ToSlash(scoped)
 	segs := strings.Split(norm, "/")
-	base := filepath.Base(p)
+	base := filepath.Base(scoped)
 
 	// 1. Check directory segments
 	for _, seg := range segs {

@@ -38,3 +38,6 @@ dev-daemon-out.log
 dev-daemon.log
 dev-daemon-out.log
 dev-daemon.log
+
+.dfmt/
+.claude/

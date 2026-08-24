@@ -7,14 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.1] - 2026-08-23
+## [0.2.1] - 2026-08-24
 
 ### Fixed
+- **Watcher Ignore Scope**: Ignore rules are now matched against paths *relative to* the watched root. Previously the whole absolute path was inspected, so a checkout living under an ancestor named like an ignore entry (`/tmp/...`, `~/build/...`, `C:\bin\...`) skipped the root directory itself and the watcher silently observed nothing.
+- **Thread-Safe Store Access**: `Engine.Store()` is guarded by an `RWMutex` and `profiler.Collector` reaches the store through a `GetStore` callback, removing the data race between the daemon's rebuild path and metric collection.
+- **Quota Check Separation**: Split read-only validation (`QuotaLimiter.CheckSpend`) from the mutating `CheckAndRecordSpend`, so a rejected request no longer consumes budget.
+- **Proxy Response Header Ordering**: Response headers are written before body streaming begins, fixing dropped headers on streamed completions.
+- **Guardrail Lock Reasons**: `lockedFiles` now carries the lock reason (`map[string]string`) so blocked agents are told *why* a file is locked.
 - **MCP Guardrail Lock Enforcement**: Integrated file lock checks directly into MCP `check_guardrail` handler so locked files are blocked for agents using MCP.
 - **Dynamic Proxy Route Boundary Matching**: Fixed `MatchRoute` prefix matching to enforce strict path boundaries, preventing false prefix matches like `/proxy/zaix` against `/proxy/zai`.
 - **Active Node Resurrection Status**: Fixed SQL queries to accurately compute active node lifecycles when code nodes are deleted and subsequently restored.
 - **Wasted Spend Zero-Division Guard**: Safeguarded dashboard metrics against negative or miscalculated wasted spend for read-only / inspection models.
-- **Dist Placeholder CI Invariant**: Restored committed `web/dist/index.html` placeholder UI for fresh git clones.
+- **Dist Placeholder CI Invariant**: Restored the committed `web/dist/index.html` placeholder UI so fresh clones satisfy `//go:embed all:web/dist` without the gitignored `/assets/*` bundles. `TestCommittedDistIndexIsPlaceholder` now enforces this in CI instead of review discipline.
 
 ---
 
