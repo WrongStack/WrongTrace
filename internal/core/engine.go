@@ -58,7 +58,7 @@ type Engine struct {
 	correlate  time.Duration
 
 	lockMu          sync.RWMutex
-	lockedFiles     map[string]bool
+	lockedFiles     map[string]string
 	projects        map[string]ProjectProfile
 	activeProjectID string
 	watcher         WatcherAPI
@@ -114,7 +114,7 @@ func NewEngine(cfg Config) *Engine {
 		hub:             NewHub(),
 		activeRuns:      make(map[string]runMeta),
 		correlate:       10 * time.Minute,
-		lockedFiles:     make(map[string]bool),
+		lockedFiles:     make(map[string]string),
 		projects:        loadedProjects,
 		activeProjectID: activeProjID,
 		webhooks:        dispatcher,
@@ -125,7 +125,11 @@ func NewEngine(cfg Config) *Engine {
 func (e *Engine) Hub() *Hub { return e.hub }
 
 // Store exposes the underlying analytical database store.
-func (e *Engine) Store() *db.Store { return e.cfg.Store }
+func (e *Engine) Store() *db.Store {
+	e.lockMu.RLock()
+	defer e.lockMu.RUnlock()
+	return e.cfg.Store
+}
 
 // Repo returns the active repository or project name.
 func (e *Engine) Repo() string {

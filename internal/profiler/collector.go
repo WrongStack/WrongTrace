@@ -14,8 +14,9 @@ import (
 
 // Config configures the runtime profiler collector.
 type Config struct {
-	Store   *db.Store
-	OnTrace func(TraceEvent)
+	Store    *db.Store
+	GetStore func() *db.Store
+	OnTrace  func(TraceEvent)
 }
 
 // Collector processes incoming profiler traces and runtime telemetry.
@@ -24,6 +25,15 @@ type Collector struct {
 	mu        sync.RWMutex
 	recent    []TraceEvent
 	maxRecent int
+}
+
+func (c *Collector) store() *db.Store {
+	if c.cfg.GetStore != nil {
+		if s := c.cfg.GetStore(); s != nil {
+			return s
+		}
+	}
+	return c.cfg.Store
 }
 
 // NewCollector constructs a new runtime profiler collector.
@@ -69,7 +79,7 @@ func (c *Collector) IngestReport(p ProfilerReportPayload) (TraceEvent, error) {
 		Timestamp:     time.Now().UTC(),
 	}
 
-	if c.cfg.Store != nil {
+	if s := c.store(); s != nil {
 		rec := db.RuntimeTraceRecord{
 			TraceID:       ev.TraceID,
 			RunID:         ev.RunID,
@@ -85,7 +95,7 @@ func (c *Collector) IngestReport(p ProfilerReportPayload) (TraceEvent, error) {
 			MetadataJSON:  string(metaJSON),
 			Timestamp:     ev.Timestamp,
 		}
-		_ = c.cfg.Store.InsertTrace(rec)
+		_ = s.InsertTrace(rec)
 	}
 
 	c.recordRecent(ev)
@@ -189,7 +199,7 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 					Timestamp:     time.Now().UTC(),
 				}
 
-				if c.cfg.Store != nil {
+				if s := c.store(); s != nil {
 					metaBytes, _ := json.Marshal(meta)
 					rec := db.RuntimeTraceRecord{
 						TraceID:       ev.TraceID,
@@ -205,7 +215,7 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 						MetadataJSON:  string(metaBytes),
 						Timestamp:     ev.Timestamp,
 					}
-					_ = c.cfg.Store.InsertTrace(rec)
+					_ = s.InsertTrace(rec)
 				}
 
 				c.recordRecent(ev)
@@ -222,10 +232,10 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 
 // Hotspots returns functions with high latency or errors.
 func (c *Collector) Hotspots(limit int) ([]db.ProfilerHotspotRow, error) {
-	if c.cfg.Store == nil {
-		return nil, nil
+	if s := c.store(); s != nil {
+		return s.ProfilerHotspots(limit)
 	}
-	return c.cfg.Store.ProfilerHotspots(limit)
+	return nil, nil
 }
 
 // Recent returns the most recent captured runtime traces.
@@ -244,10 +254,10 @@ func (c *Collector) Recent(limit int) ([]TraceEvent, error) {
 
 // Overview returns aggregate stats across all runtime traces.
 func (c *Collector) Overview() (db.ProfilerOverviewRow, error) {
-	if c.cfg.Store == nil {
-		return db.ProfilerOverviewRow{}, nil
+	if s := c.store(); s != nil {
+		return s.ProfilerOverview()
 	}
-	return c.cfg.Store.ProfilerOverview()
+	return db.ProfilerOverviewRow{}, nil
 }
 
 func (c *Collector) recordRecent(ev TraceEvent) {

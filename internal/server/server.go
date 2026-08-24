@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -166,6 +168,12 @@ func (s *Server) buildRouter() chi.Router {
 		SocketPath: s.cfg.SocketPath,
 		Profiler: profiler.NewCollector(profiler.Config{
 			Store: store,
+			GetStore: func() *db.Store {
+				if s.cfg.Engine != nil {
+					return s.cfg.Engine.Store()
+				}
+				return store
+			},
 			OnTrace: func(ev profiler.TraceEvent) {
 				if hub != nil {
 					hub.Broadcast(core.WSEvent{
@@ -307,6 +315,11 @@ func spaHandler(distFS fs.FS, fileServer http.Handler) http.HandlerFunc {
 		}
 		probe := path[1:]
 		if _, err := fs.Stat(distFS, probe); err != nil {
+			ext := strings.ToLower(filepath.Ext(probe))
+			if ext != "" && ext != ".html" {
+				http.NotFound(w, r)
+				return
+			}
 			r.URL.Path = "/"
 		}
 		fileServer.ServeHTTP(w, r)

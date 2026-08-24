@@ -88,6 +88,11 @@ func isDaemonAlive(pid int, port int) bool {
 	if isPortActive(port) {
 		return true
 	}
+	if port > 0 {
+		// If port is configured but not answering health checks, the daemon is not running.
+		// Never block startup due to unrelated OS processes with recycled PIDs.
+		return false
+	}
 	return isProcessAlive(pid)
 }
 

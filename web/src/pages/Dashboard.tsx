@@ -44,34 +44,48 @@ export function Dashboard() {
   const profilerTraces = useProfilerTraces(50, activeProjId);
   const ws = useWebSocket();
 
+  const { refetch: refetchOverview } = overview;
+  const { refetch: refetchThrashing } = thrashing;
+  const { refetch: refetchModels } = models;
+  const { refetch: refetchRecent } = recent;
+  const { refetch: refetchAtlas } = atlas;
+  const { refetch: refetchProxyTraffic } = proxyTraffic;
+  const { refetch: refetchProfilerTraces } = profilerTraces;
+
   // When the WS receives a code_event, proxy_traffic, or project_switched we invalidate the caches
   // so the live feed, code map, and telemetry update immediately without polling.
   useEffect(() => {
-    if (ws.lastMessage?.type === 'code_event') {
-      recent.refetch();
-      atlas.refetch();
+    if (!ws.lastMessage) return;
+    if (ws.lastMessage.type === 'code_event') {
+      refetchRecent();
+      refetchAtlas();
+    } else if (ws.lastMessage.type === 'run_reported') {
+      refetchOverview();
+      refetchAtlas();
+    } else if (ws.lastMessage.type === 'proxy_traffic') {
+      refetchProxyTraffic();
+      refetchOverview();
+    } else if (ws.lastMessage.type === 'profiler_trace') {
+      refetchProfilerTraces();
+    } else if (ws.lastMessage.type === 'project_switched') {
+      refetchOverview();
+      refetchThrashing();
+      refetchModels();
+      refetchRecent();
+      refetchAtlas();
+      refetchProxyTraffic();
+      refetchProfilerTraces();
     }
-    if (ws.lastMessage?.type === 'run_reported') {
-      overview.refetch();
-      atlas.refetch();
-    }
-    if (ws.lastMessage?.type === 'proxy_traffic') {
-      proxyTraffic.refetch();
-      overview.refetch();
-    }
-    if (ws.lastMessage?.type === 'profiler_trace') {
-      profilerTraces.refetch();
-    }
-    if (ws.lastMessage?.type === 'project_switched') {
-      overview.refetch();
-      thrashing.refetch();
-      models.refetch();
-      recent.refetch();
-      atlas.refetch();
-      proxyTraffic.refetch();
-      profilerTraces.refetch();
-    }
-  }, [ws.lastMessage, recent, overview, atlas, thrashing, models, proxyTraffic, profilerTraces]);
+  }, [
+    ws.lastMessage,
+    refetchRecent,
+    refetchAtlas,
+    refetchOverview,
+    refetchProxyTraffic,
+    refetchProfilerTraces,
+    refetchThrashing,
+    refetchModels,
+  ]);
 
   // Socket path as REPORTED BY THE DAEMON (/api/health socket_path), so a
   // custom --socket is shown correctly on every platform. Falls back to a

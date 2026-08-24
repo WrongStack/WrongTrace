@@ -69,9 +69,9 @@ func ScanAndRedactSecrets(body []byte) ([]byte, int) {
 		text = genericSecretRe.ReplaceAllStringFunc(text, func(m string) string {
 			redactionCount++
 			if idx := strings.IndexAny(m, ":="); idx != -1 {
-				return m[:idx+1] + ` "[REDACTED_SECRET]"`
+				return m[:idx+1] + " [REDACTED_SECRET]"
 			}
-			return `"[REDACTED_SECRET]"`
+			return "[REDACTED_SECRET]"
 		})
 	}
 

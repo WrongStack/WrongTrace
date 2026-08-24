@@ -534,7 +534,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if quotaKey == "" {
 		quotaKey = agentName
 	}
-	if allowed, _, quotaMsg := p.Quotas.CheckAndRecordSpend(quotaKey, 0.0); !allowed {
+	if allowed, _, quotaMsg := p.Quotas.CheckSpend(quotaKey, 0.0); !allowed {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -673,7 +673,6 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 	}
-	w.WriteHeader(resp.StatusCode)
 	respHeaders := maskHeaders(resp.Header)
 
 	baseRecord := ProxyTrafficRecord{
@@ -751,8 +750,10 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent string) {
 	respBytes, err := io.ReadAll(body)
 	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
+	w.WriteHeader(rec.StatusCode)
 	_, _ = w.Write(respBytes)
 
 	var parsedResp struct {
@@ -850,11 +851,7 @@ func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader,
 }
 
 func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent string) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
+	w.WriteHeader(rec.StatusCode)
 	flusher, isFlusher := w.(http.Flusher)
 	buf := make([]byte, 4096)
 

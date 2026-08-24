@@ -26,10 +26,13 @@ func (e *Engine) LockFile(path, reason string) {
 	e.lockMu.Lock()
 	defer e.lockMu.Unlock()
 	if e.lockedFiles == nil {
-		e.lockedFiles = make(map[string]bool)
+		e.lockedFiles = make(map[string]string)
 	}
 	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))))
-	e.lockedFiles[norm] = true
+	if reason == "" {
+		reason = "file is explicitly locked by administrator guardrail"
+	}
+	e.lockedFiles[norm] = reason
 }
 
 // UnlockFile removes a lock on a file.
@@ -56,12 +59,12 @@ func (e *Engine) IsFileLocked(path string) (bool, string) {
 		return false, ""
 	}
 	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))))
-	if e.lockedFiles[norm] {
-		return true, "file is explicitly locked by administrator guardrail"
+	if r, ok := e.lockedFiles[norm]; ok {
+		return true, r
 	}
-	for k := range e.lockedFiles {
+	for k, r := range e.lockedFiles {
 		if k == norm || strings.HasSuffix(norm, "/"+k) || strings.HasSuffix(k, "/"+norm) {
-			return true, "file is explicitly locked by administrator guardrail"
+			return true, r
 		}
 	}
 	return false, ""

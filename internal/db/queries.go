@@ -222,7 +222,6 @@ func (s *Store) RecentFileEvents(filePath string, limit int) ([]EventRecord, err
 	defer cancel()
 
 	normSlash := strings.ReplaceAll(filePath, "\\", "/")
-	normBackslash := strings.ReplaceAll(filePath, "/", "\\")
 
 	query := `
 		SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
@@ -230,11 +229,11 @@ func (s *Store) RecentFileEvents(filePath string, limit int) ([]EventRecord, err
 		       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
 		       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
 		FROM code_node_events
-		WHERE (file_path = ? OR file_path = ? OR file_path = ? OR file_path LIKE '%/' || ? OR file_path LIKE '%\' || ?)
+		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%/' || ?)
 		ORDER BY event_time DESC
 		LIMIT ?
 	`
-	rows, err := s.db.QueryContext(ctx, query, filePath, normSlash, normBackslash, normSlash, normBackslash, limit)
+	rows, err := s.db.QueryContext(ctx, query, filePath, normSlash, normSlash, limit)
 	if err != nil {
 		return nil, fmt.Errorf("recent file events: %w", err)
 	}
@@ -537,13 +536,12 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 
 	var edits, sigs int
 	normSlash := strings.ReplaceAll(filePath, "\\", "/")
-	normBackslash := strings.ReplaceAll(filePath, "/", "\\")
 	row := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*), COUNT(DISTINCT node_signature)
 		FROM code_node_events
-		WHERE (file_path = ? OR file_path = ? OR file_path = ? OR file_path LIKE '%/' || ? OR file_path LIKE '%\' || ?)
+		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%/' || ?)
 		  AND event_time >= datetime('now', '-1 day')
-	`, filePath, normSlash, normBackslash, normSlash, normBackslash)
+	`, filePath, normSlash, normSlash)
 	if err := row.Scan(&edits, &sigs); err != nil {
 		return out, fmt.Errorf("file health scan: %w", err)
 	}

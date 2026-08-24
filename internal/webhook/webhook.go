@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -111,6 +112,7 @@ func (d *Dispatcher) sendGeneric(ctx context.Context, url string, p Payload) err
 	if err != nil {
 		return err
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	return nil
 }
@@ -143,6 +145,7 @@ func (d *Dispatcher) sendSlack(ctx context.Context, url string, p Payload) error
 	if err != nil {
 		return err
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	return nil
 }
@@ -175,6 +178,7 @@ func (d *Dispatcher) sendDiscord(ctx context.Context, url string, p Payload) err
 	if err != nil {
 		return err
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	return nil
 }
