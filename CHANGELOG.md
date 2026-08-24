@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.1] - 2026-08-24
 
 ### Fixed
-- **Watcher Ignore Scope**: Ignore rules are now matched against paths *relative to* the watched root. Previously the whole absolute path was inspected, so a checkout living under an ancestor named like an ignore entry (`/tmp/...`, `~/build/...`, `C:\bin\...`) skipped the root directory itself and the watcher silently observed nothing.
+- **Ignore-Rule Scoping (watcher + engine)**: Ignore rules are now matched against paths *relative to* the watched root, in both `watcher.pathIgnored` and `Engine.shouldSkip`. Previously the whole absolute path was inspected, so a checkout living under an ancestor named like an ignore entry (`/tmp/...`, `~/build/...`, `C:\bin\...`) matched at its own root: the watcher registered nothing and the engine dropped every file change, so no code events were ever emitted. `core.Config` gains `WatchDir` (back-filled by `PrimeDirectory`) to carry that root.
+- **Guardrail Lock Path Folding**: Lock bookkeeping folded separators with `filepath.ToSlash`, a no-op outside Windows, so a lock taken as `internal\core\engine.go` became one opaque segment that matched nothing, not even itself under a different spelling. Both separator styles are now folded explicitly.
 - **Thread-Safe Store Access**: `Engine.Store()` is guarded by an `RWMutex` and `profiler.Collector` reaches the store through a `GetStore` callback, removing the data race between the daemon's rebuild path and metric collection.
 - **Quota Check Separation**: Split read-only validation (`QuotaLimiter.CheckSpend`) from the mutating `CheckAndRecordSpend`, so a rejected request no longer consumes budget.
 - **Proxy Response Header Ordering**: Response headers are written before body streaming begins, fixing dropped headers on streamed completions.
