@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
 # WrongTrace dev runner (Windows / PowerShell 7): daemon + Vite HMR in one command.
 #
-# Usage:  ./dev.ps1 [-Port 8000] [-WatchDir .] [-NoBuild] [-NoUI]
-#   -Port      web / proxy entrypoint port (default 8000)
+# Usage:  ./dev.ps1 [-Port 3444] [-WatchDir .] [-NoBuild] [-NoUI]
+#   -Port      web / proxy entrypoint port (default 3444)
 #   -WatchDir  directory the daemon observes (default: repo root)
 #   -NoBuild   skip the daemon build (reuse bin\wrongtrace.exe as-is)
 #   -NoUI      daemon only — no Vite dev server
@@ -11,15 +11,15 @@
 #   1. builds the daemon (fast incremental; avoids `go run` leaving orphaned
 #      children behind on interrupt)
 #   2. installs web\node_modules on first use
-#   3. starts the daemon (port 8001 in dev) and the Vite dev server
-#      (HMR at :8000, proxying /api + /api/ws + /proxy to the daemon)
+#   3. starts the daemon (port 3445 in dev) and the Vite dev server
+#      (HMR at :3444, proxying /api + /api/ws + /proxy to the daemon)
 #   4. Ctrl+C (or process exit) tears BOTH down, including vite's children
 #
 # POSIX systems: use dev.sh.
 
 [CmdletBinding()]
 param(
-    [int]$Port = 8000,
+    [int]$Port = 3444,
     [string]$WatchDir = $PSScriptRoot,
     [switch]$NoBuild,
     [switch]$NoUI,
@@ -35,7 +35,7 @@ if ($Port -le 0) {
     if ($env:PORT) {
         $Port = [int]$env:PORT
     } else {
-        $Port = 8000
+        $Port = 3444
     }
 }
 

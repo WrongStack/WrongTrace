@@ -951,7 +951,30 @@ func TestServer_Enhancements_WrongStackReport(t *testing.T) {
 		t.Errorf("expected events with since filter, got 0")
 	}
 
-	// 14. POST /api/guardrail/unlock unlocks file
+	// 14. GET /api/ipc/traffic returns recorded IPC calls
+	engine.RecordIPCTraffic(ipc.IPCTrafficRecord{
+		ID:         "ipc-test-1",
+		Method:     "telemetry/file_health",
+		Params:     map[string]interface{}{"file_path": "internal/server/server.go"},
+		DurationMs: 0.85,
+		Timestamp:  time.Now().UTC(),
+	})
+	var ipcTraffic []ipc.IPCTrafficRecord
+	getJSON(t, ts.URL+"/api/ipc/traffic", &ipcTraffic)
+	if len(ipcTraffic) == 0 || ipcTraffic[0].Method != "telemetry/file_health" {
+		t.Errorf("expected recorded IPC traffic, got: %+v", ipcTraffic)
+	}
+
+	// 15. GET /api/atlas?include_symbols=false
+	var noSymAtlas core.AtlasSnapshot
+	getJSON(t, ts.URL+"/api/atlas?include_symbols=false", &noSymAtlas)
+	if len(noSymAtlas.Packages) > 0 && len(noSymAtlas.Packages[0].Files) > 0 {
+		if len(noSymAtlas.Packages[0].Files[0].Symbols) != 0 {
+			t.Errorf("expected stripped symbols with include_symbols=false, got %d", len(noSymAtlas.Packages[0].Files[0].Symbols))
+		}
+	}
+
+	// 16. POST /api/guardrail/unlock unlocks file
 	unlockBody := `{"path":"internal/server/server.go"}`
 	unlockResp, err := http.Post(ts.URL+"/api/guardrail/unlock", "application/json", strings.NewReader(unlockBody))
 	if err != nil {

@@ -10,8 +10,8 @@ WrongTrace is designed as a **zero-dependency, high-throughput, real-time AI Obs
 flowchart TD
     subgraph Sources ["AI Agent & Ingestion Sources"]
         A1["Coding Agents (Claude Code, Cursor, Antigravity, Cline, Devin, MiniMax, Kimi, Pi)"]
-        A2["AI Gateway Proxy (:8000/proxy OpenAI/Anthropic/Gemini)"]
-        A3["OpenTelemetry OTLP & Profiler Traces (:8000/v1/traces)"]
+        A2["AI Gateway Proxy (:3444/proxy OpenAI/Anthropic/Gemini)"]
+        A3["OpenTelemetry OTLP & Profiler Traces (:3444/v1/traces)"]
         A4["File System Events (fsnotify Watcher)"]
     end
 
@@ -29,7 +29,7 @@ flowchart TD
     end
 
     subgraph Interfaces ["Egress & Observability Interfaces"]
-        I1["Embedded React 19 + Recharts Dashboard (:8000)"]
+        I1["Embedded React 19 + Recharts Dashboard (:3444)"]
         I2["WebSocket Live Event Broadcaster (/api/ws)"]
         I3["Model Context Protocol (MCP) Stdio Server"]
         I4["IPC Named Pipe / Unix Socket (\\\\.\\pipe\\wrongtrace)"]

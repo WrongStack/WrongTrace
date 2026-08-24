@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.1] - 2026-08-24
+
+### Added
+- **Live Windows Named Pipe & IPC Inspector (`\\.\pipe\wrongtrace`)**:
+  - Real-time JSON-RPC interaction inspector (`IPCTrafficView.tsx`) directly embedded in the Live Feed and Agent Sessions views, displaying incoming request payloads, returned daemon outputs, duration latency in milliseconds, and one-click JSON clipboard copying.
+  - Added `RecordIPCTraffic` on `Engine` with WebSocket streaming (`ipc_traffic`) and `GET /api/ipc/traffic` endpoint.
+- **Enhanced Universal Agent Observability & WrongStack API Standards**:
+  - `GET /api/symbol/history`: Free-form signature querying (`?signature=foo()`, `?name=foo`), case-insensitive suffix/substring matching, whole-file symbol history mode (`?file_path=...`), and AST kind documentation.
+  - `GET /api/events/recent`: Robust `since` timestamp parser supporting ISO 8601, RFC 3339 (`2026-08-24T18:00:00Z`), DateTime, and Unix epoch formats; unforced repo scoping.
+  - `GET /api/atlas`: Monorepo payload optimization via `?summary=true` (compact directory metrics without file arrays), `?include_symbols=false` (files with health scores, stripped AST trees), and standard `limit` & `offset` pagination.
+  - `GET /api/files/activity`: Official `file_path` primary parameter, sorted by `last_activity_at DESC`.
+  - `POST /api/guardrail/lock`: 409 Conflict detection and response when a file is actively locked by another agent/owner; override via `"force": true`.
+  - Standardized JSON error response format (`{"error": "...", "message": "..."}`) for 404, 405, and API errors.
+
+### Fixed
+- **IPC Client Disconnect Error Log Filtering**:
+  - Added `isClientDisconnect` check in socket handler to cleanly recognize benign client connection closes (`The pipe is being closed`, `net.ErrClosed`, `io.EOF`) on Windows named pipes without logging false error messages.
+- **Port Stability in Dev Runners**:
+  - Fixed port drift in `dev.ps1` and `dev.sh` by binding dashboard to `:8000` and daemon to `:8001` with proper environment cleanup on exit.
+
+---
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

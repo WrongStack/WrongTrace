@@ -6,7 +6,7 @@
 
 Watches your code with Tree-sitter, correlates AST-level edits with the agent runs that produced them, ingests OpenTelemetry/profiler runtime traces, tracks inter-agent code collisions ("Who Broke Whose Code?"), provides an interactive Code Atlas with full-screen graph visualization, serves an embedded React dashboard, and operates a transparent AI Gateway — all from a single, high-performance Go binary.
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat)](CHANGELOG.md)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-purple.svg)](LICENSE)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat&logo=react)](https://react.dev)
@@ -21,14 +21,15 @@ Watches your code with Tree-sitter, correlates AST-level edits with the agent ru
 ## 💡 Key Capabilities
 
 1. **🕸️ Inter-Agent Friction & Cross-Thrashing Matrix ("Who Broke Whose Code?")** — Uncovers multi-agent code collisions and friction. Tracks which AI model originally authored an AST node and which subsequent model rewrote or deleted it, complete with time-delta durations ($\Delta T$) and inline syntax-highlighted diffs.
-2. **🗺️ Interactive Next-Gen Code Atlas** — Full-screen interactive architectural map with Orbital Radial, Hierarchical Tree, and Grid layout algorithms. Features intelligent smooth auto-centering (`FlowAutoArranger`), Health Score heatmaps, Churn Velocity modes, and multi-tab symbol lineage drawers.
-3. **📜 AST Symbol Evolution & Lineage History** — Chronological lifecycle tracking for every function, method, class, and struct. Inspect exact revisions, model attributions, and localized diffs across the entire history of the symbol.
-4. **🧠 Model Intelligence & True Token ROI Matrix** — Grades AI models into Quality Tiers (S/A/B/C) based on 14-day code survival rate %, dollar expenditure per surviving node ($/node), context read-to-write ratio, and longevity.
-5. **🔍 Semantic AST Churn & Accurate Multi-Line Diffing** — Tracks code transformations via Tree-sitter AST diffing across 11+ languages with exact `+AddedLines / -DeletedLines` granularity, filtering out cosmetic formatting churn.
-6. **🤖 Universal Auto-Discovery for 20+ Coding Agents** — Zero-config transcript ingestion for WrongStack, Antigravity, Claude Code, Cursor, Windsurf, Cline/Roo, MiniMax Code, Kimi Code (Moonshot), ZCode, Devin, Trae, Goose, OpenHands, GitHub Copilot, Aider, Continue, and more.
-7. **🛡️ Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, `unlock_file`, `report_file_read`, and `get_file_read_stats`.
-8. **🌐 Transparent AI Gateway & Wire Telemetry** — Intercepts and analyzes raw LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens, budget quotas, and prompt cache savings.
-9. **⚡ Universal Profiler & Runtime Traces** — Ingests OpenTelemetry (OTLP) traces, pprof profiles, and test execution latencies, correlating runtime hotspots directly with AI code changes.
+2. **🔍 Live Named Pipe & IPC Inspector (`\\.\pipe\wrongtrace`)** — Real-time telemetry and JSON-RPC wire inspector for WrongStack and local autonomous agents, exposing request payloads, daemon replies, and execution latency.
+3. **🗺️ Interactive Next-Gen Code Atlas** — Full-screen interactive architectural map with Orbital Radial, Hierarchical Tree, and Grid layout algorithms. Features intelligent smooth auto-centering (`FlowAutoArranger`), Health Score heatmaps, Churn Velocity modes, and multi-tab symbol lineage drawers.
+4. **📜 AST Symbol Evolution & Lineage History** — Chronological lifecycle tracking for every function, method, class, and struct. Inspect exact revisions, model attributions, and localized diffs across the entire history of the symbol.
+5. **🧠 Model Intelligence & True Token ROI Matrix** — Grades AI models into Quality Tiers (S/A/B/C) based on 14-day code survival rate %, dollar expenditure per surviving node ($/node), context read-to-write ratio, and longevity.
+6. **🔍 Semantic AST Churn & Accurate Multi-Line Diffing** — Tracks code transformations via Tree-sitter AST diffing across 11+ languages with exact `+AddedLines / -DeletedLines` granularity, filtering out cosmetic formatting churn.
+7. **🤖 Universal Auto-Discovery for 20+ Coding Agents** — Zero-config transcript ingestion for WrongStack, Antigravity, Claude Code, Cursor, Windsurf, Cline/Roo, MiniMax Code, Kimi Code (Moonshot), ZCode, Devin, Trae, Goose, OpenHands, GitHub Copilot, Aider, Continue, and more.
+8. **🛡️ Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, `unlock_file`, `report_file_read`, and `get_file_read_stats`.
+9. **🌐 Transparent AI Gateway & Wire Telemetry** — Intercepts and analyzes raw LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens, budget quotas, and prompt cache savings.
+10. **⚡ Universal Profiler & Runtime Traces** — Ingests OpenTelemetry (OTLP) traces, pprof profiles, and test execution latencies, correlating runtime hotspots directly with AI code changes.
 
 ---
 
@@ -45,14 +46,14 @@ wrongtrace init
 ### 2. Start the Observer Daemon
 
 ```bash
-# Start daemon on port 8000 watching current workspace:
+# Start daemon on unified port 3444 watching current workspace:
 wrongtrace start
 
 # Or with custom port and target directory:
-wrongtrace start --watch /path/to/project --port 8000
+wrongtrace start --watch /path/to/project --port 3444
 ```
 
-Open **<http://localhost:8000>** in your browser.
+Open **<http://localhost:3444>** in your browser.
 
 ### 3. Diagnostics & Health Check
 
@@ -169,13 +170,13 @@ Route any SDK (OpenAI SDK, Anthropic SDK, LangChain, LiteLLM, Ollama) through Wr
 
 ```bash
 # OpenAI SDK / Compatible
-export OPENAI_BASE_URL="http://localhost:8000/proxy/api.openai.com/v1"
+export OPENAI_BASE_URL="http://localhost:3444/proxy/api.openai.com/v1"
 
 # Anthropic SDK
-export ANTHROPIC_BASE_URL="http://localhost:8000/proxy/api.anthropic.com"
+export ANTHROPIC_BASE_URL="http://localhost:3444/proxy/api.anthropic.com"
 
 # Google Gemini
-export GEMINI_API_BASE="http://localhost:8000/proxy/generativelanguage.googleapis.com"
+export GEMINI_API_BASE="http://localhost:3444/proxy/generativelanguage.googleapis.com"
 ```
 
 ---

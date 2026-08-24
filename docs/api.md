@@ -319,7 +319,7 @@ All HTTP error responses return a standardized JSON structure with both `error` 
 
 ---
 
-## 4. WebSocket Real-Time Feed (`ws://localhost:8000/api/ws`)
+## 4. WebSocket Real-Time Feed (`ws://localhost:3444/api/ws`)
 
 Upon connecting, the server broadcasts live JSON messages for every observed event:
 

@@ -2,14 +2,14 @@
 # WrongTrace dev runner (POSIX): daemon + Vite HMR in one command.
 #
 # Usage:  ./dev.sh [port] [watch-dir]
-#         port defaults to 8000, watch-dir to the repo root.
+#         port defaults to 3444, watch-dir to the repo root.
 #
 # What it does:
 #   1. builds the daemon (fast incremental when nothing changed) — avoids
 #      `go run` leaving orphaned children on interrupt
 #   2. installs web/node_modules on first use
 #   3. starts the daemon (watching the repo itself) and the Vite dev server
-#      (HMR at :8000, proxying /api + /api/ws + /proxy to the daemon)
+#      (HMR at :3444, proxying /api + /api/ws + /proxy to the daemon)
 #   4. on Ctrl+C tears BOTH processes down and cleans up
 #
 # Windows: use dev.ps1 (PowerShell 7). This script is for WSL / macOS / Linux.
@@ -20,11 +20,11 @@ if [ -z "${1:-}" ]; then
   elif [ -n "${PORT:-}" ]; then
     PORT="$PORT"
   elif [ -t 0 ]; then
-    printf "Enter port for WrongTrace dashboard [Press Enter for 8000]: "
+    printf "Enter port for WrongTrace dashboard [Press Enter for 3444]: "
     read -r input_port || true
-    PORT="${input_port:-8000}"
+    PORT="${input_port:-3444}"
   else
-    PORT=8000
+    PORT=3444
   fi
 else
   PORT="$1"

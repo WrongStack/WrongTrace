@@ -106,7 +106,7 @@ func init() {
 	rootCmd.AddCommand(startCmd, mcpCmd, statusCmd, doctorCmd, traceCmd, exportCmd, reportCmd, hookCmd, initCmd)
 
 	rootCmd.PersistentFlags().StringP("watch", "w", ".", "directory to observe")
-	rootCmd.PersistentFlags().IntP("port", "p", 8000, "HTTP port for the embedded dashboard and proxy")
+	rootCmd.PersistentFlags().IntP("port", "p", 3444, "HTTP port for the embedded dashboard and proxy")
 	rootCmd.PersistentFlags().String("db", filepath.Join(defaultDataDir(), "wrongtrace.db"), "SQLite database file")
 	rootCmd.PersistentFlags().String("socket", defaultSocketPath(), "Unix Domain Socket / Named Pipe path")
 	rootCmd.PersistentFlags().String("repo", filepath.Base(mustCwd()), "repository name to record events under")
