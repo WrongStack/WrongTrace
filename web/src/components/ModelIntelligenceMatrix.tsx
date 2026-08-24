@@ -85,8 +85,8 @@ export function ModelIntelligenceMatrix({
     return valid.map((m) => {
       const reads = readsByModel.get(m.model) || { count: 0, tokens: 0, cost: 0, lines: 0 };
       const wasteSpend =
-        m.total_nodes > 0
-          ? m.total_cost_usd * Math.max(0, (m.total_nodes - m.active_nodes) / m.total_nodes)
+        m.total_nodes > 0 && m.total_cost_usd > 0
+          ? m.total_cost_usd * Math.max(0, Math.min(1, (m.total_nodes - m.active_nodes) / m.total_nodes))
           : 0;
 
       const productiveSpend = Math.max(0, m.total_cost_usd - wasteSpend);

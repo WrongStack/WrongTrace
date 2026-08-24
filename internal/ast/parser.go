@@ -162,7 +162,7 @@ func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
 		Nodes:      map[string]Node{},
 		Hash:       hashBytes(src),
 		RawContent: raw,
-		LOC:        len(strings.Split(raw, "\n")),
+		LOC:        strings.Count(raw, "\n") + 1,
 	}
 	collectNodes(root, src, lang, filepath.Base(path), snap)
 	return snap, nil

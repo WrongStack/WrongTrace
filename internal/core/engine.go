@@ -94,7 +94,9 @@ type runMeta struct {
 // subcommand uses this since it never touches the filesystem).
 func NewEngine(cfg Config) *Engine {
 	loadedProjects := LoadProjectsIndex()
+	settingsMu.RLock()
 	settings := globalSettings
+	settingsMu.RUnlock()
 
 	activeProjID := ""
 	for id, p := range loadedProjects {
@@ -455,7 +457,11 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 		Intent:           p.Intent,
 		CreatedAt:        time.Now().UTC(),
 	}
-	if err := e.cfg.Store.UpsertRun(rec); err != nil {
+	st := e.Store()
+	if st == nil {
+		return fmt.Errorf("active store is not initialized")
+	}
+	if err := st.UpsertRun(rec); err != nil {
 		return fmt.Errorf("upsert run: %w", err)
 	}
 	e.runMu.Lock()

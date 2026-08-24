@@ -322,11 +322,17 @@ func runStart(cmd *cobra.Command, _ []string) error {
 						time.Sleep(2 * time.Second)
 					}
 				}()
-				if err := httpServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				if err := httpServer.Start(); err != nil {
+					if errors.Is(err, http.ErrServerClosed) || ctx.Err() != nil {
+						return
+					}
 					log.Printf("http server warning: %v (restarting in 2s)", err)
 					time.Sleep(2 * time.Second)
 				}
 			}()
+			if ctx.Err() != nil {
+				return
+			}
 			time.Sleep(500 * time.Millisecond)
 		}
 	}()

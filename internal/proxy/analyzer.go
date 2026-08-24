@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -352,9 +353,16 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 		pa.Reasoning = reasoningBuilder.String()
 	}
 
-	// Assemble streamed tools
-	for i := 0; i < len(toolMap); i++ {
-		if buf, ok := toolMap[i]; ok && buf.name != "" {
+	// Assemble streamed tools (sort keys to handle non-zero based indices in Anthropic streams)
+	toolIndices := make([]int, 0, len(toolMap))
+	for idx := range toolMap {
+		toolIndices = append(toolIndices, idx)
+	}
+	sort.Ints(toolIndices)
+
+	for _, idx := range toolIndices {
+		buf := toolMap[idx]
+		if buf != nil && buf.name != "" {
 			argStr := buf.args.String()
 			targetFile := extractFileFromArgsString(argStr)
 			pa.ToolCalls = append(pa.ToolCalls, ProxyToolCall{

@@ -85,6 +85,11 @@ func (c *ResponseCache) Get(key string) (*CachedResponse, bool) {
 
 	atomic.AddInt64(&item.HitCount, 1)
 	atomic.AddInt64(&c.totalHits, 1)
+	if item.CostSavedUSD > 0 {
+		c.mu.Lock()
+		c.totalSaved += item.CostSavedUSD
+		c.mu.Unlock()
+	}
 	return item, true
 }
 
@@ -152,10 +157,12 @@ func (c *ResponseCache) Stats() (entries int, hits int64, misses int64, hitRate 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	total := c.totalHits + c.totalMisses
+	hits = atomic.LoadInt64(&c.totalHits)
+	misses = atomic.LoadInt64(&c.totalMisses)
+	total := hits + misses
 	var rate float64
 	if total > 0 {
-		rate = (float64(c.totalHits) / float64(total)) * 100.0
+		rate = (float64(hits) / float64(total)) * 100.0
 	}
-	return len(c.items), c.totalHits, c.totalMisses, rate, c.totalSaved
+	return len(c.items), hits, misses, rate, c.totalSaved
 }

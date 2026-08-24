@@ -74,10 +74,8 @@ func (e *Engine) UnlockFile(path string) {
 	}
 }
 
-// IsFileLocked checks if a file is currently locked and unexpired.
-func (e *Engine) IsFileLocked(path string) (bool, LockInfo) {
-	e.lockMu.Lock()
-	defer e.lockMu.Unlock()
+// isFileLockedUnlocked checks if a file is currently locked and unexpired (e.lockMu must be held).
+func (e *Engine) isFileLockedUnlocked(path string) (bool, LockInfo) {
 	if len(e.lockedFiles) == 0 {
 		return false, LockInfo{}
 	}
@@ -100,6 +98,13 @@ func (e *Engine) IsFileLocked(path string) (bool, LockInfo) {
 		}
 	}
 	return false, LockInfo{}
+}
+
+// IsFileLocked checks if a file is currently locked and unexpired.
+func (e *Engine) IsFileLocked(path string) (bool, LockInfo) {
+	e.lockMu.Lock()
+	defer e.lockMu.Unlock()
+	return e.isFileLockedUnlocked(path)
 }
 
 // ListLocks returns all active, non-expired file locks.

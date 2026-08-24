@@ -19,7 +19,7 @@ var (
 
 // ScanAndRedactSecrets inspects request payloads for confidential secrets and masks them before sending to LLMs.
 func ScanAndRedactSecrets(body []byte) ([]byte, int) {
-	if len(body) == 0 {
+	if len(body) < 16 {
 		return body, 0
 	}
 

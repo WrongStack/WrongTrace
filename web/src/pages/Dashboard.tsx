@@ -18,6 +18,8 @@ import { SettingsView } from '../components/SettingsView';
 import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas, useProxyTraffic, useProfilerTraces, useProjects } from '../hooks/useMetrics';
 import { useWebSocket } from '../hooks/useWebSocket';
 
+const EMPTY_ARRAY: any[] = [];
+
 // Dashboard is the single-page surface for WrongTrace. It loads via TanStack
 // Query and is incrementally refreshed by both HTTP polling and a single
 // WebSocket subscription. The WebSocket hook supplies incremental updates;
@@ -26,7 +28,7 @@ export function Dashboard() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'profiler' | 'gateway' | 'settings'>('dashboard');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 
-  const { data: projects = [] } = useProjects();
+  const { data: projects = EMPTY_ARRAY } = useProjects();
 
   const currentProject = useMemo(() => {
     if (selectedProjectId) {
@@ -54,6 +56,28 @@ export function Dashboard() {
   const { refetch: refetchProxyTraffic } = proxyTraffic;
   const { refetch: refetchProfilerTraces } = profilerTraces;
 
+  const refetchMapRef = useRef({
+    refetchRecent,
+    refetchAtlas,
+    refetchOverview,
+    refetchProxyTraffic,
+    refetchProfilerTraces,
+    refetchThrashing,
+    refetchModels,
+  });
+
+  useEffect(() => {
+    refetchMapRef.current = {
+      refetchRecent,
+      refetchAtlas,
+      refetchOverview,
+      refetchProxyTraffic,
+      refetchProfilerTraces,
+      refetchThrashing,
+      refetchModels,
+    };
+  });
+
   const wsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // When the WS receives a code_event, proxy_traffic, or project_switched we invalidate the caches
@@ -67,25 +91,26 @@ export function Dashboard() {
     }
 
     wsTimerRef.current = setTimeout(() => {
+      const handlers = refetchMapRef.current;
       if (msgType === 'code_event') {
-        refetchRecent();
-        refetchAtlas();
+        handlers.refetchRecent();
+        handlers.refetchAtlas();
       } else if (msgType === 'run_reported') {
-        refetchOverview();
-        refetchAtlas();
+        handlers.refetchOverview();
+        handlers.refetchAtlas();
       } else if (msgType === 'proxy_traffic') {
-        refetchProxyTraffic();
-        refetchOverview();
+        handlers.refetchProxyTraffic();
+        handlers.refetchOverview();
       } else if (msgType === 'profiler_trace') {
-        refetchProfilerTraces();
+        handlers.refetchProfilerTraces();
       } else if (msgType === 'project_switched') {
-        refetchOverview();
-        refetchThrashing();
-        refetchModels();
-        refetchRecent();
-        refetchAtlas();
-        refetchProxyTraffic();
-        refetchProfilerTraces();
+        handlers.refetchOverview();
+        handlers.refetchThrashing();
+        handlers.refetchModels();
+        handlers.refetchRecent();
+        handlers.refetchAtlas();
+        handlers.refetchProxyTraffic();
+        handlers.refetchProfilerTraces();
       }
     }, 250);
 
@@ -95,16 +120,7 @@ export function Dashboard() {
         wsTimerRef.current = null;
       }
     };
-  }, [
-    ws.lastMessage,
-    refetchRecent,
-    refetchAtlas,
-    refetchOverview,
-    refetchProxyTraffic,
-    refetchProfilerTraces,
-    refetchThrashing,
-    refetchModels,
-  ]);
+  }, [ws.lastMessage]);
 
   // Socket path as REPORTED BY THE DAEMON (/api/health socket_path), so a
   // custom --socket is shown correctly on every platform. Falls back to a
@@ -137,26 +153,26 @@ export function Dashboard() {
           <>
             <MetricsOverview
               overview={overview.data?.overview}
-              thrashing={thrashing.data ?? []}
-              models={models.data ?? []}
+              thrashing={thrashing.data ?? EMPTY_ARRAY}
+              models={models.data ?? EMPTY_ARRAY}
               loading={overview.isLoading || thrashing.isLoading || models.isLoading}
               currentProject={currentProject}
             />
 
             <CodeChurnTimeline
-              events={recent.data ?? []}
+              events={recent.data ?? EMPTY_ARRAY}
               loading={recent.isLoading}
             />
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-              <ThrashingHeatmap rows={thrashing.data ?? []} loading={thrashing.isLoading} />
-              <ModelLeaderboard models={models.data ?? []} loading={models.isLoading} />
+              <ThrashingHeatmap rows={thrashing.data ?? EMPTY_ARRAY} loading={thrashing.isLoading} />
+              <ModelLeaderboard models={models.data ?? EMPTY_ARRAY} loading={models.isLoading} />
             </div>
 
             {/* Model Telemetry & Code Durability Intelligence Matrix */}
             <ModelIntelligenceMatrix
-              models={models.data ?? []}
-              events={recent.data ?? []}
+              models={models.data ?? EMPTY_ARRAY}
+              events={recent.data ?? EMPTY_ARRAY}
               loading={models.isLoading}
               projectId={activeProjId}
             />
@@ -166,9 +182,9 @@ export function Dashboard() {
 
             <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
               <div className="xl:col-span-2">
-                <LiveEventFeed events={recent.data ?? []} loading={recent.isLoading} />
+                <LiveEventFeed events={recent.data ?? EMPTY_ARRAY} loading={recent.isLoading} />
               </div>
-              <ROIAnalysis models={models.data ?? []} />
+              <ROIAnalysis models={models.data ?? EMPTY_ARRAY} />
             </div>
           </>
         )}

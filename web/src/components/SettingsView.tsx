@@ -287,7 +287,10 @@ export function SettingsView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ days: 30 }),
       });
-      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(`Prune failed with status: ${res.status}`);
+      }
+      const data = await res.json().catch(() => ({}));
       const count = data.deleted ?? data.deleted_rows ?? 0;
       setPruneMsg(`Deleted ${count} stale events (> 30 days)`);
       setTimeout(() => setPruneMsg(null), 4000);

@@ -171,7 +171,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
         const shareTokens = (t.total_tokens || 0) / t.tool_calls.length;
         const shareCost = (t.cost_usd || 0) / t.tool_calls.length;
 
-        t.tool_calls.forEach((tc) => {
+        t.tool_calls.forEach((tc, tcIdx) => {
           totalToolInvocations++;
           const name = tc.name || 'custom_tool';
           const cat = categorizeTool(name);
@@ -206,7 +206,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
           modelToolCounts.get(t.model)!.set(name, (modelToolCounts.get(t.model)!.get(name) || 0) + 1);
 
           liveToolStream.push({
-            id: `${t.id}-${tc.id || Math.random().toString(36).slice(2, 7)}`,
+            id: `${t.id}-${tc.id || `${name}-${tcIdx}`}`,
             time: new Date(t.timestamp).toLocaleTimeString(),
             tool: name,
             category: cat,

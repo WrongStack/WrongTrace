@@ -47,9 +47,11 @@ func (q *QuotaLimiter) CheckSpend(key string, estimatedCostUSD float64) (allowed
 	q.checkResetDayLocked()
 
 	limit, hasLimit := q.dailyBudgets[key]
+	isGlobal := false
 	if !hasLimit {
 		// Also check global budget
 		limit, hasLimit = q.dailyBudgets["global"]
+		isGlobal = true
 	}
 
 	if !hasLimit || limit <= 0 {
@@ -57,6 +59,9 @@ func (q *QuotaLimiter) CheckSpend(key string, estimatedCostUSD float64) (allowed
 	}
 
 	currentSpend := q.dailySpend[key]
+	if isGlobal {
+		currentSpend = q.dailySpend["global"]
+	}
 	if currentSpend+estimatedCostUSD > limit {
 		return false, limit - currentSpend, fmt.Sprintf("WrongTrace Budget Guardrail: daily budget of $%.2f exceeded (current spend: $%.2f)", limit, currentSpend)
 	}
@@ -72,24 +77,35 @@ func (q *QuotaLimiter) CheckAndRecordSpend(key string, estimatedCostUSD float64)
 	q.checkResetDayLocked()
 
 	limit, hasLimit := q.dailyBudgets[key]
+	isGlobal := false
 	if !hasLimit {
 		// Also check global budget
 		limit, hasLimit = q.dailyBudgets["global"]
+		isGlobal = true
 	}
 
 	if !hasLimit || limit <= 0 {
 		// Unlimited
 		q.dailySpend[key] += estimatedCostUSD
+		if key != "global" {
+			q.dailySpend["global"] += estimatedCostUSD
+		}
 		return true, 999999.0, ""
 	}
 
 	currentSpend := q.dailySpend[key]
+	if isGlobal {
+		currentSpend = q.dailySpend["global"]
+	}
 	if currentSpend+estimatedCostUSD > limit {
 		return false, limit - currentSpend, fmt.Sprintf("WrongTrace Budget Guardrail: daily budget of $%.2f exceeded (current spend: $%.2f)", limit, currentSpend)
 	}
 
 	q.dailySpend[key] += estimatedCostUSD
-	return true, limit - q.dailySpend[key], ""
+	if key != "global" {
+		q.dailySpend["global"] += estimatedCostUSD
+	}
+	return true, limit - currentSpend - estimatedCostUSD, ""
 }
 
 // RecordSpend records actual completed spend after an LLM request completes.
@@ -101,6 +117,9 @@ func (q *QuotaLimiter) RecordSpend(key string, costUSD float64) {
 	defer q.mu.Unlock()
 	q.checkResetDayLocked()
 	q.dailySpend[key] += costUSD
+	if key != "global" {
+		q.dailySpend["global"] += costUSD
+	}
 }
 
 // GetSpend returns today's spend for a given key.

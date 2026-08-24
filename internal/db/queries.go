@@ -1094,7 +1094,6 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		ORDER BY COUNT(*) DESC
 	`, filePath, "%"+normPath, "%"+normPath)
 	if err == nil {
-		defer mRows.Close()
 		for mRows.Next() {
 			var model string
 			var count int
@@ -1102,6 +1101,7 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 				stats.ModelBreakdown[model] = count
 			}
 		}
+		_ = mRows.Close()
 	}
 
 	// 3. Provider Breakdown
@@ -1113,7 +1113,6 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		ORDER BY COUNT(*) DESC
 	`, filePath, "%"+normPath, "%"+normPath)
 	if err == nil {
-		defer pRows.Close()
 		for pRows.Next() {
 			var prov string
 			var count int
@@ -1121,6 +1120,7 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 				stats.ProviderBreakdown[prov] = count
 			}
 		}
+		_ = pRows.Close()
 	}
 
 	// 4. Recent Reads
@@ -1135,7 +1135,6 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		LIMIT 20
 	`, filePath, "%"+normPath, "%"+normPath)
 	if err == nil {
-		defer rRows.Close()
 		for rRows.Next() {
 			var (
 				rec FileReadRecord
@@ -1152,6 +1151,7 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 				stats.RecentReads = append(stats.RecentReads, rec)
 			}
 		}
+		_ = rRows.Close()
 	}
 
 	return stats, nil
