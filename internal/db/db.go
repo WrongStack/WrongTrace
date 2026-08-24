@@ -133,9 +133,12 @@ func (s *Store) Overview(repoFilter ...string) (Overview, error) {
 		repo = repoFilter[0]
 	}
 
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
 	var o Overview
 	if repo == "" {
-		row := s.db.QueryRowContext(context.Background(), `
+		row := s.db.QueryRowContext(ctx, `
 			SELECT
 				(SELECT COUNT(*) FROM agent_runs),
 				(SELECT COUNT(*) FROM code_node_events),
@@ -148,7 +151,7 @@ func (s *Store) Overview(repoFilter ...string) (Overview, error) {
 		return o, nil
 	}
 
-	row := s.db.QueryRowContext(context.Background(), `
+	row := s.db.QueryRowContext(ctx, `
 		SELECT
 			(SELECT COUNT(DISTINCT r.run_id) FROM agent_runs r
 			 WHERE r.run_id IN (

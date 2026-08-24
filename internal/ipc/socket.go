@@ -587,12 +587,17 @@ func bindSocket(path string) (net.Listener, error) {
 	return ln, nil
 }
 
+const maxJSONLineBytes = 16 * 1024 * 1024 // 16 MB max line length to protect against unbounded RAM allocation
+
 func readJSONLine(r *bufio.Reader) ([]byte, error) {
 	var line []byte
 	for {
 		chunk, isPrefix, err := r.ReadLine()
 		if err != nil {
 			return nil, err
+		}
+		if len(line)+len(chunk) > maxJSONLineBytes {
+			return nil, errors.New("ipc: line too long, exceeded maximum buffer limit")
 		}
 		line = append(line, chunk...)
 		if !isPrefix {

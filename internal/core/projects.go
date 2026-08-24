@@ -1033,6 +1033,7 @@ func isIgnoredDir(base string) bool {
 // batch-import pathologically slow.
 func DetectPrimaryLanguage(root string) string {
 	extCounts := make(map[string]int)
+	scannedFiles := 0
 	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil || info == nil {
 			return nil
@@ -1052,6 +1053,10 @@ func DetectPrimaryLanguage(root string) string {
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		scannedFiles++
+		if scannedFiles > 2000 {
+			return filepath.SkipAll
 		}
 		ext := strings.ToLower(filepath.Ext(p))
 		switch ext {

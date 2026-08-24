@@ -875,7 +875,10 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
-			_, _ = w.Write(buf[:n])
+			if _, wErr := w.Write(buf[:n]); wErr != nil {
+				// Downstream client disconnected (e.g. cancelled stream); stop reading from upstream
+				break
+			}
 			if isFlusher {
 				flusher.Flush()
 			}

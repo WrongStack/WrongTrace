@@ -343,18 +343,18 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 			oldIdx, newIdx int
 		}
 
-		dp := make([][]int, m+1)
-		for i := range dp {
-			dp[i] = make([]int, n+1)
-		}
+		stride := n + 1
+		dp := make([]int, (m+1)*stride)
 		for i := 1; i <= m; i++ {
+			row := i * stride
+			prevRow := (i - 1) * stride
 			for j := 1; j <= n; j++ {
 				if midOld[i-1] == midNew[j-1] {
-					dp[i][j] = dp[i-1][j-1] + 1
-				} else if dp[i-1][j] >= dp[i][j-1] {
-					dp[i][j] = dp[i-1][j]
+					dp[row+j] = dp[prevRow+j-1] + 1
+				} else if dp[prevRow+j] >= dp[row+j-1] {
+					dp[row+j] = dp[prevRow+j]
 				} else {
-					dp[i][j] = dp[i][j-1]
+					dp[row+j] = dp[row+j-1]
 				}
 			}
 		}
@@ -362,11 +362,13 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 		var matches []match
 		i, j := m, n
 		for i > 0 && j > 0 {
+			row := i * stride
+			prevRow := (i - 1) * stride
 			if midOld[i-1] == midNew[j-1] {
 				matches = append(matches, match{oldIdx: i - 1, newIdx: j - 1})
 				i--
 				j--
-			} else if dp[i-1][j] >= dp[i][j-1] {
+			} else if dp[prevRow+j] >= dp[row+j-1] {
 				i--
 			} else {
 				j--

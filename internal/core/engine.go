@@ -457,6 +457,20 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 				delete(e.activeRuns, id)
 			}
 		}
+		// If still exceeding cap, evict oldest entries
+		if len(e.activeRuns) > 250 {
+			var oldestID string
+			var oldestTime time.Time
+			for id, m := range e.activeRuns {
+				if oldestTime.IsZero() || m.LastSeen.Before(oldestTime) {
+					oldestTime = m.LastSeen
+					oldestID = id
+				}
+			}
+			if oldestID != "" {
+				delete(e.activeRuns, oldestID)
+			}
+		}
 	}
 	existing, exists := e.activeRuns[p.RunID]
 	startedAt := rec.CreatedAt

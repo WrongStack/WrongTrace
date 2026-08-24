@@ -22,10 +22,10 @@ type ActiveRun struct {
 // ActiveRuns returns the active agent runs, pruning any whose last_seen is
 // older than the correlation window. Used by the dashboard's agent badge.
 func (e *Engine) ActiveRuns() []ActiveRun {
+	activeProj := e.GetActiveProject()
 	e.runMu.Lock()
 	defer e.runMu.Unlock()
 	cutoff := time.Now().Add(-e.correlate)
-	activeProj := e.GetActiveProject()
 	out := make([]ActiveRun, 0, len(e.activeRuns))
 	for id, m := range e.activeRuns {
 		if m.LastSeen.Before(cutoff) {

@@ -47,6 +47,12 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	})
 }
 
+// decodeJSON reads and decodes JSON from r.Body bounded by a 10MB memory limit to protect against RAM exhaustion.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
 // Health is a cheap readiness probe: no DB hit, no fsnotify check. It answers
 // "did the HTTP listener come up?" plus live diagnostics, including the IPC
 // endpoint agents should connect to (empty when IPC is disabled).
@@ -122,7 +128,7 @@ func (h *Handlers) ReportTelemetry(w http.ResponseWriter, r *http.Request) {
 		Cost             float64 `json:"cost"`
 		Intent           string  `json:"intent"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -450,7 +456,7 @@ func (h *Handlers) UpsertModel(w http.ResponseWriter, r *http.Request) {
 		ContextWindow      int     `json:"context_window"`
 		Description        string  `json:"description"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -483,7 +489,7 @@ func (h *Handlers) CalculateCost(w http.ResponseWriter, r *http.Request) {
 		PromptTokens     int64  `json:"prompt_tokens"`
 		CompletionTokens int64  `json:"completion_tokens"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -541,7 +547,7 @@ func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
 		TTL         string `json:"ttl"`
 		Force       bool   `json:"force"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -625,7 +631,7 @@ func (h *Handlers) UnlockFile(w http.ResponseWriter, r *http.Request) {
 		Path     string `json:"path"`
 		FilePath string `json:"file_path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -661,7 +667,7 @@ func (h *Handlers) UpsertProxyRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var route proxy.ProxyRoute
-	if err := json.NewDecoder(r.Body).Decode(&route); err != nil {
+	if err := decodeJSON(w, r, &route); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -720,7 +726,7 @@ func (h *Handlers) AddProject(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
+	if err := decodeJSON(w, r, &req); err != nil || req.Path == "" {
 		writeError(w, http.StatusBadRequest, "path is required")
 		return
 	}
@@ -765,7 +771,7 @@ func (h *Handlers) ImportFromWrongStack(w http.ResponseWriter, r *http.Request) 
 	if r.Body != nil {
 		// A body that decodes to zero roots (absent, null, or {}) means
 		// "import all"; only a present-but-unparseable body is rejected.
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		if err := decodeJSON(w, r, &req); err != nil && err != io.EOF {
 			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 			return
 		}
@@ -788,7 +794,7 @@ func (h *Handlers) ImportFromWrongStack(w http.ResponseWriter, r *http.Request) 
 // requiring a body id (as this handler once did) broke every edit.
 func (h *Handlers) UpdateProject(w http.ResponseWriter, r *http.Request) {
 	var p core.ProjectProfile
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := decodeJSON(w, r, &p); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -895,7 +901,7 @@ func (h *Handlers) GetSettings(w http.ResponseWriter, _ *http.Request) {
 // UpdateSettings updates application settings.
 func (h *Handlers) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var s core.AppSettings
-	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+	if err := decodeJSON(w, r, &s); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -939,7 +945,7 @@ func (h *Handlers) ClearStale(w http.ResponseWriter, r *http.Request) {
 			Days *int `json:"days"`
 		}
 		if r.Body != nil {
-			if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.Days != nil {
+			if err := decodeJSON(w, r, &body); err == nil && body.Days != nil {
 				days = *body.Days
 			}
 		}
@@ -974,7 +980,7 @@ func (h *Handlers) IngestProfiler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload profiler.ProfilerReportPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := decodeJSON(w, r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -992,7 +998,7 @@ func (h *Handlers) IngestOTLPTraces(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "profiler collector not available")
 		return
 	}
-	data, err := io.ReadAll(r.Body)
+	data, err := io.ReadAll(io.LimitReader(r.Body, 16*1024*1024))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "read request body: "+err.Error())
 		return

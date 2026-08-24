@@ -56,15 +56,21 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
   const timelineData = useMemo(() => {
     if (filteredEvents.length === 0) return [];
 
-    // Sort chronologically ascending
-    const validEvents = filteredEvents
-      .filter((e) => !Number.isNaN(Date.parse(e.event_time)))
-      .sort((a, b) => Date.parse(a.event_time) - Date.parse(b.event_time));
+    // Pre-parse timestamps once to avoid repeated O(N log N) Date.parse calls in sort
+    const mapped: Array<{ event: EventRecord; time: number }> = [];
+    for (let i = 0; i < filteredEvents.length; i++) {
+      const e = filteredEvents[i];
+      const t = Date.parse(e.event_time);
+      if (!Number.isNaN(t)) {
+        mapped.push({ event: e, time: t });
+      }
+    }
 
-    if (validEvents.length === 0) return [];
+    if (mapped.length === 0) return [];
+    mapped.sort((a, b) => a.time - b.time);
 
-    const firstTime = Date.parse(validEvents[0].event_time);
-    const lastTime = Date.parse(validEvents[validEvents.length - 1].event_time);
+    const firstTime = mapped[0].time;
+    const lastTime = mapped[mapped.length - 1].time;
     const spanMs = Math.max(lastTime - firstTime, 1000);
 
     // Adaptive bucket granularity:
@@ -93,8 +99,8 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
       }
     >();
 
-    validEvents.forEach((e) => {
-      const d = new Date(e.event_time);
+    mapped.forEach(({ event: e, time: t }) => {
+      const d = new Date(t);
       let timeKey: string;
       let label: string;
 

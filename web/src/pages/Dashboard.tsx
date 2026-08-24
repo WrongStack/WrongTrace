@@ -54,30 +54,46 @@ export function Dashboard() {
   const { refetch: refetchProxyTraffic } = proxyTraffic;
   const { refetch: refetchProfilerTraces } = profilerTraces;
 
+  const wsTimerRef = useState<{ timer: ReturnType<typeof setTimeout> | null }>({ timer: null })[0];
+
   // When the WS receives a code_event, proxy_traffic, or project_switched we invalidate the caches
-  // so the live feed, code map, and telemetry update immediately without polling.
+  // with a small trailing debounce to avoid high-frequency refetch storms that spike CPU & RAM.
   useEffect(() => {
     if (!ws.lastMessage) return;
-    if (ws.lastMessage.type === 'code_event') {
-      refetchRecent();
-      refetchAtlas();
-    } else if (ws.lastMessage.type === 'run_reported') {
-      refetchOverview();
-      refetchAtlas();
-    } else if (ws.lastMessage.type === 'proxy_traffic') {
-      refetchProxyTraffic();
-      refetchOverview();
-    } else if (ws.lastMessage.type === 'profiler_trace') {
-      refetchProfilerTraces();
-    } else if (ws.lastMessage.type === 'project_switched') {
-      refetchOverview();
-      refetchThrashing();
-      refetchModels();
-      refetchRecent();
-      refetchAtlas();
-      refetchProxyTraffic();
-      refetchProfilerTraces();
+    const msgType = ws.lastMessage.type;
+
+    if (wsTimerRef.timer) {
+      clearTimeout(wsTimerRef.timer);
     }
+
+    wsTimerRef.timer = setTimeout(() => {
+      if (msgType === 'code_event') {
+        refetchRecent();
+        refetchAtlas();
+      } else if (msgType === 'run_reported') {
+        refetchOverview();
+        refetchAtlas();
+      } else if (msgType === 'proxy_traffic') {
+        refetchProxyTraffic();
+        refetchOverview();
+      } else if (msgType === 'profiler_trace') {
+        refetchProfilerTraces();
+      } else if (msgType === 'project_switched') {
+        refetchOverview();
+        refetchThrashing();
+        refetchModels();
+        refetchRecent();
+        refetchAtlas();
+        refetchProxyTraffic();
+        refetchProfilerTraces();
+      }
+    }, 250);
+
+    return () => {
+      if (wsTimerRef.timer) {
+        clearTimeout(wsTimerRef.timer);
+      }
+    };
   }, [
     ws.lastMessage,
     refetchRecent,
@@ -87,6 +103,7 @@ export function Dashboard() {
     refetchProfilerTraces,
     refetchThrashing,
     refetchModels,
+    wsTimerRef,
   ]);
 
   // Socket path as REPORTED BY THE DAEMON (/api/health socket_path), so a

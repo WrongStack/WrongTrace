@@ -15,7 +15,6 @@ type SessionWatcher struct {
 	mu          sync.Mutex
 	watchPaths  []string
 	seenOffsets map[string]int64
-	dirModTimes map[string]time.Time
 	onToolCall  func(ToolCallEvent)
 	onReadEvent func(FileReadEvent)
 }
@@ -24,7 +23,6 @@ type SessionWatcher struct {
 func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 	return &SessionWatcher{
 		seenOffsets: make(map[string]int64),
-		dirModTimes: make(map[string]time.Time),
 		onToolCall:  onToolCall,
 	}
 }
@@ -158,9 +156,6 @@ func (sw *SessionWatcher) PollOnce() {
 	sw.mu.Lock()
 	paths := make([]string, len(sw.watchPaths))
 	copy(paths, sw.watchPaths)
-	if sw.dirModTimes == nil {
-		sw.dirModTimes = make(map[string]time.Time)
-	}
 	sw.mu.Unlock()
 
 	for _, rootDir := range paths {
@@ -183,18 +178,6 @@ func (sw *SessionWatcher) PollOnce() {
 							return filepath.SkipDir
 						}
 					}
-					// Prune unchanged subtrees using directory modification time
-					modTime := info.ModTime()
-					sw.mu.Lock()
-					lastMod, seenDir := sw.dirModTimes[path]
-					sw.mu.Unlock()
-					if seenDir && !modTime.After(lastMod) {
-						// Directory modification time has not changed, skip sub-tree walk
-						return filepath.SkipDir
-					}
-					sw.mu.Lock()
-					sw.dirModTimes[path] = modTime
-					sw.mu.Unlock()
 				}
 				return nil
 			}
@@ -255,10 +238,21 @@ func (sw *SessionWatcher) PollOnce() {
 			sw.mu.Lock()
 			sw.seenOffsets[path] = newOffset
 			// Prevent seenOffsets map unbounded growth
-			if len(sw.seenOffsets) > 10000 {
+			if len(sw.seenOffsets) > 2000 {
 				for k := range sw.seenOffsets {
 					if !fileExists(k) {
 						delete(sw.seenOffsets, k)
+					}
+				}
+				if len(sw.seenOffsets) > 2000 {
+					// Hard cap: clear half the map if still too large
+					count := 0
+					for k := range sw.seenOffsets {
+						delete(sw.seenOffsets, k)
+						count++
+						if count > 1000 {
+							break
+						}
 					}
 				}
 			}

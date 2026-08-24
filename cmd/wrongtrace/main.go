@@ -627,6 +627,7 @@ func runTrace(cmd *cobra.Command, args []string) error {
 		if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
 			sentToDaemon = true
 		}
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}
 
