@@ -123,6 +123,7 @@ func NewGatewayProxy(cfg Config) *GatewayProxy {
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
