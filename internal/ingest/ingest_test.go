@@ -145,3 +145,50 @@ func TestExtractModelFromRow_AntigravityTranscript(t *testing.T) {
 		t.Errorf("expected extracted model gemini-3.7-flash, got %s", events[0].ModelName)
 	}
 }
+
+func TestSessionWatcher_GlobalDiscoveryAndFileReads(t *testing.T) {
+	// Test global discovery runs safely without crash on a separate instance
+	swGlobal := NewSessionWatcher(nil)
+	swGlobal.DiscoverGlobalAgentDirs()
+
+	tempDir := t.TempDir()
+	var toolEvents []ToolCallEvent
+	var readEvents []FileReadEvent
+
+	sw := NewSessionWatcher(func(ev ToolCallEvent) {
+		toolEvents = append(toolEvents, ev)
+	})
+	sw.SetOnReadEvent(func(ev FileReadEvent) {
+		readEvents = append(readEvents, ev)
+	})
+
+	sw.DiscoverAgentDirs("")
+	sw.DiscoverAgentDirs(tempDir)
+
+	// Create subdirectories and test detection
+	claudeDir := filepath.Join(tempDir, ".claude", "logs")
+	_ = os.MkdirAll(claudeDir, 0755)
+	sw.DiscoverAgentDirs(tempDir)
+
+	// Write transcript with both view_file (read) and replace_file_content (tool)
+	logFile := filepath.Join(claudeDir, "session.jsonl")
+	transcriptContent := `{"type":"PLANNER_RESPONSE","model":"claude-3-7-sonnet","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"internal/core/engine.go","StartLine":10,"EndLine":50}}],"usage":{"input_tokens":3000,"output_tokens":200}}
+{"type":"PLANNER_RESPONSE","model":"claude-3-7-sonnet","tool_calls":[{"name":"replace_file_content","args":{"TargetFile":"internal/core/engine.go","ReplacementContent":"foo"}}],"usage":{"input_tokens":4000,"output_tokens":300}}
+`
+	_ = os.WriteFile(logFile, []byte(transcriptContent), 0644)
+
+	sw.PollOnce()
+
+	if len(toolEvents) != 1 {
+		t.Errorf("expected 1 tool event, got %d", len(toolEvents))
+	}
+	if len(readEvents) != 1 {
+		t.Errorf("expected 1 read event, got %d", len(readEvents))
+	}
+	if len(readEvents) > 0 {
+		r := readEvents[0]
+		if r.FilePath != "internal/core/engine.go" || r.StartLine != 10 || r.EndLine != 50 {
+			t.Errorf("unexpected read event: %+v", r)
+		}
+	}
+}

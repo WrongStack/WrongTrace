@@ -649,3 +649,54 @@ func TestCallTool_CheckGuardrail_LockedFile(t *testing.T) {
 	}
 }
 
+func TestMCP_ToolsAndErrorHandling(t *testing.T) {
+	sink := &fakeSink{
+		health: ipc.FileHealthReply{
+			FilePath:    "f.go",
+			HealthScore: 80,
+			IsFragile:   false,
+		},
+	}
+
+	// 1. tools/list
+	req := &jsonRPCRequest{JSONRPC: "2.0", ID: 10, Method: "tools/list"}
+	resp := dispatch(sink, req)
+	if resp.Error != nil {
+		t.Fatalf("tools/list failed: %+v", resp.Error)
+	}
+
+	// 2. lock_file and unlock_file tools
+	req = toolCallReq(11, "lock_file", `{"file_path":"test.go","reason":"refactor"}`)
+	resp = dispatch(sink, req)
+	if resp.Error != nil {
+		t.Fatalf("lock_file failed: %+v", resp.Error)
+	}
+
+	req = toolCallReq(12, "unlock_file", `{"file_path":"test.go"}`)
+	resp = dispatch(sink, req)
+	if resp.Error != nil {
+		t.Fatalf("unlock_file failed: %+v", resp.Error)
+	}
+
+	// 3. get_file_diff_history tool
+	req = toolCallReq(13, "get_file_diff_history", `{"file_path":"test.go","limit":10}`)
+	resp = dispatch(sink, req)
+	if resp.Error != nil {
+		t.Fatalf("get_file_diff_history failed: %+v", resp.Error)
+	}
+
+	// 4. Unknown tool error
+	req = toolCallReq(15, "no_such_tool", `{}`)
+	resp = dispatch(sink, req)
+	if resp.Error == nil || resp.Error.Code != -32601 {
+		t.Errorf("expected error -32601 for unknown tool, got %+v", resp.Error)
+	}
+
+	// 5. Unknown method error
+	req = &jsonRPCRequest{JSONRPC: "2.0", ID: 99, Method: "unknown/method"}
+	resp = dispatch(sink, req)
+	if resp.Error == nil || resp.Error.Code != -32601 {
+		t.Errorf("expected error -32601 for unknown method, got %+v", resp.Error)
+	}
+}
+

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 )
@@ -1092,6 +1093,54 @@ func TestRouteManager_MatchRoute_PathBoundary(t *testing.T) {
 	r, rem = rm.MatchRoute("/proxy/zai-pro/chat/completions")
 	if r != nil {
 		t.Fatalf("expected NO match for /proxy/zai-pro, got route=%v, rem=%s", r, rem)
+	}
+}
+
+func TestProxy_CacheAndQuotasAndTraffic(t *testing.T) {
+	p := NewGatewayProxy(Config{})
+
+	// 1. Traffic Clear & All
+	p.recordTraffic(ProxyTrafficRecord{ID: "tr-1", Model: "gpt-4o", StatusCode: 200})
+	if len(p.AllTraffic(10)) != 1 {
+		t.Errorf("expected 1 traffic record")
+	}
+	p.ClearTraffic()
+	if len(p.AllTraffic(10)) != 0 {
+		t.Errorf("expected 0 traffic records after clear")
+	}
+
+	// 2. RouteManager CRUD
+	rm := NewRouteManager()
+	initialCount := len(rm.AllRoutes())
+	rm.UpsertRoute(ProxyRoute{ID: "r1", Name: "Test Route", PathPrefix: "/proxy/test", TargetUpstream: "http://localhost:8000"})
+	if len(rm.AllRoutes()) != initialCount+1 {
+		t.Errorf("expected %d routes, got %d", initialCount+1, len(rm.AllRoutes()))
+	}
+	rm.DeleteRoute("r1")
+	if len(rm.AllRoutes()) != initialCount {
+		t.Errorf("expected %d routes after delete, got %d", initialCount, len(rm.AllRoutes()))
+	}
+
+	// 3. ResponseCache
+	cache := NewResponseCache(100, 24*time.Hour)
+	cache.Set("prompt-hash-1", "openai", "gpt-4o", 200, map[string]string{"content-type": "application/json"}, []byte(`{"reply":"cached"}`), false, 10, 0.001, 24*time.Hour)
+	if hit, found := cache.Get("prompt-hash-1"); !found || hit == nil {
+		t.Errorf("expected cache hit")
+	}
+	if _, found := cache.Get("nonexistent"); found {
+		t.Errorf("expected cache miss")
+	}
+	cache.Clear()
+
+	// 4. QuotaLimiter
+	ql := NewQuotaLimiter()
+	ql.SetBudget("task-1", 1.00)
+	if allowed, remaining, _ := ql.CheckSpend("task-1", 0.50); !allowed || remaining <= 0 {
+		t.Errorf("expected spend to be allowed, got allowed=%v remaining=%f", allowed, remaining)
+	}
+	_, _, _ = ql.CheckAndRecordSpend("task-1", 0.80)
+	if allowed, _, _ := ql.CheckSpend("task-1", 0.50); allowed {
+		t.Errorf("expected quota exceeded (allowed=false)")
 	}
 }
 

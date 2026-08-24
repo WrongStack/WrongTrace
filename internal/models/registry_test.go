@@ -1,8 +1,6 @@
 package models
 
 import (
-	"io"
-	"net/http"
 	"strings"
 	"testing"
 )
@@ -244,26 +242,33 @@ func TestRegistry_UpsertAndAllModels(t *testing.T) {
 	}
 }
 
-func TestLiveModelsDevSchema(t *testing.T) {
-	resp, err := http.Get("https://models.dev/api.json")
-	if err != nil {
-		t.Skipf("network unavailable: %v", err)
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	t.Logf("Response length: %d bytes", len(data))
+func TestRegistry_ProvidersAndCacheCalculations(t *testing.T) {
+	r := NewDefaultRegistry()
 
-	r := NewRegistry()
-	n, err := r.ImportModelsDevJSON(data)
-	if err != nil {
-		t.Fatalf("Import error: %v", err)
+	// 1. AllProviders and GetProvider
+	providers := r.AllProviders()
+	if len(providers) == 0 {
+		t.Errorf("expected providers in default registry")
 	}
-	t.Logf("Successfully imported %d models", n)
 
-	models := r.AllModels()
-	for i := 0; i < 25 && i < len(models); i++ {
-		m := models[i]
-		t.Logf("[%d] ID=%q ModelID=%q Name=%q Provider=%q (In=$%.2f Out=$%.2f)", i, m.ID, m.ModelID, m.Name, m.Provider, m.InputPricePerM, m.OutputPricePerM)
+	if p, ok := r.GetProvider("anthropic"); !ok || p.Name != "Anthropic" {
+		t.Errorf("expected Anthropic provider: %+v", p)
+	}
+
+	// 2. CalculateCostDetailed and CalculateCostWithProvider
+	cost, savings := r.CalculateCostDetailed("anthropic", "claude-3-7-sonnet", 1_000_000, 1_000_000, 500_000)
+	if cost <= 0 || savings <= 0 {
+		t.Errorf("expected positive cost and savings, got cost=%f savings=%f", cost, savings)
+	}
+
+	provCost := r.CalculateCostWithProvider("openai", "gpt-4o", 100_000, 50_000)
+	if provCost <= 0 {
+		t.Errorf("expected positive provider cost, got %f", provCost)
+	}
+
+	// 3. GetWithProvider
+	if m, ok := r.GetWithProvider("google", "gemini-3-7-flash"); !ok || m.Name != "Gemini 3.7 Flash" {
+		t.Errorf("expected Gemini 3.7 Flash: %+v", m)
 	}
 }
 

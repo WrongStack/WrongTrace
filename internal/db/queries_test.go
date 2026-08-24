@@ -332,3 +332,133 @@ func TestFileReadEventsAndStats(t *testing.T) {
 	}
 }
 
+func TestStore_ComprehensiveCoverage(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+
+	// 1. Overview
+	seedRun(t, s, RunRecord{RunID: "run-overview-1", TaskID: "t-1", AgentName: "agy", ModelName: "gpt-4o", Provider: "openai", CostUSD: 0.05, CreatedAt: now})
+	seedEvent(t, s, "ev-1", "run-overview-1", "func:DoTask", "ADDED", now)
+
+	overview, err := s.Overview()
+	if err != nil {
+		t.Fatalf("Overview failed: %v", err)
+	}
+	if overview.TotalRuns < 1 || overview.TotalEvents < 1 {
+		t.Errorf("expected positive overview counts: %+v", overview)
+	}
+
+	overviewFiltered, err := s.Overview("test")
+	if err != nil {
+		t.Fatalf("Overview filtered failed: %v", err)
+	}
+	if overviewFiltered.TotalEvents < 1 {
+		t.Errorf("expected filtered events >= 1: %+v", overviewFiltered)
+	}
+
+	// 2. SymbolHistory & FileModelActivity
+	seedEvent(t, s, "ev-2", "run-overview-1", "func:DoTask", "MODIFIED", now.Add(time.Minute))
+	history, err := s.SymbolHistory("f.go", "func:DoTask", 10)
+	if err != nil {
+		t.Fatalf("SymbolHistory failed: %v", err)
+	}
+	if len(history) != 2 {
+		t.Errorf("expected 2 history entries, got %d", len(history))
+	}
+
+	activity, err := s.FileModelActivity("f.go")
+	if err != nil {
+		t.Fatalf("FileModelActivity failed: %v", err)
+	}
+	if len(activity) == 0 {
+		t.Errorf("expected activity entries for f.go")
+	}
+
+	// 3. ModelFrictionMatrix
+	seedRun(t, s, RunRecord{RunID: "run-overview-2", TaskID: "t-2", AgentName: "devin", ModelName: "claude-3-7-sonnet", Provider: "anthropic", CostUSD: 0.10, CreatedAt: now.Add(2 * time.Minute)})
+	seedEvent(t, s, "ev-3", "run-overview-2", "func:DoTask", "MODIFIED", now.Add(2*time.Minute))
+
+	friction, err := s.ModelFrictionMatrix(50)
+	if err != nil {
+		t.Fatalf("ModelFrictionMatrix failed: %v", err)
+	}
+	if len(friction.Edges) == 0 && len(friction.RecentCollisions) == 0 {
+		t.Logf("friction matrix result: %+v", friction)
+	}
+
+	// 4. AllFilesHealth & AllNodeStats & RecentFileEvents
+	fileHealths, err := s.AllFilesHealth("test")
+	if err != nil {
+		t.Fatalf("AllFilesHealth failed: %v", err)
+	}
+	if len(fileHealths) == 0 {
+		t.Errorf("expected file health entries")
+	}
+
+	nodeStats, err := s.AllNodeStats("test")
+	if err != nil {
+		t.Fatalf("AllNodeStats failed: %v", err)
+	}
+	if len(nodeStats) == 0 {
+		t.Errorf("expected node stats")
+	}
+
+	fileEvs, err := s.RecentFileEvents("f.go", 10)
+	if err != nil {
+		t.Fatalf("RecentFileEvents failed: %v", err)
+	}
+	if len(fileEvs) == 0 {
+		t.Errorf("expected recent file events")
+	}
+
+	// 5. Profiler traces
+	err = s.InsertTrace(RuntimeTraceRecord{
+		TraceID:       "tr-1",
+		RunID:         "run-overview-1",
+		ServiceName:   "backend",
+		NodeSignature: "func:DoTask",
+		FilePath:      "f.go",
+		DurationMs:    150,
+		CPUUsagePct:   12.5,
+		MemoryBytes:   1024 * 1024,
+		StatusCode:    200,
+		ProfilerType:  "custom",
+		Timestamp:     now,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrace failed: %v", err)
+	}
+
+	profOverview, err := s.ProfilerOverview()
+	if err != nil {
+		t.Fatalf("ProfilerOverview failed: %v", err)
+	}
+	if profOverview.TotalTraces != 1 {
+		t.Errorf("expected 1 profiler trace, got %d", profOverview.TotalTraces)
+	}
+
+	traces, err := s.RecentTraces(10)
+	if err != nil {
+		t.Fatalf("RecentTraces failed: %v", err)
+	}
+	if len(traces) != 1 {
+		t.Errorf("expected 1 recent trace, got %d", len(traces))
+	}
+
+	// 6. Maintenance: ClearStale & Vacuum
+	deleted, err := s.ClearStale(30)
+	if err != nil {
+		t.Fatalf("ClearStale failed: %v", err)
+	}
+	t.Logf("ClearStale(30) deleted %d records", deleted)
+
+	if err := s.Vacuum(); err != nil {
+		t.Fatalf("Vacuum failed: %v", err)
+	}
+
+	// 7. DB accessor & health
+	if s.DB() == nil {
+		t.Errorf("DB() should not be nil")
+	}
+}
+

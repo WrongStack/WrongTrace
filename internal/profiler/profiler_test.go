@@ -108,4 +108,34 @@ func TestProfilerCollector(t *testing.T) {
 	if overview.TotalTraces != 2 {
 		t.Errorf("expected 2 total traces, got %d", overview.TotalTraces)
 	}
+
+	// 4. Recent
+	recent, err := collector.Recent(5)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	if len(recent) != 2 {
+		t.Errorf("expected 2 recent traces, got %d", len(recent))
+	}
+
+	// 5. Ingest error payload & fallback
+	errEv, _ := collector.IngestReport(ProfilerReportPayload{
+		ErrorMsg: "syntax error",
+	})
+	if errEv.StatusCode != 500 {
+		t.Errorf("expected status 500 for error payload, got %d", errEv.StatusCode)
+	}
+
+	// 6. Malformed OTLP
+	if _, err := collector.IngestOTLP([]byte(`{invalid}`)); err == nil {
+		t.Errorf("expected error for invalid OTLP JSON")
+	}
+
+	// 7. Dynamic GetStore config
+	collectorWithFn := NewCollector(Config{
+		GetStore: func() *db.Store { return store },
+	})
+	if collectorWithFn.store() != store {
+		t.Errorf("expected store from GetStore callback")
+	}
 }

@@ -187,3 +187,34 @@ func TestSingleInstance_PreventDuplicate(t *testing.T) {
 		t.Errorf("expected runStart to return nil on duplicate instance, got: %v", err)
 	}
 }
+
+func TestInitCmd(t *testing.T) {
+	tempDir := t.TempDir()
+	oldCwd, _ := os.Getwd()
+	_ = os.Chdir(tempDir)
+	defer func() { _ = os.Chdir(oldCwd) }()
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+
+	rootCmd.SetArgs([]string{"init"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute init failed: %v", err)
+	}
+}
+
+func TestTraceCmd(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "trace_test.db")
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+
+	// Run a fast echo command via trace
+	rootCmd.SetArgs([]string{"trace", "--db", dbPath, "--service", "test-svc", "--", "go", "version"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute trace failed: %v", err)
+	}
+}

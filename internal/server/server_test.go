@@ -16,6 +16,7 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
+	"github.com/wrongstack/wrongtrace/internal/models"
 )
 
 // newTestServer builds a Server around a REAL engine (real SQLite store in a
@@ -668,6 +669,84 @@ func TestServer_FileReadEndpoints(t *testing.T) {
 	if len(heatmap) != 1 || heatmap[0].StartLine != 1 || heatmap[0].EndLine != 100 {
 		t.Errorf("unexpected heatmap: %+v", heatmap)
 	}
+}
+
+func TestServer_FrictionAndAtlasEndpoints(t *testing.T) {
+	_, _, ts := newTestServer(t)
+
+	// 1. GET /api/metrics/friction
+	var friction db.InterAgentFrictionReport
+	resp := getJSON(t, ts.URL+"/api/metrics/friction", &friction)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/metrics/friction = %d", resp.StatusCode)
+	}
+
+	// 2. GET /api/metrics/cross-thrash
+	var crossThrash db.InterAgentFrictionReport
+	resp = getJSON(t, ts.URL+"/api/metrics/cross-thrash", &crossThrash)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/metrics/cross-thrash = %d", resp.StatusCode)
+	}
+
+	// 3. GET /api/atlas
+	var atlas core.AtlasSnapshot
+	resp = getJSON(t, ts.URL+"/api/atlas", &atlas)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/atlas = %d", resp.StatusCode)
+	}
+
+	// 4. GET /api/models/catalog
+	var catalog []models.ModelInfo
+	resp = getJSON(t, ts.URL+"/api/models/catalog", &catalog)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/models/catalog = %d", resp.StatusCode)
+	}
+	if len(catalog) == 0 {
+		t.Errorf("expected models in catalog")
+	}
+
+	// 5. GET /api/projects
+	var projects []core.ProjectProfile
+	resp = getJSON(t, ts.URL+"/api/projects", &projects)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/projects = %d", resp.StatusCode)
+	}
+
+	// 6. GET /api/settings
+	var settings core.AppSettings
+	resp = getJSON(t, ts.URL+"/api/settings", &settings)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/settings = %d", resp.StatusCode)
+	}
+
+	// 7. GET /api/metrics/recent with limit and query
+	var recentEvs []db.EventRecord
+	resp = getJSON(t, ts.URL+"/api/metrics/recent?limit=10&repo=srv-test", &recentEvs)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/metrics/recent = %d", resp.StatusCode)
+	}
+
+	// 8. GET /api/symbols/history
+	var history []db.SymbolHistoryRecord
+	resp = getJSON(t, ts.URL+"/api/symbols/history?signature=function:hot.go::Alpha", &history)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/symbols/history = %d", resp.StatusCode)
+	}
+
+	// 9. GET /api/files/activity
+	var activity []db.ModelActivitySummary
+	resp = getJSON(t, ts.URL+"/api/files/activity?file_path=src/hot.go", &activity)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/files/activity = %d", resp.StatusCode)
+	}
+
+	// 10. POST /api/settings/vacuum
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/settings/vacuum", nil)
+	vacResp, err := http.DefaultClient.Do(req)
+	if err != nil || vacResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/settings/vacuum failed: %v", err)
+	}
+	_ = vacResp.Body.Close()
 }
 
 

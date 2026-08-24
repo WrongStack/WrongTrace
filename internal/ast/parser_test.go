@@ -430,3 +430,40 @@ func TestMultiLineDiffCounting(t *testing.T) {
 		t.Fatalf("expected multi-line diff, got AddedLines=%d DeletedLines=%d (snippet:\n%s)", ev.AddedLines, ev.DeletedLines, ev.DiffSnippet)
 	}
 }
+
+func TestParse_GenericLanguages(t *testing.T) {
+	eng := newTestEngine(t)
+
+	// 1. Rust parsing
+	rustSrc := `
+pub fn calculate_hash(data: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    hasher.finish().to_string()
+}
+`
+	rustSnap := parseOrFatal(t, eng, "src/lib.rs", rustSrc)
+	if len(rustSnap.Nodes) != 1 {
+		t.Errorf("expected 1 Rust function node, got %d", len(rustSnap.Nodes))
+	}
+
+	// 2. Ruby parsing
+	rubySrc := `
+def process_payment(amount)
+  puts "Processing #{amount}"
+end
+`
+	rubySnap := parseOrFatal(t, eng, "app/pay.rb", rubySrc)
+	if len(rubySnap.Nodes) != 1 {
+		t.Errorf("expected 1 Ruby function node, got %d", len(rubySnap.Nodes))
+	}
+
+	// 3. Reset and AllSnapshots
+	eng.SetSnapshot(rustSnap)
+	if all := eng.AllSnapshots(); len(all) != 1 {
+		t.Errorf("expected 1 snapshot, got %d", len(all))
+	}
+	eng.Reset()
+	if all := eng.AllSnapshots(); len(all) != 0 {
+		t.Errorf("expected 0 snapshots after reset, got %d", len(all))
+	}
+}

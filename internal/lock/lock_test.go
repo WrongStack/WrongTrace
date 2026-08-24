@@ -85,3 +85,25 @@ func TestPortActiveCollision(t *testing.T) {
 		}
 	}
 }
+
+func TestInstanceLock_EdgeCases(t *testing.T) {
+	// 1. Nil lock release should not panic
+	var nilLock *InstanceLock
+	nilLock.Release()
+
+	// 2. Double release should be idempotent
+	tempDir := t.TempDir()
+	l, err := Acquire(tempDir, 0)
+	if err != nil {
+		t.Fatalf("acquire failed: %v", err)
+	}
+	l.Release()
+	l.Release() // second release
+
+	// 3. Invalid port should not block acquisition
+	l2, err := Acquire(tempDir, -1)
+	if err != nil {
+		t.Fatalf("acquire with port -1 failed: %v", err)
+	}
+	l2.Release()
+}
