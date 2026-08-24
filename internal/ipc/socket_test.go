@@ -431,4 +431,37 @@ func TestExtendedIPCMethods(t *testing.T) {
 	if resp.Error != nil {
 		t.Fatalf("system.listMethods failed: %v", resp.Error)
 	}
+
+	// 6. get_file_read_stats & get_file_diff_history
+	resp = srv.dispatch(&Request{
+		Method: "get_file_read_stats",
+		Params: params(t, `{"file_path":"main.go"}`),
+		ID:     8,
+	})
+	if resp.Error != nil {
+		t.Fatalf("get_file_read_stats failed: %v", resp.Error)
+	}
+
+	resp = srv.dispatch(&Request{
+		Method: "get_file_diff_history",
+		Params: params(t, `{"file_path":"main.go","limit":10}`),
+		ID:     9,
+	})
+	if resp.Error != nil {
+		t.Fatalf("get_file_diff_history failed: %v", resp.Error)
+	}
+
+	// 7. ConnectedCount
+	if count := srv.ConnectedCount(); count != 0 {
+		t.Errorf("expected 0 connected count, got %d", count)
+	}
+
+	// 8. isClientDisconnect
+	if !isClientDisconnect(errors.New("broken pipe")) {
+		t.Errorf("expected broken pipe to be client disconnect")
+	}
+	if isClientDisconnect(nil) {
+		t.Errorf("expected nil error to NOT be client disconnect")
+	}
 }
+

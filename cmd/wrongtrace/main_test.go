@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/wrongstack/wrongtrace/internal/db"
 )
 
 func TestRootCmd_HelpAndVersion(t *testing.T) {
@@ -218,3 +220,51 @@ func TestTraceCmd(t *testing.T) {
 		t.Fatalf("execute trace failed: %v", err)
 	}
 }
+
+func TestExportAndReport_Comprehensive(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "full_test.db")
+	store, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	_ = store.Migrate()
+	_ = store.InsertEvent(db.EventRecord{
+		EventID:    "ev-test-1",
+		RepoName:   "full-test",
+		FilePath:   "main.go",
+		Signature:  "func:main",
+		NodeType:   "function",
+		Action:     "ADDED",
+		BodyHash:   "h1",
+		LOC:        10,
+		OccurredAt: time.Now().UTC(),
+	})
+	_ = store.Close()
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+
+	exportCmd.Flags().Set("out", "")
+	reportCmd.Flags().Set("out", "")
+
+	// Export to stdout
+	rootCmd.SetArgs([]string{"export", "--db", dbPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute export to stdout failed: %v", err)
+	}
+
+	// Report JSON to stdout
+	rootCmd.SetArgs([]string{"report", "--db", dbPath, "--format", "json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute report json failed: %v", err)
+	}
+
+	// Status on populated DB
+	rootCmd.SetArgs([]string{"status", "--db", dbPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("execute status populated failed: %v", err)
+	}
+}
+

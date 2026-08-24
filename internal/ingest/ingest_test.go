@@ -1,9 +1,11 @@
 package ingest
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestExtractTargetFile_And_IsFileModifyingTool(t *testing.T) {
@@ -192,3 +194,31 @@ func TestSessionWatcher_GlobalDiscoveryAndFileReads(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionWatcher_StartPollingLifecycle(t *testing.T) {
+	sw := NewSessionWatcher(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	sw.StartPolling(ctx, 20*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+}
+
+func TestIngest_DirAndFileExistsHelpers(t *testing.T) {
+	tempDir := t.TempDir()
+	if !dirExists(tempDir) {
+		t.Errorf("expected dirExists=true for tempDir")
+	}
+	if fileExists(tempDir) {
+		t.Errorf("expected fileExists=false for tempDir")
+	}
+	file := filepath.Join(tempDir, "sample.txt")
+	_ = os.WriteFile(file, []byte("hello"), 0644)
+	if !fileExists(file) {
+		t.Errorf("expected fileExists=true for sample.txt")
+	}
+	if dirExists(file) {
+		t.Errorf("expected dirExists=false for sample.txt")
+	}
+}
+

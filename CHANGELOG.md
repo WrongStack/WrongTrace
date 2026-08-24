@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.4] - 2026-08-25
+
+### Fixed & Hardened (Full-Stack Concurrency, Memory & Performance)
+- **Thread-Safe Store Access & Race Condition Elimination**:
+  - Replaced direct `e.cfg.Store` accesses in `ReportRun`, `VacuumDB`, and `ClearStale` with thread-safe `e.Store()` accessor, eliminating data race conditions and nil pointer dereference risks during concurrent project switching (`SwitchActiveProject`).
+- **Guardrail Lock Contention & Deadlock Prevention**:
+  - Implemented `isFileLockedUnlocked` internal lock evaluation to avoid duplicate lock acquisitions and eliminate lock contention between `CheckGuardrail` and `FileHealth`.
+- **Global Quota Limiter Budget Enforcement**:
+  - Fixed budget tracking in `QuotaLimiter` (`CheckSpend`, `CheckAndRecordSpend`, and `RecordSpend`) to accurately account for the `"global"` daily spend limit across distinct agents and projects without isolation leaks.
+- **AI Gateway Cache Savings Accounting**:
+  - Fixed `ResponseCache.Stats()` to accumulate and accurately report `totalSaved` USD upon LRU cache hits.
+- **Secret Scanner Hot-Path CPU Optimization**:
+  - Added short-payload fast-path early exit to `ScanAndRedactSecrets` in `internal/proxy/scanner.go`, reducing heap string allocations and CPU overhead during streaming LLM proxying.
+- **Dashboard WebSocket Debounce & Memory Leak Fix**:
+  - Refactored `useEffect` debounce mechanism in `web/src/pages/Dashboard.tsx` with stable reference map (`refetchMapRef`), eliminating debounce timer leaks, stale closures, and render churn during high-frequency WebSocket event bursts.
+- **Comprehensive Test Suite & High Statement Coverage**:
+  - Added end-to-end unit and integration tests across CLI commands, JSON-RPC IPC methods, QuotaLimiter, ResponseCache, and Guardrail lifecycles, ensuring reliable stability.
+
+---
+
 ## [0.3.3] - 2026-08-24
 
 ### Fixed & Hardened (Memory, CPU & System Stability)

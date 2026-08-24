@@ -392,3 +392,67 @@ func TestFileLockingGuardrail_PathNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestGuardrailsAndLockLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test_guard.db")
+	st, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(); err != nil {
+		t.Fatalf("st.Migrate: %v", err)
+	}
+
+	eng := NewEngine(Config{Store: st, RepoName: "wrongtrace"})
+
+	// 1. Lock with options
+	info := eng.LockFileWithOptions("src/app.ts", "security audit", "admin", "run-101", 1*time.Hour)
+	if info.Owner != "admin" || info.Reason != "security audit" {
+		t.Errorf("unexpected lock info: %+v", info)
+	}
+
+	// List locks
+	locks := eng.ListLocks()
+	if len(locks) != 1 {
+		t.Errorf("expected 1 lock, got %d", len(locks))
+	}
+
+	// CheckGuardrail blocked on locked file
+	res, err := eng.CheckGuardrail("src/app.ts")
+	if err != nil || res.Allowed || !res.IsLocked {
+		t.Errorf("expected blocked guardrail, got res=%+v err=%v", res, err)
+	}
+
+	// CheckGuardrail on unlocked file
+	res2, err := eng.CheckGuardrail("src/clean.ts")
+	if err != nil || !res2.Allowed {
+		t.Errorf("expected clean file allowed, got res2=%+v err=%v", res2, err)
+	}
+
+	// Ping
+	if err := eng.Ping(); err != nil {
+		t.Errorf("ping failed: %v", err)
+	}
+
+	// RecordReadEvent
+	err = eng.RecordReadEvent(db.FileReadRecord{
+		FilePath:  "src/clean.ts",
+		AgentName: "TestAgent",
+		ModelName: "gpt-4o",
+	})
+	if err != nil {
+		t.Errorf("RecordReadEvent failed: %v", err)
+	}
+
+	// Empty read event
+	_ = eng.RecordReadEvent(db.FileReadRecord{})
+
+	// FileHealth
+	h, err := eng.FileHealth("src/clean.ts")
+	if err != nil || h.HealthScore <= 0 {
+		t.Errorf("unexpected file health: %+v, err=%v", h, err)
+	}
+}
+

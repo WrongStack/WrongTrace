@@ -1144,3 +1144,100 @@ func TestProxy_CacheAndQuotasAndTraffic(t *testing.T) {
 	}
 }
 
+func TestQuotaLimiter_GlobalAndKeyBudgets(t *testing.T) {
+	q := NewQuotaLimiter()
+	q.SetBudget("global", 10.00)
+	q.SetBudget("agent-a", 3.00)
+
+	// CheckSpend for agent-a under $3 limit
+	allowed, rem, warn := q.CheckSpend("agent-a", 2.00)
+	if !allowed || warn != "" || rem != 3.00 {
+		t.Errorf("expected agent-a allowed, rem=%f, warn=%s", rem, warn)
+	}
+
+	// CheckSpend exceeding agent-a limit
+	allowed, _, warn = q.CheckSpend("agent-a", 4.00)
+	if allowed || warn == "" {
+		t.Errorf("expected agent-a blocked on $4")
+	}
+
+	// RecordSpend for agent-a
+	q.RecordSpend("agent-a", 2.50)
+	spend, limit := q.GetSpend("agent-a")
+	if spend != 2.50 || limit != 3.00 {
+		t.Errorf("spend=%f, limit=%f", spend, limit)
+	}
+
+	// Global spend should also reflect the 2.50
+	globalSpend, globalLimit := q.GetSpend("global")
+	if globalSpend != 2.50 || globalLimit != 10.00 {
+		t.Errorf("globalSpend=%f, globalLimit=%f", globalSpend, globalLimit)
+	}
+
+	// Agent-b (no specific limit, uses global limit $10)
+	allowed, rem, _ = q.CheckSpend("agent-b", 5.00)
+	if !allowed || rem != 7.50 {
+		t.Errorf("expected agent-b allowed with 7.50 remaining global, got allowed=%v, rem=%f", allowed, rem)
+	}
+
+	// Spend $6 on agent-b
+	allowed, rem, _ = q.CheckAndRecordSpend("agent-b", 6.00)
+	if !allowed {
+		t.Errorf("expected $6 on agent-b allowed")
+	}
+
+	// Now total global is 2.50 + 6.00 = 8.50. Another $2 should exceed global $10 limit
+	allowed, _, warn = q.CheckSpend("agent-c", 2.00)
+	if allowed || warn == "" {
+		t.Errorf("expected global budget exceeded for agent-c, got allowed=%v, warn=%s", allowed, warn)
+	}
+
+	// Test zero/negative spend no-op
+	q.RecordSpend("agent-a", 0)
+	q.RecordSpend("agent-a", -1)
+}
+
+func TestResponseCache_FullLifecycle(t *testing.T) {
+	c := NewResponseCache(2, 50*time.Millisecond)
+
+	key1 := ComputeKey("openai", "gpt-4o", []byte("prompt 1"))
+	key2 := ComputeKey("openai", "gpt-4o", []byte("prompt 2"))
+	key3 := ComputeKey("openai", "gpt-4o", []byte("prompt 3"))
+
+	c.Set(key1, "openai", "gpt-4o", 200, map[string]string{"Content-Type": "application/json"}, []byte("resp 1"), false, 100, 0.05, 0)
+	c.Set(key2, "openai", "gpt-4o", 200, map[string]string{"Content-Type": "application/json"}, []byte("resp 2"), false, 200, 0.10, 0)
+
+	// Hit key1
+	item, ok := c.Get(key1)
+	if !ok || item == nil || string(item.Body) != "resp 1" {
+		t.Fatalf("expected key1 hit")
+	}
+
+	// Add key3 -> should evict key2 (oldest)
+	c.Set(key3, "openai", "gpt-4o", 200, nil, []byte("resp 3"), false, 300, 0.15, 0)
+
+	entries, hits, misses, rate, saved := c.Stats()
+	if entries > 2 || hits != 1 || misses != 0 || rate <= 0 || saved != 0.05 {
+		t.Errorf("stats mismatch: entries=%d hits=%d misses=%d rate=%f saved=%f", entries, hits, misses, rate, saved)
+	}
+
+	// Large body guard (>256KB)
+	largeBody := make([]byte, 300*1024)
+	c.Set("large", "openai", "gpt-4o", 200, nil, largeBody, false, 0, 0, 0)
+	if _, ok := c.Get("large"); ok {
+		t.Errorf("large body should not be cached")
+	}
+
+	// TTL Expiration
+	time.Sleep(60 * time.Millisecond)
+	if _, ok := c.Get(key1); ok {
+		t.Errorf("key1 should have expired")
+	}
+
+	c.Clear()
+	if entries, _, _, _, _ := c.Stats(); entries != 0 {
+		t.Errorf("expected 0 entries after clear, got %d", entries)
+	}
+}
+
+
