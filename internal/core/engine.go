@@ -62,7 +62,7 @@ type Engine struct {
 	correlate  time.Duration
 
 	lockMu          sync.RWMutex
-	lockedFiles     map[string]string
+	lockedFiles     map[string]LockInfo
 	projects        map[string]ProjectProfile
 	activeProjectID string
 	watcher         WatcherAPI
@@ -70,6 +70,9 @@ type Engine struct {
 
 	indexMu     sync.RWMutex
 	indexStatus IndexProgress
+
+	ipcMu      sync.RWMutex
+	ipcTraffic []ipc.IPCTrafficRecord
 
 	rootMu    sync.RWMutex
 	watchRoot string
@@ -122,7 +125,7 @@ func NewEngine(cfg Config) *Engine {
 		hub:             NewHub(),
 		activeRuns:      make(map[string]runMeta),
 		correlate:       10 * time.Minute,
-		lockedFiles:     make(map[string]string),
+		lockedFiles:     make(map[string]LockInfo),
 		projects:        loadedProjects,
 		activeProjectID: activeProjID,
 		webhooks:        dispatcher,
@@ -526,7 +529,18 @@ func (e *Engine) FileHealth(path string) (IPCHealth, error) {
 	if err != nil {
 		return IPCHealth{}, err
 	}
-	return ipcHealthFromDB(h), nil
+	res := ipcHealthFromDB(h)
+	if locked, lockInfo := e.IsFileLocked(path); locked {
+		res.IsLocked = true
+		res.LockReason = lockInfo.Reason
+		res.LockOwner = lockInfo.Owner
+		res.LockOwnerRunID = lockInfo.OwnerRunID
+		if !lockInfo.ExpiresAt.IsZero() {
+			exp := lockInfo.ExpiresAt
+			res.LockExpiresAt = &exp
+		}
+	}
+	return res, nil
 }
 
 // Ping verifies the daemon is alive.
@@ -582,6 +596,14 @@ func (e *Engine) GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRec
 	return e.cfg.Store.RecentEvents(limit, filter)
 }
 
+// GetRecentEventsFiltered queries recent events with flexible repository, file, and timestamp constraints.
+func (e *Engine) GetRecentEventsFiltered(limit int, repo string, filePath string, since time.Time) ([]db.EventRecord, error) {
+	if e.cfg.Store == nil {
+		return nil, nil
+	}
+	return e.cfg.Store.RecentEventsFiltered(limit, repo, filePath, since)
+}
+
 // GetRecentFileEvents returns recent diff and AST events specifically matching a file.
 func (e *Engine) GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error) {
 	if e.cfg.Store == nil {
@@ -622,6 +644,14 @@ func (e *Engine) GetFileModelActivity(filePath string) ([]db.ModelActivitySummar
 	return e.cfg.Store.FileModelActivity(filePath)
 }
 
+// GetAllFileModelActivity returns aggregated model activity across all files.
+func (e *Engine) GetAllFileModelActivity(limit int) ([]db.ModelActivitySummary, error) {
+	if e.cfg.Store == nil {
+		return nil, nil
+	}
+	return e.cfg.Store.AllFileModelActivity(limit)
+}
+
 // GetModelFrictionReport returns inter-agent cross-thrashing and collision analytics.
 func (e *Engine) GetModelFrictionReport(limit int) (*db.InterAgentFrictionReport, error) {
 	if e.cfg.Store == nil {
@@ -635,6 +665,41 @@ func (e *Engine) IndexStatus() IndexProgress {
 	e.indexMu.RLock()
 	defer e.indexMu.RUnlock()
 	return e.indexStatus
+}
+
+// RecordIPCTraffic stores and broadcasts a live JSON-RPC interaction from an IPC client (e.g. WrongStack).
+func (e *Engine) RecordIPCTraffic(rec ipc.IPCTrafficRecord) {
+	e.ipcMu.Lock()
+	if e.ipcTraffic == nil {
+		e.ipcTraffic = make([]ipc.IPCTrafficRecord, 0, 100)
+	}
+	e.ipcTraffic = append(e.ipcTraffic, rec)
+	if len(e.ipcTraffic) > 100 {
+		e.ipcTraffic = e.ipcTraffic[len(e.ipcTraffic)-100:]
+	}
+	e.ipcMu.Unlock()
+
+	if e.hub != nil {
+		e.hub.Broadcast(WSEvent{
+			Type:    "ipc_traffic",
+			Payload: rec,
+		})
+	}
+}
+
+// GetIPCTraffic returns recent recorded IPC interactions in reverse chronological order.
+func (e *Engine) GetIPCTraffic() []ipc.IPCTrafficRecord {
+	e.ipcMu.RLock()
+	defer e.ipcMu.RUnlock()
+	if len(e.ipcTraffic) == 0 {
+		return []ipc.IPCTrafficRecord{}
+	}
+	out := make([]ipc.IPCTrafficRecord, len(e.ipcTraffic))
+	copy(out, e.ipcTraffic)
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
 // recentRunID returns the most recently seen run_id within the correlation

@@ -24,6 +24,7 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ingest"
+	"github.com/wrongstack/wrongtrace/internal/ipc"
 	"github.com/wrongstack/wrongtrace/internal/models"
 	"github.com/wrongstack/wrongtrace/internal/profiler"
 	"github.com/wrongstack/wrongtrace/internal/proxy"
@@ -36,9 +37,12 @@ type EngineAPI interface {
 	Atlas(repoFilter ...string) (core.AtlasSnapshot, error)
 	FileHealth(path string) (core.IPCHealth, error)
 	CheckGuardrail(path string) (core.GuardrailResult, error)
-	LockFile(path, reason string)
+	LockFile(path, reason string) core.LockInfo
+	LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) core.LockInfo
 	UnlockFile(path string)
-	IsFileLocked(path string) (bool, string)
+	IsFileLocked(path string) (bool, core.LockInfo)
+	ListLocks() []core.LockInfo
+	ReportRun(p ipc.TelemetryReport) error
 	ModelCatalog() []models.ModelInfo
 	ProviderCatalog() []models.ProviderInfo
 	UpsertModel(m models.ModelInfo)
@@ -59,13 +63,16 @@ type EngineAPI interface {
 	VacuumDB() error
 	ClearStale(days int) (int64, error)
 	GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error)
+	GetRecentEventsFiltered(limit int, repo string, filePath string, since time.Time) ([]db.EventRecord, error)
 	GetSymbolHistory(filePath, signature string, limit int) ([]db.SymbolHistoryRecord, error)
 	GetFileModelActivity(filePath string) ([]db.ModelActivitySummary, error)
+	GetAllFileModelActivity(limit int) ([]db.ModelActivitySummary, error)
 	GetModelFrictionReport(limit int) (*db.InterAgentFrictionReport, error)
 	GetFileReadStats(filePath string) (db.FileReadStats, error)
 	GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileReadRecord, error)
 	GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error)
 	GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, error)
+	GetIPCTraffic() []ipc.IPCTrafficRecord
 	IndexStatus() core.IndexProgress
 	Hub() *core.Hub
 	Store() *db.Store
@@ -230,17 +237,32 @@ func (s *Server) buildRouter() chi.Router {
 		}),
 	}
 	r.Route("/api", func(r chi.Router) {
+		r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusNotFound, "route not found: "+r.Method+" "+r.URL.Path)
+		})
+		r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method+" "+r.URL.Path)
+		})
+
 		r.Get("/health", h.Health)
+		r.Post("/telemetry", h.ReportTelemetry)
+		r.Post("/telemetry/report", h.ReportTelemetry)
 		r.Get("/metrics/overview", h.Overview)
 		r.Get("/metrics/thrashing", h.Thrashing)
 		r.Get("/metrics/models", h.Models)
 		r.Get("/metrics/recent", h.RecentEvents)
+		r.Get("/events/recent", h.RecentEvents)
+		r.Get("/events", h.RecentEvents)
 		r.Get("/metrics/friction", h.ModelFriction)
 		r.Get("/metrics/cross-thrash", h.ModelFriction)
+		r.Get("/cross-thrash", h.ModelFriction)
+		r.Get("/friction", h.ModelFriction)
 		r.Get("/atlas", h.Atlas)
 		r.Get("/atlas/status", h.AtlasStatus)
 		r.Get("/file/health", h.FileHealth)
 		r.Get("/guardrail/check", h.CheckGuardrail)
+		r.Get("/guardrail/locks", h.ListLocks)
+		r.Get("/guardrails/locks", h.ListLocks)
 		r.Post("/guardrail/lock", h.LockFile)
 		r.Post("/guardrail/unlock", h.UnlockFile)
 
@@ -252,6 +274,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/file/heatmap", h.GetFileReadHeatmap)
 		r.Get("/files/activity", h.FileModelActivity)
 		r.Get("/file/activity", h.FileModelActivity)
+		r.Get("/ipc/traffic", h.GetIPCTraffic)
 
 		// AST Symbol History & Evolution Lineage
 		r.Get("/symbol/history", h.SymbolHistory)

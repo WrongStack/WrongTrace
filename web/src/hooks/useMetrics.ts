@@ -227,5 +227,13 @@ export function useModelFriction(limit: number = 200) {
   });
 }
 
+export function useIPCTraffic() {
+  return useQuery<import('../types').IPCTrafficRecord[]>({
+    queryKey: ['ipc_traffic'],
+    queryFn: () => jget<import('../types').IPCTrafficRecord[]>(`${base}/ipc/traffic`),
+    refetchInterval: 2_500,
+  });
+}
+
 
 

@@ -532,5 +532,19 @@ export interface InterAgentFrictionReport {
   top_friction_pair: string;
 }
 
+export interface IPCTrafficRecord {
+  id: string;
+  method: string;
+  params: Record<string, any>;
+  result?: any;
+  error?: {
+    code: number;
+    message: string;
+  };
+  duration_ms: number;
+  timestamp: string;
+  client_addr?: string;
+}
+
 
 

@@ -749,4 +749,224 @@ func TestServer_FrictionAndAtlasEndpoints(t *testing.T) {
 	_ = vacResp.Body.Close()
 }
 
+func TestServer_Enhancements_WrongStackReport(t *testing.T) {
+	engine, store, ts := newTestServer(t)
+
+	// 1. GET /api/health returns ok:true and status:ok
+	var healthResp map[string]interface{}
+	resp := getJSON(t, ts.URL+"/api/health", &healthResp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/health = %d", resp.StatusCode)
+	}
+	if healthResp["ok"] != true || healthResp["status"] != "ok" {
+		t.Errorf("health resp missing ok:true: %+v", healthResp)
+	}
+
+	// 2. POST /api/telemetry (CRITICAL missing endpoint)
+	telemetryBody := `{
+		"run_id": "run-ws-402",
+		"task_id": "TASK-12",
+		"agent_name": "WrongStack",
+		"model_name": "claude-3-7-sonnet",
+		"provider": "anthropic",
+		"prompt_tokens": 12000,
+		"completion_tokens": 850,
+		"cost_usd": 0.048,
+		"intent": "Refactor auth middleware"
+	}`
+	postResp, err := http.Post(ts.URL+"/api/telemetry", "application/json", strings.NewReader(telemetryBody))
+	if err != nil {
+		t.Fatalf("POST /api/telemetry: %v", err)
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/telemetry status = %d, want 200", postResp.StatusCode)
+	}
+	var telemResult map[string]interface{}
+	if err := json.NewDecoder(postResp.Body).Decode(&telemResult); err != nil {
+		t.Fatalf("decode telemetry result: %v", err)
+	}
+	if telemResult["ok"] != true || telemResult["event_id"] != "run-ws-402" {
+		t.Errorf("telemetry result wrong: %+v", telemResult)
+	}
+
+	// Seed code mutation event correlated with the run
+	now := time.Now().UTC()
+	err = store.InsertEvent(db.EventRecord{
+		EventID:      "ev-corr-1",
+		RunID:        "run-ws-402",
+		RepoName:     "srv-test",
+		FilePath:     "internal/server/server.go",
+		Signature:    "function:server.go::New",
+		NodeType:     "function",
+		Action:       "MODIFIED",
+		BodyHash:     "hash-new",
+		LOC:          10,
+		OccurredAt:   now,
+	})
+	if err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	// 3. GET /api/events/recent with since, limit, repo and author_model
+	var recentEvents []db.EventRecord
+	getJSON(t, ts.URL+"/api/events/recent?limit=50&repo=srv-test", &recentEvents)
+	if len(recentEvents) == 0 {
+		t.Fatalf("GET /api/events/recent returned 0 events")
+	}
+	foundCorr := false
+	for _, ev := range recentEvents {
+		if ev.EventID == "ev-corr-1" {
+			foundCorr = true
+			if ev.AuthorModel != "claude-3-7-sonnet" {
+				t.Errorf("expected author_model claude-3-7-sonnet, got %q", ev.AuthorModel)
+			}
+			if ev.Timestamp.IsZero() {
+				t.Errorf("expected timestamp populated on event")
+			}
+		}
+	}
+	if !foundCorr {
+		t.Errorf("ev-corr-1 missing from /api/events/recent")
+	}
+
+	// 4. GET /api/cross-thrash
+	var crossReport db.InterAgentFrictionReport
+	getJSON(t, ts.URL+"/api/cross-thrash", &crossReport)
+	// Must return 200 and valid report struct
+
+	// 5. POST /api/guardrail/lock with owner and TTL
+	lockBody := `{
+		"path": "internal/server/server.go",
+		"reason": "WrongStack refactor in progress",
+		"owner": "WrongStack (claude-3-7-sonnet)",
+		"owner_run_id": "run-ws-402",
+		"ttl_minutes": 15
+	}`
+	lockResp, err := http.Post(ts.URL+"/api/guardrail/lock", "application/json", strings.NewReader(lockBody))
+	if err != nil {
+		t.Fatalf("POST /api/guardrail/lock: %v", err)
+	}
+	defer lockResp.Body.Close()
+	if lockResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/guardrail/lock status = %d, want 200", lockResp.StatusCode)
+	}
+	var lockResult map[string]interface{}
+	_ = json.NewDecoder(lockResp.Body).Decode(&lockResult)
+	if lockResult["ok"] != true || lockResult["status"] != "locked" || lockResult["owner"] != "WrongStack (claude-3-7-sonnet)" {
+		t.Errorf("lock result wrong: %+v", lockResult)
+	}
+	if lockResult["expires_at"] == nil {
+		t.Errorf("lock result missing expires_at TTL timestamp")
+	}
+
+	// 6. GET /api/guardrail/locks lists active locks
+	var activeLocks []core.LockInfo
+	getJSON(t, ts.URL+"/api/guardrail/locks", &activeLocks)
+	if len(activeLocks) != 1 || activeLocks[0].Owner != "WrongStack (claude-3-7-sonnet)" {
+		t.Errorf("expected 1 active lock, got: %+v", activeLocks)
+	}
+
+	// 7. GET /api/file/health returns lock status
+	var fileHealthResp struct {
+		FilePath             string `json:"file_path"`
+		HealthScore          int    `json:"health_score"`
+		IsFragile            bool   `json:"is_fragile"`
+		RecentThrashingCount int    `json:"recent_thrashing_count"`
+		IsLocked             bool   `json:"is_locked"`
+		LockReason           string `json:"lock_reason"`
+		LockOwner            string `json:"lock_owner"`
+	}
+	getJSON(t, ts.URL+"/api/file/health?path=internal/server/server.go", &fileHealthResp)
+	if !fileHealthResp.IsLocked || fileHealthResp.LockOwner != "WrongStack (claude-3-7-sonnet)" {
+		t.Errorf("file health missing lock details: %+v", fileHealthResp)
+	}
+
+	// 8. GET /api/symbol/history with free-form signature like "New()" or "New"
+	var symbolHist []db.SymbolHistoryRecord
+	getJSON(t, ts.URL+"/api/symbol/history?path=internal/server/server.go&signature=New()", &symbolHist)
+	if len(symbolHist) == 0 {
+		t.Errorf("symbol history with 'New()' query returned empty list")
+	}
+
+	// GET /api/symbol/history with path only
+	var pathHist []db.SymbolHistoryRecord
+	getJSON(t, ts.URL+"/api/symbol/history?path=internal/server/server.go", &pathHist)
+	if len(pathHist) == 0 {
+		t.Errorf("symbol history with path only returned empty list")
+	}
+
+	// 9. GET /api/atlas with summary=true, prefix, pagination
+	var summaryAtlas core.AtlasSnapshot
+	getJSON(t, ts.URL+"/api/atlas?summary=true&limit=10", &summaryAtlas)
+	if len(summaryAtlas.Packages) > 0 && len(summaryAtlas.Packages[0].Files) > 0 {
+		if len(summaryAtlas.Packages[0].Files[0].Symbols) != 0 {
+			t.Errorf("expected 0 symbols in summary mode, got %d", len(summaryAtlas.Packages[0].Files[0].Symbols))
+		}
+	}
+
+	// 10. GET /api/files/activity without path returns 200 with all activity
+	var allAct []db.ModelActivitySummary
+	actResp := getJSON(t, ts.URL+"/api/files/activity", &allAct)
+	if actResp.StatusCode != http.StatusOK {
+		t.Errorf("GET /api/files/activity without path = %d, want 200", actResp.StatusCode)
+	}
+
+	// 11. POST /api/guardrail/lock on locked file returns 409 Conflict when locked by different owner
+	_ = engine.LockFileWithOptions("internal/server/server.go", "first lock", "Agent1", "run-1", 10*time.Minute)
+	conflictBody := `{"path":"internal/server/server.go","owner":"Agent2","reason":"attempting lock"}`
+	confResp, err := http.Post(ts.URL+"/api/guardrail/lock", "application/json", strings.NewReader(conflictBody))
+	if err != nil {
+		t.Fatalf("POST conflict lock: %v", err)
+	}
+	defer confResp.Body.Close()
+	if confResp.StatusCode != http.StatusConflict {
+		t.Errorf("expected 409 Conflict when file locked by another owner, got %d", confResp.StatusCode)
+	}
+	var confJson map[string]interface{}
+	_ = json.NewDecoder(confResp.Body).Decode(&confJson)
+	if confJson["status"] != "conflict" || confJson["owner"] != "Agent1" {
+		t.Errorf("conflict payload unexpected: %+v", confJson)
+	}
+
+	// 12. GET /api/nonexistent returns JSON 404
+	errResp, err := http.Get(ts.URL + "/api/nonexistent/endpoint")
+	if err != nil {
+		t.Fatalf("GET nonexistent: %v", err)
+	}
+	defer errResp.Body.Close()
+	if errResp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", errResp.StatusCode)
+	}
+	var errBody map[string]interface{}
+	_ = json.NewDecoder(errResp.Body).Decode(&errBody)
+	if errBody["error"] == nil || errBody["message"] == nil {
+		t.Errorf("expected JSON error structure, got: %+v", errBody)
+	}
+
+	// 13. GET /api/events/recent?since=...
+	var sinceEvents []db.EventRecord
+	getJSON(t, ts.URL+"/api/events/recent?since=2026-08-24T00:00:00Z", &sinceEvents)
+	if len(sinceEvents) == 0 {
+		t.Errorf("expected events with since filter, got 0")
+	}
+
+	// 14. POST /api/guardrail/unlock unlocks file
+	unlockBody := `{"path":"internal/server/server.go"}`
+	unlockResp, err := http.Post(ts.URL+"/api/guardrail/unlock", "application/json", strings.NewReader(unlockBody))
+	if err != nil {
+		t.Fatalf("POST /api/guardrail/unlock: %v", err)
+	}
+	defer unlockResp.Body.Close()
+	if unlockResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/guardrail/unlock = %d", unlockResp.StatusCode)
+	}
+	getJSON(t, ts.URL+"/api/file/health?path=internal/server/server.go", &fileHealthResp)
+	if fileHealthResp.IsLocked {
+		t.Errorf("file still locked after unlock")
+	}
+
+	_ = engine
+}
+
 

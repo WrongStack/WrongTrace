@@ -177,8 +177,8 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 	}
 	res := wireResult(t, resp)
 	tools, ok := res["tools"].([]interface{})
-	if !ok || len(tools) != 8 {
-		t.Fatalf("want 8 tools, got %#v", res["tools"])
+	if !ok || len(tools) != 9 {
+		t.Fatalf("want 9 tools, got %#v", res["tools"])
 	}
 
 	byName := map[string]map[string]interface{}{}
@@ -198,6 +198,15 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 	}
 	if _, ok := byName["check_guardrail"]; !ok {
 		t.Fatalf("check_guardrail missing: %v", byName)
+	}
+	if _, ok := byName["lock_file"]; !ok {
+		t.Fatalf("lock_file missing: %v", byName)
+	}
+	if _, ok := byName["unlock_file"]; !ok {
+		t.Fatalf("unlock_file missing: %v", byName)
+	}
+	if _, ok := byName["list_locks"]; !ok {
+		t.Fatalf("list_locks missing: %v", byName)
 	}
 	if _, ok := byName["report_file_read"]; !ok {
 		t.Fatalf("report_file_read missing: %v", byName)
@@ -222,7 +231,7 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 		}
 		props, _ := schema["properties"].(map[string]interface{})
 		reqd, _ := schema["required"].([]interface{})
-		if len(props) == 0 || len(reqd) == 0 {
+		if name != "list_locks" && (len(props) == 0 || len(reqd) == 0) {
 			t.Errorf("tool %s: properties/required empty", name)
 		}
 		for _, r := range reqd {

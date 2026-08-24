@@ -79,7 +79,9 @@ type EventRecord struct {
 	DiffSnippet  string    `json:"diff_snippet"`
 	AddedLines   int       `json:"added_lines"`
 	DeletedLines int       `json:"deleted_lines"`
+	AuthorModel  string    `json:"author_model,omitempty"`
 	OccurredAt   time.Time `json:"event_time"`
+	Timestamp    time.Time `json:"timestamp,omitempty"`
 }
 
 // UpsertRun inserts an agent_run, replacing any existing row with the same
@@ -153,42 +155,66 @@ func (s *Store) InsertEvent(e EventRecord) error {
 
 // RecentEvents returns the N most recent events for the live feed, optionally filtered by repo_name.
 func (s *Store) RecentEvents(limit int, repoFilter ...string) ([]EventRecord, error) {
-	if limit <= 0 {
-		limit = 50
-	}
 	var repo string
 	if len(repoFilter) > 0 {
 		repo = repoFilter[0]
 	}
+	return s.RecentEventsFiltered(limit, repo, "", time.Time{})
+}
 
-	var query string
+// RecentFileEvents returns the N most recent AST events specifically matching a file path.
+func (s *Store) RecentFileEvents(filePath string, limit int) ([]EventRecord, error) {
+	return s.RecentEventsFiltered(limit, "", filePath, time.Time{})
+}
+
+// RecentEventsFiltered queries recent AST and code mutation events with flexible filtering.
+func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, since time.Time) ([]EventRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	var whereClauses []string
 	var args []any
-	if repo == "" {
-		query = `
-			SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
-			       action, ast_content_hash, lines_of_code,
-			       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
-			       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
-			FROM code_node_events
-			ORDER BY event_time DESC
-			LIMIT ?
-		`
-		args = []any{limit}
-	} else {
-		query = `
-			SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
-			       action, ast_content_hash, lines_of_code,
-			       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
-			       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
-			FROM code_node_events
-			WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL)
-			ORDER BY event_time DESC
-			LIMIT ?
-		`
-		args = []any{repo, limit}
+
+	if repo != "" && repo != "all" && repo != "*" {
+		whereClauses = append(whereClauses, "(LOWER(e.repo_name) = LOWER(?) OR e.repo_name = '' OR e.repo_name IS NULL)")
+		args = append(args, repo)
 	}
 
-	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if filePath != "" {
+		normSlash := strings.ReplaceAll(strings.TrimSpace(filePath), "\\", "/")
+		normSlash = strings.TrimPrefix(normSlash, "./")
+		whereClauses = append(whereClauses, "(e.file_path = ? OR REPLACE(e.file_path, '\\', '/') = ? OR REPLACE(e.file_path, '\\', '/') LIKE '%' || ? OR ? LIKE '%' || REPLACE(e.file_path, '\\', '/') OR LOWER(REPLACE(e.file_path, '\\', '/')) LIKE '%' || LOWER(?))")
+		args = append(args, filePath, normSlash, normSlash, normSlash, normSlash)
+	}
+
+	if !since.IsZero() {
+		whereClauses = append(whereClauses, "e.event_time >= ?")
+		args = append(args, since.UTC().Format("2006-01-02 15:04:05"))
+	}
+
+	whereSQL := ""
+	if len(whereClauses) > 0 {
+		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
+	}
+
+	query := fmt.Sprintf(`
+		SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
+		       e.action, COALESCE(e.ast_content_hash, ''), e.lines_of_code,
+		       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
+		       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
+		       COALESCE(r.model_name, 'unknown') AS author_model
+		FROM code_node_events e
+		LEFT JOIN agent_runs r ON e.run_id = r.run_id
+		%s
+		ORDER BY e.event_time DESC
+		LIMIT ?
+	`, whereSQL)
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("recent events: %w", err)
 	}
@@ -204,55 +230,12 @@ func (s *Store) RecentEvents(limit int, repoFilter ...string) ([]EventRecord, er
 		)
 		if err := rows.Scan(&e.EventID, runID, &e.RepoName, &e.FilePath,
 			&e.Signature, &e.NodeType, &e.Action, bodyHash, &e.LOC,
-			&e.StartLine, &e.EndLine, &e.DiffSnippet, &e.AddedLines, &e.DeletedLines, &ts); err != nil {
+			&e.StartLine, &e.EndLine, &e.DiffSnippet, &e.AddedLines, &e.DeletedLines, &ts,
+			&e.AuthorModel); err != nil {
 			return nil, fmt.Errorf("scan recent event: %w", err)
 		}
 		e.OccurredAt = parseDBTime(ts)
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
-// RecentFileEvents returns the N most recent AST events specifically matching a file path.
-func (s *Store) RecentFileEvents(filePath string, limit int) ([]EventRecord, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	ctx, cancel := s.withTimeout(context.Background())
-	defer cancel()
-
-	normSlash := strings.ReplaceAll(filePath, "\\", "/")
-
-	query := `
-		SELECT event_id, run_id, repo_name, file_path, node_signature, node_type,
-		       action, ast_content_hash, lines_of_code,
-		       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(diff_snippet, ''),
-		       COALESCE(added_lines, 0), COALESCE(deleted_lines, 0), event_time
-		FROM code_node_events
-		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%/' || ?)
-		ORDER BY event_time DESC
-		LIMIT ?
-	`
-	rows, err := s.db.QueryContext(ctx, query, filePath, normSlash, normSlash, limit)
-	if err != nil {
-		return nil, fmt.Errorf("recent file events: %w", err)
-	}
-	defer rows.Close()
-
-	out := make([]EventRecord, 0, limit)
-	for rows.Next() {
-		var (
-			e        EventRecord
-			ts       string
-			runID    = nullable(&e.RunID)
-			bodyHash = nullable(&e.BodyHash)
-		)
-		if err := rows.Scan(&e.EventID, runID, &e.RepoName, &e.FilePath,
-			&e.Signature, &e.NodeType, &e.Action, bodyHash, &e.LOC,
-			&e.StartLine, &e.EndLine, &e.DiffSnippet, &e.AddedLines, &e.DeletedLines, &ts); err != nil {
-			return nil, fmt.Errorf("scan recent file event: %w", err)
-		}
-		e.OccurredAt = parseDBTime(ts)
+		e.Timestamp = e.OccurredAt
 		out = append(out, e)
 	}
 	return out, rows.Err()
@@ -1256,7 +1239,7 @@ type SymbolHistoryRecord struct {
 	CostUSD          float64   `json:"cost_usd"`
 }
 
-// SymbolHistory returns the chronological revision history of a specific AST symbol / node.
+// SymbolHistory returns the chronological revision history of a specific AST symbol / node or all symbols in a file.
 func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHistoryRecord, error) {
 	if limit <= 0 {
 		limit = 100
@@ -1264,12 +1247,22 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
-	normSlash := strings.ReplaceAll(filePath, "\\", "/")
+	normSlash := strings.ReplaceAll(strings.TrimSpace(filePath), "\\", "/")
+	normSlash = strings.TrimPrefix(normSlash, "./")
+
+	cleanSig := strings.TrimSpace(signature)
+	if idx := strings.Index(cleanSig, "("); idx != -1 {
+		cleanSig = strings.TrimSpace(cleanSig[:idx])
+	}
+	cleanSig = strings.TrimPrefix(cleanSig, "*")
+	if idx := strings.LastIndex(cleanSig, "."); idx != -1 {
+		// e.g. "Engine.LockFile" -> try matching "LockFile" or full
+	}
 
 	var query string
 	var args []any
 
-	if filePath != "" && signature != "" {
+	if normSlash != "" && cleanSig != "" {
 		query = `
 			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
 			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
@@ -1280,13 +1273,13 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			       COALESCE(r.cost_usd, 0.0)
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%/' || ?)
-			  AND (e.node_signature = ? OR e.node_signature LIKE '%' || ? || '%')
+			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? OR ? LIKE '%' || REPLACE(e.file_path, '\', '/') OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?))
+			  AND (e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%' || LOWER(?) || '%' OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) OR LOWER(e.node_signature) LIKE '%:' || LOWER(?))
 			ORDER BY e.event_time ASC
 			LIMIT ?
 		`
-		args = []any{filePath, normSlash, normSlash, signature, signature, limit}
-	} else if filePath != "" {
+		args = []any{filePath, normSlash, normSlash, normSlash, normSlash, cleanSig, cleanSig, cleanSig, cleanSig, cleanSig, limit}
+	} else if normSlash != "" {
 		query = `
 			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
 			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
@@ -1297,11 +1290,27 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			       COALESCE(r.cost_usd, 0.0)
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%/' || ?)
+			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? OR ? LIKE '%' || REPLACE(e.file_path, '\', '/') OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?))
 			ORDER BY e.event_time ASC
 			LIMIT ?
 		`
-		args = []any{filePath, normSlash, normSlash, limit}
+		args = []any{filePath, normSlash, normSlash, normSlash, normSlash, limit}
+	} else if cleanSig != "" {
+		query = `
+			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
+			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
+			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
+			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
+			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
+			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
+			       COALESCE(r.cost_usd, 0.0)
+			FROM code_node_events e
+			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+			WHERE (e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%' || LOWER(?) || '%' OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) OR LOWER(e.node_signature) LIKE '%:' || LOWER(?))
+			ORDER BY e.event_time ASC
+			LIMIT ?
+		`
+		args = []any{cleanSig, cleanSig, cleanSig, cleanSig, cleanSig, limit}
 	} else {
 		query = `
 			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
@@ -1313,11 +1322,10 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			       COALESCE(r.cost_usd, 0.0)
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE (e.node_signature = ? OR e.node_signature LIKE '%' || ? || '%')
-			ORDER BY e.event_time ASC
+			ORDER BY e.event_time DESC
 			LIMIT ?
 		`
-		args = []any{signature, signature, limit}
+		args = []any{limit}
 	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -1368,7 +1376,8 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
-	normSlash := strings.ReplaceAll(filePath, "\\", "/")
+	normSlash := strings.ReplaceAll(strings.TrimSpace(filePath), "\\", "/")
+	normSlash = strings.TrimPrefix(normSlash, "./")
 	activityMap := make(map[string]*ModelActivitySummary)
 
 	// 1. Read operations per model
@@ -1376,10 +1385,10 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 		SELECT model_name, provider, COUNT(*), COALESCE(SUM(lines_read_count), 0),
 		       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cost_usd), 0.0), MAX(read_time)
 		FROM file_read_events
-		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%/' || ?)
+		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%' || ? OR ? LIKE '%' || REPLACE(file_path, '\', '/') OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%' || LOWER(?))
 		GROUP BY model_name
 	`
-	rRows, err := s.db.QueryContext(ctx, readQuery, filePath, normSlash, normSlash)
+	rRows, err := s.db.QueryContext(ctx, readQuery, filePath, normSlash, normSlash, normSlash, normSlash)
 	if err == nil {
 		defer rRows.Close()
 		for rRows.Next() {
@@ -1410,10 +1419,98 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 		       COALESCE(SUM(e.added_lines), 0), COALESCE(SUM(e.deleted_lines), 0), MAX(e.event_time)
 		FROM code_node_events e
 		LEFT JOIN agent_runs r ON e.run_id = r.run_id
-		WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%/' || ?)
+		WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? OR ? LIKE '%' || REPLACE(e.file_path, '\', '/') OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?))
 		GROUP BY r.model_name
 	`
-	wRows, err := s.db.QueryContext(ctx, writeQuery, filePath, normSlash, normSlash)
+	wRows, err := s.db.QueryContext(ctx, writeQuery, filePath, normSlash, normSlash, normSlash, normSlash)
+	if err == nil {
+		defer wRows.Close()
+		for wRows.Next() {
+			var (
+				model, prov, maxTime     string
+				count, linesAdd, linesDel int
+			)
+			if err := wRows.Scan(&model, &prov, &count, &linesAdd, &linesDel, &maxTime); err == nil {
+				t := parseDBTime(maxTime)
+				entry, ok := activityMap[model]
+				if !ok {
+					entry = &ModelActivitySummary{
+						ModelName: model,
+						Provider:  prov,
+					}
+					activityMap[model] = entry
+				}
+				if entry.Provider == "" && prov != "" {
+					entry.Provider = prov
+				}
+				entry.WriteEvents += count
+				entry.LinesAdded += linesAdd
+				entry.LinesDeleted += linesDel
+				if t.After(entry.LastActivityAt) {
+					entry.LastActivityAt = t
+				}
+			}
+		}
+	}
+
+	out := make([]ModelActivitySummary, 0, len(activityMap))
+	for _, entry := range activityMap {
+		out = append(out, *entry)
+	}
+	return out, nil
+}
+
+// AllFileModelActivity returns aggregated per-model read and write metrics across all monitored files.
+func (s *Store) AllFileModelActivity(limit int) ([]ModelActivitySummary, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	activityMap := make(map[string]*ModelActivitySummary)
+
+	// 1. Read operations per model
+	readQuery := `
+		SELECT model_name, provider, COUNT(*), COALESCE(SUM(lines_read_count), 0),
+		       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cost_usd), 0.0), MAX(read_time)
+		FROM file_read_events
+		GROUP BY model_name
+	`
+	rRows, err := s.db.QueryContext(ctx, readQuery)
+	if err == nil {
+		defer rRows.Close()
+		for rRows.Next() {
+			var (
+				model, prov, maxTime string
+				count, linesRead     int
+				tokens               int64
+				cost                 float64
+			)
+			if err := rRows.Scan(&model, &prov, &count, &linesRead, &tokens, &cost, &maxTime); err == nil {
+				t := parseDBTime(maxTime)
+				activityMap[model] = &ModelActivitySummary{
+					ModelName:      model,
+					Provider:       prov,
+					ReadCount:      count,
+					LinesRead:      linesRead,
+					ReadTokens:     tokens,
+					ReadCostUSD:    cost,
+					LastActivityAt: t,
+				}
+			}
+		}
+	}
+
+	// 2. Write / AST mutation operations per model
+	writeQuery := `
+		SELECT COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''), COUNT(e.event_id),
+		       COALESCE(SUM(e.added_lines), 0), COALESCE(SUM(e.deleted_lines), 0), MAX(e.event_time)
+		FROM code_node_events e
+		LEFT JOIN agent_runs r ON e.run_id = r.run_id
+		GROUP BY r.model_name
+	`
+	wRows, err := s.db.QueryContext(ctx, writeQuery)
 	if err == nil {
 		defer wRows.Close()
 		for wRows.Next() {

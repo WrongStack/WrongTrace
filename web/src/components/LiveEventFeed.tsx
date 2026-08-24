@@ -15,6 +15,10 @@ import {
 import { RichDiffViewer } from './RichDiffViewer';
 import type { EventRecord } from '../types';
 
+import { IPCTrafficView } from './IPCTrafficView';
+import { useIPCTraffic } from '../hooks/useMetrics';
+import { Terminal } from 'lucide-react';
+
 interface LiveEventFeedProps {
   events: EventRecord[];
   loading: boolean;
@@ -53,10 +57,12 @@ function actionColor(action: EventRecord['action']) {
 }
 
 export function LiveEventFeed({ events, loading }: LiveEventFeedProps) {
+  const [feedMode, setFeedMode] = useState<'ast' | 'ipc'>('ast');
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [filterAction, setFilterAction] = useState<string>('ALL');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const { data: ipcTraffic = [] } = useIPCTraffic();
 
   const filteredEvents = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -80,55 +86,85 @@ export function LiveEventFeed({ events, loading }: LiveEventFeedProps) {
     <div className="panel space-y-3">
       {/* Header & Controls */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/5 pb-3">
-        <div className="flex items-center gap-2">
-          <Radio className="h-4 w-4 text-accent animate-pulse" />
-          <h2 className="font-semibold tracking-tight text-sm flex items-center gap-2">
-            Live File & Code Change Stream
-            <span className="text-xs font-normal text-slate-500 font-mono">
-              ({filteredEvents.length} events)
-            </span>
-          </h2>
-        </div>
-
-        <div className="flex items-center gap-2">
-          {/* Action Filter */}
+        <div className="flex items-center gap-3">
           <div className="flex items-center bg-slate-900 border border-white/10 rounded-lg p-0.5 text-xs">
-            {['ALL', 'MODIFIED', 'ADDED', 'DELETED'].map((act) => (
-              <button
-                key={act}
-                onClick={() => setFilterAction(act)}
-                className={`px-2 py-0.5 rounded text-[10px] font-medium transition-all ${
-                  filterAction === act
-                    ? 'bg-accent text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {act}
-              </button>
-            ))}
-          </div>
+            <button
+              onClick={() => setFeedMode('ast')}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold transition-all ${
+                feedMode === 'ast'
+                  ? 'bg-accent text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Radio className="h-3.5 w-3.5 text-cyan-300 animate-pulse" />
+              <span>AST Mutations</span>
+              <span className="text-[10px] font-mono text-slate-300 bg-black/30 px-1 rounded">
+                {events.length}
+              </span>
+            </button>
 
-          {/* Search */}
-          <div className="relative">
-            <Search className="h-3 w-3 absolute left-2 top-1/2 -translate-y-1/2 text-slate-500" />
-            <input
-              type="text"
-              placeholder="Filter changes…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="pl-7 pr-2.5 py-1 text-xs bg-slate-900 border border-white/10 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-accent w-36 sm:w-44"
-            />
+            <button
+              onClick={() => setFeedMode('ipc')}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold transition-all ${
+                feedMode === 'ipc'
+                  ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Terminal className="h-3.5 w-3.5" />
+              <span>WrongStack IPC Pipe</span>
+              <span className={`text-[10px] font-mono px-1 rounded ${feedMode === 'ipc' ? 'bg-slate-900 text-cyan-300' : 'bg-black/30 text-slate-300'}`}>
+                {ipcTraffic.length}
+              </span>
+            </button>
           </div>
         </div>
+
+        {feedMode === 'ast' && (
+          <div className="flex items-center gap-2">
+            {/* Action Filter */}
+            <div className="flex items-center bg-slate-900 border border-white/10 rounded-lg p-0.5 text-xs">
+              {['ALL', 'MODIFIED', 'ADDED', 'DELETED'].map((act) => (
+                <button
+                  key={act}
+                  onClick={() => setFilterAction(act)}
+                  className={`px-2 py-0.5 rounded text-[10px] font-medium transition-all ${
+                    filterAction === act
+                      ? 'bg-accent text-white shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {act}
+                </button>
+              ))}
+            </div>
+
+            {/* Search */}
+            <div className="relative">
+              <Search className="h-3 w-3 absolute left-2 top-1/2 -translate-y-1/2 text-slate-500" />
+              <input
+                type="text"
+                placeholder="Filter changes…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="pl-7 pr-2.5 py-1 text-xs bg-slate-900 border border-white/10 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-accent w-36 sm:w-44"
+              />
+            </div>
+          </div>
+        )}
       </div>
 
-      {loading && <div className="text-xs text-slate-500 py-4">loading events…</div>}
+      {feedMode === 'ipc' ? (
+        <IPCTrafficView limit={100} />
+      ) : (
+        <>
+          {loading && <div className="text-xs text-slate-500 py-4">loading events…</div>}
 
-      {!loading && filteredEvents.length === 0 && (
-        <div className="text-xs text-slate-500 py-10 text-center">
-          waiting for file changes or AST node transitions…
-        </div>
-      )}
+          {!loading && filteredEvents.length === 0 && (
+            <div className="text-xs text-slate-500 py-10 text-center">
+              waiting for file changes or AST node transitions…
+            </div>
+          )}
 
       {/* Events List */}
       <ul className="divide-y divide-white/5 max-h-[500px] overflow-y-auto pr-1 space-y-1">
@@ -217,6 +253,8 @@ export function LiveEventFeed({ events, loading }: LiveEventFeedProps) {
           );
         })}
       </ul>
+        </>
+      )}
     </div>
   );
 }

@@ -9,16 +9,29 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/webhook"
 )
 
+// LockInfo records guardrail lock metadata including ownership and expiry TTL.
+type LockInfo struct {
+	Path       string    `json:"path"`
+	Reason     string    `json:"reason"`
+	Owner      string    `json:"owner,omitempty"`
+	OwnerRunID string    `json:"owner_run_id,omitempty"`
+	LockedAt   time.Time `json:"locked_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
 // GuardrailResult indicates whether an agent should proceed editing a file.
 type GuardrailResult struct {
-	Allowed              bool      `json:"allowed"`
-	HealthScore          int       `json:"health_score"`
-	RecentThrashingCount int       `json:"recent_thrashing_count"`
-	IsFragile            bool      `json:"is_fragile"`
-	IsLocked             bool      `json:"is_locked"`
-	LockReason           string    `json:"lock_reason,omitempty"`
-	Recommendation       string    `json:"recommendation"`
-	CheckedAt            time.Time `json:"checked_at"`
+	Allowed              bool       `json:"allowed"`
+	HealthScore          int        `json:"health_score"`
+	RecentThrashingCount int        `json:"recent_thrashing_count"`
+	IsFragile            bool       `json:"is_fragile"`
+	IsLocked             bool       `json:"is_locked"`
+	LockReason           string     `json:"lock_reason,omitempty"`
+	LockOwner            string     `json:"lock_owner,omitempty"`
+	LockOwnerRunID       string     `json:"lock_owner_run_id,omitempty"`
+	LockExpiresAt        *time.Time `json:"lock_expires_at,omitempty"`
+	Recommendation       string     `json:"recommendation"`
+	CheckedAt            time.Time  `json:"checked_at"`
 }
 
 // normalizeLockPath canonicalizes a path for lock bookkeeping. Both separator
@@ -31,18 +44,36 @@ func normalizeLockPath(p string) string {
 	return strings.ToLower(path.Clean(p))
 }
 
-// LockFile locks a file from agent modifications.
-func (e *Engine) LockFile(path, reason string) {
+// LockFile locks a file from agent modifications with default 15-minute TTL.
+func (e *Engine) LockFile(path, reason string) LockInfo {
+	return e.LockFileWithOptions(path, reason, "", "", 15*time.Minute)
+}
+
+// LockFileWithOptions locks a file with explicit owner, run ID, and duration.
+func (e *Engine) LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) LockInfo {
 	e.lockMu.Lock()
 	defer e.lockMu.Unlock()
 	if e.lockedFiles == nil {
-		e.lockedFiles = make(map[string]string)
+		e.lockedFiles = make(map[string]LockInfo)
 	}
 	norm := normalizeLockPath(path)
 	if reason == "" {
 		reason = "file is explicitly locked by administrator guardrail"
 	}
-	e.lockedFiles[norm] = reason
+	if ttl <= 0 {
+		ttl = 15 * time.Minute
+	}
+	now := time.Now().UTC()
+	info := LockInfo{
+		Path:       norm,
+		Reason:     reason,
+		Owner:      owner,
+		OwnerRunID: ownerRunID,
+		LockedAt:   now,
+		ExpiresAt:  now.Add(ttl),
+	}
+	e.lockedFiles[norm] = info
+	return info
 }
 
 // UnlockFile removes a lock on a file.
@@ -61,41 +92,77 @@ func (e *Engine) UnlockFile(path string) {
 	}
 }
 
-// IsFileLocked checks if a file is currently locked.
-func (e *Engine) IsFileLocked(path string) (bool, string) {
-	e.lockMu.RLock()
-	defer e.lockMu.RUnlock()
+// IsFileLocked checks if a file is currently locked and unexpired.
+func (e *Engine) IsFileLocked(path string) (bool, LockInfo) {
+	e.lockMu.Lock()
+	defer e.lockMu.Unlock()
 	if len(e.lockedFiles) == 0 {
-		return false, ""
+		return false, LockInfo{}
 	}
+	now := time.Now().UTC()
 	norm := normalizeLockPath(path)
-	if r, ok := e.lockedFiles[norm]; ok {
-		return true, r
-	}
-	for k, r := range e.lockedFiles {
-		if k == norm || strings.HasSuffix(norm, "/"+k) || strings.HasSuffix(k, "/"+norm) {
-			return true, r
+	if info, ok := e.lockedFiles[norm]; ok {
+		if now.After(info.ExpiresAt) {
+			delete(e.lockedFiles, norm)
+		} else {
+			return true, info
 		}
 	}
-	return false, ""
+	for k, info := range e.lockedFiles {
+		if now.After(info.ExpiresAt) {
+			delete(e.lockedFiles, k)
+			continue
+		}
+		if k == norm || strings.HasSuffix(norm, "/"+k) || strings.HasSuffix(k, "/"+norm) {
+			return true, info
+		}
+	}
+	return false, LockInfo{}
+}
+
+// ListLocks returns all active, non-expired file locks.
+func (e *Engine) ListLocks() []LockInfo {
+	e.lockMu.Lock()
+	defer e.lockMu.Unlock()
+	if len(e.lockedFiles) == 0 {
+		return []LockInfo{}
+	}
+	now := time.Now().UTC()
+	out := make([]LockInfo, 0, len(e.lockedFiles))
+	for k, info := range e.lockedFiles {
+		if now.After(info.ExpiresAt) {
+			delete(e.lockedFiles, k)
+			continue
+		}
+		out = append(out, info)
+	}
+	return out
 }
 
 // CheckGuardrail assesses file safety before an AI agent attempts to edit it.
 func (e *Engine) CheckGuardrail(path string) (GuardrailResult, error) {
-	locked, reason := e.IsFileLocked(path)
+	locked, lockInfo := e.IsFileLocked(path)
 	if locked {
 		if e.webhooks != nil {
 			e.webhooks.Dispatch(webhook.Payload{
 				EventType: webhook.EventGuardrailBlock,
 				Severity:  "critical",
-				Message:   fmt.Sprintf("Guardrail blocked modification on locked file: %s (%s)", path, reason),
-				Details:   map[string]interface{}{"file_path": path, "reason": reason},
+				Message:   fmt.Sprintf("Guardrail blocked modification on locked file: %s (%s)", path, lockInfo.Reason),
+				Details:   map[string]interface{}{"file_path": path, "reason": lockInfo.Reason, "owner": lockInfo.Owner},
 			})
+		}
+		var expPtr *time.Time
+		if !lockInfo.ExpiresAt.IsZero() {
+			exp := lockInfo.ExpiresAt
+			expPtr = &exp
 		}
 		return GuardrailResult{
 			Allowed:        false,
 			IsLocked:       true,
-			LockReason:     reason,
+			LockReason:     lockInfo.Reason,
+			LockOwner:      lockInfo.Owner,
+			LockOwnerRunID: lockInfo.OwnerRunID,
+			LockExpiresAt:  expPtr,
 			Recommendation: "BLOCKED: File is locked against automated agent changes.",
 			CheckedAt:      time.Now().UTC(),
 		}, nil

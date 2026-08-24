@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 )
@@ -139,19 +140,24 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 					"inputSchema": map[string]interface{}{
 						"type": "object",
 						"properties": map[string]interface{}{
-							"model":       map[string]string{"type": "string"},
-							"provider":    map[string]string{"type": "string"},
-							"task_id":     map[string]string{"type": "string"},
-							"intent":      map[string]string{"type": "string"},
-							"tokens_used": map[string]string{"type": "integer"},
-							"cost":        map[string]string{"type": "number"},
+							"model":             map[string]string{"type": "string"},
+							"model_name":        map[string]string{"type": "string"},
+							"provider":          map[string]string{"type": "string"},
+							"agent_name":        map[string]string{"type": "string"},
+							"task_id":           map[string]string{"type": "string"},
+							"intent":            map[string]string{"type": "string"},
+							"tokens_used":       map[string]string{"type": "integer"},
+							"prompt_tokens":     map[string]string{"type": "integer"},
+							"completion_tokens": map[string]string{"type": "integer"},
+							"cost":              map[string]string{"type": "number"},
+							"cost_usd":          map[string]string{"type": "number"},
 						},
 						"required": []string{"model", "provider", "task_id", "intent"},
 					},
 				},
 				{
 					"name":        "get_file_health_score",
-					"description": "Inspect a file's recent churn. Returns a 0-100 health score and a fragile flag so the agent can avoid files currently being thrashed.",
+					"description": "Inspect a file's recent churn and lock status. Returns a 0-100 health score, fragile flag, and guardrail lock status.",
 					"inputSchema": map[string]interface{}{
 						"type": "object",
 						"properties": map[string]interface{}{
@@ -162,12 +168,16 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 				},
 				{
 					"name":        "lock_file",
-					"description": "Lock a fragile file against unwanted edits while another critical refactor is underway.",
+					"description": "Lock a fragile file against unwanted edits with optional ownership and duration (TTL).",
 					"inputSchema": map[string]interface{}{
 						"type": "object",
 						"properties": map[string]interface{}{
-							"file_path": map[string]string{"type": "string"},
-							"reason":    map[string]string{"type": "string"},
+							"file_path":    map[string]string{"type": "string"},
+							"reason":       map[string]string{"type": "string"},
+							"owner":        map[string]string{"type": "string"},
+							"owner_run_id": map[string]string{"type": "string"},
+							"ttl_minutes":  map[string]string{"type": "integer"},
+							"ttl_seconds":  map[string]string{"type": "integer"},
 						},
 						"required": []string{"file_path"},
 					},
@@ -181,6 +191,16 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 							"file_path": map[string]string{"type": "string"},
 						},
 						"required": []string{"file_path"},
+					},
+				},
+				{
+					"name":        "list_locks",
+					"description": "List all active guardrail file locks and their TTL expiry times.",
+					"inputSchema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"filter": map[string]string{"type": "string"},
+						},
 					},
 				},
 				{
@@ -259,26 +279,37 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 	switch name {
 	case "report_telemetry":
 		model, _ := args["model"].(string)
+		if model == "" {
+			model, _ = args["model_name"].(string)
+		}
 		provider, _ := args["provider"].(string)
 		taskID, _ := args["task_id"].(string)
 		intent, _ := args["intent"].(string)
-		var tokens int64
-		if v, ok := args["tokens_used"]; ok && v != nil {
-			tokens = toInt64(v)
-		} else if v, ok := args["tokens"]; ok && v != nil {
-			tokens = toInt64(v)
-		} else if v, ok := args["prompt_tokens"]; ok && v != nil {
-			tokens = toInt64(v)
+		var promptTokens, completionTokens int64
+		if v, ok := args["prompt_tokens"]; ok && v != nil {
+			promptTokens = toInt64(v)
+		}
+		if v, ok := args["completion_tokens"]; ok && v != nil {
+			completionTokens = toInt64(v)
+		}
+		if promptTokens == 0 {
+			if v, ok := args["tokens_used"]; ok && v != nil {
+				promptTokens = toInt64(v)
+			} else if v, ok := args["tokens"]; ok && v != nil {
+				promptTokens = toInt64(v)
+			}
 		}
 		var cost float64
 		if v, ok := args["cost"]; ok && v != nil {
+			cost = toFloat(v)
+		} else if v, ok := args["cost_usd"]; ok && v != nil {
 			cost = toFloat(v)
 		}
 		if model == "" || provider == "" || taskID == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "model, provider, and task_id are required"}
 			return resp
 		}
-		runID, err := sink.ReportRunMCP(model, provider, taskID, intent, tokens, 0, cost)
+		runID, err := sink.ReportRunMCP(model, provider, taskID, intent, promptTokens, completionTokens, cost)
 		if err != nil {
 			resp.Error = &rpcError{Code: -32010, Message: err.Error()}
 			return resp
@@ -299,8 +330,8 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			resp.Error = &rpcError{Code: -32011, Message: err.Error()}
 			return resp
 		}
-		text := fmt.Sprintf("health_score=%d fragile=%v recent_thrashing_count=%d warning=%q",
-			h.HealthScore, h.IsFragile, h.RecentThrashingCount, h.Warning)
+		text := fmt.Sprintf("health_score=%d fragile=%v recent_thrashing_count=%d is_locked=%v warning=%q",
+			h.HealthScore, h.IsFragile, h.RecentThrashingCount, h.IsLocked, h.Warning)
 		resp.Result = map[string]interface{}{
 			"content": []map[string]interface{}{
 				{"type": "text", "text": text},
@@ -339,6 +370,28 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			resp.Error = &rpcError{Code: -32011, Message: err.Error()}
 			return resp
 		}
+		if h.IsLocked {
+			rec := fmt.Sprintf("GUARDRAIL BLOCKED: File %s is locked (%s).", path, h.LockReason)
+			text := fmt.Sprintf("allowed=false health_score=%d fragile=%v is_locked=true lock_reason=%q recommendation=%q",
+				h.HealthScore, h.IsFragile, h.LockReason, rec)
+			resp.Result = map[string]interface{}{
+				"content": []map[string]interface{}{
+					{"type": "text", "text": text},
+				},
+				"data": map[string]interface{}{
+					"allowed":                false,
+					"health_score":           h.HealthScore,
+					"is_fragile":             h.IsFragile,
+					"is_locked":              true,
+					"lock_reason":            h.LockReason,
+					"lock_owner":             h.LockOwner,
+					"lock_expires_at":        h.LockExpiresAt,
+					"recent_thrashing_count": h.RecentThrashingCount,
+					"recommendation":         rec,
+				},
+			}
+			return resp
+		}
 		allowed := !h.IsFragile && h.HealthScore >= 40
 		rec := "Safe to modify."
 		if h.IsFragile || h.HealthScore < 40 {
@@ -354,6 +407,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 				"allowed":                allowed,
 				"health_score":           h.HealthScore,
 				"is_fragile":             h.IsFragile,
+				"is_locked":              false,
 				"recent_thrashing_count": h.RecentThrashingCount,
 				"recommendation":         rec,
 			},
@@ -361,16 +415,28 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 	case "lock_file":
 		path, _ := args["file_path"].(string)
 		reason, _ := args["reason"].(string)
+		owner, _ := args["owner"].(string)
+		ownerRunID, _ := args["owner_run_id"].(string)
+		var ttl time.Duration = 15 * time.Minute
+		if mins := int(toInt64(args["ttl_minutes"])); mins > 0 {
+			ttl = time.Duration(mins) * time.Minute
+		} else if secs := int(toInt64(args["ttl_seconds"])); secs > 0 {
+			ttl = time.Duration(secs) * time.Second
+		}
 		if path == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
 			return resp
 		}
-		if locker, ok := sink.(interface{ LockFile(path, reason string) }); ok {
+		if locker, ok := sink.(interface {
+			LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration)
+		}); ok {
+			locker.LockFileWithOptions(path, reason, owner, ownerRunID, ttl)
+		} else if locker, ok := sink.(interface{ LockFile(path, reason string) }); ok {
 			locker.LockFile(path, reason)
 		}
 		resp.Result = map[string]interface{}{
 			"content": []map[string]interface{}{
-				{"type": "text", "text": fmt.Sprintf("File %s locked successfully. reason=%s", path, reason)},
+				{"type": "text", "text": fmt.Sprintf("File %s locked successfully. reason=%s owner=%s", path, reason, owner)},
 			},
 		}
 	case "unlock_file":
@@ -386,6 +452,17 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			"content": []map[string]interface{}{
 				{"type": "text", "text": fmt.Sprintf("File %s unlocked successfully.", path)},
 			},
+		}
+	case "list_locks":
+		var locks interface{} = []interface{}{}
+		if locker, ok := sink.(interface{ ListLocks() []core.LockInfo }); ok {
+			locks = locker.ListLocks()
+		}
+		resp.Result = map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "text", "text": "Active guardrail locks retrieved."},
+			},
+			"data": locks,
 		}
 	case "report_file_read":
 		path, _ := args["file_path"].(string)

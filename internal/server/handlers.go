@@ -4,16 +4,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
-	"io"
-
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
+	"github.com/wrongstack/wrongtrace/internal/ipc"
 	"github.com/wrongstack/wrongtrace/internal/models"
 	"github.com/wrongstack/wrongtrace/internal/profiler"
 	"github.com/wrongstack/wrongtrace/internal/proxy"
@@ -37,9 +39,12 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// writeError emits a structured {"error": "..."} body with the given status.
+// writeError emits a structured {"error": "...", "message": "..."} body with the given status.
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeJSON(w, status, map[string]interface{}{
+		"error":   msg,
+		"message": msg,
+	})
 }
 
 // Health is a cheap readiness probe: no DB hit, no fsnotify check. It answers
@@ -47,6 +52,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // endpoint agents should connect to (empty when IPC is disabled).
 func (h *Handlers) Health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":          true,
 		"status":      "ok",
 		"repo":        h.Engine.Repo(),
 		"timestamp":   time.Now().UTC(),
@@ -99,28 +105,130 @@ func (h *Handlers) Models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snap.Models)
 }
 
-// RecentEvents returns the most recent AST events for the live feed, optionally filtered by file_path or repo.
+// ReportTelemetry accepts run and token telemetry from AI agents.
+func (h *Handlers) ReportTelemetry(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RunID            string  `json:"run_id"`
+		TaskID           string  `json:"task_id"`
+		ProjectID        string  `json:"project_id"`
+		ProjectSlug      string  `json:"project_slug"`
+		AgentName        string  `json:"agent_name"`
+		ModelName        string  `json:"model_name"`
+		Provider         string  `json:"provider"`
+		PromptTokens     int64   `json:"prompt_tokens"`
+		CompletionTokens int64   `json:"completion_tokens"`
+		TokensUsed       int64   `json:"tokens_used"`
+		CostUSD          float64 `json:"cost_usd"`
+		Cost             float64 `json:"cost"`
+		Intent           string  `json:"intent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	runID := req.RunID
+	if runID == "" {
+		runID = "run-" + time.Now().UTC().Format("20060102150405") + "-" + fmt.Sprintf("%04x", time.Now().UnixNano()%0xffff)
+	}
+	promptTokens := req.PromptTokens
+	if promptTokens == 0 && req.TokensUsed > 0 {
+		promptTokens = req.TokensUsed
+	}
+	cost := req.CostUSD
+	if cost == 0 && req.Cost > 0 {
+		cost = req.Cost
+	}
+
+	report := ipc.TelemetryReport{
+		RunID:            runID,
+		TaskID:           req.TaskID,
+		ProjectID:        req.ProjectID,
+		ProjectSlug:      req.ProjectSlug,
+		AgentName:        req.AgentName,
+		ModelName:        req.ModelName,
+		Provider:         req.Provider,
+		PromptTokens:     promptTokens,
+		CompletionTokens: req.CompletionTokens,
+		CostUSD:          cost,
+		Intent:           req.Intent,
+	}
+
+	if err := h.Engine.ReportRun(report); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":       true,
+		"status":   "ok",
+		"event_id": runID,
+		"run_id":   runID,
+	})
+}
+
+// parseSince parses an ISO8601, RFC3339, DateTime, or Unix timestamp.
+func parseSince(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	s = strings.TrimSpace(s)
+	if epoch, err := strconv.ParseInt(s, 10, 64); err == nil && epoch > 0 {
+		if epoch > 1e11 { // milliseconds
+			return time.UnixMilli(epoch).UTC(), nil
+		}
+		return time.Unix(epoch, 0).UTC(), nil
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		time.DateTime,
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, s); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid since timestamp: %s", s)
+}
+
+// RecentEvents returns the most recent AST events for the live feed, optionally filtered by file_path, repo, or since.
 func (h *Handlers) RecentEvents(w http.ResponseWriter, r *http.Request) {
-	limit := 500
+	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if val, err := strconv.Atoi(l); err == nil && val > 0 {
 			limit = val
 		}
-	}
-	if filePath := r.URL.Query().Get("file_path"); filePath != "" {
-		events, err := h.Engine.GetRecentFileEvents(filePath, limit)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if events == nil {
-			events = []db.EventRecord{}
-		}
-		writeJSON(w, http.StatusOK, events)
-		return
+	} else if strings.Contains(r.URL.Path, "/metrics/") {
+		limit = 500
 	}
 
-	events, err := h.Engine.GetRecentEvents(limit, h.getProjectFilter(r))
+	var since time.Time
+	if s := r.URL.Query().Get("since"); s != "" {
+		t, err := parseSince(s)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		since = t
+	}
+
+	filePath := r.URL.Query().Get("file_path")
+	if filePath == "" {
+		filePath = r.URL.Query().Get("path")
+	}
+
+	repoFilter := r.URL.Query().Get("repo")
+	if repoFilter == "" && r.URL.Query().Get("project_id") != "" {
+		repoFilter = h.getProjectFilter(r)
+	}
+
+	events, err := h.Engine.GetRecentEventsFiltered(limit, repoFilter, filePath, since)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -133,13 +241,16 @@ func (h *Handlers) RecentEvents(w http.ResponseWriter, r *http.Request) {
 
 // SymbolHistory returns the revision history and model lineage of an AST node.
 func (h *Handlers) SymbolHistory(w http.ResponseWriter, r *http.Request) {
-	filePath := r.URL.Query().Get("path")
+	filePath := r.URL.Query().Get("file_path")
 	if filePath == "" {
-		filePath = r.URL.Query().Get("file_path")
+		filePath = r.URL.Query().Get("path")
 	}
 	signature := r.URL.Query().Get("signature")
 	if signature == "" {
 		signature = r.URL.Query().Get("symbol")
+	}
+	if signature == "" {
+		signature = r.URL.Query().Get("name")
 	}
 	limit := 100
 	if l := r.URL.Query().Get("limit"); l != "" {
@@ -158,14 +269,25 @@ func (h *Handlers) SymbolHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, history)
 }
 
-// FileModelActivity returns per-model read vs write stats for a file.
+// FileModelActivity returns per-model read vs write stats for a file or all monitored files.
 func (h *Handlers) FileModelActivity(w http.ResponseWriter, r *http.Request) {
-	filePath := r.URL.Query().Get("path")
+	filePath := r.URL.Query().Get("file_path")
 	if filePath == "" {
-		filePath = r.URL.Query().Get("file_path")
+		filePath = r.URL.Query().Get("path")
 	}
 	if filePath == "" {
-		writeError(w, http.StatusBadRequest, "path or file_path is required")
+		filePath = r.URL.Query().Get("file")
+	}
+	if filePath == "" {
+		activity, err := h.Engine.GetAllFileModelActivity(50)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if activity == nil {
+			activity = []db.ModelActivitySummary{}
+		}
+		writeJSON(w, http.StatusOK, activity)
 		return
 	}
 	activity, err := h.Engine.GetFileModelActivity(filePath)
@@ -201,13 +323,82 @@ func (h *Handlers) ModelFriction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, report)
 }
 
-// Atlas returns the full repository Code Atlas graph (packages, files, symbols).
+// Atlas returns the repository Code Atlas graph (packages, files, symbols) with optional scoping, summary mode, and pagination.
 func (h *Handlers) Atlas(w http.ResponseWriter, r *http.Request) {
 	atlas, err := h.Engine.Atlas(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	wsFilter := r.URL.Query().Get("workspace")
+	prefixFilter := r.URL.Query().Get("prefix")
+	summaryMode := r.URL.Query().Get("summary") == "true" || r.URL.Query().Get("mode") == "summary"
+	includeSymbols := true
+	if incSym := r.URL.Query().Get("include_symbols"); incSym == "false" || incSym == "0" {
+		includeSymbols = false
+	} else if sym := r.URL.Query().Get("symbols"); sym == "false" || sym == "0" {
+		includeSymbols = false
+	}
+
+	filteredPackages := make([]core.AtlasPackage, 0, len(atlas.Packages))
+	for _, pkg := range atlas.Packages {
+		if wsFilter != "" && !strings.EqualFold(pkg.Workspace, wsFilter) && !strings.Contains(strings.ToLower(pkg.Workspace), strings.ToLower(wsFilter)) {
+			continue
+		}
+		if prefixFilter != "" {
+			normPrefix := strings.ToLower(filepath.ToSlash(prefixFilter))
+			normPkg := strings.ToLower(filepath.ToSlash(pkg.Path))
+			if !strings.HasPrefix(normPkg, normPrefix) {
+				var matchingFiles []core.AtlasFile
+				for _, f := range pkg.Files {
+					normFile := strings.ToLower(filepath.ToSlash(f.Path))
+					if strings.HasPrefix(normFile, normPrefix) {
+						matchingFiles = append(matchingFiles, f)
+					}
+				}
+				if len(matchingFiles) == 0 {
+					continue
+				}
+				pkg.Files = matchingFiles
+			}
+		}
+		if summaryMode {
+			pkg.Files = nil
+		} else if !includeSymbols {
+			for i := range pkg.Files {
+				pkg.Files[i].Symbols = nil
+			}
+		}
+		filteredPackages = append(filteredPackages, pkg)
+	}
+
+	atlas.TotalPackages = len(filteredPackages)
+	atlas.Packages = filteredPackages
+
+	// Pagination
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if limit, err := strconv.Atoi(l); err == nil && limit > 0 {
+			offset := 0
+			if o := r.URL.Query().Get("offset"); o != "" {
+				if off, err := strconv.Atoi(o); err == nil && off >= 0 {
+					offset = off
+				}
+			}
+			atlas.Limit = limit
+			atlas.Offset = offset
+			if offset >= len(atlas.Packages) {
+				atlas.Packages = []core.AtlasPackage{}
+			} else {
+				end := offset + limit
+				if end > len(atlas.Packages) {
+					end = len(atlas.Packages)
+				}
+				atlas.Packages = atlas.Packages[offset:end]
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, atlas)
 }
 
@@ -334,37 +525,123 @@ func (h *Handlers) CheckGuardrail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// LockFile locks a file against agent modification.
+// LockFile locks a file against agent modification with optional ownership and TTL.
 func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path   string `json:"path"`
-		Reason string `json:"reason"`
+		Path        string `json:"path"`
+		FilePath    string `json:"file_path"`
+		Reason      string `json:"reason"`
+		Owner       string `json:"owner"`
+		AgentName   string `json:"agent_name"`
+		ModelName   string `json:"model_name"`
+		OwnerRunID  string `json:"owner_run_id"`
+		RunID       string `json:"run_id"`
+		TTLSeconds  int    `json:"ttl_seconds"`
+		TTLMinutes  int    `json:"ttl_minutes"`
+		TTL         string `json:"ttl"`
+		Force       bool   `json:"force"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
-		writeError(w, http.StatusBadRequest, "path is required in body")
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	h.Engine.LockFile(req.Path, req.Reason)
+	targetPath := req.Path
+	if targetPath == "" {
+		targetPath = req.FilePath
+	}
+	if targetPath == "" {
+		writeError(w, http.StatusBadRequest, "path or file_path is required in body")
+		return
+	}
+	owner := req.Owner
+	if owner == "" {
+		if req.AgentName != "" && req.ModelName != "" {
+			owner = req.AgentName + " (" + req.ModelName + ")"
+		} else if req.AgentName != "" {
+			owner = req.AgentName
+		} else if req.ModelName != "" {
+			owner = req.ModelName
+		}
+	}
+	ownerRunID := req.OwnerRunID
+	if ownerRunID == "" {
+		ownerRunID = req.RunID
+	}
+
+	if locked, existing := h.Engine.IsFileLocked(targetPath); locked {
+		if existing.Owner != "" && existing.Owner != owner && !req.Force {
+			writeJSON(w, http.StatusConflict, map[string]interface{}{
+				"ok":           false,
+				"status":       "conflict",
+				"error":        "file is already locked",
+				"message":      fmt.Sprintf("file %s is already locked by %s", targetPath, existing.Owner),
+				"path":         existing.Path,
+				"reason":       existing.Reason,
+				"owner":        existing.Owner,
+				"owner_run_id": existing.OwnerRunID,
+				"locked_at":    existing.LockedAt,
+				"expires_at":   existing.ExpiresAt,
+			})
+			return
+		}
+	}
+
+	ttl := 15 * time.Minute
+	if req.TTLSeconds > 0 {
+		ttl = time.Duration(req.TTLSeconds) * time.Second
+	} else if req.TTLMinutes > 0 {
+		ttl = time.Duration(req.TTLMinutes) * time.Minute
+	} else if req.TTL != "" {
+		if d, err := time.ParseDuration(req.TTL); err == nil && d > 0 {
+			ttl = d
+		}
+	}
+
+	info := h.Engine.LockFileWithOptions(targetPath, req.Reason, owner, ownerRunID, ttl)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status": "locked",
-		"path":   req.Path,
-		"reason": req.Reason,
+		"ok":           true,
+		"status":       "locked",
+		"path":         info.Path,
+		"reason":       info.Reason,
+		"owner":        info.Owner,
+		"owner_run_id": info.OwnerRunID,
+		"locked_at":    info.LockedAt,
+		"expires_at":   info.ExpiresAt,
 	})
+}
+
+// ListLocks returns all active guardrail locks.
+func (h *Handlers) ListLocks(w http.ResponseWriter, _ *http.Request) {
+	locks := h.Engine.ListLocks()
+	if locks == nil {
+		locks = []core.LockInfo{}
+	}
+	writeJSON(w, http.StatusOK, locks)
 }
 
 // UnlockFile removes a lock on a file.
 func (h *Handlers) UnlockFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path string `json:"path"`
+		Path     string `json:"path"`
+		FilePath string `json:"file_path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
-		writeError(w, http.StatusBadRequest, "path is required in body")
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	h.Engine.UnlockFile(req.Path)
+	targetPath := req.Path
+	if targetPath == "" {
+		targetPath = req.FilePath
+	}
+	if targetPath == "" {
+		writeError(w, http.StatusBadRequest, "path or file_path is required in body")
+		return
+	}
+	h.Engine.UnlockFile(targetPath)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":     true,
 		"status": "unlocked",
-		"path":   req.Path,
+		"path":   targetPath,
 	})
 }
 
@@ -836,6 +1113,15 @@ func (h *Handlers) GetFileReadHeatmap(w http.ResponseWriter, r *http.Request) {
 		heatmap = []db.LineReadHeatmap{}
 	}
 	writeJSON(w, http.StatusOK, heatmap)
+}
+
+// GetIPCTraffic returns recent recorded IPC interactions from connected AI agents.
+func (h *Handlers) GetIPCTraffic(w http.ResponseWriter, _ *http.Request) {
+	traffic := h.Engine.GetIPCTraffic()
+	if traffic == nil {
+		traffic = []ipc.IPCTrafficRecord{}
+	}
+	writeJSON(w, http.StatusOK, traffic)
 }
 
 

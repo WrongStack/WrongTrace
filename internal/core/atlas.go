@@ -27,27 +27,34 @@ type IndexProgress struct {
 }
 
 // AtlasSnapshot represents the entire repository's structure:
+// AtlasSnapshot represents the entire repository's structure:
 // Packages -> Files -> Symbols with their health and churn metrics.
 type AtlasSnapshot struct {
-	Repo        string         `json:"repo"`
-	GeneratedAt time.Time      `json:"generated_at"`
-	IsMonorepo  bool           `json:"is_monorepo"`
-	Workspaces  []string       `json:"workspaces,omitempty"`
-	Packages    []AtlasPackage `json:"packages"`
-	TotalFiles  int            `json:"total_files"`
-	TotalLOC    int            `json:"total_loc"`
-	TotalNodes  int            `json:"total_nodes"`
-	IndexStatus IndexProgress  `json:"index_status"`
+	Repo          string         `json:"repo"`
+	GeneratedAt   time.Time      `json:"generated_at"`
+	IsMonorepo    bool           `json:"is_monorepo"`
+	Workspaces    []string       `json:"workspaces,omitempty"`
+	TotalPackages int            `json:"total_packages"`
+	Limit         int            `json:"limit,omitempty"`
+	Offset        int            `json:"offset,omitempty"`
+	TotalFiles    int            `json:"total_files"`
+	TotalLOC      int            `json:"total_loc"`
+	TotalNodes    int            `json:"total_nodes"`
+	Packages      []AtlasPackage `json:"packages"`
+	IndexStatus   IndexProgress  `json:"index_status"`
 }
 
 // AtlasPackage groups files belonging to a specific directory or package module.
 type AtlasPackage struct {
-	Path      string      `json:"path"`                // e.g. "internal/ast", "web/src/components", "."
-	Name      string      `json:"name"`                // e.g. "ast", "components", "root"
-	Workspace string      `json:"workspace,omitempty"` // Monorepo scope e.g. "apps/web", "packages/core", "internal"
-	Files     []AtlasFile `json:"files"`
-	TotalLOC  int         `json:"total_loc"`
-	IsFragile bool        `json:"is_fragile"`
+	Path           string      `json:"path"`                // e.g. "internal/ast", "web/src/components", "."
+	Name           string      `json:"name"`                // e.g. "ast", "components", "root"
+	Workspace      string      `json:"workspace,omitempty"` // Monorepo scope e.g. "apps/web", "packages/core", "internal"
+	Files          []AtlasFile `json:"files,omitempty"`
+	FileCount      int         `json:"file_count"`
+	FragileCount   int         `json:"fragile_files_count"`
+	AvgHealthScore float64     `json:"avg_health_score"`
+	TotalLOC       int         `json:"total_loc"`
+	IsFragile      bool        `json:"is_fragile"`
 }
 
 // AtlasFile represents a single source file and its symbols.
@@ -329,6 +336,10 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 
 		pkg.TotalLOC += af.TotalLOC
 		pkg.Files = append(pkg.Files, af)
+		pkg.FileCount++
+		if af.IsFragile {
+			pkg.FragileCount++
+		}
 		snap.TotalFiles++
 		snap.TotalLOC += af.TotalLOC
 		snap.TotalNodes += len(af.Symbols)
@@ -344,6 +355,13 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	workspaceSet := make(map[string]struct{})
 	for _, p := range pkgPaths {
 		pkg := pkgMap[p]
+		totalHealth := 0
+		for _, f := range pkg.Files {
+			totalHealth += f.HealthScore
+		}
+		if len(pkg.Files) > 0 {
+			pkg.AvgHealthScore = math.Round((float64(totalHealth)/float64(len(pkg.Files)))*10) / 10
+		}
 		sort.Slice(pkg.Files, func(i, j int) bool {
 			return pkg.Files[i].Name < pkg.Files[j].Name
 		})
@@ -352,6 +370,7 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 		}
 		snap.Packages = append(snap.Packages, *pkg)
 	}
+	snap.TotalPackages = len(snap.Packages)
 
 	if len(workspaceSet) >= 2 {
 		snap.IsMonorepo = true

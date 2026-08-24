@@ -19,7 +19,7 @@
 
 [CmdletBinding()]
 param(
-    [int]$Port = 0,
+    [int]$Port = 8000,
     [string]$WatchDir = $PSScriptRoot,
     [switch]$NoBuild,
     [switch]$NoUI,
@@ -32,17 +32,8 @@ $Bin = Join-Path $Root 'bin\wrongtrace.exe'
 $Socket = '\\.\pipe\wrongtrace'
 
 if ($Port -le 0) {
-    if ($env:WRONGTRACE_PORT) {
-        $Port = [int]$env:WRONGTRACE_PORT
-    } elseif ($env:PORT) {
+    if ($env:PORT) {
         $Port = [int]$env:PORT
-    } elseif (-not $NonInteractive -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
-        $promptVal = Read-Host "Enter port for WrongTrace dashboard [Press Enter for 8000]"
-        if ($promptVal -match '^\d+$') {
-            $Port = [int]$promptVal
-        } else {
-            $Port = 8000
-        }
     } else {
         $Port = 8000
     }
@@ -117,7 +108,7 @@ try {
         # kill the tree rather than just the shell.
         Push-Location (Join-Path $Root 'web')
         try {
-            $env:WRONGTRACE_PORT = "$daemonPort"
+            $env:WRONGTRACE_DAEMON_PORT = "$daemonPort"
             $env:VITE_PORT = "$Port"
             $vite = Start-Process -FilePath 'cmd.exe' -PassThru -WindowStyle Hidden `
                 -ArgumentList '/c', 'npm', 'run', 'dev'
@@ -194,6 +185,9 @@ try {
     }
 } finally {
     Write-Host '==> stopping dev processes' -ForegroundColor Cyan
+    Remove-Item Env:\WRONGTRACE_PORT -ErrorAction SilentlyContinue
+    Remove-Item Env:\WRONGTRACE_DAEMON_PORT -ErrorAction SilentlyContinue
+    Remove-Item Env:\VITE_PORT -ErrorAction SilentlyContinue
 
     # Kill the vite tree first (cmd -> npm -> node) so no orphan lingers;
     # taskkill /T walks the whole process tree, unlike Stop-Process.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
+	"github.com/wrongstack/wrongtrace/internal/ipc"
 	"github.com/wrongstack/wrongtrace/internal/models"
 )
 
@@ -52,9 +53,20 @@ func (f *failingEngine) FileHealth(string) (core.IPCHealth, error) {
 func (f *failingEngine) CheckGuardrail(string) (core.GuardrailResult, error) {
 	return core.GuardrailResult{}, errForced
 }
-func (f *failingEngine) LockFile(string, string)              {}
-func (f *failingEngine) UnlockFile(string)                    {}
-func (f *failingEngine) IsFileLocked(string) (bool, string)   { return false, "" }
+func (f *failingEngine) LockFile(string, string) core.LockInfo {
+	return core.LockInfo{}
+}
+func (f *failingEngine) LockFileWithOptions(string, string, string, string, time.Duration) core.LockInfo {
+	return core.LockInfo{}
+}
+func (f *failingEngine) UnlockFile(string)                  {}
+func (f *failingEngine) IsFileLocked(string) (bool, core.LockInfo) {
+	return false, core.LockInfo{}
+}
+func (f *failingEngine) ListLocks() []core.LockInfo { return nil }
+func (f *failingEngine) ReportRun(ipc.TelemetryReport) error {
+	return errForced
+}
 func (f *failingEngine) ModelCatalog() []models.ModelInfo     { return nil }
 func (f *failingEngine) ProviderCatalog() []models.ProviderInfo { return nil }
 func (f *failingEngine) UpsertModel(models.ModelInfo)         {}
@@ -109,10 +121,16 @@ func (f *failingEngine) GetFileReadHeatmap(string) ([]db.LineReadHeatmap, error)
 func (f *failingEngine) GetRecentEvents(int, ...string) ([]db.EventRecord, error) {
 	return nil, errForced
 }
+func (f *failingEngine) GetRecentEventsFiltered(int, string, string, time.Time) ([]db.EventRecord, error) {
+	return nil, errForced
+}
 func (f *failingEngine) GetSymbolHistory(string, string, int) ([]db.SymbolHistoryRecord, error) {
 	return nil, errForced
 }
 func (f *failingEngine) GetFileModelActivity(string) ([]db.ModelActivitySummary, error) {
+	return nil, errForced
+}
+func (f *failingEngine) GetAllFileModelActivity(int) ([]db.ModelActivitySummary, error) {
 	return nil, errForced
 }
 func (f *failingEngine) GetModelFrictionReport(int) (*db.InterAgentFrictionReport, error) {
@@ -121,6 +139,7 @@ func (f *failingEngine) GetModelFrictionReport(int) (*db.InterAgentFrictionRepor
 func (f *failingEngine) IndexStatus() core.IndexProgress {
 	return core.IndexProgress{}
 }
+func (f *failingEngine) GetIPCTraffic() []ipc.IPCTrafficRecord { return nil }
 func (f *failingEngine) Hub() *core.Hub                        { return f.hub }
 func (f *failingEngine) Store() *db.Store                      { return nil }
 func (f *failingEngine) Repo() string                          { return "failing" }

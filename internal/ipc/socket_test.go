@@ -38,6 +38,8 @@ func (f *fakeSink) Ping() error {
 	return f.pingErr
 }
 
+func (f *fakeSink) RecordIPCTraffic(rec IPCTrafficRecord) {}
+
 func newTestServer(sink *fakeSink) *Server {
 	return NewServer(Config{Engine: sink})
 }

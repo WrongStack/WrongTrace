@@ -80,7 +80,7 @@ done
 echo "    daemon healthy: http://localhost:$DAEMON_PORT/api/health"
 
 echo "==> starting vite dev server on :$PORT"
-(cd "$ROOT/web" && WRONGTRACE_PORT="$DAEMON_PORT" VITE_PORT="$PORT" npm run dev) &
+(cd "$ROOT/web" && WRONGTRACE_DAEMON_PORT="$DAEMON_PORT" WRONGTRACE_PORT="$DAEMON_PORT" VITE_PORT="$PORT" npm run dev) &
 VITE_PID=$!
 
 echo ""

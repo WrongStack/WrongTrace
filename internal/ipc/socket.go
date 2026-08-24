@@ -12,10 +12,23 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// IPCTrafficRecord captures an individual IPC JSON-RPC request and response pair.
+type IPCTrafficRecord struct {
+	ID         string                 `json:"id"`
+	Method     string                 `json:"method"`
+	Params     map[string]interface{} `json:"params"`
+	Result     interface{}            `json:"result,omitempty"`
+	Error      *RPCError              `json:"error,omitempty"`
+	DurationMs float64                `json:"duration_ms"`
+	Timestamp  time.Time              `json:"timestamp"`
+	ClientAddr string                 `json:"client_addr,omitempty"`
+}
 
 // EngineSink is the subset of the core Engine used by the IPC server. Keeping
 // it as an interface lets us test the IPC layer without spinning up the full
@@ -24,16 +37,22 @@ type EngineSink interface {
 	ReportRun(r TelemetryReport) error
 	FileHealth(p string) (FileHealthReply, error)
 	Ping() error
+	RecordIPCTraffic(rec IPCTrafficRecord)
 }
 
 // FileHealthReply is the JSON-serializable view of db.FileHealth. The ipc
 // package re-declares it so the protocol is decoupled from the storage type.
 type FileHealthReply struct {
-	FilePath             string `json:"file_path"`
-	HealthScore          int    `json:"health_score"`
-	IsFragile            bool   `json:"is_fragile"`
-	RecentThrashingCount int    `json:"recent_thrashing_count"`
-	Warning              string `json:"warning"`
+	FilePath             string     `json:"file_path"`
+	HealthScore          int        `json:"health_score"`
+	IsFragile            bool       `json:"is_fragile"`
+	RecentThrashingCount int        `json:"recent_thrashing_count"`
+	Warning              string     `json:"warning"`
+	IsLocked             bool       `json:"is_locked"`
+	LockReason           string     `json:"lock_reason,omitempty"`
+	LockOwner            string     `json:"lock_owner,omitempty"`
+	LockOwnerRunID       string     `json:"lock_owner_run_id,omitempty"`
+	LockExpiresAt        *time.Time `json:"lock_expires_at,omitempty"`
 }
 
 // Config configures the IPC server.
@@ -144,6 +163,22 @@ func (s *Server) track(c net.Conn, add bool) {
 	_ = c.Close()
 }
 
+func isClientDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "pipe is being closed") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "closed pipe") ||
+		strings.Contains(msg, "wsasend") ||
+		strings.Contains(msg, "wsarecv")
+}
+
 // handleConn reads newline-delimited JSON-RPC requests and writes one response
 // per request until EOF, error, or cancellation.
 func (s *Server) handleConn(ctx context.Context, c net.Conn) {
@@ -159,7 +194,7 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 		}
 		line, err := readJSONLine(reader)
 		if err != nil {
-			if err != io.EOF {
+			if !isClientDisconnect(err) {
 				log.Printf("ipc: read error: %v", err)
 			}
 			return
@@ -173,9 +208,31 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 			})
 			continue
 		}
+		start := time.Now()
 		resp := s.dispatch(&req)
+		durMs := float64(time.Since(start).Microseconds()) / 1000.0
+
+		if s.cfg.Engine != nil {
+			clientAddr := "named_pipe"
+			if c.RemoteAddr() != nil {
+				clientAddr = c.RemoteAddr().String()
+			}
+			s.cfg.Engine.RecordIPCTraffic(IPCTrafficRecord{
+				ID:         fmt.Sprintf("ipc-%d", time.Now().UnixNano()),
+				Method:     req.Method,
+				Params:     req.Params,
+				Result:     resp.Result,
+				Error:      resp.Error,
+				DurationMs: durMs,
+				Timestamp:  time.Now().UTC(),
+				ClientAddr: clientAddr,
+			})
+		}
+
 		if err := writeJSONLine(writer, resp); err != nil {
-			log.Printf("ipc: write error: %v", err)
+			if !isClientDisconnect(err) {
+				log.Printf("ipc: write error: %v", err)
+			}
 			return
 		}
 	}
