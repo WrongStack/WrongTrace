@@ -38,11 +38,13 @@ export function useModels(projectId?: string | null) {
   });
 }
 
-export function useRecentEvents(projectId?: string | null) {
-  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+export function useRecentEvents(projectId?: string | null, limit: number = 500) {
+  const pParam = projectId ? `project_id=${encodeURIComponent(projectId)}` : '';
+  const lParam = `limit=${limit}`;
+  const q = [pParam, lParam].filter(Boolean).join('&');
   return useQuery<EventRecord[]>({
-    queryKey: ['recent', projectId || 'active'],
-    queryFn: () => jget<EventRecord[]>(`${base}/metrics/recent${q}`),
+    queryKey: ['recent', projectId || 'active', limit],
+    queryFn: () => jget<EventRecord[]>(`${base}/metrics/recent?${q}`),
     refetchInterval: 5_000,
   });
 }
@@ -194,5 +196,36 @@ export function useRecentFileEvents(filePath: string | null, limit: number = 50)
     refetchInterval: 5_000,
   });
 }
+
+export function useSymbolHistory(filePath: string | null, signature: string | null, limit: number = 100) {
+  const pParam = filePath ? `path=${encodeURIComponent(filePath)}` : '';
+  const sParam = signature ? `signature=${encodeURIComponent(signature)}` : '';
+  const queryStr = [pParam, sParam, `limit=${limit}`].filter(Boolean).join('&');
+
+  return useQuery<import('../types').SymbolHistoryRecord[]>({
+    queryKey: ['symbol_history', filePath, signature, limit],
+    queryFn: () => jget<import('../types').SymbolHistoryRecord[]>(`${base}/symbol/history?${queryStr}`),
+    enabled: !!(filePath || signature),
+    refetchInterval: 5_000,
+  });
+}
+
+export function useFileModelActivity(filePath: string | null) {
+  return useQuery<import('../types').ModelActivitySummary[]>({
+    queryKey: ['file_model_activity', filePath],
+    queryFn: () => jget<import('../types').ModelActivitySummary[]>(`${base}/files/activity?path=${encodeURIComponent(filePath ?? '')}`),
+    enabled: !!filePath,
+    refetchInterval: 10_000,
+  });
+}
+
+export function useModelFriction(limit: number = 200) {
+  return useQuery<import('../types').InterAgentFrictionReport>({
+    queryKey: ['model_friction', limit],
+    queryFn: () => jget<import('../types').InterAgentFrictionReport>(`${base}/metrics/friction?limit=${limit}`),
+    refetchInterval: 5_000,
+  });
+}
+
 
 

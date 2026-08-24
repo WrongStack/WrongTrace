@@ -1230,4 +1230,397 @@ func (s *Store) Vacuum() error {
 	return err
 }
 
+// SymbolHistoryRecord joins code_node_events with agent_runs for full timeline and evolution inspection.
+type SymbolHistoryRecord struct {
+	EventID          string    `json:"event_id"`
+	RunID            string    `json:"run_id"`
+	RepoName         string    `json:"repo_name"`
+	FilePath         string    `json:"file_path"`
+	Signature        string    `json:"node_signature"`
+	NodeType         string    `json:"node_type"`
+	Action           string    `json:"action"`
+	BodyHash         string    `json:"ast_content_hash"`
+	LOC              int       `json:"lines_of_code"`
+	StartLine        uint32    `json:"start_line"`
+	EndLine          uint32    `json:"end_line"`
+	DiffSnippet      string    `json:"diff_snippet"`
+	AddedLines       int       `json:"added_lines"`
+	DeletedLines     int       `json:"deleted_lines"`
+	OccurredAt       time.Time `json:"event_time"`
+	AgentName        string    `json:"agent_name"`
+	ModelName        string    `json:"model_name"`
+	Provider         string    `json:"provider"`
+	Intent           string    `json:"intent"`
+	PromptTokens     int64     `json:"prompt_tokens"`
+	CompletionTokens int64     `json:"completion_tokens"`
+	CostUSD          float64   `json:"cost_usd"`
+}
+
+// SymbolHistory returns the chronological revision history of a specific AST symbol / node.
+func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHistoryRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	normSlash := strings.ReplaceAll(filePath, "\\", "/")
+
+	var query string
+	var args []any
+
+	if filePath != "" && signature != "" {
+		query = `
+			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
+			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
+			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
+			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
+			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
+			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
+			       COALESCE(r.cost_usd, 0.0)
+			FROM code_node_events e
+			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%/' || ?)
+			  AND (e.node_signature = ? OR e.node_signature LIKE '%' || ? || '%')
+			ORDER BY e.event_time ASC
+			LIMIT ?
+		`
+		args = []any{filePath, normSlash, normSlash, signature, signature, limit}
+	} else if filePath != "" {
+		query = `
+			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
+			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
+			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
+			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
+			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
+			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
+			       COALESCE(r.cost_usd, 0.0)
+			FROM code_node_events e
+			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%/' || ?)
+			ORDER BY e.event_time ASC
+			LIMIT ?
+		`
+		args = []any{filePath, normSlash, normSlash, limit}
+	} else {
+		query = `
+			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
+			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
+			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
+			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
+			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
+			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
+			       COALESCE(r.cost_usd, 0.0)
+			FROM code_node_events e
+			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+			WHERE (e.node_signature = ? OR e.node_signature LIKE '%' || ? || '%')
+			ORDER BY e.event_time ASC
+			LIMIT ?
+		`
+		args = []any{signature, signature, limit}
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("symbol history: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]SymbolHistoryRecord, 0, 16)
+	for rows.Next() {
+		var (
+			rec SymbolHistoryRecord
+			ts  string
+		)
+		if err := rows.Scan(
+			&rec.EventID, &rec.RunID, &rec.RepoName, &rec.FilePath, &rec.Signature, &rec.NodeType,
+			&rec.Action, &rec.BodyHash, &rec.LOC,
+			&rec.StartLine, &rec.EndLine, &rec.DiffSnippet,
+			&rec.AddedLines, &rec.DeletedLines, &ts,
+			&rec.AgentName, &rec.ModelName, &rec.Provider,
+			&rec.Intent, &rec.PromptTokens, &rec.CompletionTokens,
+			&rec.CostUSD,
+		); err != nil {
+			return nil, fmt.Errorf("scan symbol history: %w", err)
+		}
+		rec.OccurredAt = parseDBTime(ts)
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// ModelActivitySummary aggregates read and write operations performed by an AI model on a file.
+type ModelActivitySummary struct {
+	ModelName      string    `json:"model_name"`
+	Provider       string    `json:"provider"`
+	ReadCount      int       `json:"read_count"`
+	LinesRead      int       `json:"lines_read"`
+	ReadTokens     int64     `json:"read_tokens"`
+	ReadCostUSD    float64   `json:"read_cost_usd"`
+	WriteEvents    int       `json:"write_events"`
+	LinesAdded     int       `json:"lines_added"`
+	LinesDeleted   int       `json:"lines_deleted"`
+	LastActivityAt time.Time `json:"last_activity_at"`
+}
+
+// FileModelActivity returns per-model read and write statistics for a target file.
+func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, error) {
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	normSlash := strings.ReplaceAll(filePath, "\\", "/")
+	activityMap := make(map[string]*ModelActivitySummary)
+
+	// 1. Read operations per model
+	readQuery := `
+		SELECT model_name, provider, COUNT(*), COALESCE(SUM(lines_read_count), 0),
+		       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cost_usd), 0.0), MAX(read_time)
+		FROM file_read_events
+		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%/' || ?)
+		GROUP BY model_name
+	`
+	rRows, err := s.db.QueryContext(ctx, readQuery, filePath, normSlash, normSlash)
+	if err == nil {
+		defer rRows.Close()
+		for rRows.Next() {
+			var (
+				model, prov, maxTime string
+				count, linesRead     int
+				tokens               int64
+				cost                 float64
+			)
+			if err := rRows.Scan(&model, &prov, &count, &linesRead, &tokens, &cost, &maxTime); err == nil {
+				t := parseDBTime(maxTime)
+				activityMap[model] = &ModelActivitySummary{
+					ModelName:      model,
+					Provider:       prov,
+					ReadCount:      count,
+					LinesRead:      linesRead,
+					ReadTokens:     tokens,
+					ReadCostUSD:    cost,
+					LastActivityAt: t,
+				}
+			}
+		}
+	}
+
+	// 2. Write / AST mutation operations per model
+	writeQuery := `
+		SELECT COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''), COUNT(e.event_id),
+		       COALESCE(SUM(e.added_lines), 0), COALESCE(SUM(e.deleted_lines), 0), MAX(e.event_time)
+		FROM code_node_events e
+		LEFT JOIN agent_runs r ON e.run_id = r.run_id
+		WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%/' || ?)
+		GROUP BY r.model_name
+	`
+	wRows, err := s.db.QueryContext(ctx, writeQuery, filePath, normSlash, normSlash)
+	if err == nil {
+		defer wRows.Close()
+		for wRows.Next() {
+			var (
+				model, prov, maxTime     string
+				count, linesAdd, linesDel int
+			)
+			if err := wRows.Scan(&model, &prov, &count, &linesAdd, &linesDel, &maxTime); err == nil {
+				t := parseDBTime(maxTime)
+				entry, ok := activityMap[model]
+				if !ok {
+					entry = &ModelActivitySummary{
+						ModelName: model,
+						Provider:  prov,
+					}
+					activityMap[model] = entry
+				}
+				if entry.Provider == "" && prov != "" {
+					entry.Provider = prov
+				}
+				entry.WriteEvents += count
+				entry.LinesAdded += linesAdd
+				entry.LinesDeleted += linesDel
+				if t.After(entry.LastActivityAt) {
+					entry.LastActivityAt = t
+				}
+			}
+		}
+	}
+
+	out := make([]ModelActivitySummary, 0, len(activityMap))
+	for _, entry := range activityMap {
+		out = append(out, *entry)
+	}
+	return out, nil
+}
+
+// ModelFrictionEdge represents a directed friction / collision between an author model and an overwriter model.
+type ModelFrictionEdge struct {
+	AuthorModel     string  `json:"author_model"`
+	OverwriterModel string  `json:"overwriter_model"`
+	ConflictCount   int     `json:"conflict_count"`
+	LinesModified   int     `json:"lines_modified"`
+	LinesDeleted    int     `json:"lines_deleted"`
+	SelfThrash      bool    `json:"is_self_thrash"`
+	WastedCostUSD   float64 `json:"wasted_cost_usd"`
+}
+
+// CrossThrashEvent is an individual record of one model modifying or deleting code authored by another model (or itself).
+type CrossThrashEvent struct {
+	EventID          string    `json:"event_id"`
+	FilePath         string    `json:"file_path"`
+	Signature        string    `json:"node_signature"`
+	Action           string    `json:"action"`
+	AuthorModel      string    `json:"author_model"`
+	AuthorRunID      string    `json:"author_run_id"`
+	AuthorTime       time.Time `json:"author_time"`
+	OverwriterModel  string    `json:"overwriter_model"`
+	OverwriterRunID  string    `json:"overwriter_run_id"`
+	OverwriterTime   time.Time `json:"overwriter_time"`
+	TimeDeltaSeconds int64     `json:"time_delta_seconds"`
+	AddedLines       int       `json:"added_lines"`
+	DeletedLines     int       `json:"deleted_lines"`
+	DiffSnippet      string    `json:"diff_snippet"`
+	IsCrossAgent     bool      `json:"is_cross_agent"`
+}
+
+// InterAgentFrictionReport holds the aggregated collision matrix and the recent cross-thrash events.
+type InterAgentFrictionReport struct {
+	Edges            []ModelFrictionEdge `json:"edges"`
+	RecentCollisions []CrossThrashEvent  `json:"recent_collisions"`
+	TotalCollisions  int                 `json:"total_collisions"`
+	CrossAgentRatio  float64             `json:"cross_agent_ratio_pct"`
+	TopFrictionPair  string              `json:"top_friction_pair"`
+}
+
+// ModelFrictionMatrix computes inter-agent code overwrites, deletions, and self-thrash loops.
+func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error) {
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+
+	const q = `
+		WITH OrderedEvents AS (
+			SELECT 
+				e.event_id,
+				e.file_path,
+				e.node_signature,
+				e.action,
+				COALESCE(e.added_lines, 0) AS added_lines,
+				COALESCE(e.deleted_lines, 0) AS deleted_lines,
+				COALESCE(e.diff_snippet, '') AS diff_snippet,
+				e.event_time,
+				COALESCE(r.model_name, 'unknown') AS overwriter_model,
+				COALESCE(r.run_id, '') AS overwriter_run_id,
+				LAG(COALESCE(r.model_name, 'unknown')) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time) AS author_model,
+				LAG(COALESCE(r.run_id, '')) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time) AS author_run_id,
+				LAG(e.event_time) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time) AS author_time
+			FROM code_node_events e
+			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+		)
+		SELECT 
+			event_id, file_path, node_signature, action, added_lines, deleted_lines,
+			diff_snippet, event_time, overwriter_model, overwriter_run_id,
+			author_model, author_run_id, author_time
+		FROM OrderedEvents
+		WHERE author_model IS NOT NULL AND action IN ('MODIFIED', 'DELETED')
+		ORDER BY event_time DESC
+		LIMIT ?;
+	`
+
+	rows, err := s.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query model friction: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		events           []CrossThrashEvent
+		edgeMap          = make(map[string]*ModelFrictionEdge)
+		totalCollisions  int
+		crossCount       int
+		maxPairCount     int
+		topPair          string
+	)
+
+	for rows.Next() {
+		var (
+			ev                                                 CrossThrashEvent
+			evTimeStr, authorTimeStr                           string
+			added, deleted                                     int
+		)
+
+		if err := rows.Scan(
+			&ev.EventID,
+			&ev.FilePath,
+			&ev.Signature,
+			&ev.Action,
+			&added,
+			&deleted,
+			&ev.DiffSnippet,
+			&evTimeStr,
+			&ev.OverwriterModel,
+			&ev.OverwriterRunID,
+			&ev.AuthorModel,
+			&ev.AuthorRunID,
+			&authorTimeStr,
+		); err != nil {
+			continue
+		}
+
+		ev.AddedLines = added
+		ev.DeletedLines = deleted
+		ev.OverwriterTime = parseDBTime(evTimeStr)
+		ev.AuthorTime = parseDBTime(authorTimeStr)
+		if !ev.AuthorTime.IsZero() && !ev.OverwriterTime.IsZero() {
+			ev.TimeDeltaSeconds = int64(ev.OverwriterTime.Sub(ev.AuthorTime).Seconds())
+		}
+		ev.IsCrossAgent = (ev.AuthorModel != ev.OverwriterModel) && ev.AuthorModel != "unknown" && ev.OverwriterModel != "unknown"
+
+		events = append(events, ev)
+		totalCollisions++
+		if ev.IsCrossAgent {
+			crossCount++
+		}
+
+		edgeKey := fmt.Sprintf("%s->%s", ev.AuthorModel, ev.OverwriterModel)
+		edge, ok := edgeMap[edgeKey]
+		if !ok {
+			edge = &ModelFrictionEdge{
+				AuthorModel:     ev.AuthorModel,
+				OverwriterModel: ev.OverwriterModel,
+				SelfThrash:      ev.AuthorModel == ev.OverwriterModel,
+			}
+			edgeMap[edgeKey] = edge
+		}
+		edge.ConflictCount++
+		edge.LinesModified += added
+		edge.LinesDeleted += deleted
+
+		if edge.ConflictCount > maxPairCount && ev.AuthorModel != ev.OverwriterModel {
+			maxPairCount = edge.ConflictCount
+			topPair = fmt.Sprintf("%s ➔ %s (%d collisions)", ev.AuthorModel, ev.OverwriterModel, maxPairCount)
+		}
+	}
+
+	edges := make([]ModelFrictionEdge, 0, len(edgeMap))
+	for _, e := range edgeMap {
+		edges = append(edges, *e)
+	}
+
+	ratio := 0.0
+	if totalCollisions > 0 {
+		ratio = (float64(crossCount) / float64(totalCollisions)) * 100.0
+	}
+
+	return &InterAgentFrictionReport{
+		Edges:            edges,
+		RecentCollisions: events,
+		TotalCollisions:  totalCollisions,
+		CrossAgentRatio:  ratio,
+		TopFrictionPair:  topPair,
+	}, nil
+}
+
+
 

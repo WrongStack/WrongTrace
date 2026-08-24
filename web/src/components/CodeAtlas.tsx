@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useDeferredValue } from 'react';
+import { useState, useEffect, useMemo, useCallback, useDeferredValue } from 'react';
 import {
   ReactFlow,
   Controls,
@@ -8,6 +8,8 @@ import {
   Handle,
   Position,
   MarkerType,
+  ReactFlowProvider,
+  useReactFlow,
   type Node,
   type Edge,
   type NodeProps,
@@ -31,6 +33,7 @@ import {
   Bot,
   Activity,
   Maximize2,
+  Minimize2,
   RefreshCw,
   ChevronRight,
   ChevronDown,
@@ -39,10 +42,26 @@ import {
   Compass,
   Circle,
   GitFork,
+  GitCommit,
 } from 'lucide-react';
 import { RichDiffViewer } from './RichDiffViewer';
 import { FileReadDetails } from './FileReadDetails';
+import { SymbolHistoryTimeline } from './SymbolHistoryTimeline';
 import type { AtlasSnapshot, AtlasPackage, AtlasFile, AtlasSymbol, EventRecord } from '../types';
+
+function FlowAutoArranger({ scopeKey }: { scopeKey: string }) {
+  const { fitView } = useReactFlow();
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      fitView({ duration: 500, padding: 0.25 });
+    }, 60);
+
+    return () => clearTimeout(timer);
+  }, [scopeKey, fitView]);
+
+  return null;
+}
 
 interface CodeAtlasProps {
   atlas?: AtlasSnapshot;
@@ -67,33 +86,34 @@ interface RootProjectNodeData extends Record<string, unknown> {
 function RootProjectNode({ data }: NodeProps<Node<RootProjectNodeData>>) {
   const { repo, isMonorepo, workspacesCount, totalPackages, totalFiles, totalLOC } = data;
   return (
-    <div className="px-5 py-4 rounded-2xl border border-accent/40 bg-gradient-to-br from-slate-900/95 via-indigo-950/40 to-slate-900/95 shadow-2xl backdrop-blur-xl min-w-[270px]">
+    <div className="px-5 py-4 rounded-2xl border border-indigo-500/50 bg-gradient-to-br from-slate-950 via-indigo-950/60 to-slate-900/95 shadow-[0_0_30px_rgba(99,102,241,0.25)] backdrop-blur-2xl min-w-[280px]">
       <div className="flex items-center justify-between gap-2.5">
         <div className="flex items-center gap-2.5">
-          <div className="p-2 rounded-xl bg-accent/20 text-accent shadow-inner border border-accent/30">
+          <div className="p-2.5 rounded-xl bg-gradient-to-br from-indigo-500/30 to-purple-500/20 text-indigo-300 shadow-inner border border-indigo-500/40">
             <Boxes className="h-5 w-5" />
           </div>
           <div>
-            <div className="text-[10px] uppercase font-mono tracking-wider text-accent font-semibold flex items-center gap-1.5">
-              {isMonorepo ? 'Monorepo Root' : 'Project Root'}
+            <div className="text-[10px] uppercase font-mono tracking-wider text-indigo-400 font-bold flex items-center gap-1.5">
+              <span className="h-1.5 w-1.5 rounded-full bg-indigo-400 animate-pulse" />
+              {isMonorepo ? 'Monorepo Root' : 'Project Architecture'}
             </div>
             <div className="font-bold text-sm tracking-tight text-white">{repo || 'Workspace'}</div>
           </div>
         </div>
         {isMonorepo && (
-          <span className="chip bg-purple-500/15 text-purple-300 border border-purple-500/30 text-[10px] font-mono font-semibold">
+          <span className="chip bg-purple-500/20 text-purple-300 border border-purple-500/40 text-[10px] font-mono font-bold">
             {workspacesCount} Workspaces
           </span>
         )}
       </div>
-      <div className="mt-3 pt-2.5 border-t border-white/10 flex items-center justify-between text-xs text-slate-300 font-mono">
-        <span>{totalPackages} packages</span>
+      <div className="mt-3.5 pt-2.5 border-t border-white/10 flex items-center justify-between text-xs text-slate-300 font-mono">
+        <span className="flex items-center gap-1"><Folder className="h-3 w-3 text-indigo-400" /> {totalPackages} pkgs</span>
         <span>·</span>
-        <span>{totalFiles} files</span>
+        <span className="flex items-center gap-1"><FileCode className="h-3 w-3 text-cyan-400" /> {totalFiles} files</span>
         <span>·</span>
-        <span className="text-accent font-semibold">{totalLOC.toLocaleString()} LOC</span>
+        <span className="text-emerald-400 font-bold">{totalLOC.toLocaleString()} LOC</span>
       </div>
-      <Handle type="source" position={Position.Right} className="!bg-accent !w-2.5 !h-2.5" />
+      <Handle type="source" position={Position.Right} className="!bg-indigo-400 !w-3 !h-3 !border-2 !border-white" />
     </div>
   );
 }
@@ -108,45 +128,45 @@ function PackageNode({ data }: NodeProps<Node<PackageNodeData>>) {
   return (
     <div
       onClick={() => onSelect(pkg)}
-      className={`px-4 py-3 rounded-xl border transition-all cursor-pointer min-w-[240px] shadow-lg backdrop-blur-md ${
+      className={`px-4 py-3 rounded-xl border transition-all cursor-pointer min-w-[240px] shadow-lg backdrop-blur-xl ${
         pkg.is_fragile
-          ? 'bg-red-950/40 border-red-500/50 hover:border-red-400 hover:shadow-red-500/20'
-          : 'bg-slate-900/90 border-indigo-500/40 hover:border-indigo-400 hover:shadow-indigo-500/20'
+          ? 'bg-gradient-to-br from-red-950/60 to-slate-900/90 border-red-500/60 hover:border-red-400 hover:shadow-[0_0_20px_rgba(239,68,68,0.3)]'
+          : 'bg-gradient-to-br from-slate-900/95 via-indigo-950/30 to-slate-900/95 border-indigo-500/40 hover:border-indigo-400 hover:shadow-[0_0_20px_rgba(99,102,241,0.25)]'
       }`}
     >
-      <Handle type="target" position={Position.Left} className="!bg-indigo-400 !w-2 !h-2" />
+      <Handle type="target" position={Position.Left} className="!bg-indigo-400 !w-2.5 !h-2.5 !border !border-white" />
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <div className="p-1.5 rounded-lg bg-indigo-500/20 text-indigo-400">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className={`p-1.5 rounded-lg shrink-0 ${pkg.is_fragile ? 'bg-red-500/20 text-red-400' : 'bg-indigo-500/20 text-indigo-400'}`}>
             <Folder className="h-4 w-4" />
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <span className="font-semibold text-xs tracking-tight text-white">{pkg.name}</span>
+              <span className="font-semibold text-xs tracking-tight text-white truncate">{pkg.name}</span>
               {pkg.workspace && pkg.workspace !== 'root' && (
-                <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-mono">
+                <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-mono shrink-0">
                   {pkg.workspace}
                 </span>
               )}
             </div>
-            <div className="text-[10px] text-slate-400 font-mono truncate max-w-[140px]" title={pkg.path}>
+            <div className="text-[10px] text-slate-400 font-mono truncate max-w-[150px]" title={pkg.path}>
               {pkg.path}
             </div>
           </div>
         </div>
         {pkg.is_fragile && (
-          <span className="flex items-center gap-0.5 text-[10px] font-semibold text-red-400 bg-red-500/10 px-1.5 py-0.5 rounded-full border border-red-500/30">
-            <Flame className="h-3 w-3" />
+          <span className="flex items-center gap-0.5 text-[10px] font-semibold text-red-400 bg-red-500/15 px-1.5 py-0.5 rounded-full border border-red-500/30 shrink-0">
+            <Flame className="h-3 w-3 animate-pulse" />
             fragile
           </span>
         )}
       </div>
 
-      <div className="mt-2.5 pt-2 border-t border-white/5 flex items-center justify-between text-[11px] text-slate-400">
-        <span>{pkg.files.length} files</span>
-        <span className="font-mono text-slate-300 font-medium">{pkg.total_loc.toLocaleString()} LOC</span>
+      <div className="mt-2.5 pt-2 border-t border-white/5 flex items-center justify-between text-[11px] text-slate-400 font-mono">
+        <span className="text-slate-300">{pkg.files.length} files</span>
+        <span className="text-indigo-300 font-semibold">{pkg.total_loc.toLocaleString()} LOC</span>
       </div>
-      <Handle type="source" position={Position.Right} className="!bg-indigo-400 !w-2 !h-2" />
+      <Handle type="source" position={Position.Right} className="!bg-indigo-400 !w-2.5 !h-2.5 !border !border-white" />
     </div>
   );
 }
@@ -168,20 +188,20 @@ function FileNode({ data }: NodeProps<Node<FileNodeData>>) {
   return (
     <div
       onClick={() => onSelect(file)}
-      className={`px-3.5 py-2.5 rounded-xl border transition-all cursor-pointer min-w-[220px] shadow-md backdrop-blur-md ${
+      className={`px-3.5 py-2.5 rounded-xl border transition-all cursor-pointer min-w-[220px] shadow-md backdrop-blur-xl ${
         file.is_fragile
-          ? 'bg-red-950/30 border-red-500/40 hover:border-red-400'
-          : 'bg-slate-900/80 border-slate-700/60 hover:border-slate-500 hover:shadow-cyan-500/10'
+          ? 'bg-gradient-to-br from-red-950/40 to-slate-900/90 border-red-500/50 hover:border-red-400 hover:shadow-[0_0_15px_rgba(239,68,68,0.25)]'
+          : 'bg-gradient-to-br from-slate-900/90 to-cyan-950/20 border-slate-700/60 hover:border-cyan-400 hover:shadow-[0_0_15px_rgba(6,182,212,0.2)]'
       }`}
     >
-      <Handle type="target" position={Position.Left} className="!bg-cyan-400 !w-2 !h-2" />
+      <Handle type="target" position={Position.Left} className="!bg-cyan-400 !w-2.5 !h-2.5 !border !border-white" />
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
-          <div className="p-1 rounded bg-cyan-500/20 text-cyan-400 shrink-0">
+          <div className="p-1 rounded-lg bg-cyan-500/20 text-cyan-400 shrink-0">
             <FileCode className="h-3.5 w-3.5" />
           </div>
           <div className="min-w-0">
-            <div className="font-medium text-xs text-slate-100 truncate" title={file.name}>
+            <div className="font-semibold text-xs text-slate-100 truncate" title={file.name}>
               {file.name}
             </div>
             <div className="text-[10px] text-slate-400 uppercase tracking-wider font-mono">
@@ -189,18 +209,18 @@ function FileNode({ data }: NodeProps<Node<FileNodeData>>) {
             </div>
           </div>
         </div>
-        <div className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold border ${scoreColor}`}>
+        <div className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold border ${scoreColor}`}>
           {file.health_score}%
         </div>
       </div>
 
       {file.recent_thrashing_count > 0 && (
-        <div className="mt-2 text-[10px] flex items-center gap-1 text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded">
+        <div className="mt-2 text-[10px] flex items-center gap-1 text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20 font-mono">
           <Flame className="h-2.5 w-2.5 shrink-0" />
-          <span>{file.recent_thrashing_count} recent edits</span>
+          <span>{file.recent_thrashing_count} recent edits (Thrash)</span>
         </div>
       )}
-      <Handle type="source" position={Position.Right} className="!bg-cyan-400 !w-2 !h-2" />
+      <Handle type="source" position={Position.Right} className="!bg-cyan-400 !w-2.5 !h-2.5 !border !border-white" />
     </div>
   );
 }
@@ -235,35 +255,39 @@ function SymbolNode({ data }: NodeProps<Node<SymbolNodeData>>) {
   return (
     <div
       onClick={() => onSelect(symbol, file)}
-      className={`px-3 py-2 rounded-lg border transition-all cursor-pointer min-w-[200px] shadow-sm backdrop-blur-md ${
+      className={`px-3 py-2.5 rounded-xl border transition-all cursor-pointer min-w-[210px] shadow-sm backdrop-blur-xl ${
         symbol.status === 'DELETED'
-          ? 'bg-red-950/20 border-red-500/30 opacity-60'
+          ? 'bg-red-950/30 border-red-500/40 opacity-70'
           : symbol.status === 'MODIFIED' || isChurned
-          ? 'bg-amber-950/20 border-amber-500/40 hover:border-amber-400'
-          : 'bg-slate-900/70 border-white/10 hover:border-indigo-400'
+          ? 'bg-gradient-to-br from-amber-950/30 to-slate-900/90 border-amber-500/50 hover:border-amber-400 hover:shadow-[0_0_15px_rgba(245,158,11,0.2)]'
+          : 'bg-slate-900/85 border-white/10 hover:border-purple-400 hover:shadow-[0_0_15px_rgba(168,85,247,0.2)]'
       }`}
     >
-      <Handle type="target" position={Position.Left} className="!bg-purple-400 !w-2 !h-2" />
+      <Handle type="target" position={Position.Left} className="!bg-purple-400 !w-2.5 !h-2.5 !border !border-white" />
       <div className="flex items-center justify-between gap-1.5">
         <div className="flex items-center gap-1.5 min-w-0">
-          <div className="p-0.5 rounded bg-white/5 shrink-0">{symbolKindIcon(symbol.kind)}</div>
-          <div className="font-mono text-xs text-slate-200 truncate" title={symbol.node_signature}>
+          <div className="p-1 rounded bg-white/5 shrink-0">{symbolKindIcon(symbol.kind)}</div>
+          <div className="font-mono text-xs font-semibold text-slate-200 truncate" title={symbol.node_signature}>
             {symbol.name}
           </div>
         </div>
-        <span className="text-[9px] font-mono text-slate-400 shrink-0">L{symbol.start_line}</span>
+        <span className="text-[9px] font-mono text-purple-300 bg-purple-500/10 px-1 py-0.2 rounded border border-purple-500/20 shrink-0">
+          L{symbol.start_line}
+        </span>
       </div>
 
-      <div className="mt-1 flex items-center justify-between text-[10px] text-slate-400">
-        <span className="font-mono text-slate-400">{symbol.lines_of_code} LOC</span>
-        {symbol.edit_count > 0 && (
+      <div className="mt-1.5 flex items-center justify-between text-[10px] text-slate-400 font-mono">
+        <span className="text-slate-400">{symbol.lines_of_code} LOC</span>
+        {symbol.edit_count > 0 ? (
           <span
-            className={`font-mono text-[9px] px-1 py-0.2 rounded ${
-              isChurned ? 'text-red-400 bg-red-500/15' : 'text-slate-300 bg-white/5'
+            className={`font-mono text-[9px] px-1.5 py-0.2 rounded font-bold ${
+              isChurned ? 'text-red-400 bg-red-500/20 border border-red-500/30' : 'text-slate-300 bg-white/5'
             }`}
           >
             {symbol.edit_count}x edit
           </span>
+        ) : (
+          <span className="text-slate-500 capitalize text-[9px]">{symbol.kind}</span>
         )}
       </div>
     </div>
@@ -309,18 +333,36 @@ const nodeTypes = {
 
 export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlasProps) {
   const [viewMode, setViewMode] = useState<'graph' | 'tree'>('graph');
+  const [colorMode, setColorMode] = useState<'hierarchy' | 'health' | 'churn'>('hierarchy');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedWorkspace, setSelectedWorkspace] = useState<string>('all');
   const [selectedKind, setSelectedKind] = useState<string>('all');
   const [selectedFilter, setSelectedFilter] = useState<'all' | 'fragile' | 'modified'>('all');
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['.']));
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
+  const [inspectorTab, setInspectorTab] = useState<'metrics' | 'history' | 'activity'>('metrics');
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [selectedItem, setSelectedItem] = useState<{
     type: 'package' | 'file' | 'symbol';
     pkg?: AtlasPackage;
     file?: AtlasFile;
     symbol?: AtlasSymbol;
   } | null>(null);
+
+  // Keyboard shortcut listener for '/' search focus and 'Escape' to exit fullscreen
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.key === '/' || (e.ctrlKey && e.key === 'k')) && document.activeElement?.tagName !== 'INPUT') {
+        e.preventDefault();
+        document.getElementById('atlas-search-input')?.focus();
+      }
+      if (e.key === 'Escape' && isFullscreen) {
+        setIsFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isFullscreen]);
 
   const toggleFolder = (path: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -803,9 +845,9 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
   }, [filteredPackages, focusedScope, graphLayout]);
 
   return (
-    <div className="space-y-4">
+    <div className={`space-y-4 ${isFullscreen ? 'fixed inset-0 z-50 bg-[#0c1017] p-4 flex flex-col h-screen w-screen overflow-hidden' : ''}`}>
       {/* Top Header & Filter Toolbar */}
-      <div className="panel flex flex-wrap items-center justify-between gap-4">
+      <div className="panel flex flex-wrap items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-3">
           <div className="p-2 rounded-lg bg-accent/20 text-accent">
             <Boxes className="h-5 w-5" />
@@ -825,17 +867,33 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
 
         {/* Controls */}
         <div className="flex flex-wrap items-center gap-2.5">
-          {/* Search */}
+          {/* Search with keyboard shortcut indicator */}
           <div className="relative">
             <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
             <input
+              id="atlas-search-input"
               type="text"
-              placeholder="Search symbols, files, packages…"
+              placeholder="Search symbols, files, packages… (/)"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-8 pr-3 py-1.5 text-xs bg-slate-900/90 border border-white/10 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-accent w-48 sm:w-64"
+              className="pl-8 pr-8 py-1.5 text-xs bg-slate-900/90 border border-white/10 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-accent w-48 sm:w-64"
             />
+            <kbd className="hidden sm:inline-block absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono px-1 py-0.2 bg-slate-800 text-slate-400 rounded border border-white/10">
+              /
+            </kbd>
           </div>
+
+          {/* Color Palette Mode */}
+          <select
+            value={colorMode}
+            onChange={(e) => setColorMode(e.target.value as any)}
+            className="text-xs bg-slate-900 border border-indigo-500/30 rounded-lg px-2.5 py-1.5 text-indigo-300 font-mono focus:outline-none focus:border-indigo-400"
+            title="Visual Color Coding Palette"
+          >
+            <option value="hierarchy">🎨 Hierarchy Palette</option>
+            <option value="health">🟢 Health Heatmap</option>
+            <option value="churn">🔥 Churn Velocity</option>
+          </select>
 
           {/* Monorepo Workspace Filter */}
           {atlas?.is_monorepo && (
@@ -909,6 +967,20 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
               <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
             </button>
           )}
+
+          {/* Fullscreen Toggle */}
+          <button
+            type="button"
+            onClick={() => setIsFullscreen((prev) => !prev)}
+            className={`p-1.5 rounded-lg border transition-all ${
+              isFullscreen
+                ? 'bg-accent text-white border-accent shadow-md'
+                : 'text-slate-400 hover:text-white bg-slate-900 border-white/10 hover:border-slate-600'
+            }`}
+            title={isFullscreen ? 'Exit Fullscreen (Esc)' : 'Enter Fullscreen Mode'}
+          >
+            {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+          </button>
         </div>
       </div>
 
@@ -996,12 +1068,70 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
         </div>
       )}
 
+      {/* Code Atlas KPI Stats Bar */}
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+        <div className="panel-raised p-3 border-l-2 border-l-indigo-500 bg-slate-950/60 shadow-md">
+          <div className="flex items-center justify-between text-slate-400 text-xs">
+            <span>Packages</span>
+            <Folder className="h-3.5 w-3.5 text-indigo-400" />
+          </div>
+          <div className="font-mono text-lg font-bold text-white mt-1">
+            {atlas?.packages?.length ?? 0}
+          </div>
+          <div className="text-[10px] text-slate-500 font-mono">Module boundaries</div>
+        </div>
+
+        <div className="panel-raised p-3 border-l-2 border-l-cyan-500 bg-slate-950/60 shadow-md">
+          <div className="flex items-center justify-between text-slate-400 text-xs">
+            <span>Files Tracked</span>
+            <FileCode className="h-3.5 w-3.5 text-cyan-400" />
+          </div>
+          <div className="font-mono text-lg font-bold text-cyan-300 mt-1">
+            {atlas?.total_files ?? 0}
+          </div>
+          <div className="text-[10px] text-slate-500 font-mono">Tree-sitter monitored</div>
+        </div>
+
+        <div className="panel-raised p-3 border-l-2 border-l-purple-500 bg-slate-950/60 shadow-md">
+          <div className="flex items-center justify-between text-slate-400 text-xs">
+            <span>AST Symbols</span>
+            <Workflow className="h-3.5 w-3.5 text-purple-400" />
+          </div>
+          <div className="font-mono text-lg font-bold text-purple-300 mt-1">
+            {atlas?.total_nodes ?? 0}
+          </div>
+          <div className="text-[10px] text-slate-500 font-mono">Functions & classes</div>
+        </div>
+
+        <div className="panel-raised p-3 border-l-2 border-l-emerald-500 bg-slate-950/60 shadow-md">
+          <div className="flex items-center justify-between text-slate-400 text-xs">
+            <span>Code Volume</span>
+            <GitCommit className="h-3.5 w-3.5 text-emerald-400" />
+          </div>
+          <div className="font-mono text-lg font-bold text-emerald-400 mt-1">
+            {(atlas?.total_loc ?? 0).toLocaleString()}
+          </div>
+          <div className="text-[10px] text-slate-500 font-mono">Total lines of code</div>
+        </div>
+
+        <div className="panel-raised p-3 border-l-2 border-l-rose-500 bg-slate-950/60 shadow-md col-span-2 sm:col-span-1">
+          <div className="flex items-center justify-between text-slate-400 text-xs">
+            <span>Fragile / Thrash</span>
+            <Flame className="h-3.5 w-3.5 text-rose-400" />
+          </div>
+          <div className="font-mono text-lg font-bold text-rose-400 mt-1">
+            {atlas?.packages?.reduce((acc, p) => acc + p.files.filter((f) => f.is_fragile || f.recent_thrashing_count >= 3).length, 0) ?? 0}
+          </div>
+          <div className="text-[10px] text-slate-500 font-mono">≥3x rewritten in 24h</div>
+        </div>
+      </div>
+
       {/* Main Content Area */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         {/* Canvas or Tree View */}
-        <div className={`${selectedItem ? 'lg:col-span-8' : 'lg:col-span-12'} transition-all`}>
+        <div className={`${selectedItem ? 'lg:col-span-8' : 'lg:col-span-12'} transition-all ${isFullscreen ? 'flex-1 h-full min-h-0' : ''}`}>
           {viewMode === 'graph' ? (
-            <div className="panel p-0 h-[650px] overflow-hidden rounded-xl relative border border-white/10 bg-[#0c1017]">
+            <div className={`panel p-0 ${isFullscreen ? 'h-full flex-1' : 'h-[680px]'} overflow-hidden rounded-xl relative border border-white/10 bg-[#0c1017]`}>
               {loading && nodes.length === 0 ? (
                 <div className="flex items-center justify-center h-full text-slate-400 text-sm gap-2">
                   <RefreshCw className="h-4 w-4 animate-spin text-accent" />
@@ -1013,115 +1143,118 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                   <span>No code nodes match the current filters.</span>
                 </div>
               ) : (
-                <ReactFlow
-                  nodes={nodes}
-                  edges={edges}
-                  nodeTypes={nodeTypes}
-                  fitView
-                  minZoom={0.2}
-                  maxZoom={1.8}
-                  proOptions={{ hideAttribution: true }}
-                >
-                  <Background color="#1e293b" gap={20} size={1} />
-                  <Controls className="!bg-slate-900 !border-white/10 !fill-slate-300" />
-                  <MiniMap
-                    nodeColor={(n) => {
-                      if (n.type === 'packageNode') return '#6366f1';
-                      if (n.type === 'fileNode') return '#06b6d4';
-                      return '#a855f7';
-                    }}
-                    maskColor="rgba(15, 23, 42, 0.7)"
-                    className="!bg-slate-950 !border-white/10 !rounded-lg"
-                  />
-                  <Panel position="top-left" className="bg-slate-900/90 backdrop-blur-md px-2.5 py-1.5 rounded-lg border border-white/10 text-xs shadow-lg flex items-center gap-2">
-                    {/* Drill-down Breadcrumb */}
-                    <div className="flex items-center gap-1">
-                      <button
-                        type="button"
-                        onClick={() => setFocusedScope({ level: 'all' })}
-                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
-                          focusedScope.level === 'all'
-                            ? 'bg-indigo-500/20 text-indigo-300 font-semibold'
-                            : 'text-slate-400 hover:text-white'
-                        }`}
-                      >
-                        <Boxes className="h-3.5 w-3.5 text-indigo-400" />
-                        All Packages
-                      </button>
-                      {focusedScope.level !== 'all' && (
-                        <>
-                          <ChevronRight className="h-3 w-3 text-slate-600" />
-                          <button
-                            type="button"
-                            onClick={() => setFocusedScope({ level: 'package', pkg: focusedScope.pkg })}
-                            className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
-                              focusedScope.level === 'package'
-                                ? 'bg-indigo-500/20 text-indigo-300 font-semibold'
-                                : 'text-slate-400 hover:text-white'
-                            }`}
-                          >
-                            <Folder className="h-3.5 w-3.5 text-indigo-400" />
-                            {focusedScope.pkg.name}
-                          </button>
-                        </>
-                      )}
-                      {focusedScope.level === 'file' && (
-                        <>
-                          <ChevronRight className="h-3 w-3 text-slate-600" />
-                          <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-semibold">
-                            <FileCode className="h-3.5 w-3.5 text-cyan-400" />
-                            {focusedScope.file.name}
-                          </span>
-                        </>
-                      )}
-                    </div>
+                <ReactFlowProvider>
+                  <ReactFlow
+                    nodes={nodes}
+                    edges={edges}
+                    nodeTypes={nodeTypes}
+                    fitView
+                    minZoom={0.15}
+                    maxZoom={2.0}
+                    proOptions={{ hideAttribution: true }}
+                  >
+                    <FlowAutoArranger scopeKey={`${focusedScope.level}-${selectedItem?.type}-${selectedItem?.symbol?.node_signature || selectedItem?.file?.path || selectedItem?.pkg?.path}-${graphLayout}-${nodes.length}`} />
+                    <Background color="#1e293b" gap={20} size={1} />
+                    <Controls className="!bg-slate-900 !border-white/10 !fill-slate-300" />
+                    <MiniMap
+                      nodeColor={(n) => {
+                        if (n.type === 'packageNode') return '#6366f1';
+                        if (n.type === 'fileNode') return '#06b6d4';
+                        return '#a855f7';
+                      }}
+                      maskColor="rgba(15, 23, 42, 0.7)"
+                      className="!bg-slate-950 !border-white/10 !rounded-lg"
+                    />
+                    <Panel position="top-left" className="bg-slate-900/90 backdrop-blur-md px-2.5 py-1.5 rounded-lg border border-white/10 text-xs shadow-lg flex items-center gap-2">
+                      {/* Drill-down Breadcrumb */}
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => setFocusedScope({ level: 'all' })}
+                          className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                            focusedScope.level === 'all'
+                              ? 'bg-indigo-500/20 text-indigo-300 font-semibold'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          <Boxes className="h-3.5 w-3.5 text-indigo-400" />
+                          All Packages
+                        </button>
+                        {focusedScope.level !== 'all' && (
+                          <>
+                            <ChevronRight className="h-3 w-3 text-slate-600" />
+                            <button
+                              type="button"
+                              onClick={() => setFocusedScope({ level: 'package', pkg: focusedScope.pkg })}
+                              className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                                focusedScope.level === 'package'
+                                  ? 'bg-indigo-500/20 text-indigo-300 font-semibold'
+                                  : 'text-slate-400 hover:text-white'
+                              }`}
+                            >
+                              <Folder className="h-3.5 w-3.5 text-indigo-400" />
+                              {focusedScope.pkg.name}
+                            </button>
+                          </>
+                        )}
+                        {focusedScope.level === 'file' && (
+                          <>
+                            <ChevronRight className="h-3 w-3 text-slate-600" />
+                            <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-semibold">
+                              <FileCode className="h-3.5 w-3.5 text-cyan-400" />
+                              {focusedScope.file.name}
+                            </span>
+                          </>
+                        )}
+                      </div>
 
-                    <div className="h-3.5 w-px bg-white/10" />
+                      <div className="h-3.5 w-px bg-white/10" />
 
-                    {/* Layout Switcher (Radial / Tree / Grid) */}
-                    <div className="flex items-center bg-slate-950/80 border border-white/10 rounded-md p-0.5 text-[11px]">
-                      <button
-                        type="button"
-                        onClick={() => setGraphLayout('radial')}
-                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
-                          graphLayout === 'radial' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
-                        }`}
-                        title="Radial / Orbit (Orbital Graph Layout)"
-                      >
-                        <Circle className="h-3 w-3" />
-                        Orbit
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setGraphLayout('tree')}
-                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
-                          graphLayout === 'tree' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
-                        }`}
-                        title="Hierarchical Tree Layout"
-                      >
-                        <GitFork className="h-3 w-3" />
-                        Tree
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setGraphLayout('grid')}
-                        className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
-                          graphLayout === 'grid' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
-                        }`}
-                        title="Grid Matrix Layout"
-                      >
-                        <LayoutGrid className="h-3 w-3" />
-                        Grid
-                      </button>
-                    </div>
-                  </Panel>
+                      {/* Layout Switcher (Radial / Tree / Grid) */}
+                      <div className="flex items-center bg-slate-950/80 border border-white/10 rounded-md p-0.5 text-[11px]">
+                        <button
+                          type="button"
+                          onClick={() => setGraphLayout('radial')}
+                          className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                            graphLayout === 'radial' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
+                          }`}
+                          title="Radial / Orbit (Orbital Graph Layout)"
+                        >
+                          <Circle className="h-3 w-3" />
+                          Orbit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setGraphLayout('tree')}
+                          className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                            graphLayout === 'tree' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
+                          }`}
+                          title="Hierarchical Tree Layout"
+                        >
+                          <GitFork className="h-3 w-3" />
+                          Tree
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setGraphLayout('grid')}
+                          className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all ${
+                            graphLayout === 'grid' ? 'bg-accent text-white font-medium shadow-sm' : 'text-slate-400 hover:text-white'
+                          }`}
+                          title="Grid Matrix Layout"
+                        >
+                          <LayoutGrid className="h-3 w-3" />
+                          Grid
+                        </button>
+                      </div>
+                    </Panel>
 
-                  <Panel position="top-right" className="bg-slate-900/80 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 text-[11px] text-slate-400 flex items-center gap-3">
-                    <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-indigo-500" /> Package</span>
-                    <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-cyan-500" /> File</span>
-                    <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-purple-500" /> Symbol</span>
-                  </Panel>
-                </ReactFlow>
+                    <Panel position="top-right" className="bg-slate-900/80 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 text-[11px] text-slate-400 flex items-center gap-3">
+                      <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-indigo-500" /> Package</span>
+                      <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-cyan-500" /> File</span>
+                      <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-purple-500" /> Symbol</span>
+                    </Panel>
+                  </ReactFlow>
+                </ReactFlowProvider>
               )}
             </div>
           ) : (
@@ -1314,89 +1447,143 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
               </button>
             </div>
 
+            {/* Inspector Navigation Tabs */}
+            {selectedItem.type === 'symbol' && (
+              <div className="flex items-center bg-slate-950 border border-white/10 rounded-lg p-0.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setInspectorTab('metrics')}
+                  className={`flex-1 py-1 text-center rounded font-medium transition-all ${
+                    inspectorTab === 'metrics'
+                      ? 'bg-accent text-white shadow-sm font-semibold'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Metrics
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setInspectorTab('history')}
+                  className={`flex-1 py-1 text-center rounded font-medium transition-all ${
+                    inspectorTab === 'history'
+                      ? 'bg-accent text-white shadow-sm font-semibold'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Lineage
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setInspectorTab('activity')}
+                  className={`flex-1 py-1 text-center rounded font-medium transition-all ${
+                    inspectorTab === 'activity'
+                      ? 'bg-accent text-white shadow-sm font-semibold'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Context Reads
+                </button>
+              </div>
+            )}
+
             {selectedItem.type === 'symbol' && selectedItem.symbol && (
               <div className="space-y-3 text-xs">
-                <div>
-                  <div className="text-slate-400 mb-1">Symbol Signature</div>
-                  <div className="font-mono text-slate-200 bg-slate-950 p-2 rounded-lg border border-white/5 break-all">
-                    {selectedItem.symbol.node_signature}
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="panel-raised p-2.5">
-                    <div className="text-slate-400 text-[11px]">Kind</div>
-                    <div className="font-medium text-slate-200 capitalize mt-0.5">
-                      {selectedItem.symbol.kind}
-                    </div>
-                  </div>
-                  <div className="panel-raised p-2.5">
-                    <div className="text-slate-400 text-[11px]">Lines of Code</div>
-                    <div className="font-mono text-slate-200 mt-0.5">
-                      {selectedItem.symbol.lines_of_code} (L{selectedItem.symbol.start_line}-L{selectedItem.symbol.end_line})
-                    </div>
-                  </div>
-                  <div className="panel-raised p-2.5">
-                    <div className="text-slate-400 text-[11px]">Edit / Churn Count</div>
-                    <div className="font-mono text-slate-200 mt-0.5">
-                      {selectedItem.symbol.edit_count} times
-                    </div>
-                  </div>
-                  <div className="panel-raised p-2.5">
-                    <div className="text-slate-400 text-[11px]">Status</div>
-                    <div className="font-medium text-accent mt-0.5">
-                      {selectedItem.symbol.status}
-                    </div>
-                  </div>
-                </div>
-
-                {selectedItem.symbol.last_model && (
-                  <div className="panel-raised p-2.5 flex items-center gap-2">
-                    <Bot className="h-4 w-4 text-accent" />
+                {inspectorTab === 'metrics' && (
+                  <>
                     <div>
-                      <div className="text-[10px] text-slate-400">Last touched by AI Model</div>
-                      <div className="font-mono text-slate-200 font-semibold">{selectedItem.symbol.last_model}</div>
-                    </div>
-                  </div>
-                )}
-
-                {selectedItem.symbol.ast_content_hash && (
-                  <div>
-                    <div className="text-slate-400 mb-1">AST Normalized Hash</div>
-                    <div className="font-mono text-[10px] text-slate-400 bg-slate-950 p-1.5 rounded border border-white/5 truncate">
-                      {selectedItem.symbol.ast_content_hash}
-                    </div>
-                  </div>
-                )}
-
-                {/* Latest Diff Snippet if symbol was modified */}
-                {(() => {
-                  const ev = recentEvents?.find((r) => r.node_signature === selectedItem.symbol?.node_signature && !!r.diff_snippet);
-                  if (!ev) return null;
-                  return (
-                    <div>
-                      <div className="text-slate-400 mb-1.5 flex items-center justify-between text-xs">
-                        <span>Latest Code Change Diff ({ev.action})</span>
+                      <div className="text-slate-400 mb-1">Symbol Signature</div>
+                      <div className="font-mono text-slate-200 bg-slate-950 p-2 rounded-lg border border-white/5 break-all">
+                        {selectedItem.symbol.node_signature}
                       </div>
-                      <RichDiffViewer
-                        diff={ev.diff_snippet}
-                        filePath={ev.file_path}
-                        signature={ev.node_signature}
-                        action={ev.action}
-                        startLine={ev.start_line}
-                        endLine={ev.end_line}
-                        maxHeight="220px"
-                      />
                     </div>
-                  );
-                })()}
 
-                <div className="p-3 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-200 text-[11px]">
-                  💡 <strong>Agent Guardrail:</strong>{' '}
-                  {selectedItem.symbol.edit_count >= 5
-                    ? 'High thrashing detected on this symbol. Avoid rewriting unless addressing failing tests.'
-                    : 'Symbol is stable and safe for refactoring.'}
-                </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="panel-raised p-2.5">
+                        <div className="text-slate-400 text-[11px]">Kind</div>
+                        <div className="font-medium text-slate-200 capitalize mt-0.5">
+                          {selectedItem.symbol.kind}
+                        </div>
+                      </div>
+                      <div className="panel-raised p-2.5">
+                        <div className="text-slate-400 text-[11px]">Lines of Code</div>
+                        <div className="font-mono text-slate-200 mt-0.5">
+                          {selectedItem.symbol.lines_of_code} (L{selectedItem.symbol.start_line}-L{selectedItem.symbol.end_line})
+                        </div>
+                      </div>
+                      <div className="panel-raised p-2.5">
+                        <div className="text-slate-400 text-[11px]">Edit / Churn Count</div>
+                        <div className="font-mono text-slate-200 mt-0.5">
+                          {selectedItem.symbol.edit_count} times
+                        </div>
+                      </div>
+                      <div className="panel-raised p-2.5">
+                        <div className="text-slate-400 text-[11px]">Status</div>
+                        <div className="font-medium text-accent mt-0.5">
+                          {selectedItem.symbol.status}
+                        </div>
+                      </div>
+                    </div>
+
+                    {selectedItem.symbol.last_model && (
+                      <div className="panel-raised p-2.5 flex items-center gap-2">
+                        <Bot className="h-4 w-4 text-accent" />
+                        <div>
+                          <div className="text-[10px] text-slate-400">Last touched by AI Model</div>
+                          <div className="font-mono text-slate-200 font-semibold">{selectedItem.symbol.last_model}</div>
+                        </div>
+                      </div>
+                    )}
+
+                    {selectedItem.symbol.ast_content_hash && (
+                      <div>
+                        <div className="text-slate-400 mb-1">AST Normalized Hash</div>
+                        <div className="font-mono text-[10px] text-slate-400 bg-slate-950 p-1.5 rounded border border-white/5 truncate">
+                          {selectedItem.symbol.ast_content_hash}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Latest Diff Snippet if symbol was modified */}
+                    {(() => {
+                      const ev = recentEvents?.find((r) => r.node_signature === selectedItem.symbol?.node_signature && !!r.diff_snippet);
+                      if (!ev) return null;
+                      return (
+                        <div>
+                          <div className="text-slate-400 mb-1.5 flex items-center justify-between text-xs">
+                            <span>Latest Code Change Diff ({ev.action})</span>
+                          </div>
+                          <RichDiffViewer
+                            diff={ev.diff_snippet}
+                            filePath={ev.file_path}
+                            signature={ev.node_signature}
+                            action={ev.action}
+                            startLine={ev.start_line}
+                            endLine={ev.end_line}
+                            maxHeight="220px"
+                          />
+                        </div>
+                      );
+                    })()}
+
+                    <div className="p-3 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-200 text-[11px]">
+                      💡 <strong>Agent Guardrail:</strong>{' '}
+                      {selectedItem.symbol.edit_count >= 5
+                        ? 'High thrashing detected on this symbol. Avoid rewriting unless addressing failing tests.'
+                        : 'Symbol is stable and safe for refactoring.'}
+                    </div>
+                  </>
+                )}
+
+                {inspectorTab === 'history' && (
+                  <SymbolHistoryTimeline
+                    signature={selectedItem.symbol.node_signature}
+                    filePath={selectedItem.file?.path}
+                  />
+                )}
+
+                {inspectorTab === 'activity' && selectedItem.file && (
+                  <FileReadDetails filePath={selectedItem.file.path} />
+                )}
               </div>
             )}
 

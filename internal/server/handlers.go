@@ -101,13 +101,13 @@ func (h *Handlers) Models(w http.ResponseWriter, r *http.Request) {
 
 // RecentEvents returns the most recent AST events for the live feed, optionally filtered by file_path or repo.
 func (h *Handlers) RecentEvents(w http.ResponseWriter, r *http.Request) {
-	if filePath := r.URL.Query().Get("file_path"); filePath != "" {
-		limit := 50
-		if l := r.URL.Query().Get("limit"); l != "" {
-			if val, err := strconv.Atoi(l); err == nil && val > 0 {
-				limit = val
-			}
+	limit := 500
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			limit = val
 		}
+	}
+	if filePath := r.URL.Query().Get("file_path"); filePath != "" {
 		events, err := h.Engine.GetRecentFileEvents(filePath, limit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -120,12 +120,85 @@ func (h *Handlers) RecentEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := h.Engine.Metrics(h.getProjectFilter(r))
+	events, err := h.Engine.GetRecentEvents(limit, h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, snap.RecentEvents)
+	if events == nil {
+		events = []db.EventRecord{}
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+// SymbolHistory returns the revision history and model lineage of an AST node.
+func (h *Handlers) SymbolHistory(w http.ResponseWriter, r *http.Request) {
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		filePath = r.URL.Query().Get("file_path")
+	}
+	signature := r.URL.Query().Get("signature")
+	if signature == "" {
+		signature = r.URL.Query().Get("symbol")
+	}
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+	history, err := h.Engine.GetSymbolHistory(filePath, signature, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if history == nil {
+		history = []db.SymbolHistoryRecord{}
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
+// FileModelActivity returns per-model read vs write stats for a file.
+func (h *Handlers) FileModelActivity(w http.ResponseWriter, r *http.Request) {
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		filePath = r.URL.Query().Get("file_path")
+	}
+	if filePath == "" {
+		writeError(w, http.StatusBadRequest, "path or file_path is required")
+		return
+	}
+	activity, err := h.Engine.GetFileModelActivity(filePath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if activity == nil {
+		activity = []db.ModelActivitySummary{}
+	}
+	writeJSON(w, http.StatusOK, activity)
+}
+
+// ModelFriction returns the inter-agent friction and cross-model code collision report.
+func (h *Handlers) ModelFriction(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+	report, err := h.Engine.GetModelFrictionReport(limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if report == nil {
+		report = &db.InterAgentFrictionReport{
+			Edges:            []db.ModelFrictionEdge{},
+			RecentCollisions: []db.CrossThrashEvent{},
+		}
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 // Atlas returns the full repository Code Atlas graph (packages, files, symbols).

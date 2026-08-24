@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { RichDiffViewer } from './RichDiffViewer';
 import { FileReadDetails } from './FileReadDetails';
+import { SymbolHistoryTimeline } from './SymbolHistoryTimeline';
 import type { EventRecord, Project } from '../types';
 
 interface DiffInspectorViewProps {
@@ -171,8 +172,8 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
 
       {/* Main Split Layout: Left List, Right Code Diff View */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-        {/* Left: Events List */}
-        <div className="lg:col-span-5 panel p-0 overflow-hidden flex flex-col h-[680px]">
+        {/* Left: Events List (Sticky pinned on scroll) */}
+        <div className="lg:col-span-5 panel p-0 overflow-hidden flex flex-col h-[calc(100vh-10rem)] min-h-[550px] sticky top-4">
           <div className="p-3 bg-white/5 border-b border-white/5 flex items-center justify-between text-xs text-slate-400 font-medium">
             <span>Transitions Timeline</span>
             <span>{filteredEvents.length} recorded</span>
@@ -246,8 +247,8 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
           </div>
         </div>
 
-        {/* Right: Full Diff Inspector Canvas */}
-        <div className="lg:col-span-7 panel p-0 overflow-hidden flex flex-col h-[680px] bg-[#0c1017]">
+        {/* Right: Full Diff Inspector Canvas (Expands naturally down the page) */}
+        <div className="lg:col-span-7 panel p-0 flex flex-col min-h-[600px] bg-[#0c1017] rounded-xl border border-white/10 shadow-2xl">
           {currentEvent ? (
             <>
               {/* Diff Header */}
@@ -289,7 +290,7 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
               </div>
 
               {/* Rich Diff Body Content */}
-              <div className="p-3 flex-1 overflow-auto space-y-4">
+              <div className="p-4 space-y-5">
                 <RichDiffViewer
                   diff={currentEvent.diff_snippet}
                   filePath={currentEvent.file_path}
@@ -297,7 +298,13 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
                   action={currentEvent.action}
                   startLine={currentEvent.start_line}
                   endLine={currentEvent.end_line}
-                  maxHeight="420px"
+                  maxHeight="none"
+                />
+
+                {/* AST Symbol Evolution & Lineage */}
+                <SymbolHistoryTimeline
+                  filePath={currentEvent.file_path}
+                  signature={currentEvent.node_signature}
                 />
 
                 {/* File Read & Context Analytics */}

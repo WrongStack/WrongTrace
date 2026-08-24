@@ -264,7 +264,7 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 			snap.Nodes[sig] = Node{
 				Signature: sig,
 				Kind:      kind,
-				Body:      normalizedBody,
+				Body:      fullBody,
 				StartLine: uint32(startLine),
 				EndLine:   uint32(endLine),
 				Hash:      hex.EncodeToString(hash[:]),
@@ -401,13 +401,13 @@ func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out
 	kind, ok := classifyNode(lang, kindStr, node)
 	if ok {
 		sig := buildSignature(lang, file, kind, node, src)
-		body := sliceText(node, src)
-		body = normalizeForHash(body, lang)
-		hash := sha256.Sum256([]byte(body))
+		rawBody := sliceText(node, src)
+		normalized := normalizeForHash(rawBody, lang)
+		hash := sha256.Sum256([]byte(normalized))
 		out.Nodes[sig] = Node{
 			Signature: sig,
 			Kind:      kind,
-			Body:      body,
+			Body:      rawBody,
 			StartLine: node.StartPoint().Row + 1,
 			EndLine:   node.EndPoint().Row + 1,
 			Hash:      hex.EncodeToString(hash[:]),

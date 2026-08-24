@@ -597,6 +597,30 @@ func (e *Engine) GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, erro
 	return e.cfg.Store.GetFileReadHeatmap(filePath)
 }
 
+// GetSymbolHistory returns the chronological evolution and revision history of an AST symbol.
+func (e *Engine) GetSymbolHistory(filePath, signature string, limit int) ([]db.SymbolHistoryRecord, error) {
+	if e.cfg.Store == nil {
+		return nil, nil
+	}
+	return e.cfg.Store.SymbolHistory(filePath, signature, limit)
+}
+
+// GetFileModelActivity returns per-model read vs write activity breakdown for a file.
+func (e *Engine) GetFileModelActivity(filePath string) ([]db.ModelActivitySummary, error) {
+	if e.cfg.Store == nil {
+		return nil, nil
+	}
+	return e.cfg.Store.FileModelActivity(filePath)
+}
+
+// GetModelFrictionReport returns inter-agent cross-thrashing and collision analytics.
+func (e *Engine) GetModelFrictionReport(limit int) (*db.InterAgentFrictionReport, error) {
+	if e.cfg.Store == nil {
+		return nil, nil
+	}
+	return e.cfg.Store.ModelFrictionMatrix(limit)
+}
+
 // IndexStatus returns the current codebase indexing progress and stats.
 func (e *Engine) IndexStatus() IndexProgress {
 	e.indexMu.RLock()

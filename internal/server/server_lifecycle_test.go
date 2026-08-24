@@ -106,6 +106,18 @@ func (f *failingEngine) GetRecentFileEvents(string, int) ([]db.EventRecord, erro
 func (f *failingEngine) GetFileReadHeatmap(string) ([]db.LineReadHeatmap, error) {
 	return nil, errForced
 }
+func (f *failingEngine) GetRecentEvents(int, ...string) ([]db.EventRecord, error) {
+	return nil, errForced
+}
+func (f *failingEngine) GetSymbolHistory(string, string, int) ([]db.SymbolHistoryRecord, error) {
+	return nil, errForced
+}
+func (f *failingEngine) GetFileModelActivity(string) ([]db.ModelActivitySummary, error) {
+	return nil, errForced
+}
+func (f *failingEngine) GetModelFrictionReport(int) (*db.InterAgentFrictionReport, error) {
+	return nil, errForced
+}
 func (f *failingEngine) IndexStatus() core.IndexProgress {
 	return core.IndexProgress{}
 }
@@ -152,6 +164,8 @@ func TestReadHandlers_MapEngineErrorsTo500(t *testing.T) {
 		{"RecentEvents", h.RecentEvents, "/api/metrics/recent"},
 		{"Atlas", h.Atlas, "/api/atlas"},
 		{"FileHealth", h.FileHealth, "/api/file/health?path=hot.go"},
+		{"SymbolHistory", h.SymbolHistory, "/api/symbol/history?path=hot.go&signature=foo"},
+		{"FileModelActivity", h.FileModelActivity, "/api/files/activity?path=hot.go"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

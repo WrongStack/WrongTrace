@@ -58,6 +58,10 @@ type EngineAPI interface {
 	UpdateSettings(s core.AppSettings) core.AppSettings
 	VacuumDB() error
 	ClearStale(days int) (int64, error)
+	GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error)
+	GetSymbolHistory(filePath, signature string, limit int) ([]db.SymbolHistoryRecord, error)
+	GetFileModelActivity(filePath string) ([]db.ModelActivitySummary, error)
+	GetModelFrictionReport(limit int) (*db.InterAgentFrictionReport, error)
 	GetFileReadStats(filePath string) (db.FileReadStats, error)
 	GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileReadRecord, error)
 	GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error)
@@ -231,6 +235,8 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/metrics/thrashing", h.Thrashing)
 		r.Get("/metrics/models", h.Models)
 		r.Get("/metrics/recent", h.RecentEvents)
+		r.Get("/metrics/friction", h.ModelFriction)
+		r.Get("/metrics/cross-thrash", h.ModelFriction)
 		r.Get("/atlas", h.Atlas)
 		r.Get("/atlas/status", h.AtlasStatus)
 		r.Get("/file/health", h.FileHealth)
@@ -241,7 +247,17 @@ func (s *Server) buildRouter() chi.Router {
 		// File Read Tracing & Context Hotspots
 		r.Get("/reads/recent", h.GetRecentReads)
 		r.Get("/files/reads", h.GetFileReadStats)
+		r.Get("/file/reads", h.GetFileReadStats)
 		r.Get("/files/heatmap", h.GetFileReadHeatmap)
+		r.Get("/file/heatmap", h.GetFileReadHeatmap)
+		r.Get("/files/activity", h.FileModelActivity)
+		r.Get("/file/activity", h.FileModelActivity)
+
+		// AST Symbol History & Evolution Lineage
+		r.Get("/symbol/history", h.SymbolHistory)
+		r.Get("/symbols/history", h.SymbolHistory)
+		r.Get("/node/history", h.SymbolHistory)
+		r.Get("/nodes/history", h.SymbolHistory)
 
 		r.Get("/proxy/routes", h.ListProxyRoutes)
 		r.Post("/proxy/routes", h.UpsertProxyRoute)

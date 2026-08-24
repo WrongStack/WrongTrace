@@ -42,6 +42,7 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
 
   // Filter events based on selected time window
   const filteredEvents = useMemo(() => {
+    if (!events || events.length === 0) return [];
     if (timeFilter === 'all') return events;
     const now = Date.now();
     const windowMs = timeFilter === '24h' ? 24 * 3600 * 1000 : 7 * 24 * 3600 * 1000;
@@ -51,16 +52,32 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
     });
   }, [events, timeFilter]);
 
-  // Aggregate events into time buckets for chart
+  // Aggregate events into adaptive time buckets for chart
   const timelineData = useMemo(() => {
     if (filteredEvents.length === 0) return [];
 
     // Sort chronologically ascending
-    const sorted = [...filteredEvents].sort(
-      (a, b) => Date.parse(a.event_time) - Date.parse(b.event_time)
-    );
+    const validEvents = filteredEvents
+      .filter((e) => !Number.isNaN(Date.parse(e.event_time)))
+      .sort((a, b) => Date.parse(a.event_time) - Date.parse(b.event_time));
 
-    // Group by formatted date/time bucket
+    if (validEvents.length === 0) return [];
+
+    const firstTime = Date.parse(validEvents[0].event_time);
+    const lastTime = Date.parse(validEvents[validEvents.length - 1].event_time);
+    const spanMs = Math.max(lastTime - firstTime, 1000);
+
+    // Adaptive bucket granularity:
+    // < 4 hours: 15-minute buckets
+    // < 48 hours: 1-hour buckets
+    // >= 48 hours: 1-day buckets
+    const bucketMode =
+      timeFilter === '24h' || spanMs <= 4 * 3600 * 1000
+        ? '15m'
+        : spanMs <= 48 * 3600 * 1000
+        ? '1h'
+        : '1d';
+
     const buckets = new Map<
       string,
       {
@@ -76,17 +93,22 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
       }
     >();
 
-    sorted.forEach((e) => {
+    validEvents.forEach((e) => {
       const d = new Date(e.event_time);
-      const isShortWindow = timeFilter === '24h';
-      // Format label
-      const timeKey = isShortWindow
-        ? `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:00`
-        : `${d.getMonth() + 1}/${d.getDate()}`;
+      let timeKey: string;
+      let label: string;
 
-      const label = isShortWindow
-        ? `${String(d.getHours()).padStart(2, '0')}:00`
-        : `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`;
+      if (bucketMode === '15m') {
+        const m = Math.floor(d.getMinutes() / 15) * 15;
+        timeKey = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+        label = `${String(d.getHours()).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+      } else if (bucketMode === '1h') {
+        timeKey = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:00`;
+        label = `${d.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })} ${String(d.getHours()).padStart(2, '0')}:00`;
+      } else {
+        timeKey = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+        label = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      }
 
       if (!buckets.has(timeKey)) {
         buckets.set(timeKey, {
@@ -103,8 +125,21 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
       }
 
       const b = buckets.get(timeKey)!;
-      const added = e.added_lines ?? (e.action === 'ADDED' ? e.lines_of_code || 10 : 0);
-      const deleted = e.deleted_lines ?? (e.action === 'DELETED' ? e.lines_of_code || 10 : 0);
+      const added =
+        typeof e.added_lines === 'number' && e.added_lines > 0
+          ? e.added_lines
+          : e.action === 'ADDED'
+          ? e.lines_of_code || 10
+          : e.action === 'MODIFIED'
+          ? Math.max(1, Math.round((e.lines_of_code || 6) * 0.3))
+          : 0;
+
+      const deleted =
+        typeof e.deleted_lines === 'number' && e.deleted_lines > 0
+          ? e.deleted_lines
+          : e.action === 'DELETED'
+          ? e.lines_of_code || 10
+          : 0;
 
       b.addedLines += added;
       b.deletedLines += deleted;
@@ -116,7 +151,8 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
       else if (e.action === 'DELETED') b.deletedEvents += 1;
     });
 
-    return Array.from(buckets.values());
+    const result = Array.from(buckets.values());
+    return result;
   }, [filteredEvents, timeFilter]);
 
   // Overall KPI aggregates
@@ -128,8 +164,24 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
     let delEv = 0;
 
     filteredEvents.forEach((e) => {
-      added += e.added_lines ?? (e.action === 'ADDED' ? e.lines_of_code || 10 : 0);
-      deleted += e.deleted_lines ?? (e.action === 'DELETED' ? e.lines_of_code || 10 : 0);
+      const add =
+        typeof e.added_lines === 'number' && e.added_lines > 0
+          ? e.added_lines
+          : e.action === 'ADDED'
+          ? e.lines_of_code || 10
+          : e.action === 'MODIFIED'
+          ? Math.max(1, Math.round((e.lines_of_code || 6) * 0.3))
+          : 0;
+
+      const del =
+        typeof e.deleted_lines === 'number' && e.deleted_lines > 0
+          ? e.deleted_lines
+          : e.action === 'DELETED'
+          ? e.lines_of_code || 10
+          : 0;
+
+      added += add;
+      deleted += del;
       if (e.action === 'ADDED') addedEv++;
       else if (e.action === 'MODIFIED') modEv++;
       else if (e.action === 'DELETED') delEv++;

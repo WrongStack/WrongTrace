@@ -5,6 +5,8 @@ import { MetricsOverview } from '../components/MetricsOverview';
 import { CodeChurnTimeline } from '../components/CodeChurnTimeline';
 import { ThrashingHeatmap } from '../components/ThrashingHeatmap';
 import { ModelLeaderboard } from '../components/ModelLeaderboard';
+import { ModelIntelligenceMatrix } from '../components/ModelIntelligenceMatrix';
+import { ModelFrictionMatrix } from '../components/ModelFrictionMatrix';
 import { LiveEventFeed } from '../components/LiveEventFeed';
 import { ROIAnalysis } from '../components/ROIAnalysis';
 import { CodeAtlas } from '../components/CodeAtlas';
@@ -133,6 +135,17 @@ export function Dashboard() {
               <ThrashingHeatmap rows={thrashing.data ?? []} loading={thrashing.isLoading} />
               <ModelLeaderboard models={models.data ?? []} loading={models.isLoading} />
             </div>
+
+            {/* Model Telemetry & Code Durability Intelligence Matrix */}
+            <ModelIntelligenceMatrix
+              models={models.data ?? []}
+              events={recent.data ?? []}
+              loading={models.isLoading}
+              projectId={activeProjId}
+            />
+
+            {/* Inter-Agent Friction & Cross-Thrashing Matrix */}
+            <ModelFrictionMatrix />
 
             <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
               <div className="xl:col-span-2">

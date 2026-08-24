@@ -406,3 +406,27 @@ func TestParse_UnsupportedFile(t *testing.T) {
 		t.Errorf("unsupported file returned snapshot: %+v", snap)
 	}
 }
+
+func TestMultiLineDiffCounting(t *testing.T) {
+	eng := newTestEngine(t)
+
+	v1 := "package main\n\nfunc ComputeSum(a, b int) int {\n\tres := a + b\n\treturn res\n}\n"
+	v2 := "package main\n\nfunc ComputeSum(a, b int) int {\n\ttemp := a * 2\n\tintermediate := b * 3\n\tfinalRes := temp + intermediate\n\treturn finalRes\n}\n"
+
+	prev := parseOrFatal(t, eng, "calc.go", v1)
+	next := parseOrFatal(t, eng, "calc.go", v2)
+
+	res := Diff("repo", prev, next)
+	if len(res.Events) != 1 {
+		t.Fatalf("expected 1 modified event, got %d", len(res.Events))
+	}
+
+	ev := res.Events[0]
+	if ev.Action != ActionModified {
+		t.Fatalf("expected action MODIFIED, got %s", ev.Action)
+	}
+
+	if ev.AddedLines < 3 || ev.DeletedLines < 1 {
+		t.Fatalf("expected multi-line diff, got AddedLines=%d DeletedLines=%d (snippet:\n%s)", ev.AddedLines, ev.DeletedLines, ev.DiffSnippet)
+	}
+}

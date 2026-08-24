@@ -458,4 +458,79 @@ export interface ProfilerOverview {
   active_services: number;
 }
 
+export interface SymbolHistoryRecord {
+  event_id: string;
+  run_id: string;
+  repo_name: string;
+  file_path: string;
+  node_signature: string;
+  node_type: NodeKind;
+  action: Action;
+  ast_content_hash: string;
+  lines_of_code: number;
+  start_line: number;
+  end_line: number;
+  diff_snippet: string;
+  added_lines: number;
+  deleted_lines: number;
+  event_time: string;
+  agent_name: string;
+  model_name: string;
+  provider: string;
+  intent: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+}
+
+export interface ModelActivitySummary {
+  model_name: string;
+  provider: string;
+  read_count: number;
+  lines_read: number;
+  read_tokens: number;
+  read_cost_usd: number;
+  write_events: number;
+  lines_added: number;
+  lines_deleted: number;
+  last_activity_at: string;
+}
+
+export interface ModelFrictionEdge {
+  author_model: string;
+  overwriter_model: string;
+  conflict_count: number;
+  lines_modified: number;
+  lines_deleted: number;
+  is_self_thrash: boolean;
+  wasted_cost_usd: number;
+}
+
+export interface CrossThrashEvent {
+  event_id: string;
+  file_path: string;
+  node_signature: string;
+  action: string;
+  author_model: string;
+  author_run_id: string;
+  author_time: string;
+  overwriter_model: string;
+  overwriter_run_id: string;
+  overwriter_time: string;
+  time_delta_seconds: number;
+  added_lines: number;
+  deleted_lines: number;
+  diff_snippet: string;
+  is_cross_agent: boolean;
+}
+
+export interface InterAgentFrictionReport {
+  edges: ModelFrictionEdge[];
+  recent_collisions: CrossThrashEvent[];
+  total_collisions: number;
+  cross_agent_ratio_pct: number;
+  top_friction_pair: string;
+}
+
+
 

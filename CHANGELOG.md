@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-08-24
+
+### Added
+- **Inter-Agent Friction & Cross-Thrashing Matrix ("Who Broke Whose Code?")**:
+  - Implemented deep causality tracking via SQLite window functions (`LAG(...) OVER PARTITION BY file_path, node_signature ORDER BY event_time`) identifying the original author model and subsequent overwriting or deleting models.
+  - Interactive **Collision Heatmap Grid** visualizing cross-model overwrite frequencies and deleted LOC volumes.
+  - Real-time **Inter-Agent Overwrites Stream** displaying time-delta durations ($\Delta T$), action pills (`MODIFIED` / `DELETED`), and expandable syntax-highlighted Rich Diff code snippets.
+  - Multi-mode filtering: All Events, Cross-Model Collisions Only (`⚔️`), and Self-Thrashing Loops (`🔄`).
+  - Added `/api/metrics/friction` and `/api/metrics/cross-thrash` endpoints.
+- **Next-Gen Code Atlas Architecture**:
+  - **Immersive Fullscreen Mode**: Added full-viewport interactive canvas mode with smooth transitions and `Escape` key shortcut.
+  - **Intelligent Smooth Auto-Arranger (`FlowAutoArranger`)**: Automatic viewport framing and smooth centering animation (`fitView({ duration: 500, padding: 0.25 })`) across package/file/symbol drilldowns and layout switches (`Orbit`, `Tree`, `Grid`).
+  - **Visual Color Palette Modes**: Seamlessly toggle between Hierarchy Palette (architecture-coded), Health Heatmap (score-based), and Churn Velocity.
+  - **Global Quick Search Keyboard Shortcut**: `/` and `Ctrl+K` for instant AST symbol filtering.
+  - **Tabbed Multi-Inspector Drawer**: Organized into Architecture Metrics, AST Symbol Evolution Timeline, and Context Reads / Model Activity breakdown.
+- **Model Intelligence & Code Durability Matrix**:
+  - Unified table evaluating AI model performance: Quality Tiers (S/A/B/C), 14-Day Code Survival Rate %, True Token ROI ($/survived node), context read volume, and net code longevity.
+- **AST Symbol Evolution & Lineage API**:
+  - Added `/api/symbol/history`, `/api/symbols/history`, `/api/node/history`, and `/api/nodes/history` routes providing full chronological revision history for any AST node.
+  - Added `/api/files/activity` and `/api/file/activity` for per-model file read vs write volume breakdown.
+
+### Fixed
+- **AST Parser Multi-Line Diffing Precision**:
+  - Resolved single-line diff counting where `normalizeForHash` collapsed newlines into single spaces before assigning to `Node.Body`. `Node.Body` now preserves original multi-line formatting while computing normalized SHA-256 hashes, producing exact `+AddedLines / -DeletedLines` line counts.
+- **Diff Inspector Height & Viewport Layout**:
+  - Removed restrictive fixed height boundaries on the diff viewer panel, allowing seamless full-page code expansion with sticky timeline navigation.
+
+---
+
 ## [0.2.2] - 2026-08-24
 
 ### Changed
