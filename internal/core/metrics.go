@@ -10,13 +10,13 @@ import (
 // small set of DB queries (overview, recent events, thrashing, model
 // comparison) so the React UI can hit a single endpoint on page load.
 type MetricsSnapshot struct {
-	Repo         string           `json:"repo"`
-	GeneratedAt  time.Time        `json:"generated_at"`
-	Overview     db.Overview      `json:"overview"`
+	Repo         string            `json:"repo"`
+	GeneratedAt  time.Time         `json:"generated_at"`
+	Overview     db.Overview       `json:"overview"`
 	Thrashing    []db.ThrashingRow `json:"thrashing"`
-	Models       []db.ModelRow    `json:"models"`
-	RecentEvents []db.EventRecord `json:"recent_events"`
-	ActiveRuns   []ActiveRun      `json:"active_runs"`
+	Models       []db.ModelRow     `json:"models"`
+	RecentEvents []db.EventRecord  `json:"recent_events"`
+	ActiveRuns   []ActiveRun       `json:"active_runs"`
 }
 
 // Metrics assembles a fresh snapshot from the underlying store, optionally filtered by repo_name.
@@ -27,7 +27,7 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
 		filter = active.Name
 	} else {
-		filter = e.cfg.RepoName
+		filter = e.repoName()
 	}
 
 	store := e.Store()
@@ -69,8 +69,8 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 // WSEvent is the wire format pushed to all dashboard WebSocket clients. The
 // Type discriminator lets the UI switch on payload shape without reflection.
 type WSEvent struct {
-	Type    string      `json:"type"`                 // "code_event", "run_reported", "hello"
-	Payload interface{} `json:"payload,omitempty"`    // ast.Event, db.RunRecord, ...
+	Type    string      `json:"type"`              // "code_event", "run_reported", "hello"
+	Payload interface{} `json:"payload,omitempty"` // ast.Event, db.RunRecord, ...
 	EventID string      `json:"event_id,omitempty"`
 	At      time.Time   `json:"at"`
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,7 +94,10 @@ func (s *Store) Migrate() error {
 	if err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
-	// Add new columns to existing databases safely
+	// Add new columns to existing databases safely. Only the expected
+	// "already migrated" no-op may be swallowed: a locked database, full
+	// disk, or corrupt page must fail startup here instead of surfacing as
+	// "table has no column named ..." on every later insert.
 	for _, col := range []string{
 		"ALTER TABLE code_node_events ADD COLUMN start_line INTEGER DEFAULT 0",
 		"ALTER TABLE code_node_events ADD COLUMN end_line INTEGER DEFAULT 0",
@@ -101,7 +105,12 @@ func (s *Store) Migrate() error {
 		"ALTER TABLE code_node_events ADD COLUMN added_lines INTEGER DEFAULT 0",
 		"ALTER TABLE code_node_events ADD COLUMN deleted_lines INTEGER DEFAULT 0",
 	} {
-		_, _ = s.db.ExecContext(context.Background(), col)
+		if _, err := s.db.ExecContext(context.Background(), col); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("migrate alter: %w", err)
+		}
 	}
 
 	// Ensure composite performance indexes exist on existing DBs
@@ -112,7 +121,12 @@ func (s *Store) Migrate() error {
 		"CREATE INDEX IF NOT EXISTS idx_runs_created ON agent_runs(created_at DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_read_file_time ON file_read_events(file_path, read_time DESC)",
 	} {
-		_, _ = s.db.ExecContext(context.Background(), idx)
+		if _, err := s.db.ExecContext(context.Background(), idx); err != nil {
+			if msg := err.Error(); strings.Contains(msg, "already exists") {
+				continue
+			}
+			return fmt.Errorf("migrate index: %w", err)
+		}
 	}
 
 	return nil

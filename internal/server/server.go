@@ -10,9 +10,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -81,7 +84,12 @@ type EngineAPI interface {
 
 // Config configures a Server.
 type Config struct {
-	Port   int
+	Port int
+	// Host is the interface the HTTP listener binds to. Empty defaults to
+	// loopback: the dashboard and gateway are single-user, unauthenticated
+	// surfaces, so binding all interfaces ("0.0.0.0") must stay an explicit
+	// opt-in for remote-tail scenarios.
+	Host   string
 	Engine *core.Engine
 	// SocketPath is the IPC endpoint (UDS / named pipe) the daemon bound, if
 	// any. Reported via /api/health so the dashboard can show agents the real
@@ -110,14 +118,18 @@ func New(cfg Config) *Server {
 // Start begins listening. It returns when the listener fails or ctx-style
 // shutdown is initiated via Shutdown.
 func (s *Server) Start() error {
-	addr := fmt.Sprintf(":%d", s.cfg.Port)
+	host := s.cfg.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	addr := net.JoinHostPort(host, strconv.Itoa(s.cfg.Port))
 	hs := &http.Server{
 		Addr:              addr,
 		Handler:           s.router,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	s.setHS(hs)
-	log.Printf("http: listening on http://localhost%s", addr)
+	log.Printf("http: listening on http://%s", addr)
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -160,7 +172,22 @@ func (s *Server) buildRouter() chi.Router {
 	r.Use(requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"*"},
+		// Loopback origins only (any port): the dashboard is served
+		// same-origin and the vite dev server proxies from localhost:<port>.
+		// A "*" policy would let any webpage the developer opens read the
+		// unauthenticated API (telemetry, traffic records, cost data) and
+		// drive destructive endpoints.
+		AllowedOriginsFunc: func(origin string) bool {
+			u, err := url.Parse(origin)
+			if err != nil {
+				return false
+			}
+			switch u.Hostname() {
+			case "localhost", "127.0.0.1", "::1":
+				return true
+			}
+			return false
+		},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
 		AllowCredentials: false,

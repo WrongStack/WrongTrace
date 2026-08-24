@@ -125,16 +125,31 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 	reader := bufio.NewReaderSize(f, 64*1024)
 	var modEvents []ToolCallEvent
 	var readEvents []FileReadEvent
-	sessionID := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+	sessionID := sessionIDForPath(filePath)
 	agentName := detectAgentFromPath(filePath)
 	currentModel := detectAgentDefaultModel(agentName)
 	currentIntent := ""
 	currentOffset := startOffset
+	committed := startOffset // offset through the last '\n'-terminated line
 
 	for {
+		lineStart := currentOffset
 		lineBytes, err := reader.ReadBytes('\n')
 		readLen := int64(len(lineBytes))
 		currentOffset += readLen
+
+		if err == nil {
+			// Complete line: safe to parse and to advance the committed offset.
+			committed = currentOffset
+		} else if err == io.EOF {
+			// Unterminated tail: the writer may still be mid-line. Neither
+			// parse it nor commit past it — the next poll re-reads the line
+			// once its terminating newline lands. Committing here would
+			// permanently lose every event on that line.
+			break
+		} else {
+			return modEvents, readEvents, committed, err
+		}
 
 		trimmed := bytes.TrimSpace(lineBytes)
 		if len(trimmed) > 0 {
@@ -218,7 +233,12 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 						if isRead && targetFile != "" {
 							sLine, eLine, lCount := ExtractLineRange(args)
 							rEv := FileReadEvent{
-								ReadID:         fmt.Sprintf("read-%s-%d", sessionID, len(readEvents)+1),
+								// Keyed by the line's byte offset so the ID is
+								// stable across re-reads (dedup on the PK) and
+								// unique per session file. A per-batch counter
+								// collided across polls, silently discarding
+								// every batch after the first.
+								ReadID:         fmt.Sprintf("read-%s-%d", sessionID, lineStart),
 								SessionID:      sessionID,
 								FilePath:       targetFile,
 								AgentName:      agentName,
@@ -238,16 +258,24 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 				}
 			}
 		}
-
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return modEvents, readEvents, currentOffset, err
-		}
 	}
 
-	return modEvents, readEvents, currentOffset, nil
+	return modEvents, readEvents, committed, nil
+}
+
+// sessionIDForPath derives a stable, collision-free session identifier from
+// the transcript path. Every agent session directory stores its transcript
+// under the same file name (transcript.jsonl), so using only the base name
+// collapses all sessions into one session id — and via ReportRun into a
+// single agent_runs row. Including the parent directory (the session UUID or
+// date folder) keeps sessions distinct while staying human-readable.
+func sessionIDForPath(filePath string) string {
+	base := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+	parent := filepath.Base(filepath.Dir(filePath))
+	if parent == "" || parent == "." || parent == string(filepath.Separator) || parent == "/" {
+		return base
+	}
+	return parent + "-" + base
 }
 
 // ParseClineTask parses a Cline / Roo Code task JSON structure.
@@ -547,4 +575,3 @@ func runeSafeTruncate(s string, maxRunes int) string {
 	}
 	return string(runes[:maxRunes]) + "…"
 }
-

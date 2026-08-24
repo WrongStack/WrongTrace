@@ -176,7 +176,12 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 			e.cfg.Store = newStore
 			e.lockMu.Unlock()
 			if oldStore != nil && oldStore != newStore {
-				_ = oldStore.Close()
+				// Callers fetch Store() per call and may already hold the
+				// retired pointer; closing it immediately fails those
+				// in-flight queries with "database is closed". Give them a
+				// drain window instead — sql.DB.Close does not cancel
+				// running queries, so a straggler still finishes cleanly.
+				time.AfterFunc(10*time.Second, func() { _ = oldStore.Close() })
 			}
 		}
 	}
@@ -320,7 +325,6 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	sessions := ScanAgentSessions(absPath)
 	lang := DetectPrimaryLanguage(absPath)
 
-	isFirst := len(e.projects) == 0
 	proj := ProjectProfile{
 		ID:                 id,
 		Name:               name,
@@ -335,13 +339,15 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 		WrongStackLogsPath: FindWrongStackLogsPath(absPath),
 		DiscoveredSessions: sessions,
 		CreatedAt:          time.Now().UTC(),
-		IsActive:           isFirst,
 	}
 
 	e.lockMu.Lock()
 	if e.projects == nil {
 		e.projects = make(map[string]ProjectProfile)
 	}
+	// isFirst must be decided under the lock: reading len(e.projects) before
+	// it let two concurrent adds both mark themselves active.
+	proj.IsActive = len(e.projects) == 0
 	e.projects[id] = proj
 	SaveProjectsIndex(e.projects)
 	watcher := e.watcher
@@ -584,10 +590,9 @@ func (e *Engine) ImportFromWrongStack(roots []string) (ImportFromWrongStackResul
 // UpdateProject updates metadata or custom session log paths for a project.
 func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 	e.lockMu.Lock()
-	defer e.lockMu.Unlock()
-
 	existing, ok := e.projects[p.ID]
 	if !ok {
+		e.lockMu.Unlock()
 		return ProjectProfile{}, fmt.Errorf("%w: %s", ErrProjectNotFound, p.ID)
 	}
 
@@ -613,10 +618,24 @@ func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 		existing.CustomLogsPath = p.CustomLogsPath
 	}
 
-	// Re-scan sessions
-	existing.DiscoveredSessions = ScanAgentSessions(existing.Path)
 	e.projects[p.ID] = existing
 	SaveProjectsIndex(e.projects)
+	e.lockMu.Unlock()
+
+	// Re-scan sessions outside the lock: ScanAgentSessions walks many user
+	// directories and easily takes seconds — holding lockMu that long stalls
+	// the synchronous IPC guardrail checks agents run before every edit.
+	sessions := ScanAgentSessions(existing.Path)
+
+	e.lockMu.Lock()
+	if cur, ok := e.projects[p.ID]; ok {
+		// Keep any metadata applied concurrently while we scanned.
+		cur.DiscoveredSessions = sessions
+		existing = cur
+		e.projects[p.ID] = cur
+		SaveProjectsIndex(e.projects)
+	}
+	e.lockMu.Unlock()
 
 	return existing, nil
 }
@@ -642,31 +661,60 @@ func (e *Engine) RemoveProject(id string) error {
 
 // RescanProject re-runs agent session discovery for a specific project.
 func (e *Engine) RescanProject(id string) (*ProjectProfile, error) {
-	e.lockMu.Lock()
-	defer e.lockMu.Unlock()
+	e.lockMu.RLock()
 	proj, ok := e.projects[id]
+	e.lockMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("project not found: %s", id)
 	}
-	proj.DiscoveredSessions = ScanAgentSessions(proj.Path)
+
+	// Scan outside lockMu — see UpdateProject for why the walk must not
+	// hold the lock.
+	sessions := ScanAgentSessions(proj.Path)
+
+	e.lockMu.Lock()
+	proj, ok = e.projects[id]
+	if !ok {
+		e.lockMu.Unlock()
+		return nil, fmt.Errorf("project not found: %s", id)
+	}
+	proj.DiscoveredSessions = sessions
 	e.projects[id] = proj
 	SaveProjectsIndex(e.projects)
+	e.lockMu.Unlock()
 	return &proj, nil
 }
 
 // RescanAllProjects re-runs session discovery on all registered workspaces.
 func (e *Engine) RescanAllProjects() []ProjectProfile {
-	e.lockMu.Lock()
-	defer e.lockMu.Unlock()
+	// Snapshot under the lock, scan outside it (see UpdateProject).
+	e.lockMu.RLock()
+	ids := make([]string, 0, len(e.projects))
+	paths := make(map[string]string, len(e.projects))
 	for id, proj := range e.projects {
-		proj.DiscoveredSessions = ScanAgentSessions(proj.Path)
-		e.projects[id] = proj
+		ids = append(ids, id)
+		paths[id] = proj.Path
+	}
+	e.lockMu.RUnlock()
+
+	sessions := make(map[string]map[string]int, len(ids))
+	for _, id := range ids {
+		sessions[id] = ScanAgentSessions(paths[id])
+	}
+
+	e.lockMu.Lock()
+	for _, id := range ids {
+		if proj, ok := e.projects[id]; ok {
+			proj.DiscoveredSessions = sessions[id]
+			e.projects[id] = proj
+		}
 	}
 	SaveProjectsIndex(e.projects)
 	out := make([]ProjectProfile, 0, len(e.projects))
 	for _, p := range e.projects {
 		out = append(out, p)
 	}
+	e.lockMu.Unlock()
 	return out
 }
 

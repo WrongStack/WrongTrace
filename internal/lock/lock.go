@@ -47,10 +47,22 @@ func Acquire(dataDir string, port int) (*InstanceLock, error) {
 		return nil, fmt.Errorf("%w (active endpoint detected at http://localhost:%d)", ErrAlreadyRunning, port)
 	}
 
-	// 3. Acquire file lock
+	// 3. Acquire the OS-level single-instance lock. The PID/port pre-checks
+	// above only produce friendly error messages; this non-blocking lock is
+	// the authoritative gate — it closes the check-then-act window where two
+	// concurrently started daemons both passed step 1 and 2, and the
+	// different-port bypass where a healthy daemon on another port was
+	// invisible to isDaemonAlive.
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file: %w", err)
+	}
+	if err := tryLock(f); err != nil {
+		_ = f.Close()
+		if errors.Is(err, ErrAlreadyRunning) {
+			return nil, fmt.Errorf("%w (lock file held by another daemon)", ErrAlreadyRunning)
+		}
+		return nil, err
 	}
 
 	// Record current PID
@@ -68,16 +80,17 @@ func Acquire(dataDir string, port int) (*InstanceLock, error) {
 	}, nil
 }
 
-// Release releases the lock and removes the PID file.
+// Release releases the lock and removes the PID file. daemon.lock itself is
+// deliberately kept: removing it would let a second process open a new file
+// (new inode) and lock that instead of contending with the live lock holder.
 func (l *InstanceLock) Release() {
 	if l == nil {
 		return
 	}
 	if l.file != nil {
-		_ = l.file.Close()
+		_ = l.file.Close() // closing the handle releases the OS lock
 	}
 	_ = os.Remove(l.pidPath)
-	_ = os.Remove(l.lockPath)
 }
 
 // isDaemonAlive checks if a process with the given PID is running and responds on the health port.

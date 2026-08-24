@@ -1239,5 +1239,3 @@ func TestResponseCache_FullLifecycle(t *testing.T) {
 		t.Errorf("expected 0 entries after clear, got %d", entries)
 	}
 }
-
-

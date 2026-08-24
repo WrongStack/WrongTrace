@@ -107,6 +107,7 @@ func init() {
 
 	rootCmd.PersistentFlags().StringP("watch", "w", ".", "directory to observe")
 	rootCmd.PersistentFlags().IntP("port", "p", 3444, "HTTP port for the embedded dashboard and proxy")
+	rootCmd.PersistentFlags().String("bind", "127.0.0.1", "network interface the HTTP dashboard binds to (0.0.0.0 exposes it on all interfaces)")
 	rootCmd.PersistentFlags().String("db", filepath.Join(defaultDataDir(), "wrongtrace.db"), "SQLite database file")
 	rootCmd.PersistentFlags().String("socket", defaultSocketPath(), "Unix Domain Socket / Named Pipe path")
 	rootCmd.PersistentFlags().String("repo", filepath.Base(mustCwd()), "repository name to record events under")
@@ -124,6 +125,25 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// resolvePort applies the flag → WRONGTRACE_PORT → PORT precedence shared by
+// `start` and `trace` so a trace command talks to the daemon the user
+// actually started instead of falling back to a default-port miss and a
+// direct-SQLite write to the wrong database.
+func resolvePort(cmd *cobra.Command) int {
+	port, _ := cmd.Flags().GetInt("port")
+	if cmd.Flags().Changed("port") {
+		return port
+	}
+	for _, key := range []string{"WRONGTRACE_PORT", "PORT"} {
+		if envPort := os.Getenv(key); envPort != "" {
+			if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
+				return p
+			}
+		}
+	}
+	return port
 }
 
 func runStart(cmd *cobra.Command, _ []string) error {
@@ -146,21 +166,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	debug.SetMemoryLimit(256 * 1024 * 1024)
 
 	watchDir, _ := cmd.Flags().GetString("watch")
-	port, _ := cmd.Flags().GetInt("port")
-	if !cmd.Flags().Changed("port") {
-		if envPort := os.Getenv("WRONGTRACE_PORT"); envPort != "" {
-			if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
-				port = p
-			}
-		} else if envPort := os.Getenv("PORT"); envPort != "" {
-			if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
-				port = p
-			}
-		}
-	}
+	port := resolvePort(cmd)
 	dbPath, _ := cmd.Flags().GetString("db")
 	socketPath, _ := cmd.Flags().GetString("socket")
 	repoName, _ := cmd.Flags().GetString("repo")
+	bindHost, _ := cmd.Flags().GetString("bind")
 
 	// Enforce single instance: prevent 2nd copy from running concurrently
 	instanceLock, err := lock.Acquire(dataDir, port)
@@ -241,6 +251,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	// Embedded HTTP server + WebSocket hub.
 	httpServer := server.New(server.Config{
 		Port:       port,
+		Host:       bindHost,
 		Engine:     engine,
 		SocketPath: socketPath,
 	})
@@ -611,10 +622,7 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	}
 
 	// 1. Try sending trace to active daemon via HTTP API
-	port, _ := cmd.Flags().GetInt("port")
-	if port <= 0 {
-		port = 8000
-	}
+	port := resolvePort(cmd)
 	daemonURL := fmt.Sprintf("http://localhost:%d/api/profiler/ingest", port)
 	payload := map[string]interface{}{
 		"service_name":   service,

@@ -165,7 +165,7 @@ func TestPrimeDirectory_PopulatesAtlas(t *testing.T) {
 // TestPrimeDirectory_NilASTIsSafe pins the guard: an engine without an AST
 // backend must no-op instead of panicking.
 func TestPrimeDirectory_NilASTIsSafe(t *testing.T) {
-	e, _ := newTestEngine(t) // AST: nil
+	e, _ := newTestEngine(t)      // AST: nil
 	e.PrimeDirectory(t.TempDir()) // must not panic
 }
 

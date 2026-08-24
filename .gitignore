@@ -41,3 +41,5 @@ dev-daemon.log
 
 .dfmt/
 .claude/
+
+.mimosa/

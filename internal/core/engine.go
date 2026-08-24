@@ -158,15 +158,25 @@ func (e *Engine) Store() *db.Store {
 	return e.cfg.Store
 }
 
+// repoName snapshots cfg.RepoName under lockMu. SwitchActiveProject writes the
+// field under the same mutex while watcher goroutines and HTTP handlers read
+// it concurrently, so an unlocked read is a data race on the string header.
+func (e *Engine) repoName() string {
+	e.lockMu.RLock()
+	defer e.lockMu.RUnlock()
+	return e.cfg.RepoName
+}
+
 // Repo returns the active repository or project name.
 func (e *Engine) Repo() string {
-	if e.cfg.RepoName != "" && e.cfg.RepoName != "default" {
-		return e.cfg.RepoName
+	name := e.repoName()
+	if name != "" && name != "default" {
+		return name
 	}
 	if active := e.GetActiveProject(); active != nil && active.Name != "" {
 		return active.Name
 	}
-	return e.cfg.RepoName
+	return name
 }
 
 // HandleFileChange is invoked by the watcher after the debounce timer fires.
@@ -190,7 +200,7 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 		return
 	}
 
-	repoName := e.cfg.RepoName
+	repoName := e.repoName()
 	if proj, ok := e.FindProjectForFile(path); ok && proj.Name != "" {
 		repoName = proj.Name
 	}
@@ -220,7 +230,7 @@ func (e *Engine) handleFileGone(_ context.Context, path string) {
 	if e.cfg.AST == nil {
 		return
 	}
-	repoName := e.cfg.RepoName
+	repoName := e.repoName()
 	if proj, ok := e.FindProjectForFile(path); ok && proj.Name != "" {
 		repoName = proj.Name
 	}
@@ -244,7 +254,7 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 		}
 		repo := ev.RepoName
 		if repo == "" {
-			repo = e.cfg.RepoName
+			repo = e.repoName()
 		}
 		if p, ok := e.FindProjectForFile(ev.FilePath); ok && p.Name != "" {
 			repo = p.Name
@@ -605,7 +615,7 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 		rec.ReadID = newID()
 	}
 	if rec.RepoName == "" {
-		rec.RepoName = e.cfg.RepoName
+		rec.RepoName = e.repoName()
 		if proj, ok := e.FindProjectForFile(rec.FilePath); ok {
 			rec.RepoName = proj.Name
 		}

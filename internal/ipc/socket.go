@@ -73,12 +73,12 @@ type Config struct {
 
 // Server is the agent-facing IPC endpoint.
 type Server struct {
-	cfg      Config
-	ln       net.Listener
-	wg       sync.WaitGroup
-	cancel   context.CancelFunc
-	connsMu  sync.Mutex
-	conns    map[net.Conn]struct{}
+	cfg       Config
+	ln        net.Listener
+	wg        sync.WaitGroup
+	cancel    context.CancelFunc
+	connsMu   sync.Mutex
+	conns     map[net.Conn]struct{}
 	connected atomic.Int64
 	startedAt time.Time
 }

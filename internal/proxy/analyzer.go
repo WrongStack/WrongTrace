@@ -576,4 +576,3 @@ func runeSafeTruncate(s string, maxRunes int) string {
 	}
 	return string(runes[:maxRunes]) + "…"
 }
-

@@ -534,18 +534,18 @@ func (h *Handlers) CheckGuardrail(w http.ResponseWriter, r *http.Request) {
 // LockFile locks a file against agent modification with optional ownership and TTL.
 func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path        string `json:"path"`
-		FilePath    string `json:"file_path"`
-		Reason      string `json:"reason"`
-		Owner       string `json:"owner"`
-		AgentName   string `json:"agent_name"`
-		ModelName   string `json:"model_name"`
-		OwnerRunID  string `json:"owner_run_id"`
-		RunID       string `json:"run_id"`
-		TTLSeconds  int    `json:"ttl_seconds"`
-		TTLMinutes  int    `json:"ttl_minutes"`
-		TTL         string `json:"ttl"`
-		Force       bool   `json:"force"`
+		Path       string `json:"path"`
+		FilePath   string `json:"file_path"`
+		Reason     string `json:"reason"`
+		Owner      string `json:"owner"`
+		AgentName  string `json:"agent_name"`
+		ModelName  string `json:"model_name"`
+		OwnerRunID string `json:"owner_run_id"`
+		RunID      string `json:"run_id"`
+		TTLSeconds int    `json:"ttl_seconds"`
+		TTLMinutes int    `json:"ttl_minutes"`
+		TTL        string `json:"ttl"`
+		Force      bool   `json:"force"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -1009,9 +1009,9 @@ func (h *Handlers) IngestOTLPTraces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":        "ok",
+		"status":         "ok",
 		"spans_ingested": count,
-		"message":       fmt.Sprintf("%d OTLP spans ingested into WrongTrace", count),
+		"message":        fmt.Sprintf("%d OTLP spans ingested into WrongTrace", count),
 	})
 }
 
@@ -1129,6 +1129,3 @@ func (h *Handlers) GetIPCTraffic(w http.ResponseWriter, _ *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, traffic)
 }
-
-
-

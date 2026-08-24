@@ -75,22 +75,22 @@ type FileReadEvent struct {
 
 // KnownFileReadingTools lists standard tool/function call names used by AI agents to read files.
 var KnownFileReadingTools = map[string]bool{
-	"view_file":            true,
-	"read_file":            true,
-	"read_file_range":      true,
-	"get_file_contents":    true,
-	"read":                 true,
-	"view":                 true,
-	"cat":                  true,
-	"head":                 true,
-	"tail":                 true,
-	"show_file":            true,
-	"open_file":            true,
-	"inspect_file":         true,
-	"load_file":            true,
-	"get_file_tree":        true,
-	"grep_search":          true,
-	"find_by_name":         true,
+	"view_file":         true,
+	"read_file":         true,
+	"read_file_range":   true,
+	"get_file_contents": true,
+	"read":              true,
+	"view":              true,
+	"cat":               true,
+	"head":              true,
+	"tail":              true,
+	"show_file":         true,
+	"open_file":         true,
+	"inspect_file":      true,
+	"load_file":         true,
+	"get_file_tree":     true,
+	"grep_search":       true,
+	"find_by_name":      true,
 }
 
 // IsFileReadingTool returns true if the tool name indicates a file system read/inspection operation.
@@ -108,4 +108,3 @@ func IsFileReadingTool(name string) bool {
 		strings.Contains(norm, "inspect") ||
 		strings.Contains(norm, "cat")
 }
-

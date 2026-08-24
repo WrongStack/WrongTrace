@@ -188,7 +188,7 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
 		filter = active.Name
 	} else {
-		filter = e.cfg.RepoName
+		filter = e.repoName()
 	}
 
 	snap := AtlasSnapshot{

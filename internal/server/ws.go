@@ -5,25 +5,47 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// upgrader is shared across all /api/ws connections. CheckOrigin returns true
-// because the dashboard is served from the same origin in production; for
-// deployments where the React UI is hosted separately, swap in a domain check.
+// upgrader is shared across all /api/ws connections. checkOrigin admits
+// loopback origins (embedded dashboard, vite dev proxy) and same-host
+// requests; remote origins are rejected because the event stream carries
+// prompt/reply telemetry and the API has no authentication.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(_ *http.Request) bool { return true },
+	CheckOrigin:     checkOrigin,
+}
+
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // non-browser clients do not send Origin
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 // writeWait bounds how long a single write may block before we declare the
 // client unhealthy and tear down the connection.
 const (
-	writeWait = 5 * time.Second
-	pongWait  = 60 * time.Second
+	writeWait  = 5 * time.Second
+	pongWait   = 60 * time.Second
 	pingPeriod = (pongWait * 9) / 10
 )
 
@@ -52,7 +74,9 @@ func (h *Handlers) WebSocket(w http.ResponseWriter, r *http.Request) {
 	defer h.Engine.Hub().Unsubscribe(conn)
 
 	// Greeting: send a hello so the client knows the connection is live.
-	if err := conn.WriteJSON(map[string]interface{}{
+	// Bounded like every later write — a stalled client must not pin this
+	// goroutine (and its hub subscription) forever.
+	if err := writeJSONWithDeadline(conn, map[string]interface{}{
 		"type": "hello",
 		"at":   time.Now().UTC(),
 		"repo": h.Engine.Repo(),

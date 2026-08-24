@@ -249,4 +249,3 @@ func GenerateJSONReport(data ReportData) (string, error) {
 	}
 	return string(b), nil
 }
-

@@ -90,4 +90,3 @@ func DetectLanguage(path string) Language {
 
 	return LangUnknown
 }
-

@@ -793,16 +793,16 @@ func TestServer_Enhancements_WrongStackReport(t *testing.T) {
 	// Seed code mutation event correlated with the run
 	now := time.Now().UTC()
 	err = store.InsertEvent(db.EventRecord{
-		EventID:      "ev-corr-1",
-		RunID:        "run-ws-402",
-		RepoName:     "srv-test",
-		FilePath:     "internal/server/server.go",
-		Signature:    "function:server.go::New",
-		NodeType:     "function",
-		Action:       "MODIFIED",
-		BodyHash:     "hash-new",
-		LOC:          10,
-		OccurredAt:   now,
+		EventID:    "ev-corr-1",
+		RunID:      "run-ws-402",
+		RepoName:   "srv-test",
+		FilePath:   "internal/server/server.go",
+		Signature:  "function:server.go::New",
+		NodeType:   "function",
+		Action:     "MODIFIED",
+		BodyHash:   "hash-new",
+		LOC:        10,
+		OccurredAt: now,
 	})
 	if err != nil {
 		t.Fatalf("insert event: %v", err)
@@ -991,5 +991,3 @@ func TestServer_Enhancements_WrongStackReport(t *testing.T) {
 
 	_ = engine
 }
-
-

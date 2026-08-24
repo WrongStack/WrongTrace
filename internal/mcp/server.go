@@ -349,7 +349,9 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
 			return resp
 		}
-		if locker, ok := sink.(interface{ IsFileLocked(path string) (bool, string) }); ok {
+		if locker, ok := sink.(interface {
+			IsFileLocked(path string) (bool, string)
+		}); ok {
 			if locked, reason := locker.IsFileLocked(path); locked {
 				rec := fmt.Sprintf("GUARDRAIL BLOCKED: File %s is locked (%s).", path, reason)
 				text := fmt.Sprintf("allowed=false health_score=0 fragile=true recent_thrashing_count=0 is_locked=true lock_reason=%q recommendation=%q", reason, rec)

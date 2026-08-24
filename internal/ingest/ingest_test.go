@@ -221,4 +221,3 @@ func TestIngest_DirAndFileExistsHelpers(t *testing.T) {
 		t.Errorf("expected dirExists=false for sample.txt")
 	}
 }
-

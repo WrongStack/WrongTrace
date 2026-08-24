@@ -59,7 +59,7 @@ func (f *failingEngine) LockFile(string, string) core.LockInfo {
 func (f *failingEngine) LockFileWithOptions(string, string, string, string, time.Duration) core.LockInfo {
 	return core.LockInfo{}
 }
-func (f *failingEngine) UnlockFile(string)                  {}
+func (f *failingEngine) UnlockFile(string) {}
 func (f *failingEngine) IsFileLocked(string) (bool, core.LockInfo) {
 	return false, core.LockInfo{}
 }
@@ -67,14 +67,14 @@ func (f *failingEngine) ListLocks() []core.LockInfo { return nil }
 func (f *failingEngine) ReportRun(ipc.TelemetryReport) error {
 	return errForced
 }
-func (f *failingEngine) ModelCatalog() []models.ModelInfo     { return nil }
+func (f *failingEngine) ModelCatalog() []models.ModelInfo       { return nil }
 func (f *failingEngine) ProviderCatalog() []models.ProviderInfo { return nil }
-func (f *failingEngine) UpsertModel(models.ModelInfo)         {}
+func (f *failingEngine) UpsertModel(models.ModelInfo)           {}
 func (f *failingEngine) CalculateCost(string, int64, int64) float64 {
 	return 0
 }
-func (f *failingEngine) SyncModelsDev() (int, error)          { return 0, errForced }
-func (f *failingEngine) ListProjects() []core.Project         { return nil }
+func (f *failingEngine) SyncModelsDev() (int, error)  { return 0, errForced }
+func (f *failingEngine) ListProjects() []core.Project { return nil }
 func (f *failingEngine) GetProject(string) (core.ProjectProfile, error) {
 	return core.ProjectProfile{}, errForced
 }
@@ -99,13 +99,13 @@ func (f *failingEngine) RescanProject(string) (*core.ProjectProfile, error) {
 func (f *failingEngine) RescanAllProjects() []core.ProjectProfile {
 	return nil
 }
-func (f *failingEngine) RemoveProject(string) error            { return errForced }
-func (f *failingEngine) GetSettings() core.AppSettings         { return core.AppSettings{} }
+func (f *failingEngine) RemoveProject(string) error    { return errForced }
+func (f *failingEngine) GetSettings() core.AppSettings { return core.AppSettings{} }
 func (f *failingEngine) UpdateSettings(s core.AppSettings) core.AppSettings {
 	return s
 }
-func (f *failingEngine) VacuumDB() error                       { return errForced }
-func (f *failingEngine) ClearStale(int) (int64, error)         { return 0, errForced }
+func (f *failingEngine) VacuumDB() error               { return errForced }
+func (f *failingEngine) ClearStale(int) (int64, error) { return 0, errForced }
 func (f *failingEngine) GetFileReadStats(string) (db.FileReadStats, error) {
 	return db.FileReadStats{}, errForced
 }

@@ -441,4 +441,3 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 
 	return b.String(), added, deleted
 }
-

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"sync"
 	"time"
@@ -95,7 +96,9 @@ func (c *Collector) IngestReport(p ProfilerReportPayload) (TraceEvent, error) {
 			MetadataJSON:  string(metaJSON),
 			Timestamp:     ev.Timestamp,
 		}
-		_ = s.InsertTrace(rec)
+		if err := s.InsertTrace(rec); err != nil {
+			log.Printf("profiler: insert trace %s: %v", ev.TraceID, err)
+		}
 	}
 
 	c.recordRecent(ev)
@@ -215,7 +218,9 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 						MetadataJSON:  string(metaBytes),
 						Timestamp:     ev.Timestamp,
 					}
-					_ = s.InsertTrace(rec)
+					if err := s.InsertTrace(rec); err != nil {
+						log.Printf("profiler: insert trace %s: %v", ev.TraceID, err)
+					}
 				}
 
 				c.recordRecent(ev)
@@ -271,8 +276,12 @@ func (c *Collector) recordRecent(ev TraceEvent) {
 	c.recent = append(c.recent, ev)
 }
 
+// randomID mints a prefixed 128-bit identifier. trace_id is the PRIMARY KEY
+// of runtime_traces: at the previous 32 bits the birthday bound reached ~1%
+// collision after only ~9k traces, silently discarding rows on a table that
+// only ever accumulates.
 func randomID(prefix string) string {
-	b := make([]byte, 4)
+	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(b))
 }

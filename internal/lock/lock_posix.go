@@ -3,9 +3,25 @@
 package lock
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"syscall"
 )
+
+// tryLock takes a non-blocking exclusive flock on the lock file. The kernel
+// releases it on close and on process crash, so a second daemon gets
+// EWOULDBLOCK immediately instead of racing the PID/port pre-checks, and a
+// crashed daemon never leaves a stale lock behind.
+func tryLock(f *os.File) error {
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return ErrAlreadyRunning
+		}
+		return fmt.Errorf("flock daemon.lock: %w", err)
+	}
+	return nil
+}
 
 func isProcessAlive(pid int) bool {
 	if pid <= 0 {

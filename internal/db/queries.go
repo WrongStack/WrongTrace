@@ -305,7 +305,7 @@ func (s *Store) Thrashing(minEdits int, lookbackDays int, repoFilter ...string) 
 	var out []ThrashingRow
 	for rows.Next() {
 		var (
-			r         ThrashingRow
+			r           ThrashingRow
 			first, last string
 		)
 		if err := rows.Scan(&r.FilePath, &r.Signature, &r.EditCount, &first, &last); err != nil {
@@ -761,21 +761,21 @@ type RuntimeTraceRecord struct {
 
 // ProfilerHotspotRow correlates AST churn with runtime execution latency/memory.
 type ProfilerHotspotRow struct {
-	NodeSignature string  `json:"node_signature"`
-	FilePath      string  `json:"file_path"`
-	TraceCount    int     `json:"trace_count"`
-	AvgDurationMs float64 `json:"avg_duration_ms"`
-	MaxDurationMs float64 `json:"max_duration_ms"`
-	TotalErrors   int     `json:"total_errors"`
+	NodeSignature string    `json:"node_signature"`
+	FilePath      string    `json:"file_path"`
+	TraceCount    int       `json:"trace_count"`
+	AvgDurationMs float64   `json:"avg_duration_ms"`
+	MaxDurationMs float64   `json:"max_duration_ms"`
+	TotalErrors   int       `json:"total_errors"`
 	LastSeen      time.Time `json:"last_seen"`
 }
 
 // ProfilerOverviewRow summarizes runtime profiling and test execution stats.
 type ProfilerOverviewRow struct {
-	TotalTraces   int     `json:"total_traces"`
-	TotalErrors   int     `json:"total_errors"`
-	AvgDurationMs float64 `json:"avg_duration_ms"`
-	ActiveServices int    `json:"active_services"`
+	TotalTraces    int     `json:"total_traces"`
+	TotalErrors    int     `json:"total_errors"`
+	AvgDurationMs  float64 `json:"avg_duration_ms"`
+	ActiveServices int     `json:"active_services"`
 }
 
 // InsertTrace appends a runtime profiler trace row.
@@ -1197,48 +1197,46 @@ func (s *Store) ClearStale(days int) (int64, error) {
 	defer cancel()
 
 	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.DateTime)
+
+	// All four deletes run in ONE transaction: with per-statement implicit
+	// transactions a mid-flight failure committed a partial prune while the
+	// API still reported an error — an inconsistent state that is hard to
+	// reason about afterwards.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("clear stale: begin: %w", err)
+	}
+	defer tx.Rollback()
+
 	var totalDeleted int64
-
-	// 1. Delete code_node_events
-	if res, err := s.db.ExecContext(ctx, "DELETE FROM code_node_events WHERE event_time < ?", cutoff); err == nil {
-		if n, _ := res.RowsAffected(); n > 0 {
-			totalDeleted += n
-		}
-	} else {
-		return totalDeleted, fmt.Errorf("clear code_node_events: %w", err)
+	steps := []struct {
+		name string
+		sql  string
+	}{
+		{"code_node_events", "DELETE FROM code_node_events WHERE event_time < ?"},
+		{"runtime_traces", "DELETE FROM runtime_traces WHERE timestamp < ?"},
+		{"file_read_events", "DELETE FROM file_read_events WHERE read_time < ?"},
+		{"agent_runs", `
+			DELETE FROM agent_runs
+			WHERE created_at < ?
+			  AND run_id NOT IN (SELECT DISTINCT run_id FROM code_node_events WHERE run_id IS NOT NULL)
+			  AND run_id NOT IN (SELECT DISTINCT run_id FROM runtime_traces WHERE run_id IS NOT NULL)
+			  AND run_id NOT IN (SELECT DISTINCT run_id FROM file_read_events WHERE run_id IS NOT NULL)
+		`},
 	}
-
-	// 2. Delete runtime_traces
-	if res, err := s.db.ExecContext(ctx, "DELETE FROM runtime_traces WHERE timestamp < ?", cutoff); err == nil {
-		if n, _ := res.RowsAffected(); n > 0 {
-			totalDeleted += n
+	for _, step := range steps {
+		res, err := tx.ExecContext(ctx, step.sql, cutoff)
+		if err != nil {
+			return 0, fmt.Errorf("clear %s: %w", step.name, err)
 		}
-	} else {
-		return totalDeleted, fmt.Errorf("clear runtime_traces: %w", err)
-	}
-
-	// 3. Delete file_read_events
-	if res, err := s.db.ExecContext(ctx, "DELETE FROM file_read_events WHERE read_time < ?", cutoff); err == nil {
-		if n, _ := res.RowsAffected(); n > 0 {
-			totalDeleted += n
-		}
-	} else {
-		return totalDeleted, fmt.Errorf("clear file_read_events: %w", err)
-	}
-
-	// 4. Delete unreferenced old agent_runs
-	if res, err := s.db.ExecContext(ctx, `
-		DELETE FROM agent_runs
-		WHERE created_at < ?
-		  AND run_id NOT IN (SELECT DISTINCT run_id FROM code_node_events WHERE run_id IS NOT NULL)
-		  AND run_id NOT IN (SELECT DISTINCT run_id FROM runtime_traces WHERE run_id IS NOT NULL)
-		  AND run_id NOT IN (SELECT DISTINCT run_id FROM file_read_events WHERE run_id IS NOT NULL)
-	`, cutoff); err == nil {
 		if n, _ := res.RowsAffected(); n > 0 {
 			totalDeleted += n
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("clear stale: commit: %w", err)
+	}
 	return totalDeleted, nil
 }
 
@@ -1465,7 +1463,7 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 		defer wRows.Close()
 		for wRows.Next() {
 			var (
-				model, prov, maxTime     string
+				model, prov, maxTime      string
 				count, linesAdd, linesDel int
 			)
 			if err := wRows.Scan(&model, &prov, &count, &linesAdd, &linesDel, &maxTime); err == nil {
@@ -1553,7 +1551,7 @@ func (s *Store) AllFileModelActivity(limit int) ([]ModelActivitySummary, error) 
 		defer wRows.Close()
 		for wRows.Next() {
 			var (
-				model, prov, maxTime     string
+				model, prov, maxTime      string
 				count, linesAdd, linesDel int
 			)
 			if err := wRows.Scan(&model, &prov, &count, &linesAdd, &linesDel, &maxTime); err == nil {
@@ -1670,19 +1668,19 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 	defer rows.Close()
 
 	var (
-		events           []CrossThrashEvent
-		edgeMap          = make(map[string]*ModelFrictionEdge)
-		totalCollisions  int
-		crossCount       int
-		maxPairCount     int
-		topPair          string
+		events          []CrossThrashEvent
+		edgeMap         = make(map[string]*ModelFrictionEdge)
+		totalCollisions int
+		crossCount      int
+		maxPairCount    int
+		topPair         string
 	)
 
 	for rows.Next() {
 		var (
-			ev                                                 CrossThrashEvent
-			evTimeStr, authorTimeStr                           string
-			added, deleted                                     int
+			ev                       CrossThrashEvent
+			evTimeStr, authorTimeStr string
+			added, deleted           int
 		)
 
 		if err := rows.Scan(
@@ -1756,6 +1754,3 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 		TopFrictionPair:  topPair,
 	}, nil
 }
-
-
-

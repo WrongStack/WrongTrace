@@ -221,8 +221,8 @@ func TestParse_GoSignatures(t *testing.T) {
 
 	expect := map[string]NodeKind{}
 	for sig, kind := range map[string]NodeKind{
-		"function:srv.go::Free":    NodeFunction,
-		"struct:srv.go::Server":    NodeStruct,
+		"function:srv.go::Free": NodeFunction,
+		"struct:srv.go::Server": NodeStruct,
 	} {
 		expect[sig] = kind
 	}

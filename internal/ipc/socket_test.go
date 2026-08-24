@@ -464,4 +464,3 @@ func TestExtendedIPCMethods(t *testing.T) {
 		t.Errorf("expected nil error to NOT be client disconnect")
 	}
 }
-

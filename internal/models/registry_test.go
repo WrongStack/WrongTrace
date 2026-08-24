@@ -166,11 +166,11 @@ func TestImportModelsDevJSON_CalculateCostWithLivePricing(t *testing.T) {
 func TestImportModelsDevJSON_ReplacesButKeepsCustom(t *testing.T) {
 	r := NewRegistry()
 	r.Upsert(ModelInfo{
-		ID:              "custom-ollama-qwen",
-		Name:            "Custom Ollama Qwen",
-		Provider:        "Local / Self-Hosted",
-		ContextWindow:   32000,
-		IsCustom:        true,
+		ID:            "custom-ollama-qwen",
+		Name:          "Custom Ollama Qwen",
+		Provider:      "Local / Self-Hosted",
+		ContextWindow: 32000,
+		IsCustom:      true,
 	})
 
 	if _, err := r.ImportModelsDevJSON([]byte(fixture)); err != nil {
@@ -185,9 +185,9 @@ func TestImportModelsDevJSON_ReplacesButKeepsCustom(t *testing.T) {
 	// A custom entry that happens to collide with an imported id is also
 	// preserved: the user's local override outranks the remote catalog.
 	r.Upsert(ModelInfo{
-		ID:             "claude-opus-4-7",
-		Name:           "Local Opus Override",
-		Provider:       "Local",
+		ID:              "claude-opus-4-7",
+		Name:            "Local Opus Override",
+		Provider:        "Local",
 		InputPricePerM:  99,
 		OutputPricePerM: 99,
 		IsCustom:        true,
@@ -271,4 +271,3 @@ func TestRegistry_ProvidersAndCacheCalculations(t *testing.T) {
 		t.Errorf("expected Gemini 3.7 Flash: %+v", m)
 	}
 }
-

@@ -15,10 +15,10 @@ import (
 type EventType string
 
 const (
-	EventThrashingAlert  EventType = "thrashing_alert"
-	EventSpendAlert      EventType = "spend_limit_exceeded"
-	EventSelfRollback    EventType = "self_rollback_detected"
-	EventGuardrailBlock  EventType = "guardrail_blocked"
+	EventThrashingAlert EventType = "thrashing_alert"
+	EventSpendAlert     EventType = "spend_limit_exceeded"
+	EventSelfRollback   EventType = "self_rollback_detected"
+	EventGuardrailBlock EventType = "guardrail_blocked"
 )
 
 // Payload represents the structured notification sent to external webhooks.

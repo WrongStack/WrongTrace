@@ -459,10 +459,17 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	reqID := randomID("px")
 
-	// Read request body to extract model and intent (capped at 32MB to prevent OOM)
-	reqBody, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024))
+	// Read request body to extract model and intent. Over-sized payloads are
+	// rejected outright: a silently truncated body would be forwarded upstream
+	// as corrupt JSON (Content-Length is stripped) with no trace of why.
+	const maxBodyBytes = 32 * 1024 * 1024
+	reqBody, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		http.Error(w, "cannot read request body", http.StatusBadRequest)
+		return
+	}
+	if len(reqBody) > maxBodyBytes {
+		http.Error(w, "request body exceeds 32MB limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -557,7 +564,24 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Exact Response Cache Lookup
+	// Automatically inject stream_options.include_usage for OpenAI-compatible
+	// streaming if missing. This MUST run before the cache lookup below: the
+	// cache key is hashed from the forwarded body, so mutating it afterwards
+	// stored entries under a key no lookup could ever hit.
+	isStream := parsedReq.Stream || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+	if isStream && bytes.Contains(reqBody, []byte(`"stream"`)) && !bytes.Contains(reqBody, []byte(`"stream_options"`)) {
+		var reqMap map[string]interface{}
+		if err := json.Unmarshal(reqBody, &reqMap); err == nil {
+			reqMap["stream_options"] = map[string]interface{}{
+				"include_usage": true,
+			}
+			if modified, err := json.Marshal(reqMap); err == nil {
+				reqBody = modified
+			}
+		}
+	}
+
+	// 3. Exact Response Cache Lookup (on the final forwarded body)
 	bypassCache := r.Header.Get("Cache-Control") == "no-cache" || r.Header.Get("X-Bypass-Cache") == "true"
 	cacheKey := ComputeKey(provider, modelName, reqBody)
 
@@ -603,20 +627,6 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			p.recordTraffic(rec)
 			return
-		}
-	}
-
-	// Automatically inject stream_options.include_usage for OpenAI-compatible streaming if missing
-	isStream := parsedReq.Stream || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
-	if isStream && bytes.Contains(reqBody, []byte(`"stream"`)) && !bytes.Contains(reqBody, []byte(`"stream_options"`)) {
-		var reqMap map[string]interface{}
-		if err := json.Unmarshal(reqBody, &reqMap); err == nil {
-			reqMap["stream_options"] = map[string]interface{}{
-				"include_usage": true,
-			}
-			if modified, err := json.Marshal(reqMap); err == nil {
-				reqBody = modified
-			}
 		}
 	}
 
@@ -713,9 +723,9 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	baseRecord.IsStream = isStream
 
 	if isStream {
-		p.handleStreamingResponse(w, resp.Body, baseRecord, userIntent)
+		p.handleStreamingResponse(w, resp.Body, baseRecord, userIntent, cacheKey)
 	} else {
-		p.handleJSONResponse(w, resp.Body, baseRecord, userIntent)
+		p.handleJSONResponse(w, resp.Body, baseRecord, userIntent, cacheKey)
 	}
 }
 
@@ -760,7 +770,11 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent string) {
+// handleJSONResponse writes the upstream JSON body to the client and records
+// the exchange. cacheKey is the lookup-time response-cache key; reusing it for
+// the store (instead of recomputing from rec.RequestBody/rec.Model, which
+// analysis may have rewritten) is what makes future lookups actually hit.
+func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent, cacheKey string) {
 	respBytes, err := io.ReadAll(body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
@@ -857,13 +871,12 @@ func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader,
 	}
 
 	// Save to response cache if successful
-	if rec.StatusCode == http.StatusOK && p.Cache != nil && len(respBytes) > 0 {
-		cacheKey := ComputeKey(rec.Provider, rec.Model, []byte(rec.RequestBody))
+	if rec.StatusCode == http.StatusOK && p.Cache != nil && len(respBytes) > 0 && cacheKey != "" {
 		p.Cache.Set(cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, respBytes, false, promptTokens+completionTokens, costUSD, 24*time.Hour)
 	}
 }
 
-func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent string) {
+func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent, cacheKey string) {
 	w.WriteHeader(rec.StatusCode)
 	flusher, isFlusher := w.(http.Flusher)
 	buf := make([]byte, 4096)
@@ -995,8 +1008,7 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 	}
 
 	// Save to response cache if successful
-	if rec.StatusCode == http.StatusOK && p.Cache != nil && len(fullSSE) > 0 {
-		cacheKey := ComputeKey(rec.Provider, rec.Model, []byte(rec.RequestBody))
+	if rec.StatusCode == http.StatusOK && p.Cache != nil && len(fullSSE) > 0 && cacheKey != "" {
 		p.Cache.Set(cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, []byte(fullSSE), true, promptTokens+completionTokens, costUSD, 24*time.Hour)
 	}
 }

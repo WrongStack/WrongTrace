@@ -86,4 +86,3 @@ func TestGenerateReports(t *testing.T) {
 		t.Errorf("GenerateJSONReport failed: %v", err)
 	}
 }
-

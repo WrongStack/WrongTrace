@@ -28,13 +28,13 @@ type ModelInfo struct {
 
 // ProviderInfo captures an AI Provider and its complete list of supported models.
 type ProviderInfo struct {
-	ID         string      `json:"id"`                    // Slug e.g. "anthropic", "openai", "groq"
-	Name       string      `json:"name"`                  // Display Name e.g. "Anthropic", "OpenAI"
-	API        string      `json:"api,omitempty"`         // Upstream base API endpoint
-	NPM        string      `json:"npm,omitempty"`         // SDK package adapter e.g. "@ai-sdk/anthropic"
-	Doc        string      `json:"doc,omitempty"`         // Documentation link
-	ModelCount int         `json:"model_count"`          // Total models available
-	Models     []ModelInfo `json:"models"`                // List of models provided
+	ID         string      `json:"id"`            // Slug e.g. "anthropic", "openai", "groq"
+	Name       string      `json:"name"`          // Display Name e.g. "Anthropic", "OpenAI"
+	API        string      `json:"api,omitempty"` // Upstream base API endpoint
+	NPM        string      `json:"npm,omitempty"` // SDK package adapter e.g. "@ai-sdk/anthropic"
+	Doc        string      `json:"doc,omitempty"` // Documentation link
+	ModelCount int         `json:"model_count"`   // Total models available
+	Models     []ModelInfo `json:"models"`        // List of models provided
 }
 
 // Registry maintains an up-to-date catalog of multi-provider LLM pricing and specifications.

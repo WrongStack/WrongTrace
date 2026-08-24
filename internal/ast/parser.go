@@ -36,8 +36,8 @@ type Node struct {
 	Body      string   // raw source slice (used for hashing only)
 	StartLine uint32
 	EndLine   uint32
-	Hash      string   // SHA256 over the normalized body
-	LOC       int      // lines of code
+	Hash      string // SHA256 over the normalized body
+	LOC       int    // lines of code
 }
 
 // FileSnapshot captures the parsed state of a single file at one point in time.
@@ -338,7 +338,6 @@ func countCodeBraces(s string) int {
 	return net
 }
 
-
 // Snapshot returns the cached snapshot for a file, if any.
 func (e *Engine) Snapshot(path string) (*FileSnapshot, bool) {
 	e.mu.RLock()
@@ -473,9 +472,11 @@ func classifyNode(lang Language, typeStr string, n *sitter.Node) (NodeKind, bool
 }
 
 // buildSignature produces a stable identifier like:
-//   func:auth.go::ValidateToken(string)
-//   method:server.go::(*Server).Handle(string)
-//   class:ui.tsx::Dashboard
+//
+//	func:auth.go::ValidateToken(string)
+//	method:server.go::(*Server).Handle(string)
+//	class:ui.tsx::Dashboard
+//
 // Renames of the parent package or class shift the signature, which is
 // intentional: surviving a rename is not the same as surviving intact.
 func buildSignature(lang Language, file string, kind NodeKind, n *sitter.Node, src []byte) string {

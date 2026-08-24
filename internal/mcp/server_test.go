@@ -708,4 +708,3 @@ func TestMCP_ToolsAndErrorHandling(t *testing.T) {
 		t.Errorf("expected error -32601 for unknown method, got %+v", resp.Error)
 	}
 }
-
