@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func TestRootCmd_HelpAndVersion(t *testing.T) {
@@ -144,16 +147,43 @@ func TestSingleInstance_PreventDuplicate(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("WRONGTRACE_HOME", tempDir)
 
-	// Writing the current process PID to daemon.pid simulates a running daemon
+	// A live daemon is simulated by an endpoint that answers the health probe
+	// lock.Acquire uses. A PID file alone is NOT enough: isDaemonAlive
+	// deliberately ignores a PID equal to the current process (a stale file
+	// holding a recycled PID must never block startup), so runStart would
+	// acquire the lock, boot the whole daemon and block on its signal channel
+	// until the test binary hit its 10-minute timeout.
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/health" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			http.NotFound(w, r)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := rootCmd.PersistentFlags().Set("port", strconv.Itoa(port)); err != nil {
+		t.Fatalf("set port flag: %v", err)
+	}
+	t.Cleanup(func() { _ = rootCmd.PersistentFlags().Set("port", "4318") })
+
+	// The PID file is present too, so step 1 of Acquire is exercised as well.
 	pidPath := filepath.Join(tempDir, "daemon.pid")
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
 		t.Fatalf("write pid: %v", err)
 	}
 
 	// Calling runStart should detect the running instance and return nil gracefully
-	err := runStart(rootCmd, []string{})
-	if err != nil {
+	if err := runStart(rootCmd, []string{}); err != nil {
 		t.Errorf("expected runStart to return nil on duplicate instance, got: %v", err)
 	}
 }
-

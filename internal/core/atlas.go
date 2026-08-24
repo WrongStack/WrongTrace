@@ -83,6 +83,9 @@ func (e *Engine) PrimeDirectory(dir string) {
 	if e.cfg.AST == nil || dir == "" {
 		return
 	}
+	// The primed tree doubles as the ignore-scoping root when Config.WatchDir
+	// was not supplied.
+	e.adoptWatchRoot(dir)
 	start := time.Now()
 
 	e.indexMu.Lock()

@@ -2,7 +2,7 @@ package core
 
 import (
 	"fmt"
-	"path/filepath"
+	"path"
 	"strings"
 	"time"
 
@@ -21,6 +21,16 @@ type GuardrailResult struct {
 	CheckedAt            time.Time `json:"checked_at"`
 }
 
+// normalizeLockPath canonicalizes a path for lock bookkeeping. Both separator
+// styles are folded to "/" explicitly rather than through filepath.ToSlash,
+// which is a no-op on Linux and left a Windows-style path as one opaque
+// segment there -- so a lock taken as "internal\core\engine.go" matched
+// nothing, not even itself under a different spelling.
+func normalizeLockPath(p string) string {
+	p = strings.ReplaceAll(strings.TrimSpace(p), "\\", "/")
+	return strings.ToLower(path.Clean(p))
+}
+
 // LockFile locks a file from agent modifications.
 func (e *Engine) LockFile(path, reason string) {
 	e.lockMu.Lock()
@@ -28,7 +38,7 @@ func (e *Engine) LockFile(path, reason string) {
 	if e.lockedFiles == nil {
 		e.lockedFiles = make(map[string]string)
 	}
-	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))))
+	norm := normalizeLockPath(path)
 	if reason == "" {
 		reason = "file is explicitly locked by administrator guardrail"
 	}
@@ -42,7 +52,7 @@ func (e *Engine) UnlockFile(path string) {
 	if e.lockedFiles == nil {
 		return
 	}
-	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))))
+	norm := normalizeLockPath(path)
 	delete(e.lockedFiles, norm)
 	for k := range e.lockedFiles {
 		if k == norm || strings.HasSuffix(norm, "/"+k) || strings.HasSuffix(k, "/"+norm) {
@@ -58,7 +68,7 @@ func (e *Engine) IsFileLocked(path string) (bool, string) {
 	if len(e.lockedFiles) == 0 {
 		return false, ""
 	}
-	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))))
+	norm := normalizeLockPath(path)
 	if r, ok := e.lockedFiles[norm]; ok {
 		return true, r
 	}
