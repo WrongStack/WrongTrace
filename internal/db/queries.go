@@ -639,25 +639,39 @@ func (s *Store) AllNodeStats(repoFilter ...string) (map[string]NodeStat, error) 
 	var args []any
 	if repo == "" {
 		query = `
-			SELECT e.node_signature, e.file_path, COUNT(*) as edit_count,
-			       COALESCE((SELECT action FROM code_node_events WHERE node_signature = e.node_signature ORDER BY event_time DESC LIMIT 1), 'ACTIVE') as last_action,
-			       COALESCE((SELECT r.model_name FROM code_node_events c LEFT JOIN agent_runs r ON c.run_id = r.run_id WHERE c.node_signature = e.node_signature AND r.model_name IS NOT NULL ORDER BY c.event_time DESC LIMIT 1), 'unknown') as last_model,
-			       MAX(e.event_time) as last_event_time
-			FROM code_node_events e
-			GROUP BY e.node_signature, e.file_path
+			WITH RankedEvents AS (
+				SELECT e.node_signature, e.file_path, e.action, COALESCE(r.model_name, 'unknown') as model_name, e.event_time,
+				       ROW_NUMBER() OVER (PARTITION BY e.node_signature ORDER BY e.event_time DESC) as rn,
+				       COUNT(*) OVER (PARTITION BY e.node_signature, e.file_path) as edit_count,
+				       MAX(e.event_time) OVER (PARTITION BY e.node_signature, e.file_path) as max_event_time
+				FROM code_node_events e
+				LEFT JOIN agent_runs r ON e.run_id = r.run_id
+			)
+			SELECT node_signature, file_path, edit_count, action, model_name, max_event_time
+			FROM RankedEvents
+			WHERE rn = 1
 		`
 		args = []any{}
 	} else {
 		query = `
-			SELECT e.node_signature, e.file_path, COUNT(*) as edit_count,
-			       COALESCE((SELECT action FROM code_node_events WHERE node_signature = e.node_signature AND (repo_name = ? OR repo_name = '' OR repo_name IS NULL) ORDER BY event_time DESC LIMIT 1), 'ACTIVE') as last_action,
-			       COALESCE((SELECT r.model_name FROM code_node_events c LEFT JOIN agent_runs r ON c.run_id = r.run_id WHERE c.node_signature = e.node_signature AND (c.repo_name = ? OR c.repo_name = '' OR c.repo_name IS NULL) AND r.model_name IS NOT NULL ORDER BY c.event_time DESC LIMIT 1), 'unknown') as last_model,
-			       MAX(e.event_time) as last_event_time
-			FROM code_node_events e
-			WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
-			GROUP BY e.node_signature, e.file_path
+			WITH FilteredEvents AS (
+				SELECT e.node_signature, e.file_path, e.action, COALESCE(r.model_name, 'unknown') as model_name, e.event_time
+				FROM code_node_events e
+				LEFT JOIN agent_runs r ON e.run_id = r.run_id
+				WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
+			),
+			RankedEvents AS (
+				SELECT node_signature, file_path, action, model_name, event_time,
+				       ROW_NUMBER() OVER (PARTITION BY node_signature ORDER BY event_time DESC) as rn,
+				       COUNT(*) OVER (PARTITION BY node_signature, file_path) as edit_count,
+				       MAX(event_time) OVER (PARTITION BY node_signature, file_path) as max_event_time
+				FROM FilteredEvents
+			)
+			SELECT node_signature, file_path, edit_count, action, model_name, max_event_time
+			FROM RankedEvents
+			WHERE rn = 1
 		`
-		args = []any{repo, repo, repo}
+		args = []any{repo}
 	}
 
 	out := make(map[string]NodeStat)

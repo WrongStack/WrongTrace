@@ -105,7 +105,8 @@ func (q *QuotaLimiter) RecordSpend(key string, costUSD float64) {
 
 // GetSpend returns today's spend for a given key.
 func (q *QuotaLimiter) GetSpend(key string) (spend float64, limit float64) {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.checkResetDayLocked()
 	return q.dailySpend[key], q.dailyBudgets[key]
 }

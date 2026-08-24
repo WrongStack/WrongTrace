@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Navbar } from '../components/Navbar';
 import { WrongStackBanner } from '../components/WrongStackBanner';
 import { MetricsOverview } from '../components/MetricsOverview';
@@ -54,7 +54,7 @@ export function Dashboard() {
   const { refetch: refetchProxyTraffic } = proxyTraffic;
   const { refetch: refetchProfilerTraces } = profilerTraces;
 
-  const wsTimerRef = useState<{ timer: ReturnType<typeof setTimeout> | null }>({ timer: null })[0];
+  const wsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // When the WS receives a code_event, proxy_traffic, or project_switched we invalidate the caches
   // with a small trailing debounce to avoid high-frequency refetch storms that spike CPU & RAM.
@@ -62,11 +62,11 @@ export function Dashboard() {
     if (!ws.lastMessage) return;
     const msgType = ws.lastMessage.type;
 
-    if (wsTimerRef.timer) {
-      clearTimeout(wsTimerRef.timer);
+    if (wsTimerRef.current) {
+      clearTimeout(wsTimerRef.current);
     }
 
-    wsTimerRef.timer = setTimeout(() => {
+    wsTimerRef.current = setTimeout(() => {
       if (msgType === 'code_event') {
         refetchRecent();
         refetchAtlas();
@@ -90,8 +90,9 @@ export function Dashboard() {
     }, 250);
 
     return () => {
-      if (wsTimerRef.timer) {
-        clearTimeout(wsTimerRef.timer);
+      if (wsTimerRef.current) {
+        clearTimeout(wsTimerRef.current);
+        wsTimerRef.current = null;
       }
     };
   }, [
@@ -103,7 +104,6 @@ export function Dashboard() {
     refetchProfilerTraces,
     refetchThrashing,
     refetchModels,
-    wsTimerRef,
   ]);
 
   // Socket path as REPORTED BY THE DAEMON (/api/health socket_path), so a

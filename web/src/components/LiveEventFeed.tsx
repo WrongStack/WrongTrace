@@ -62,17 +62,19 @@ export function LiveEventFeed({ events, loading }: LiveEventFeedProps) {
   const [search, setSearch] = useState('');
   const [filterAction, setFilterAction] = useState<string>('ALL');
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const { data: ipcTraffic = [] } = useIPCTraffic();
+  const { data: ipcTraffic = [] } = useIPCTraffic(feedMode === 'ipc');
 
   const filteredEvents = useMemo(() => {
     const q = search.toLowerCase().trim();
-    return events.filter((e) => {
-      if (filterAction !== 'ALL' && e.action !== filterAction) return false;
-      if (q && !e.file_path.toLowerCase().includes(q) && !e.node_signature.toLowerCase().includes(q)) {
-        return false;
-      }
-      return true;
-    });
+    return events
+      .filter((e) => {
+        if (filterAction !== 'ALL' && e.action !== filterAction) return false;
+        if (q && !e.file_path.toLowerCase().includes(q) && !e.node_signature.toLowerCase().includes(q)) {
+          return false;
+        }
+        return true;
+      })
+      .slice(0, 100);
   }, [events, search, filterAction]);
 
   const handleCopy = (id: string, text: string, evt: React.MouseEvent) => {

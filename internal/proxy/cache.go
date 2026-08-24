@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,7 +21,7 @@ type CachedResponse struct {
 	CostSavedUSD float64           `json:"cost_saved_usd"`
 	CreatedAt    time.Time         `json:"created_at"`
 	ExpiresAt    time.Time         `json:"expires_at"`
-	HitCount     int               `json:"hit_count"`
+	HitCount     int64             `json:"hit_count"`
 }
 
 // ResponseCache manages an in-memory LRU cache for LLM completions.
@@ -62,24 +63,28 @@ func ComputeKey(provider, model string, body []byte) string {
 
 // Get retrieves a valid, non-expired cached response.
 func (c *ResponseCache) Get(key string) (*CachedResponse, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
 	item, found := c.items[key]
 	if !found {
-		c.totalMisses++
+		c.mu.RUnlock()
+		atomic.AddInt64(&c.totalMisses, 1)
 		return nil, false
 	}
 
 	if time.Now().After(item.ExpiresAt) {
-		delete(c.items, key)
-		c.totalMisses++
+		c.mu.RUnlock()
+		c.mu.Lock()
+		if cur, ok := c.items[key]; ok && time.Now().After(cur.ExpiresAt) {
+			delete(c.items, key)
+		}
+		c.mu.Unlock()
+		atomic.AddInt64(&c.totalMisses, 1)
 		return nil, false
 	}
+	c.mu.RUnlock()
 
-	item.HitCount++
-	c.totalHits++
-	c.totalSaved += item.CostSavedUSD
+	atomic.AddInt64(&item.HitCount, 1)
+	atomic.AddInt64(&c.totalHits, 1)
 	return item, true
 }
 

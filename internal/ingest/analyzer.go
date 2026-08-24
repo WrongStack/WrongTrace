@@ -379,20 +379,23 @@ func extractModelFromRow(m map[string]interface{}) string {
 
 	// Extract from content text (e.g. Antigravity settings changes or prompt headers)
 	if content, ok := m["content"].(string); ok && content != "" {
-		if match := modelSelectionRe.FindStringSubmatch(content); len(match) > 1 {
-			extracted := strings.TrimSpace(match[1])
-			if extracted != "" && !strings.EqualFold(extracted, "none") {
-				if norm := normalizeModelName(extracted); norm != "" {
-					return norm
-				}
-			}
-		}
-		if match := modelTagRe.FindStringSubmatch(content); len(match) > 0 {
-			for i := 1; i < len(match); i++ {
-				if match[i] != "" {
-					extracted := strings.TrimSpace(match[i])
+		lowerContent := strings.ToLower(content)
+		if strings.Contains(lowerContent, "model") || strings.Contains(content, "<!--") {
+			if match := modelSelectionRe.FindStringSubmatch(content); len(match) > 1 {
+				extracted := strings.TrimSpace(match[1])
+				if extracted != "" && !strings.EqualFold(extracted, "none") {
 					if norm := normalizeModelName(extracted); norm != "" {
 						return norm
+					}
+				}
+			}
+			if match := modelTagRe.FindStringSubmatch(content); len(match) > 0 {
+				for i := 1; i < len(match); i++ {
+					if match[i] != "" {
+						extracted := strings.TrimSpace(match[i])
+						if norm := normalizeModelName(extracted); norm != "" {
+							return norm
+						}
 					}
 				}
 			}

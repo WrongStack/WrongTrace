@@ -3,8 +3,16 @@ package ast
 import (
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+var dpPool = sync.Pool{
+	New: func() any {
+		s := make([]int, 0, 16384)
+		return &s
+	},
+}
 
 // Action is the lifecycle state transition produced by a semantic diff.
 type Action string
@@ -352,7 +360,19 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 		}
 
 		stride := n + 1
-		dp := make([]int, (m+1)*stride)
+		reqSize := (m + 1) * stride
+		bufPtr := dpPool.Get().(*[]int)
+		if cap(*bufPtr) < reqSize {
+			*bufPtr = make([]int, reqSize)
+		} else {
+			*bufPtr = (*bufPtr)[:reqSize]
+			for k := range *bufPtr {
+				(*bufPtr)[k] = 0
+			}
+		}
+		dp := *bufPtr
+		defer dpPool.Put(bufPtr)
+
 		for i := 1; i <= m; i++ {
 			row := i * stride
 			prevRow := (i - 1) * stride
