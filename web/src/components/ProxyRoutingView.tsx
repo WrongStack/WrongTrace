@@ -431,7 +431,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
 
   // Helper to generate replayable curl command
   const generateCurlCommand = (t: ProxyTrafficRecord) => {
-    const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173';
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000';
     const url = `${origin}${t.incoming_path || '/proxy/custom'}`;
     const headerLines = Object.entries(t.request_headers || {})
       .filter(([k]) => !['host', 'content-length', 'connection'].includes(k.toLowerCase()))
@@ -547,15 +547,15 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
               <span className="text-[9px] bg-emerald-500/10 text-emerald-400 px-2 py-0.2 rounded border border-emerald-500/20 font-mono">No setup required</span>
             </div>
             <p className="text-xs text-slate-400">
-              You can use WrongTrace as a transparent proxy without configuring routes! Simply prepend <code className="text-indigo-300 font-mono bg-white/5 px-1 py-0.5 rounded">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173'}/proxy/</code> to ANY upstream host or URL:
+              You can use WrongTrace as a transparent proxy without configuring routes! Simply prepend <code className="text-indigo-300 font-mono bg-white/5 px-1 py-0.5 rounded">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'}/proxy/</code> to ANY upstream host or URL:
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-mono pt-1">
               <div className="p-2 bg-slate-950/70 rounded border border-white/5 flex items-center justify-between gap-2">
                 <span className="truncate text-slate-300">
-                  <span className="text-indigo-400">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173'}/proxy/</span>api.z.ai/api/coding/paas/v4
+                  <span className="text-indigo-400">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'}/proxy/</span>api.z.ai/api/coding/paas/v4
                 </span>
                 <button
-                  onClick={() => handleCopy('direct-zai', `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173'}/proxy/api.z.ai/api/coding/paas/v4`)}
+                  onClick={() => handleCopy('direct-zai', `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'}/proxy/api.z.ai/api/coding/paas/v4`)}
                   className="text-indigo-400 hover:text-indigo-300 shrink-0 flex items-center gap-1"
                 >
                   {copiedId === 'direct-zai' ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
@@ -564,10 +564,10 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
               </div>
               <div className="p-2 bg-slate-950/70 rounded border border-white/5 flex items-center justify-between gap-2">
                 <span className="truncate text-slate-300">
-                  <span className="text-indigo-400">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173'}/proxy/</span>api.groq.com/openai/v1
+                  <span className="text-indigo-400">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'}/proxy/</span>api.groq.com/openai/v1
                 </span>
                 <button
-                  onClick={() => handleCopy('direct-groq', `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173'}/proxy/api.groq.com/openai/v1`)}
+                  onClick={() => handleCopy('direct-groq', `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'}/proxy/api.groq.com/openai/v1`)}
                   className="text-indigo-400 hover:text-indigo-300 shrink-0 flex items-center gap-1"
                 >
                   {copiedId === 'direct-groq' ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
@@ -940,7 +940,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
               <Activity className="h-10 w-10 text-slate-600 mx-auto animate-pulse" />
               <div className="text-sm font-semibold text-slate-300">No Gateway Traffic Intercepted Yet</div>
               <p className="text-xs text-slate-500 max-w-md mx-auto">
-                Send an LLM request through <code className="text-indigo-300 font-mono bg-white/5 px-1 py-0.5 rounded">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173'}/proxy/api.z.ai/api/coding/paas/v4</code> to inspect raw wire traffic in real-time.
+                Send an LLM request through <code className="text-indigo-300 font-mono bg-white/5 px-1 py-0.5 rounded">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'}/proxy/api.z.ai/api/coding/paas/v4</code> to inspect raw wire traffic in real-time.
               </p>
             </div>
           ) : (

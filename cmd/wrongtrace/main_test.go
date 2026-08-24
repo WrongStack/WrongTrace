@@ -174,7 +174,7 @@ func TestSingleInstance_PreventDuplicate(t *testing.T) {
 	if err := rootCmd.PersistentFlags().Set("port", strconv.Itoa(port)); err != nil {
 		t.Fatalf("set port flag: %v", err)
 	}
-	t.Cleanup(func() { _ = rootCmd.PersistentFlags().Set("port", "4318") })
+	t.Cleanup(func() { _ = rootCmd.PersistentFlags().Set("port", "8000") })
 
 	// The PID file is present too, so step 1 of Acquire is exercised as well.
 	pidPath := filepath.Join(tempDir, "daemon.pid")

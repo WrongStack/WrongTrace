@@ -43,14 +43,14 @@ wrongtrace init
 ### 2. Start the Daemon
 
 ```bash
-# Start observer daemon on port 4318 watching current repo:
+# Start observer daemon on port 8000 watching current repo:
 wrongtrace start
 
 # Or with custom port and target workspace:
-wrongtrace start --watch /path/to/project --port 4318
+wrongtrace start --watch /path/to/project --port 8000
 ```
 
-Open **<http://localhost:4318>** in your browser.
+Open **<http://localhost:8000>** in your browser.
 
 ### 3. Diagnostics & Health Check
 
@@ -165,13 +165,13 @@ Route any SDK (OpenAI SDK, Anthropic SDK, LangChain, LiteLLM, Ollama) through Wr
 
 ```bash
 # OpenAI SDK / Compatible
-export OPENAI_BASE_URL="http://localhost:4318/proxy/api.openai.com/v1"
+export OPENAI_BASE_URL="http://localhost:8000/proxy/api.openai.com/v1"
 
 # Anthropic SDK
-export ANTHROPIC_BASE_URL="http://localhost:4318/proxy/api.anthropic.com"
+export ANTHROPIC_BASE_URL="http://localhost:8000/proxy/api.anthropic.com"
 
 # Google Gemini
-export GEMINI_API_BASE="http://localhost:4318/proxy/generativelanguage.googleapis.com"
+export GEMINI_API_BASE="http://localhost:8000/proxy/generativelanguage.googleapis.com"
 ```
 
 ---

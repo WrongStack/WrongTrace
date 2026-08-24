@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -145,6 +146,7 @@ func (s *Server) buildRouter() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	r.Use(requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
@@ -324,4 +326,54 @@ func spaHandler(distFS fs.FS, fileServer http.Handler) http.HandlerFunc {
 		}
 		fileServer.ServeHTTP(w, r)
 	}
+}
+
+// requestLogger logs proxy traffic and errors by default, and all HTTP requests if WRONGTRACE_LOG_ALL_HTTP=1.
+func requestLogger(next http.Handler) http.Handler {
+	logAll := os.Getenv("WRONGTRACE_LOG_ALL_HTTP") == "1" || os.Getenv("WRONGTRACE_VERBOSE") == "true"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+
+		next.ServeHTTP(ww, r)
+
+		duration := time.Since(start)
+		status := ww.Status()
+		if status == 0 {
+			status = http.StatusOK
+		}
+
+		path := r.URL.Path
+
+		category := "HTTP"
+		switch {
+		case strings.HasPrefix(path, "/proxy") || strings.HasPrefix(path, "/v1/chat") || strings.HasPrefix(path, "/v1/messages") || (strings.HasPrefix(path, "/v1/") && !strings.HasPrefix(path, "/v1/traces")):
+			category = "PROXY"
+		case strings.HasPrefix(path, "/api/ws") || path == "/ws":
+			category = "WS"
+		case strings.HasPrefix(path, "/api"):
+			category = "API"
+		case strings.HasPrefix(path, "/v1/traces") || strings.HasPrefix(path, "/profiler"):
+			category = "OTLP"
+		}
+
+		// PROXY handles its own detailed lifecycle logging with internal Request IDs.
+		if category == "PROXY" {
+			if status >= 500 {
+				log.Printf("[%s] %d %s %s (%v, %d bytes)", category, status, r.Method, path, duration.Round(time.Millisecond/10), ww.BytesWritten())
+			}
+			return
+		}
+
+		// Only error responses (status >= 400) or explicit WRONGTRACE_LOG_ALL_HTTP=1 are logged for API/OTLP/WS.
+		if !logAll && status < 400 {
+			return
+		}
+
+		if (path == "/api/health" || path == "/api/atlas/status" || path == "/favicon.ico") && status == http.StatusOK {
+			return
+		}
+
+		log.Printf("[%s] %d %s %s (%v, %d bytes)", category, status, r.Method, path, duration.Round(time.Millisecond/10), ww.BytesWritten())
+	})
 }

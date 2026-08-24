@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.2] - 2026-08-24
+
+### Changed
+- **Unified Port 8000 Architecture**: Migrated default HTTP/API/Dashboard entrypoint to port `8000`. Cleaned up legacy `5173` port references across Vite dev server, dev runners (`dev.ps1`, `dev.sh`), and proxy components.
+- **High-Signal Focused Console Logging**: Console output now filters noisy background API/polling requests (`/api/*`, health checks) by default while keeping AI Proxy completions and errors active. Full verbose logging remains accessible via `WRONGTRACE_LOG_ALL_HTTP=1`.
+
+### Added
+- **Internal Request ID Tagging (`px-xxxx`)**: Every AI proxy request is assigned a unique internal correlation ID stamped on every log line (`[PROXY] [px-xxxx] -> ...`, `[PROXY] [px-xxxx] <- ...`). The ID matches the persisted SQLite traffic ID and UI record for instant multi-agent correlation.
+- **PowerShell Real-time Telemetry Feed**: Integrated a colorized live request and proxy log streamer directly into `dev.ps1`.
+
+---
+
 ## [0.2.1] - 2026-08-24
 
 ### Fixed

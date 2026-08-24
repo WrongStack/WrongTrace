@@ -4,29 +4,37 @@ WrongTrace exposes multiple protocol interfaces for bidirectional AI agent commu
 
 ---
 
-## 1. REST API (`http://localhost:4318`)
+## 1. REST API (`http://localhost:8000`)
 
-| Endpoint | Method | Description |
-|:---|:---|:---|
-| `/api/health` | `GET` | Daemon health and version status |
-| `/api/metrics/overview` | `GET` | Summary counters: runs, events, spend, thrashing count |
-| `/api/metrics/thrashing` | `GET` | Nodes mutated $\ge 3\times$ in 24h (`?threshold=3&window_days=7`) |
-| `/api/metrics/models` | `GET` | Model survival rate, cost per survived node, total spend |
-| `/api/metrics/recent` | `GET` | Chronological stream of AST code churn events (`?limit=50`) |
-| `/api/file/health` | `GET` | File health score and fragility (`?path=src/auth.go`) |
-| `/api/atlas` | `GET` | Code Atlas graph nodes and edges for React Flow |
-| `/api/models/pricing` | `GET` | Multi-provider model pricing and context window catalog |
-| `/api/models/sync` | `POST` | Force refresh pricing catalog from models.dev |
-| `/api/profiler/overview` | `GET` | Profiler spans, latency percentiles (P50/P90/P99), error rates |
-| `/api/profiler/hotspots` | `GET` | Top 10 runtime latency bottlenecks |
-| `/api/gateway/stats` | `GET` | Wire proxy metrics: tokens, reasoning tokens, cache savings |
-| `/api/settings` | `GET` / `PUT` | Read or update webhook URLs, retention days, and guardrails |
-| `/api/settings/vacuum` | `POST` | Execute SQLite VACUUM optimization |
-| `/api/settings/prune` | `POST` | Delete records older than retention threshold |
+| Method | Path | Description |
+| :--- | :--- | :--- |
+| `GET` | `/api/health` | Daemon status, watcher state, SQLite DB path, IPC socket. |
+| `GET` | `/api/metrics/overview` | High-level metrics: files observed, thrash count, token costs. |
+| `GET` | `/api/metrics/thrashing` | Files with highest thrashing / low survival rates. |
+| `GET` | `/api/metrics/models` | Efficiency, total token spending, churn by LLM model. |
+| `GET` | `/api/metrics/recent` | Recent edit / read telemetry events stream. |
+| `GET` | `/api/atlas` | Semantic codebase map nodes, dependencies, and health. |
+| `GET` | `/api/atlas/status` | Current progress of background code graph indexing. |
+| `GET` | `/api/file/health?path=...` | Health score, fragility, and thrash history for a file. |
+| `GET` | `/api/guardrail/check?path=...` | Check if a file is protected/locked against agent edits. |
+| `POST` | `/api/guardrail/lock` | Lock a critical file (`{"path": "...", "reason": "..."}`). |
+| `POST` | `/api/guardrail/unlock` | Unlock a previously locked file (`{"path": "..."}`). |
+| `GET` | `/api/reads/recent` | Real-time file read events captured by agent tools. |
+| `GET` | `/api/files/reads` | Most frequently read files and token costs. |
+| `GET` | `/api/files/heatmap?path=...` | Line-by-line read frequency heatmap for a file. |
+| `GET` | `/api/proxy/routes` | Active AI reverse proxy routes. |
+| `POST` | `/api/proxy/routes` | Register or update upstream AI route. |
+| `DELETE` | `/api/proxy/routes/:id` | Remove a proxy route. |
+| `GET` | `/api/proxy/traffic` | Intercepted AI completions, tokens, latency, cost. |
+| `GET` | `/api/projects` | Multi-project workspace profiles and status. |
+| `POST` | `/api/projects` | Register a new project workspace. |
+| `GET` | `/api/models/catalog` | Dynamic pricing and context window registry. |
+| `POST` | `/api/profiler/ingest` | Universal profiler test runner / CLI execution trace. |
+| `POST` | `/v1/traces` | Standard OpenTelemetry OTLP trace receiver. |
 
 ---
 
-## 2. WebSocket Real-Time Feed (`ws://localhost:4318/api/ws`)
+## 2. WebSocket Real-Time Feed (`ws://localhost:8000/api/ws`)
 
 Upon connecting, the server broadcasts live JSON messages for every observed event:
 

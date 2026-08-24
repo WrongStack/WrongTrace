@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
 # WrongTrace dev runner (Windows / PowerShell 7): daemon + Vite HMR in one command.
 #
-# Usage:  ./dev.ps1 [-Port 4318] [-WatchDir .] [-NoBuild] [-NoUI]
-#   -Port      daemon + proxy port (default 4318)
+# Usage:  ./dev.ps1 [-Port 8000] [-WatchDir .] [-NoBuild] [-NoUI]
+#   -Port      web / proxy entrypoint port (default 8000)
 #   -WatchDir  directory the daemon observes (default: repo root)
 #   -NoBuild   skip the daemon build (reuse bin\wrongtrace.exe as-is)
 #   -NoUI      daemon only — no Vite dev server
@@ -11,15 +11,15 @@
 #   1. builds the daemon (fast incremental; avoids `go run` leaving orphaned
 #      children behind on interrupt)
 #   2. installs web\node_modules on first use
-#   3. starts the daemon and the Vite dev server (HMR at :5173, proxying
-#      /api + /api/ws to the daemon via WRONGTRACE_PORT)
+#   3. starts the daemon (port 8001 in dev) and the Vite dev server
+#      (HMR at :8000, proxying /api + /api/ws + /proxy to the daemon)
 #   4. Ctrl+C (or process exit) tears BOTH down, including vite's children
 #
 # POSIX systems: use dev.sh.
 
 [CmdletBinding()]
 param(
-    [int]$Port = 4318,
+    [int]$Port = 8000,
     [string]$WatchDir = $PSScriptRoot,
     [switch]$NoBuild,
     [switch]$NoUI
@@ -29,6 +29,8 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $Bin = Join-Path $Root 'bin\wrongtrace.exe'
 $Socket = '\\.\pipe\wrongtrace'
+
+$daemonPort = if ($NoUI) { $Port } else { $Port + 1 }
 
 foreach ($tool in 'go', 'npm') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
@@ -64,10 +66,10 @@ $daemonLog = Join-Path $wrongtraceHome 'daemon.log'
 $daemonOut = Join-Path $wrongtraceHome 'daemon-out.log'
 
 try {
-    Write-Host "==> starting daemon on :$Port (multi-project workspace hub)" -ForegroundColor Cyan
+    Write-Host "==> starting daemon on :$daemonPort (multi-project workspace hub)" -ForegroundColor Cyan
     $daemonArgs = @(
         'start',
-        "--port=$Port",
+        "--port=$daemonPort",
         "--socket=$Socket"
     )
     if ($WatchDir -ne '') {
@@ -82,22 +84,23 @@ try {
             Write-Error "daemon failed to start: $errContent"
         }
         try {
-            Invoke-WebRequest "http://localhost:$Port/api/health" -UseBasicParsing -TimeoutSec 1 | Out-Null
+            Invoke-WebRequest "http://localhost:$daemonPort/api/health" -UseBasicParsing -TimeoutSec 1 | Out-Null
             break
         } catch {
-            if ($i -eq 49) { Write-Error "daemon did not become healthy within 10s on port $Port" }
+            if ($i -eq 49) { Write-Error "daemon did not become healthy within 10s on port $daemonPort" }
             Start-Sleep -Milliseconds 200
         }
     }
-    Write-Host "    daemon healthy: http://localhost:$Port/api/health"
+    Write-Host "    daemon healthy: http://localhost:$daemonPort/api/health"
 
     if (-not $NoUI) {
-        Write-Host '==> starting vite dev server' -ForegroundColor Cyan
+        Write-Host "==> starting vite dev server on :$Port" -ForegroundColor Cyan
         # JobProcess tree-kill: vite spawns children, so run it via cmd /c and
         # kill the tree rather than just the shell.
         Push-Location (Join-Path $Root 'web')
         try {
-            $env:WRONGTRACE_PORT = "$Port"
+            $env:WRONGTRACE_PORT = "$daemonPort"
+            $env:VITE_PORT = "$Port"
             $vite = Start-Process -FilePath 'cmd.exe' -PassThru -WindowStyle Hidden `
                 -ArgumentList '/c', 'npm', 'run', 'dev'
         } finally { Pop-Location }
@@ -108,12 +111,22 @@ try {
 
     Write-Host ''
     Write-Host 'WrongTrace dev is up:' -ForegroundColor Green
-    if (-not $NoUI) { Write-Host '  dashboard (HMR): http://localhost:5173' }
-    Write-Host "  daemon API:      http://localhost:$Port"
+    if (-not $NoUI) {
+        Write-Host "  dashboard (HMR): http://localhost:$Port"
+        Write-Host "  proxy gateway:   http://localhost:$Port/proxy/"
+    }
+    Write-Host "  daemon API:      http://localhost:$daemonPort"
     Write-Host '  press Ctrl+C to stop both'
     Write-Host ''
 
-    # Park until interrupted or either child exits on its own.
+    Write-Host '--- Live Request & Telemetry Feed ---' -ForegroundColor DarkGray
+
+    $logOffset = 0
+    if (Test-Path $daemonLog) {
+        $logOffset = (Get-Item $daemonLog).Length
+    }
+
+    # Park until interrupted or either child exits on its own while streaming logs.
     while ($true) {
         if ($daemon.HasExited) {
             Write-Warning "daemon process stopped (exit code: $($daemon.ExitCode)); shutting down"
@@ -121,17 +134,45 @@ try {
                 Write-Host "--- Last 30 lines of dev-daemon.log (stderr) ---" -ForegroundColor Yellow
                 Get-Content $daemonLog | Select-Object -Last 30 | Write-Host -ForegroundColor Red
             }
-            if (Test-Path $daemonOut) {
-                Write-Host "--- Last 30 lines of dev-daemon-out.log (stdout) ---" -ForegroundColor Yellow
-                Get-Content $daemonOut | Select-Object -Last 30 | Write-Host -ForegroundColor Red
-            }
             break
         }
         if ($vite -and $vite.HasExited) {
             Write-Warning "vite dev server stopped (exit code: $($vite.ExitCode)); shutting down"
             break
         }
-        Start-Sleep -Seconds 1
+
+        if (Test-Path $daemonLog) {
+            try {
+                $file = [System.IO.File]::Open($daemonLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                if ($file.Length -gt $logOffset) {
+                    $file.Seek($logOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+                    $reader = New-Object System.IO.StreamReader($file)
+                    while (-not $reader.EndOfStream) {
+                        $line = $reader.ReadLine()
+                        if ($line -match '\[PROXY\]') {
+                            Write-Host $line -ForegroundColor Magenta
+                        } elseif ($line -match 'proxy:') {
+                            Write-Host $line -ForegroundColor DarkMagenta
+                        } elseif ($line -match '\[API\]') {
+                            Write-Host $line -ForegroundColor Cyan
+                        } elseif ($line -match '\[OTLP\]') {
+                            Write-Host $line -ForegroundColor Yellow
+                        } elseif ($line -match '\[WS\]') {
+                            Write-Host $line -ForegroundColor Blue
+                        } elseif ($line -match 'error|FATAL|PANIC') {
+                            Write-Host $line -ForegroundColor Red
+                        } else {
+                            Write-Host $line -ForegroundColor DarkGray
+                        }
+                    }
+                    $logOffset = $file.Position
+                }
+                $file.Close()
+            } catch {
+                # Ignore transient read locks
+            }
+        }
+        Start-Sleep -Milliseconds 250
     }
 } finally {
     Write-Host '==> stopping dev processes' -ForegroundColor Cyan

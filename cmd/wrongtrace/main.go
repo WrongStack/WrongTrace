@@ -105,7 +105,7 @@ func init() {
 	rootCmd.AddCommand(startCmd, mcpCmd, statusCmd, doctorCmd, traceCmd, exportCmd, reportCmd, hookCmd, initCmd)
 
 	rootCmd.PersistentFlags().StringP("watch", "w", ".", "directory to observe")
-	rootCmd.PersistentFlags().IntP("port", "p", 4318, "HTTP port for the embedded dashboard")
+	rootCmd.PersistentFlags().IntP("port", "p", 8000, "HTTP port for the embedded dashboard and proxy")
 	rootCmd.PersistentFlags().String("db", filepath.Join(defaultDataDir(), "wrongtrace.db"), "SQLite database file")
 	rootCmd.PersistentFlags().String("socket", defaultSocketPath(), "Unix Domain Socket / Named Pipe path")
 	rootCmd.PersistentFlags().String("repo", filepath.Base(mustCwd()), "repository name to record events under")
@@ -592,7 +592,7 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	// 1. Try sending trace to active daemon via HTTP API
 	port, _ := cmd.Flags().GetInt("port")
 	if port <= 0 {
-		port = 4318
+		port = 8000
 	}
 	daemonURL := fmt.Sprintf("http://localhost:%d/api/profiler/ingest", port)
 	payload := map[string]interface{}{

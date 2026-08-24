@@ -176,7 +176,7 @@ pipe path, winio in Go).
 ## Option C — REST API
 
 For dashboards, scripts, or anything that prefers HTTP. Read-only today;
-served by the daemon (default `http://localhost:4318`).
+served by the daemon (default `http://localhost:8000`).
 
 | Endpoint | Returns |
 |---|---|
@@ -194,10 +194,10 @@ served by the daemon (default `http://localhost:4318`).
 
 ```bash
 # from the release binary (download from GitHub Releases)
-./wrongtrace start --watch /path/to/your/project --repo my-app --port 4318
+./wrongtrace start --watch /path/to/your/project --repo my-app --port 8000
 ```
 
-Then open <http://localhost:4318> — the dashboard shows live churn as any
+Then open <http://localhost:8000> — the dashboard shows live churn as any
 agent (or human) edits the watched tree. `--repo` is just a label recorded
 on events; `--watch` supports Go, TypeScript/JavaScript, and Python files.
 
@@ -207,7 +207,7 @@ run several side by side). All flags:
 | Flag | Default | Description |
 |---|---|---|
 | `--watch, -w` | `.` | Root directory to observe |
-| `--port, -p` | `4318` | HTTP port for the dashboard + API |
+| `--port, -p` | `8000` | HTTP port for the dashboard + API |
 | `--db` | `~/.wrongtrace/wrongtrace.db` | SQLite database file |
 | `--socket` | platform default (above) | IPC socket / pipe path |
 | `--repo` | basename of cwd | Repository label on events |

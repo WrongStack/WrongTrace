@@ -181,6 +181,11 @@ func (p *GatewayProxy) recordTraffic(rec ProxyTrafficRecord) {
 	p.trafficLog = append(p.trafficLog, rec)
 	p.trafficMu.Unlock()
 
+	if rec.PromptTokens > 0 || rec.CompletionTokens > 0 || rec.Model != "" {
+		log.Printf("[PROXY] [%s] COMPLETED HTTP %d | model: %s | in: %d tok, out: %d tok, cached: %d | cost: $%.5f | duration: %dms",
+			rec.ID, rec.StatusCode, rec.Model, rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens, rec.CostUSD, rec.DurationMs)
+	}
+
 	if p.cfg.OnTraffic != nil {
 		p.cfg.OnTraffic(rec)
 	}
@@ -449,6 +454,8 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// query-authenticated providers (e.g. Gemini ?key=...) keep working.
 	safeTargetURL := sanitizeURLForRecord(targetURL)
 
+	reqID := randomID("px")
+
 	// Read request body to extract model and intent
 	reqBody, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -459,7 +466,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Real-time Secret Scanner: sanitize leaked API keys or passwords before sending to cloud LLMs
 	reqBody, redactedSecrets := ScanAndRedactSecrets(reqBody)
 	if redactedSecrets > 0 {
-		log.Printf("proxy: security guardrail redacted %d secret(s) in outgoing payload to %s", redactedSecrets, provider)
+		log.Printf("[PROXY] [%s] security guardrail redacted %d secret(s) in outgoing payload to %s", reqID, redactedSecrets, provider)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(reqBody))
 
@@ -560,8 +567,10 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(cached.StatusCode)
 			_, _ = w.Write(cached.Body)
 
+			log.Printf("[PROXY] [%s] CACHE HIT -> returned %d cached tokens in %dms (saved $%.5f)", reqID, cached.TokensSaved, time.Since(start).Milliseconds(), cached.CostSavedUSD)
+
 			rec := ProxyTrafficRecord{
-				ID:              randomID("cache_hit"),
+				ID:              reqID,
 				Timestamp:       start,
 				DurationMs:      time.Since(start).Milliseconds(),
 				Method:          r.Method,
@@ -619,7 +628,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyProxyHeaders(outReq, r.Header)
 	outReq.Host = outReq.URL.Host
 
-	log.Printf("proxy: forwarding %s %s -> %s (provider: %s, model: %s)", r.Method, r.URL.Path, safeTargetURL, provider, modelName)
+	log.Printf("[PROXY] [%s] -> %s %s -> %s (provider: %s, model: %s)", reqID, r.Method, r.URL.Path, safeTargetURL, provider, modelName)
 
 	resp, err := p.httpClient.Do(outReq)
 	if err != nil {
@@ -630,12 +639,12 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// form-independent: http.Client re-normalizes the URL inside the
 		// error, so an exact ReplaceAll(targetURL→safeURL) can miss it.
 		safeErr := scrubErrorString(err.Error())
-		log.Printf("proxy: upstream error for %s: %s", safeTargetURL, safeErr)
+		log.Printf("[PROXY] [%s] upstream error for %s: %s", reqID, safeTargetURL, safeErr)
 		http.Error(w, "upstream error: "+safeErr, http.StatusBadGateway)
 
 		// Record error traffic
 		p.recordTraffic(ProxyTrafficRecord{
-			ID:             randomID("traffic"),
+			ID:             reqID,
 			Timestamp:      start,
 			DurationMs:     duration,
 			Method:         r.Method,
@@ -653,7 +662,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	duration := time.Since(start).Milliseconds()
-	log.Printf("proxy: %s responded with HTTP %d in %dms", safeTargetURL, resp.StatusCode, duration)
+	log.Printf("[PROXY] [%s] <- %s responded HTTP %d in %dms", reqID, safeTargetURL, resp.StatusCode, duration)
 
 	isStream = parsedReq.Stream || strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
@@ -676,7 +685,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	respHeaders := maskHeaders(resp.Header)
 
 	baseRecord := ProxyTrafficRecord{
-		ID:             randomID("traffic"),
+		ID:             reqID,
 		Timestamp:      start,
 		DurationMs:     duration,
 		Method:         r.Method,
@@ -714,6 +723,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // they must never enter the proxy/trace flow: no run recording, no traffic
 // record, no cache or quota interaction.
 func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Request, provider, targetBase, cleanPath string) {
+	catID := randomID("px-cat")
 	targetURL := strings.TrimSuffix(targetBase, "/") + "/" + strings.TrimPrefix(cleanPath, "/")
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
@@ -727,12 +737,12 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 	copyProxyHeaders(outReq, r.Header)
 	outReq.Host = outReq.URL.Host
 
-	log.Printf("proxy: relaying catalog call %s %s -> %s (provider: %s, untraced)", r.Method, r.URL.Path, sanitizeURLForRecord(targetURL), provider)
+	log.Printf("[PROXY] [%s] relaying catalog call %s %s -> %s (provider: %s, untraced)", catID, r.Method, r.URL.Path, sanitizeURLForRecord(targetURL), provider)
 
 	resp, err := p.httpClient.Do(outReq)
 	if err != nil {
 		safeErr := scrubErrorString(err.Error())
-		log.Printf("proxy: upstream error for %s: %s", sanitizeURLForRecord(targetURL), safeErr)
+		log.Printf("[PROXY] [%s] upstream error for %s: %s", catID, sanitizeURLForRecord(targetURL), safeErr)
 		http.Error(w, "upstream error: "+safeErr, http.StatusBadGateway)
 		return
 	}

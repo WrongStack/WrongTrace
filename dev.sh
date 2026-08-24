@@ -2,25 +2,26 @@
 # WrongTrace dev runner (POSIX): daemon + Vite HMR in one command.
 #
 # Usage:  ./dev.sh [port] [watch-dir]
-#         port defaults to 4318, watch-dir to the repo root.
+#         port defaults to 8000, watch-dir to the repo root.
 #
 # What it does:
 #   1. builds the daemon (fast incremental when nothing changed) — avoids
 #      `go run` leaving orphaned children on interrupt
 #   2. installs web/node_modules on first use
 #   3. starts the daemon (watching the repo itself) and the Vite dev server
-#      (HMR at :5173, proxying /api + /api/ws to the daemon)
+#      (HMR at :8000, proxying /api + /api/ws + /proxy to the daemon)
 #   4. on Ctrl+C tears BOTH processes down and cleans up
 #
 # Windows: use dev.ps1 (PowerShell 7). This script is for WSL / macOS / Linux.
 
 set -eu
 
-PORT="${1:-4318}"
+PORT="${1:-8000}"
+DAEMON_PORT=$((PORT + 1))
 WATCH_DIR="${2:-"$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"}"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 BIN="$ROOT/bin/wrongtrace"
-VITE_URL="http://localhost:5173"
+VITE_URL="http://localhost:$PORT"
 
 command -v go >/dev/null 2>&1 || { echo "dev.sh: go not found in PATH" >&2; exit 1; }
 command -v npm >/dev/null 2>&1 || { echo "dev.sh: npm not found in PATH" >&2; exit 1; }
@@ -46,9 +47,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "==> starting daemon on :$PORT (multi-project workspace hub)"
+echo "==> starting daemon on :$DAEMON_PORT (multi-project workspace hub)"
 "$BIN" start \
-  --port "$PORT" \
+  --port "$DAEMON_PORT" \
   --watch "$WATCH_DIR" \
   --repo "$(basename "$WATCH_DIR")" &
 DAEMON_PID=$!
@@ -56,7 +57,7 @@ DAEMON_PID=$!
 # Wait for the daemon's health endpoint before starting vite so the proxy
 # target is guaranteed live (avoids a confusing first-load proxy error).
 i=0
-until curl -fsS "http://localhost:$PORT/api/health" >/dev/null 2>&1; do
+until curl -fsS "http://localhost:$DAEMON_PORT/api/health" >/dev/null 2>&1; do
   i=$((i + 1))
   if [ "$i" -ge 50 ]; then
     echo "dev.sh: daemon did not become healthy within 10s" >&2
@@ -64,16 +65,17 @@ until curl -fsS "http://localhost:$PORT/api/health" >/dev/null 2>&1; do
   fi
   sleep 0.2
 done
-echo "    daemon healthy: http://localhost:$PORT/api/health"
+echo "    daemon healthy: http://localhost:$DAEMON_PORT/api/health"
 
-echo "==> starting vite dev server"
-(cd "$ROOT/web" && WRONGTRACE_PORT="$PORT" npm run dev) &
+echo "==> starting vite dev server on :$PORT"
+(cd "$ROOT/web" && WRONGTRACE_PORT="$DAEMON_PORT" VITE_PORT="$PORT" npm run dev) &
 VITE_PID=$!
 
 echo ""
 echo "WrongTrace dev is up:"
 echo "  dashboard (HMR): $VITE_URL"
-echo "  daemon API:      http://localhost:$PORT"
+echo "  proxy gateway:   $VITE_URL/proxy/"
+echo "  daemon API:      http://localhost:$DAEMON_PORT"
 echo "  press Ctrl+C to stop both"
 echo ""
 
