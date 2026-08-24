@@ -176,9 +176,11 @@ func (p *GatewayProxy) recordTraffic(rec ProxyTrafficRecord) {
 
 	p.trafficMu.Lock()
 	if len(p.trafficLog) >= p.maxTraffic {
-		p.trafficLog = p.trafficLog[1:]
+		copy(p.trafficLog, p.trafficLog[1:])
+		p.trafficLog[len(p.trafficLog)-1] = rec
+	} else {
+		p.trafficLog = append(p.trafficLog, rec)
 	}
-	p.trafficLog = append(p.trafficLog, rec)
 	p.trafficMu.Unlock()
 
 	if rec.PromptTokens > 0 || rec.CompletionTokens > 0 || rec.Model != "" {

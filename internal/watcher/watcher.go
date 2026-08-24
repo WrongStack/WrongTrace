@@ -310,6 +310,9 @@ func (w *Watcher) Run(ctx context.Context) {
 				pendingMu.Lock()
 				delete(pending, path)
 				pendingMu.Unlock()
+				if ctx.Err() != nil {
+					return
+				}
 				w.cfg.Engine.HandleFileChange(ctx, path)
 			})
 			pendingMu.Unlock()

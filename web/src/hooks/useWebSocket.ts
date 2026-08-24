@@ -12,6 +12,7 @@ export function useWebSocket(): {
   const [lastMessage, setLastMessage] = useState<WSMessage | null>(null);
   const retryRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedRef = useRef(false);
 
   useEffect(() => {
@@ -42,7 +43,7 @@ export function useWebSocket(): {
         if (stoppedRef.current) return;
         const delay = Math.min(8000, 500 * 2 ** retryRef.current);
         retryRef.current += 1;
-        setTimeout(connect, delay);
+        timerRef.current = setTimeout(connect, delay);
       };
       ws.onerror = () => {
         // onclose will follow; close handler triggers reconnect.
@@ -52,6 +53,10 @@ export function useWebSocket(): {
     connect();
     return () => {
       stoppedRef.current = true;
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
       wsRef.current?.close();
     };
   }, []);

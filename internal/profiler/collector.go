@@ -264,7 +264,9 @@ func (c *Collector) recordRecent(ev TraceEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.recent) >= c.maxRecent {
-		c.recent = c.recent[1:]
+		copy(c.recent, c.recent[1:])
+		c.recent[len(c.recent)-1] = ev
+		return
 	}
 	c.recent = append(c.recent, ev)
 }

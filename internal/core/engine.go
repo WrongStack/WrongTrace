@@ -166,7 +166,8 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 		log.Printf("engine: stat %s: %v", path, err)
 		return
 	}
-	if info.IsDir() || e.shouldSkip(path) {
+	// Skip directories, files over 5MB (avoids parsing huge logs/binaries), and ignored paths
+	if info.IsDir() || info.Size() > 5*1024*1024 || e.shouldSkip(path) {
 		return
 	}
 
@@ -429,6 +430,14 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 		return fmt.Errorf("upsert run: %w", err)
 	}
 	e.runMu.Lock()
+	if len(e.activeRuns) > 250 {
+		cutoff := time.Now().Add(-e.correlate)
+		for id, m := range e.activeRuns {
+			if m.LastSeen.Before(cutoff) {
+				delete(e.activeRuns, id)
+			}
+		}
+	}
 	existing, exists := e.activeRuns[p.RunID]
 	startedAt := rec.CreatedAt
 	if exists && !existing.StartedAt.IsZero() {
