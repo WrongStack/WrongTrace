@@ -233,15 +233,17 @@ func (w *Watcher) pathIgnored(p string) bool {
 		return false
 	}
 	norm := filepath.ToSlash(scoped)
-	segs := strings.Split(norm, "/")
+	normLower := strings.ToLower(norm)
 	base := filepath.Base(scoped)
 
-	// 1. Check directory segments
-	for _, seg := range segs {
-		for _, ig := range w.cfg.IgnoreDirs {
-			if strings.EqualFold(seg, ig) {
-				return true
-			}
+	// 1. Check directory segments without heap allocation
+	for _, ig := range w.cfg.IgnoreDirs {
+		igLower := strings.ToLower(ig)
+		if normLower == igLower ||
+			strings.HasPrefix(normLower, igLower+"/") ||
+			strings.HasSuffix(normLower, "/"+igLower) ||
+			strings.Contains(normLower, "/"+igLower+"/") {
+			return true
 		}
 	}
 
@@ -251,7 +253,8 @@ func (w *Watcher) pathIgnored(p string) bool {
 		if matched, _ := filepath.Match(patNorm, base); matched {
 			return true
 		}
-		if strings.Contains(norm, "/"+patNorm+"/") || strings.HasSuffix(norm, "/"+patNorm) || strings.HasPrefix(norm, patNorm+"/") {
+		patLower := strings.ToLower(patNorm)
+		if strings.Contains(normLower, "/"+patLower+"/") || strings.HasSuffix(normLower, "/"+patLower) || strings.HasPrefix(normLower, patLower+"/") {
 			return true
 		}
 	}

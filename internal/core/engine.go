@@ -317,7 +317,16 @@ func (e *Engine) WatchRoot() string {
 // see shouldSkip.
 func ignoredPathSegment(path string) bool {
 	norm := filepath.ToSlash(path)
-	for _, seg := range strings.Split(norm, "/") {
+	for len(norm) > 0 {
+		idx := strings.IndexByte(norm, '/')
+		var seg string
+		if idx == -1 {
+			seg = norm
+			norm = ""
+		} else {
+			seg = norm[:idx]
+			norm = norm[idx+1:]
+		}
 		if isIgnoredDir(seg) {
 			return true
 		}

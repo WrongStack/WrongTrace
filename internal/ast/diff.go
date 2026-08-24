@@ -241,6 +241,14 @@ func splitLines(s string) []string {
 	if s == "" {
 		return nil
 	}
+	// Fast path: avoid full-string ReplaceAll allocation when no \r is present
+	if !strings.Contains(s, "\r") {
+		s = strings.TrimSuffix(s, "\n")
+		if s == "" {
+			return nil
+		}
+		return strings.Split(s, "\n")
+	}
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.TrimSuffix(s, "\n")
 	if s == "" {

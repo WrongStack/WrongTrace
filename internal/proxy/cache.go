@@ -97,22 +97,29 @@ func (c *ResponseCache) Set(key, provider, model string, statusCode int, headers
 		ttl = c.defaultTTL
 	}
 
+	now := time.Now()
 	if len(c.items) >= c.maxEntries {
-		// Evict oldest item
-		var oldestKey string
-		var oldestTime time.Time
+		// First pass: purge expired entries
 		for k, v := range c.items {
-			if oldestTime.IsZero() || v.CreatedAt.Before(oldestTime) {
-				oldestTime = v.CreatedAt
-				oldestKey = k
+			if now.After(v.ExpiresAt) {
+				delete(c.items, k)
 			}
 		}
-		if oldestKey != "" {
-			delete(c.items, oldestKey)
+		// Second pass: if still at capacity, evict oldest
+		if len(c.items) >= c.maxEntries {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range c.items {
+				if oldestTime.IsZero() || v.CreatedAt.Before(oldestTime) {
+					oldestTime = v.CreatedAt
+					oldestKey = k
+				}
+			}
+			if oldestKey != "" {
+				delete(c.items, oldestKey)
+			}
 		}
 	}
-
-	now := time.Now()
 	c.items[key] = &CachedResponse{
 		Key:          key,
 		StatusCode:   statusCode,

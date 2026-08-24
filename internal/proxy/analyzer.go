@@ -69,10 +69,8 @@ func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysi
 	// 2. Analyze Response
 	if len(respBody) > 0 {
 		if !isStream {
-			if !json.Valid(respBody) {
+			if !analysis.parseJSONResponse(respBody) {
 				analysis.AssistantReply = string(respBody)
-			} else {
-				analysis.parseJSONResponse(respBody)
 			}
 			if analysis.PromptTokens == 0 && len(reqBody) > 0 {
 				analysis.PromptTokens = EstimatePromptTokens(reqBody)
@@ -100,10 +98,10 @@ func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysi
 	return analysis
 }
 
-func (pa *PayloadAnalysis) parseJSONResponse(data []byte) {
+func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 	var respMap map[string]interface{}
 	if err := json.Unmarshal(data, &respMap); err != nil {
-		return
+		return false
 	}
 
 	if id, ok := respMap["id"].(string); ok && id != "" {
@@ -158,7 +156,7 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) {
 				}
 			}
 		}
-		return
+		return true
 	}
 
 	// Anthropic format
@@ -198,6 +196,7 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) {
 			}
 		}
 	}
+	return true
 }
 
 func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {

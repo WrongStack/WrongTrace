@@ -57,7 +57,6 @@ func (l Language) String() string {
 // DetectLanguage maps a file path's extension to a Tree-sitter or semantic language.
 func DetectLanguage(path string) Language {
 	ext := strings.ToLower(filepath.Ext(path))
-	base := strings.ToLower(filepath.Base(path))
 
 	switch ext {
 	case ".go":
@@ -82,7 +81,8 @@ func DetectLanguage(path string) Language {
 		return LangRuby
 	}
 
-	// Config files to skip.
+	// Config files to skip (evaluated lazily only when extension didn't match).
+	base := strings.ToLower(filepath.Base(path))
 	switch base {
 	case "tsconfig.json", "package.json", "go.mod", "go.sum", "cargo.lock":
 		return LangUnknown

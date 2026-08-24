@@ -84,12 +84,17 @@ func ServeStdio(sink EngineSink) error {
 	}
 }
 
+const maxMCPLineBytes = 16 * 1024 * 1024 // 16 MB max line length to protect against unbounded RAM allocation
+
 func readMessage(r *bufio.Reader) ([]byte, error) {
 	var line []byte
 	for {
 		chunk, isPrefix, err := r.ReadLine()
 		if err != nil {
 			return nil, err
+		}
+		if len(line)+len(chunk) > maxMCPLineBytes {
+			return nil, fmt.Errorf("mcp: message line exceeded maximum limit of %d bytes", maxMCPLineBytes)
 		}
 		line = append(line, chunk...)
 		if !isPrefix {

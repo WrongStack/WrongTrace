@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,8 +89,7 @@ func extractInt(v interface{}) int {
 	case float64:
 		return int(n)
 	case string:
-		var parsed int
-		if _, err := fmt.Sscanf(n, "%d", &parsed); err == nil {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
 			return parsed
 		}
 	}
