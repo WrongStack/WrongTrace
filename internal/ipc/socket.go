@@ -149,6 +149,7 @@ func (s *Server) acceptLoop(ctx context.Context) {
 				return
 			}
 			log.Printf("ipc: accept error: %v", err)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		s.track(conn, true)

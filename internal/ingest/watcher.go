@@ -15,6 +15,7 @@ type SessionWatcher struct {
 	mu          sync.Mutex
 	watchPaths  []string
 	seenOffsets map[string]int64
+	dirModTimes map[string]time.Time
 	onToolCall  func(ToolCallEvent)
 	onReadEvent func(FileReadEvent)
 }
@@ -23,6 +24,7 @@ type SessionWatcher struct {
 func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 	return &SessionWatcher{
 		seenOffsets: make(map[string]int64),
+		dirModTimes: make(map[string]time.Time),
 		onToolCall:  onToolCall,
 	}
 }
@@ -98,15 +100,12 @@ func (sw *SessionWatcher) DiscoverGlobalAgentDirs() {
 
 		// 4. Cursor (Anysphere)
 		filepath.Join(appData, "Cursor", "User", "workspaceStorage"),
-		filepath.Join(appData, "Cursor", "User", "globalStorage"),
 
 		// 5. Windsurf (Codeium)
 		filepath.Join(appData, "Windsurf", "User", "workspaceStorage"),
-		filepath.Join(appData, "Windsurf", "User", "globalStorage"),
 
 		// 6. ByteDance Trae IDE
 		filepath.Join(appData, "Trae", "User", "workspaceStorage"),
-		filepath.Join(appData, "Trae", "User", "globalStorage"),
 
 		// 7. GitHub Copilot
 		filepath.Join(appData, "Code", "User", "globalStorage", "github.copilot-chat"),
@@ -157,7 +156,7 @@ func isIgnoredLogDir(name string) bool {
 		"temp", "tmp", "extensions", "dist", "build", "bin", "obj", "venv", ".venv",
 		"__pycache__", "crashpad", "dawngraphitecache", "grshadercache", "shadercache",
 		"indexeddb", "local storage", "session storage", "blob_storage", "service worker",
-		"dictionaries", "webrtc", "packaged-extensions":
+		"dictionaries", "webrtc", "packaged-extensions", "state.vscdb.backup", "backup":
 		return true
 	}
 	return false
@@ -168,17 +167,43 @@ func (sw *SessionWatcher) PollOnce() {
 	sw.mu.Lock()
 	paths := make([]string, len(sw.watchPaths))
 	copy(paths, sw.watchPaths)
+	if sw.dirModTimes == nil {
+		sw.dirModTimes = make(map[string]time.Time)
+	}
 	sw.mu.Unlock()
 
-	for _, dir := range paths {
-		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	for _, rootDir := range paths {
+		_ = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info == nil {
 				return nil
 			}
 
 			if info.IsDir() {
-				if path != dir && isIgnoredLogDir(info.Name()) {
-					return filepath.SkipDir
+				if path != rootDir {
+					name := info.Name()
+					if isIgnoredLogDir(name) {
+						return filepath.SkipDir
+					}
+					// Depth limit: transcript files are max 4-5 levels deep from root
+					rel, relErr := filepath.Rel(rootDir, path)
+					if relErr == nil {
+						segs := strings.Split(filepath.ToSlash(rel), "/")
+						if len(segs) > 5 {
+							return filepath.SkipDir
+						}
+					}
+					// Prune unchanged subtrees using directory modification time
+					modTime := info.ModTime()
+					sw.mu.Lock()
+					lastMod, seenDir := sw.dirModTimes[path]
+					sw.mu.Unlock()
+					if seenDir && !modTime.After(lastMod) {
+						// Directory modification time has not changed, skip sub-tree walk
+						return filepath.SkipDir
+					}
+					sw.mu.Lock()
+					sw.dirModTimes[path] = modTime
+					sw.mu.Unlock()
 				}
 				return nil
 			}

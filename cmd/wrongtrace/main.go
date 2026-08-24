@@ -305,7 +305,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	})
 	sessionWatcher.DiscoverAgentDirs(abs)
 	sessionWatcher.DiscoverGlobalAgentDirs()
-	sessionWatcher.StartPolling(ctx, 3*time.Second)
+	sessionWatcher.StartPolling(ctx, 8*time.Second)
 
 	// Resilient HTTP Server Loop: never drops daemon on temporary listener issues
 	go func() {
@@ -327,6 +327,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 					time.Sleep(2 * time.Second)
 				}
 			}()
+			time.Sleep(500 * time.Millisecond)
 		}
 	}()
 
@@ -347,6 +348,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 				}()
 				w.Run(ctx)
 			}()
+			time.Sleep(1 * time.Second)
 		}
 	}()
 
@@ -367,6 +369,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 				}()
 				engine.Run(ctx)
 			}()
+			time.Sleep(1 * time.Second)
 		}
 	}()
 
