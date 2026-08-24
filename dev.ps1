@@ -59,8 +59,8 @@ if (-not $NoBuild) {
 # Clean up any lingering wrongtrace processes before starting
 Get-Process -Name wrongtrace -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-if (-not $NoUI -and -not (Test-Path (Join-Path $Root 'web\node_modules'))) {
-    Write-Host '==> installing dashboard dependencies (first run)' -ForegroundColor Cyan
+if (-not $NoUI -and (-not (Test-Path (Join-Path $Root 'web\node_modules')) -or -not (Test-Path (Join-Path $Root 'web\node_modules\.bin\vite.cmd')))) {
+    Write-Host '==> installing dashboard dependencies' -ForegroundColor Cyan
     Push-Location (Join-Path $Root 'web')
     try { npm install }
     finally { Pop-Location }
@@ -191,10 +191,10 @@ try {
 
     # Kill the vite tree first (cmd -> npm -> node) so no orphan lingers;
     # taskkill /T walks the whole process tree, unlike Stop-Process.
-    if ($vite) {
-        & taskkill /PID $vite.Id /T /F 2>$null | Out-Null
+    if ($vite -and -not $vite.HasExited) {
+        cmd.exe /c "taskkill /PID $($vite.Id) /T /F >nul 2>&1"
     }
-    if ($daemon) {
+    if ($daemon -and -not $daemon.HasExited) {
         Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
     }
 }
