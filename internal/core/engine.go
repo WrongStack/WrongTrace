@@ -44,6 +44,10 @@ type Config struct {
 	RepoName string
 	Store    *db.Store
 	AST      *ast.Engine
+	// WatchDir is the root the filesystem watcher observes. Ignore-directory
+	// filtering is evaluated relative to it; leaving it empty defers that
+	// filtering entirely to the watcher. PrimeDirectory back-fills it.
+	WatchDir string
 }
 
 // Engine is the heart of WrongTrace. It is safe for concurrent use and exposes
@@ -66,6 +70,9 @@ type Engine struct {
 
 	indexMu     sync.RWMutex
 	indexStatus IndexProgress
+
+	rootMu    sync.RWMutex
+	watchRoot string
 }
 
 // runMeta is the metadata kept for an active (or recently-seen) agent run —
@@ -111,6 +118,7 @@ func NewEngine(cfg Config) *Engine {
 
 	return &Engine{
 		cfg:             cfg,
+		watchRoot:       absClean(cfg.WatchDir),
 		hub:             NewHub(),
 		activeRuns:      make(map[string]runMeta),
 		correlate:       10 * time.Minute,
@@ -246,9 +254,46 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 	}
 }
 
+// absClean normalizes a directory into an absolute, cleaned path. An empty or
+// unresolvable input yields "", which callers read as "no root known".
+func absClean(dir string) string {
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(abs)
+}
+
+// adoptWatchRoot records the directory the engine observes unless one is
+// already known. PrimeDirectory calls it so the daemon and the tests share
+// the same ignore scoping without extra wiring.
+func (e *Engine) adoptWatchRoot(dir string) {
+	root := absClean(dir)
+	if root == "" {
+		return
+	}
+	e.rootMu.Lock()
+	defer e.rootMu.Unlock()
+	if e.watchRoot == "" {
+		e.watchRoot = root
+	}
+}
+
+// WatchRoot returns the directory ignore rules are scoped to, or "" when the
+// engine has not been given one.
+func (e *Engine) WatchRoot() string {
+	e.rootMu.RLock()
+	defer e.rootMu.RUnlock()
+	return e.watchRoot
+}
+
 // ignoredPathSegment reports whether any segment of the path names an
 // ignored directory (case-insensitive, via the shared isIgnoredDir
-// predicate). Used for watcher-delivered absolute paths as defense in depth.
+// predicate). Callers must pass a path already scoped to a project root --
+// see shouldSkip.
 func ignoredPathSegment(path string) bool {
 	norm := filepath.ToSlash(path)
 	for _, seg := range strings.Split(norm, "/") {
@@ -275,10 +320,29 @@ func (e *Engine) parseEligible(path string) bool {
 	return true
 }
 
-// shouldSkip filters files we never want to watch: temporary files, ignored directories,
+// shouldSkip filters files we never want to watch: ignored directories,
 // unsupported languages, and pathologies like very large generated bundles.
+//
+// The ignore check runs against the path RELATIVE to the watch root. Matching
+// the absolute path made every ancestor segment count, so a checkout living
+// under /tmp, ~/build or C:in matched the ignore list at its own root and
+// every file in the project was silently dropped -- exactly the false
+// positive parseEligible documents. Without a known root (and for paths
+// outside it) the watcher, which prunes ignored subtrees at registration
+// time, remains the only filter.
 func (e *Engine) shouldSkip(path string) bool {
-	return ignoredPathSegment(path) || !e.parseEligible(path)
+	if !e.parseEligible(path) {
+		return true
+	}
+	root := e.WatchRoot()
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return ignoredPathSegment(rel)
 }
 
 // Run periodically prunes expired active runs until ctx is done.

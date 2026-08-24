@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -299,6 +300,63 @@ func TestFileHealth_DelegatesToStore(t *testing.T) {
 	}
 	if !strings.Contains(hot.Warning, "6 edits") {
 		t.Errorf("warning should mention edit count: %q", hot.Warning)
+	}
+}
+
+// TestShouldSkip_IgnoreRulesAreScopedToWatchRoot pins the scoping contract:
+// directory-ignore matching applies to the path RELATIVE to the watch root.
+// Matching the absolute path meant a checkout under an ancestor named like an
+// ignore entry (/tmp, ~/build, C:in) matched at its own root, so every file
+// in the project was dropped and no code events were ever emitted.
+func TestShouldSkip_IgnoreRulesAreScopedToWatchRoot(t *testing.T) {
+	t.Setenv("WRONGTRACE_HOME", t.TempDir())
+
+	// Every ancestor segment of the root is itself a default ignore name.
+	root := filepath.Join(t.TempDir(), "tmp", "build", "myproject")
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	e := NewEngine(Config{RepoName: "scope-test", WatchDir: root})
+
+	if e.WatchRoot() != absClean(root) {
+		t.Fatalf("WatchRoot = %q, want %q", e.WatchRoot(), absClean(root))
+	}
+	if e.shouldSkip(filepath.Join(root, "src", "main.go")) {
+		t.Error("a source file must not be skipped because an ANCESTOR is named tmp/build")
+	}
+	// Ignore names INSIDE the project still filter.
+	if !e.shouldSkip(filepath.Join(root, "node_modules", "left-pad", "index.js")) {
+		t.Error("node_modules inside the project must still be skipped")
+	}
+	if !e.shouldSkip(filepath.Join(root, "web", "dist", "bundle.js")) {
+		t.Error("a nested dist directory must still be skipped")
+	}
+	// Unsupported languages are still filtered regardless of scoping.
+	if !e.shouldSkip(filepath.Join(root, "README.md")) {
+		t.Error("unsupported language must still be skipped")
+	}
+}
+
+// TestPrimeDirectory_AdoptsWatchRoot documents the back-fill: an engine built
+// without Config.WatchDir takes the primed directory as its ignore scope.
+func TestPrimeDirectory_AdoptsWatchRoot(t *testing.T) {
+	t.Setenv("WRONGTRACE_HOME", t.TempDir())
+
+	e := NewEngine(Config{RepoName: "adopt-test"})
+	if e.WatchRoot() != "" {
+		t.Fatalf("WatchRoot = %q, want empty before priming", e.WatchRoot())
+	}
+	// A nil AST engine makes PrimeDirectory a no-op, so adopt explicitly --
+	// the daemon path passes Config.WatchDir anyway.
+	dir := t.TempDir()
+	e.adoptWatchRoot(dir)
+	if e.WatchRoot() != absClean(dir) {
+		t.Errorf("WatchRoot = %q, want %q", e.WatchRoot(), absClean(dir))
+	}
+	// First root wins: a later directory must not silently re-scope the engine.
+	e.adoptWatchRoot(t.TempDir())
+	if e.WatchRoot() != absClean(dir) {
+		t.Errorf("WatchRoot changed to %q; the first root must win", e.WatchRoot())
 	}
 }
 

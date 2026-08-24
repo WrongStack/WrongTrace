@@ -199,6 +199,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		RepoName: repoName,
 		Store:    store,
 		AST:      astEngine,
+		WatchDir: abs,
 	})
 	engine.PrimeDirectory(abs)
 
