@@ -93,14 +93,14 @@ try {
             Write-Error "daemon failed to start: $errContent"
         }
         try {
-            Invoke-WebRequest "http://localhost:$daemonPort/api/health" -UseBasicParsing -TimeoutSec 1 | Out-Null
+            Invoke-WebRequest "http://127.0.0.1:$daemonPort/api/health" -UseBasicParsing -TimeoutSec 1 | Out-Null
             break
         } catch {
             if ($i -eq 49) { Write-Error "daemon did not become healthy within 10s on port $daemonPort" }
             Start-Sleep -Milliseconds 200
         }
     }
-    Write-Host "    daemon healthy: http://localhost:$daemonPort/api/health"
+    Write-Host "    daemon healthy: http://127.0.0.1:$daemonPort/api/health"
 
     if (-not $NoUI) {
         Write-Host "==> starting vite dev server on :$Port" -ForegroundColor Cyan

@@ -102,16 +102,17 @@ func (e *Engine) PrimeDirectory(dir string) {
 	e.indexMu.Unlock()
 
 	var discovered, eligible, indexed, skipped, failed int
+	lastUpdate := time.Now()
 
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil {
 			return nil
 		}
-		if info.IsDir() {
+		if d.IsDir() {
 			if path == dir {
 				return nil
 			}
-			if isIgnoredDir(filepath.Base(path)) {
+			if isIgnoredDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -124,12 +125,6 @@ func (e *Engine) PrimeDirectory(dir string) {
 		}
 
 		eligible++
-		e.indexMu.Lock()
-		e.indexStatus.TotalDiscovered = discovered
-		e.indexStatus.EligibleFiles = eligible
-		e.indexStatus.CurrentFile = filepath.Base(path)
-		e.indexMu.Unlock()
-
 		src, rerr := os.ReadFile(path)
 		if rerr != nil {
 			failed++
@@ -143,14 +138,21 @@ func (e *Engine) PrimeDirectory(dir string) {
 		e.cfg.AST.SetSnapshot(snap)
 		indexed++
 
-		e.indexMu.Lock()
-		e.indexStatus.IndexedFiles = indexed
-		e.indexStatus.SkippedFiles = skipped
-		e.indexStatus.FailedFiles = failed
-		if eligible > 0 {
-			e.indexStatus.Percentage = math.Round((float64(indexed)/float64(eligible))*10000) / 100
+		// Throttle progress updates to avoid lock contention (every 50 files or 150ms)
+		if indexed%50 == 0 || time.Since(lastUpdate) > 150*time.Millisecond {
+			e.indexMu.Lock()
+			e.indexStatus.TotalDiscovered = discovered
+			e.indexStatus.EligibleFiles = eligible
+			e.indexStatus.IndexedFiles = indexed
+			e.indexStatus.SkippedFiles = skipped
+			e.indexStatus.FailedFiles = failed
+			e.indexStatus.CurrentFile = d.Name()
+			if eligible > 0 {
+				e.indexStatus.Percentage = math.Round((float64(indexed)/float64(eligible))*10000) / 100
+			}
+			e.indexMu.Unlock()
+			lastUpdate = time.Now()
 		}
-		e.indexMu.Unlock()
 
 		return nil
 	})

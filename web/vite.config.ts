@@ -14,16 +14,16 @@ export default defineConfig({
     port: vitePort,
     proxy: {
       '/api': {
-        target: `http://localhost:${daemonPort}`,
+        target: `http://127.0.0.1:${daemonPort}`,
         changeOrigin: true,
         ws: true,
       },
       '/proxy': {
-        target: `http://localhost:${daemonPort}`,
+        target: `http://127.0.0.1:${daemonPort}`,
         changeOrigin: true,
       },
       '/v1': {
-        target: `http://localhost:${daemonPort}`,
+        target: `http://127.0.0.1:${daemonPort}`,
         changeOrigin: true,
       },
     },

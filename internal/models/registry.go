@@ -43,6 +43,7 @@ type Registry struct {
 	models     map[string]ModelInfo    // keyed by full provider/model ID or custom ID
 	providers  map[string]ProviderInfo // keyed by provider slug
 	canonicals map[string]string       // bare model ID -> canonical full ID
+	aliasCache map[string]ModelInfo    // cache for resolved versioned aliases / prefix matches
 }
 
 // Global default registry singleton with built-in provider defaults.
@@ -54,6 +55,7 @@ func NewRegistry() *Registry {
 		models:     make(map[string]ModelInfo),
 		providers:  make(map[string]ProviderInfo),
 		canonicals: make(map[string]string),
+		aliasCache: make(map[string]ModelInfo),
 	}
 }
 
@@ -178,10 +180,13 @@ func (r *Registry) AllModels() []ModelInfo {
 // Get finds a model by ID, full provider/model key, or bare model alias.
 func (r *Registry) Get(id string) (ModelInfo, bool) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	raw := strings.ToLower(strings.TrimSpace(id))
 	if m, ok := r.models[raw]; ok {
+		r.mu.RUnlock()
+		return m, true
+	}
+	if m, ok := r.aliasCache[raw]; ok {
+		r.mu.RUnlock()
 		return m, true
 	}
 
@@ -192,6 +197,7 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 		mID := normalizeModelID(parts[1])
 		fullKey := provID + "/" + mID
 		if m, ok := r.models[fullKey]; ok {
+			r.mu.RUnlock()
 			return m, true
 		}
 	}
@@ -199,21 +205,19 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 	// 2. Direct exact normalized lookup
 	norm := normalizeModelID(id)
 	if m, ok := r.models[norm]; ok {
+		r.mu.RUnlock()
 		return m, true
 	}
 
 	// 3. Check canonical map for bare model ID (e.g. "claude-opus-4-7" -> "anthropic/claude-opus-4-7")
 	if canonKey, ok := r.canonicals[norm]; ok {
 		if m, ok := r.models[canonKey]; ok {
+			r.mu.RUnlock()
 			return m, true
 		}
 	}
 
 	// 4. Try prefix match for versioned snapshots (e.g. claude-3-7-sonnet-20250219).
-	// Map iteration order is random, so collect candidates and pick the most
-	// specific match deterministically (longest matching key, lexical
-	// tie-break) — otherwise the same query could resolve to different
-	// providers' prices on consecutive calls.
 	type candidate struct {
 		key   string
 		model ModelInfo
@@ -228,6 +232,8 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 			candidates = append(candidates, candidate{k, model})
 		}
 	}
+	r.mu.RUnlock()
+
 	if len(candidates) > 0 {
 		sort.Slice(candidates, func(i, j int) bool {
 			ci, cj := candidates[i], candidates[j]
@@ -240,14 +246,20 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 			}
 			return ci.key < cj.key // stable lexical tie-break
 		})
-		// Prefer the canonical first-party entry when multiple providers
-		// share the top specificity.
+		res := candidates[0].model
 		for _, c := range candidates {
 			if c.model.IsCanonical {
-				return c.model, true
+				res = c.model
+				break
 			}
 		}
-		return candidates[0].model, true
+		r.mu.Lock()
+		if r.aliasCache != nil {
+			r.aliasCache[raw] = res
+			r.aliasCache[norm] = res
+		}
+		r.mu.Unlock()
+		return res, true
 	}
 
 	return ModelInfo{}, false
@@ -319,6 +331,7 @@ func (r *Registry) Upsert(m ModelInfo) {
 
 	r.models[key] = m
 	r.canonicals[normModel] = key
+	r.aliasCache = make(map[string]ModelInfo)
 }
 
 // CalculateCost computes total dollar cost from prompt and completion token counts.
@@ -585,5 +598,6 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 	r.models = nextModels
 	r.providers = nextProviders
 	r.canonicals = nextCanonicals
+	r.aliasCache = make(map[string]ModelInfo)
 	return len(nextModels), nil
 }

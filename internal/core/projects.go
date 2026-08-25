@@ -1063,13 +1063,14 @@ var alwaysIgnoredDirs = []string{
 // shared by DetectPrimaryLanguage, PrimeDirectory, and any future walk —
 // do not inline pattern lists in walkers.
 func isIgnoredDir(base string) bool {
-	for _, ig := range ignorePatterns() {
-		if strings.EqualFold(base, ig) {
+	baseLower := strings.ToLower(base)
+	for _, ig := range alwaysIgnoredDirs {
+		if baseLower == ig || strings.EqualFold(baseLower, ig) {
 			return true
 		}
 	}
-	for _, ig := range alwaysIgnoredDirs {
-		if strings.EqualFold(base, ig) {
+	for _, ig := range ignorePatterns() {
+		if baseLower == ig || strings.EqualFold(baseLower, ig) {
 			return true
 		}
 	}
@@ -1084,22 +1085,20 @@ func isIgnoredDir(base string) bool {
 func DetectPrimaryLanguage(root string) string {
 	extCounts := make(map[string]int)
 	scannedFiles := 0
-	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d == nil {
 			return nil
 		}
 		if p == root {
 			return nil
 		}
-		rel, err := filepath.Rel(root, p)
-		if err == nil && rel != "." && ignoredPathSegment(rel) {
-			if info.IsDir() {
+		if d.IsDir() {
+			name := d.Name()
+			if isIgnoredDir(name) {
 				return filepath.SkipDir
 			}
-			return nil
-		}
-		if info.IsDir() {
-			if isIgnoredDir(filepath.Base(p)) {
+			rel, err := filepath.Rel(root, p)
+			if err == nil && rel != "." && ignoredPathSegment(rel) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -1108,7 +1107,7 @@ func DetectPrimaryLanguage(root string) string {
 		if scannedFiles > 2000 {
 			return filepath.SkipAll
 		}
-		ext := strings.ToLower(filepath.Ext(p))
+		ext := strings.ToLower(filepath.Ext(d.Name()))
 		switch ext {
 		case ".go":
 			extCounts["Go"]++

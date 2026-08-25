@@ -36,14 +36,18 @@ func (sw *SessionWatcher) SetOnReadEvent(cb func(FileReadEvent)) {
 
 // AddWatchDir registers a directory path to monitor for session logs.
 func (sw *SessionWatcher) AddWatchDir(dir string) {
+	if dir == "" {
+		return
+	}
+	clean := filepath.Clean(dir)
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	for _, p := range sw.watchPaths {
-		if p == dir {
+		if p == clean {
 			return
 		}
 	}
-	sw.watchPaths = append(sw.watchPaths, dir)
+	sw.watchPaths = append(sw.watchPaths, clean)
 }
 
 // DiscoverAgentDirs automatically detects standard agent directories in the workspace.
@@ -87,7 +91,6 @@ func (sw *SessionWatcher) DiscoverGlobalAgentDirs() {
 	candidateDirs := []string{
 		// 1. WrongStack
 		filepath.Join(home, ".wrongstack", "projects"),
-		filepath.Join(home, ".wrongstack"),
 
 		// 2. Google Antigravity & Gemini CLI (ONLY brain/logs, NOT ~/.gemini root)
 		filepath.Join(home, ".gemini", "antigravity-cli", "brain"),
@@ -145,7 +148,10 @@ func isIgnoredLogDir(name string) bool {
 		"temp", "tmp", "extensions", "dist", "build", "bin", "obj", "venv", ".venv",
 		"__pycache__", "crashpad", "dawngraphitecache", "grshadercache", "shadercache",
 		"indexeddb", "local storage", "session storage", "blob_storage", "service worker",
-		"dictionaries", "webrtc", "packaged-extensions", "state.vscdb.backup", "backup":
+		"dictionaries", "webrtc", "packaged-extensions", "state.vscdb.backup", "backup",
+		"assets", "images", "videos", "media", "thumbnails", "coverage", ".turbo",
+		".next", ".svelte-kit", ".nuxt", "out", ".idea", ".npm", ".yarn", ".cargo",
+		"scratch", "plans", "artifacts", "snapshots", "diffs", "checkpoints", "storage":
 		return true
 	}
 	return false
@@ -159,38 +165,44 @@ func (sw *SessionWatcher) PollOnce() {
 	sw.mu.Unlock()
 
 	for _, rootDir := range paths {
-		_ = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info == nil {
+		cleanRoot := filepath.Clean(rootDir)
+		_ = filepath.WalkDir(cleanRoot, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d == nil {
 				return nil
 			}
 
-			if info.IsDir() {
-				if path != rootDir {
-					name := info.Name()
+			name := d.Name()
+
+			if d.IsDir() {
+				if path != cleanRoot {
 					if isIgnoredLogDir(name) {
 						return filepath.SkipDir
 					}
-					// Depth limit: transcript files are max 4-5 levels deep from root
-					rel, relErr := filepath.Rel(rootDir, path)
-					if relErr == nil {
-						segs := strings.Split(filepath.ToSlash(rel), "/")
-						if len(segs) > 5 {
-							return filepath.SkipDir
+					// Depth limit: count path separators without allocations
+					rel := path[len(cleanRoot):]
+					if len(rel) > 0 && (rel[0] == '/' || rel[0] == '\\') {
+						rel = rel[1:]
+					}
+					depth := 0
+					for i := 0; i < len(rel); i++ {
+						if rel[i] == '/' || rel[i] == '\\' {
+							depth++
 						}
+					}
+					if depth >= 5 {
+						return filepath.SkipDir
 					}
 				}
 				return nil
 			}
 
-			ext := filepath.Ext(path)
-			base := filepath.Base(path)
-
 			// Skip transcript_full.jsonl when transcript.jsonl exists (compact version is sufficient)
-			if base == "transcript_full.jsonl" {
+			if name == "transcript_full.jsonl" {
 				return nil
 			}
 
-			if ext != ".jsonl" && ext != ".json" && base != ".aider.chat.history.md" {
+			ext := filepath.Ext(name)
+			if ext != ".jsonl" && ext != ".json" && name != ".aider.chat.history.md" {
 				return nil
 			}
 
@@ -200,6 +212,12 @@ func (sw *SessionWatcher) PollOnce() {
 				if parent != "tasks" && parent != "cline" && parent != "sessions" && parent != "conversations" {
 					return nil
 				}
+			}
+
+			// Fast file metadata lookup only for matched candidates
+			info, err := d.Info()
+			if err != nil || info == nil {
+				return nil
 			}
 
 			sw.mu.Lock()
@@ -225,7 +243,7 @@ func (sw *SessionWatcher) PollOnce() {
 			} else if ext == ".json" {
 				events, parseErr = ParseClineTask(path)
 				newOffset = currentSize
-			} else if base == ".aider.chat.history.md" {
+			} else if name == ".aider.chat.history.md" {
 				events, parseErr = ParseAiderHistory(path)
 				newOffset = currentSize
 			}
@@ -239,20 +257,12 @@ func (sw *SessionWatcher) PollOnce() {
 			sw.seenOffsets[path] = newOffset
 			// Prevent seenOffsets map unbounded growth
 			if len(sw.seenOffsets) > 2000 {
+				count := 0
 				for k := range sw.seenOffsets {
-					if !fileExists(k) {
-						delete(sw.seenOffsets, k)
-					}
-				}
-				if len(sw.seenOffsets) > 2000 {
-					// Hard cap: clear half the map if still too large
-					count := 0
-					for k := range sw.seenOffsets {
-						delete(sw.seenOffsets, k)
-						count++
-						if count > 1000 {
-							break
-						}
+					delete(sw.seenOffsets, k)
+					count++
+					if count > 1000 {
+						break
 					}
 				}
 			}

@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,10 +54,10 @@ func NewResponseCache(maxEntries int, defaultTTL time.Duration) *ResponseCache {
 // ComputeKey calculates a deterministic SHA-256 hash of the provider, model, and sanitized request body.
 func ComputeKey(provider, model string, body []byte) string {
 	hasher := sha256.New()
-	hasher.Write([]byte(provider))
-	hasher.Write([]byte(":"))
-	hasher.Write([]byte(model))
-	hasher.Write([]byte(":"))
+	_, _ = io.WriteString(hasher, provider)
+	_, _ = io.WriteString(hasher, ":")
+	_, _ = io.WriteString(hasher, model)
+	_, _ = io.WriteString(hasher, ":")
 	hasher.Write(body)
 	return hex.EncodeToString(hasher.Sum(nil))
 }

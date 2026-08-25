@@ -16,15 +16,22 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/models"
 )
 
+var targetFileKeys = []string{
+	"AbsolutePath", "absolute_path", "TargetFile", "target_file", "targetFile", "TargetContent",
+	"path", "FilePath", "file_path", "filePath", "filename", "fileName", "file_name", "file", "target", "dest",
+	"URI", "uri", "Url", "url", "relative_path", "relativePath", "rel_path",
+	"SourceFile", "source_file", "SearchPath", "search_path", "DirectoryPath", "directory_path",
+}
+
+var (
+	startLineKeys = []string{"StartLine", "start_line", "startLine", "offset", "line_start", "lineStart", "from_line", "fromLine", "start"}
+	endLineKeys   = []string{"EndLine", "end_line", "endLine", "line_end", "lineEnd", "to_line", "toLine", "end"}
+	countLineKeys = []string{"lines", "line_count", "count", "num_lines", "limit"}
+)
+
 // ExtractTargetFile attempts to extract the destination file path from a tool call payload.
 func ExtractTargetFile(args map[string]interface{}) string {
-	keys := []string{
-		"AbsolutePath", "absolute_path", "TargetFile", "target_file", "targetFile", "TargetContent",
-		"path", "FilePath", "file_path", "filePath", "filename", "fileName", "file_name", "file", "target", "dest",
-		"URI", "uri", "Url", "url", "relative_path", "relativePath", "rel_path",
-		"SourceFile", "source_file", "SearchPath", "search_path", "DirectoryPath", "directory_path",
-	}
-	for _, k := range keys {
+	for _, k := range targetFileKeys {
 		if val, ok := args[k]; ok {
 			if s, isStr := val.(string); isStr && s != "" {
 				return s
@@ -40,8 +47,7 @@ func ExtractLineRange(args map[string]interface{}) (int, int, int) {
 	endLine := 0
 	linesCount := 0
 
-	startKeys := []string{"StartLine", "start_line", "startLine", "offset", "line_start", "lineStart", "from_line", "fromLine", "start"}
-	for _, k := range startKeys {
+	for _, k := range startLineKeys {
 		if val, ok := args[k]; ok {
 			if n := extractInt(val); n > 0 {
 				startLine = n
@@ -50,8 +56,7 @@ func ExtractLineRange(args map[string]interface{}) (int, int, int) {
 		}
 	}
 
-	endKeys := []string{"EndLine", "end_line", "endLine", "line_end", "lineEnd", "to_line", "toLine", "end"}
-	for _, k := range endKeys {
+	for _, k := range endLineKeys {
 		if val, ok := args[k]; ok {
 			if n := extractInt(val); n > 0 {
 				endLine = n
@@ -60,8 +65,7 @@ func ExtractLineRange(args map[string]interface{}) (int, int, int) {
 		}
 	}
 
-	countKeys := []string{"lines", "line_count", "count", "num_lines", "limit"}
-	for _, k := range countKeys {
+	for _, k := range countLineKeys {
 		if val, ok := args[k]; ok {
 			if n := extractInt(val); n > 0 {
 				linesCount = n
@@ -371,12 +375,13 @@ var (
 	modelTagRe       = regexp.MustCompile(`(?i)<(?:model|model_name)>([^<]+)</(?:model|model_name)>|<!--\s*model:\s*([a-zA-Z0-9\.\-_/]+)\s*-->`)
 )
 
+var (
+	modelKeys       = []string{"model", "model_name", "modelName", "model_id", "modelId", "apiModelId", "selectedModel", "planner_model", "llm_model", "wire_model"}
+	modelNestedKeys = []string{"metadata", "params", "options", "config", "response", "system_info", "args"}
+)
+
 func extractModelFromRow(m map[string]interface{}) string {
-	keys := []string{
-		"model", "model_name", "modelName", "model_id", "modelId",
-		"apiModelId", "selectedModel", "planner_model", "llm_model", "wire_model",
-	}
-	for _, k := range keys {
+	for _, k := range modelKeys {
 		if val, ok := m[k]; ok {
 			if s, isStr := val.(string); isStr && s != "" && s != "inherit" {
 				if norm := normalizeModelName(s); norm != "" {
@@ -386,10 +391,9 @@ func extractModelFromRow(m map[string]interface{}) string {
 		}
 	}
 
-	nestedKeys := []string{"metadata", "params", "options", "config", "response", "system_info", "args"}
-	for _, nk := range nestedKeys {
+	for _, nk := range modelNestedKeys {
 		if sub, ok := m[nk].(map[string]interface{}); ok {
-			for _, k := range keys {
+			for _, k := range modelKeys {
 				if val, ok := sub[k]; ok {
 					if s, isStr := val.(string); isStr && s != "" && s != "inherit" {
 						if norm := normalizeModelName(s); norm != "" {

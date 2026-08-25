@@ -162,8 +162,8 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		defer logFile.Close()
 	}
 
-	// Soft memory limit to keep Go GC and virtual memory footprint lean (< 256MB)
-	debug.SetMemoryLimit(256 * 1024 * 1024)
+	// Soft memory limit for Go GC to prevent runaway footprint while avoiding excessive GC thrashing on large LLM payloads
+	debug.SetMemoryLimit(1024 * 1024 * 1024)
 
 	watchDir, _ := cmd.Flags().GetString("watch")
 	port := resolvePort(cmd)
@@ -316,7 +316,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	})
 	sessionWatcher.DiscoverAgentDirs(abs)
 	sessionWatcher.DiscoverGlobalAgentDirs()
-	sessionWatcher.StartPolling(ctx, 8*time.Second)
+	sessionWatcher.StartPolling(ctx, 25*time.Second)
 
 	// Resilient HTTP Server Loop: never drops daemon on temporary listener issues
 	go func() {
@@ -406,7 +406,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	// Periodic memory recycler: returns unused pages back to the OS kernel
 	go func() {
-		ticker := time.NewTicker(2 * time.Minute)
+		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {

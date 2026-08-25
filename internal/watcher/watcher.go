@@ -69,14 +69,17 @@ var DefaultIgnoreDirs = []string{
 
 // Watcher is a debouncing filesystem observer rooted at a single directory.
 type Watcher struct {
-	cfg Config
+	cfg           Config
 	// root is cfg.Dir made absolute and clean. Ignore rules are evaluated
 	// against paths relative to it so directories ABOVE the project never
 	// participate in matching.
-	root     string
-	fs       *fsnotify.Watcher
-	debounce time.Duration
-	patterns []string
+	root          string
+	fs            *fsnotify.Watcher
+	debounce      time.Duration
+	patterns      []string
+	patternsNorm  []string
+	patternsLower []string
+	ignoreSet     map[string]struct{}
 }
 
 // New constructs and primes a Watcher. It does not start the event loop; call
@@ -93,12 +96,30 @@ func New(cfg Config) (*Watcher, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	ignoreSet := make(map[string]struct{}, len(cfg.IgnoreDirs))
+	for _, ig := range cfg.IgnoreDirs {
+		ignoreSet[strings.ToLower(filepath.Clean(ig))] = struct{}{}
+	}
+
+	patterns := loadGitIgnorePatterns(cfg.Dir)
+	patternsNorm := make([]string, len(patterns))
+	patternsLower := make([]string, len(patterns))
+	for i, pat := range patterns {
+		patNorm := filepath.ToSlash(pat)
+		patternsNorm[i] = patNorm
+		patternsLower[i] = strings.ToLower(patNorm)
+	}
+
 	w := &Watcher{
-		cfg:      cfg,
-		root:     absRoot(cfg.Dir),
-		fs:       fw,
-		debounce: cfg.Debounce,
-		patterns: loadGitIgnorePatterns(cfg.Dir),
+		cfg:           cfg,
+		root:          absRoot(cfg.Dir),
+		fs:            fw,
+		debounce:      cfg.Debounce,
+		patterns:      patterns,
+		patternsNorm:  patternsNorm,
+		patternsLower: patternsLower,
+		ignoreSet:     ignoreSet,
 	}
 	if err := w.addRecursive(cfg.Dir); err != nil {
 		_ = fw.Close()
@@ -161,8 +182,8 @@ func (w *Watcher) RemoveWatchDir(dir string) error {
 	if w == nil || w.fs == nil {
 		return nil
 	}
-	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || !info.IsDir() {
+	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || !d.IsDir() {
 			return nil
 		}
 		_ = w.fs.Remove(path)
@@ -174,17 +195,12 @@ func (w *Watcher) RemoveWatchDir(dir string) error {
 // Symlink loops and permission errors are logged and skipped rather than
 // aborting the whole watch.
 func (w *Watcher) addRecursive(root string) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			// Permission denied on a single subdir should not kill startup.
-			if info == nil {
-				log.Printf("watcher: skip %s: %v", path, err)
-				return nil
-			}
 			log.Printf("watcher: skip %s: %v", path, err)
 			return nil
 		}
-		if !info.IsDir() {
+		if d == nil || !d.IsDir() {
 			return nil
 		}
 		if w.pathIgnored(path) {
@@ -235,26 +251,37 @@ func (w *Watcher) pathIgnored(p string) bool {
 	norm := filepath.ToSlash(scoped)
 	normLower := strings.ToLower(norm)
 	base := filepath.Base(scoped)
+	baseLower := strings.ToLower(base)
 
-	// 1. Check directory segments without heap allocation
-	for _, ig := range w.cfg.IgnoreDirs {
-		igLower := strings.ToLower(ig)
-		if normLower == igLower ||
-			strings.HasPrefix(normLower, igLower+"/") ||
-			strings.HasSuffix(normLower, "/"+igLower) ||
-			strings.Contains(normLower, "/"+igLower+"/") {
+	// 1. Fast O(1) segment check without allocations
+	if _, ok := w.ignoreSet[baseLower]; ok {
+		return true
+	}
+	for seg := normLower; len(seg) > 0; {
+		idx := strings.IndexByte(seg, '/')
+		var s string
+		if idx == -1 {
+			s = seg
+			seg = ""
+		} else {
+			s = seg[:idx]
+			seg = seg[idx+1:]
+		}
+		if _, ok := w.ignoreSet[s]; ok {
 			return true
 		}
 	}
 
-	// 2. Check .gitignore patterns
-	for _, pattern := range w.patterns {
-		patNorm := filepath.ToSlash(pattern)
+	// 2. Check .gitignore patterns using precomputed normalized patterns
+	for i, patNorm := range w.patternsNorm {
 		if matched, _ := filepath.Match(patNorm, base); matched {
 			return true
 		}
-		patLower := strings.ToLower(patNorm)
-		if strings.Contains(normLower, "/"+patLower+"/") || strings.HasSuffix(normLower, "/"+patLower) || strings.HasPrefix(normLower, patLower+"/") {
+		patLower := w.patternsLower[i]
+		if patLower == normLower ||
+			strings.HasPrefix(normLower, patLower+"/") ||
+			strings.HasSuffix(normLower, "/"+patLower) ||
+			strings.Contains(normLower, "/"+patLower+"/") {
 			return true
 		}
 	}

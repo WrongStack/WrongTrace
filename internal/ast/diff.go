@@ -271,6 +271,7 @@ func formatAddedDiff(body string) (string, int, int) {
 		return "", 0, 0
 	}
 	var b strings.Builder
+	b.Grow(len(body) + len(lines)*3)
 	for i, l := range lines {
 		if i > 0 {
 			b.WriteByte('\n')
@@ -287,6 +288,7 @@ func formatDeletedDiff(body string) (string, int, int) {
 		return "", 0, 0
 	}
 	var b strings.Builder
+	b.Grow(len(body) + len(lines)*3)
 	for i, l := range lines {
 		if i > 0 {
 			b.WriteByte('\n')
@@ -312,6 +314,7 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 	}
 
 	var b strings.Builder
+	b.Grow(len(oldText) + len(newText) + (len(oldLines)+len(newLines))*3)
 	added := 0
 	deleted := 0
 

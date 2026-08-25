@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
 	"sort"
@@ -201,7 +202,6 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 }
 
 func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
-	lines := strings.Split(string(data), "\n")
 	var textBuilder strings.Builder
 	var reasoningBuilder strings.Builder
 
@@ -212,18 +212,27 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 	}
 	toolMap := make(map[int]*toolBuffer)
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
+	remaining := data
+	for len(remaining) > 0 {
+		var line []byte
+		if idx := bytes.IndexByte(remaining, '\n'); idx >= 0 {
+			line = remaining[:idx]
+			remaining = remaining[idx+1:]
+		} else {
+			line = remaining
+			remaining = nil
+		}
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
-		jsonPart := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if jsonPart == "[DONE]" || jsonPart == "" {
+		jsonPart := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if bytes.Equal(jsonPart, []byte("[DONE]")) || len(jsonPart) == 0 {
 			continue
 		}
 
 		var chunk map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonPart), &chunk); err != nil {
+		if err := json.Unmarshal(jsonPart, &chunk); err != nil {
 			continue
 		}
 
@@ -546,12 +555,13 @@ func extractFileFromArgsString(args string) string {
 	return ""
 }
 
+var extractFileKeys = []string{
+	"AbsolutePath", "target_file", "TargetFile", "path", "FilePath", "file_path",
+	"filename", "file", "target", "dest", "uri",
+}
+
 func extractFileFromMap(m map[string]interface{}) string {
-	keys := []string{
-		"AbsolutePath", "target_file", "TargetFile", "path", "FilePath", "file_path",
-		"filename", "file", "target", "dest", "uri",
-	}
-	for _, k := range keys {
+	for _, k := range extractFileKeys {
 		if val, ok := m[k]; ok {
 			if s, isStr := val.(string); isStr && s != "" {
 				return s

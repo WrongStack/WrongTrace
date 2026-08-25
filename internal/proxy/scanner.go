@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"regexp"
 	"strings"
 )
@@ -17,9 +18,82 @@ var (
 	genericSecretRe = regexp.MustCompile(`(?i)\b(?:password|passwd|api_secret|client_secret|auth_token)\s*[:=]\s*["']?([a-zA-Z0-9!@#$%^&*()_+\-={}\[\]]{8,})["']?`)
 )
 
+var secretFoldTargets = []struct {
+	lower      []byte
+	firstLower byte
+	firstUpper byte
+}{
+	{lower: []byte("password"), firstLower: 'p', firstUpper: 'P'},
+	{lower: []byte("passwd"), firstLower: 'p', firstUpper: 'P'},
+	{lower: []byte("api_secret"), firstLower: 'a', firstUpper: 'A'},
+	{lower: []byte("client_secret"), firstLower: 'c', firstUpper: 'C'},
+	{lower: []byte("auth_token"), firstLower: 'a', firstUpper: 'A'},
+}
+
+func bytesContainsFold(b []byte, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	subLower := strings.ToLower(sub)
+	firstLower := subLower[0]
+	firstUpper := strings.ToUpper(sub[:1])[0]
+	return bytesContainsFoldStatic(b, []byte(subLower), firstLower, firstUpper)
+}
+
+func bytesContainsFoldStatic(b, subLower []byte, firstLower, firstUpper byte) bool {
+	subLen := len(subLower)
+	if len(b) < subLen {
+		return false
+	}
+	maxIdx := len(b) - subLen
+	for i := 0; i <= maxIdx; i++ {
+		c := b[i]
+		if c == firstLower || c == firstUpper {
+			match := true
+			for j := 1; j < subLen; j++ {
+				bc := b[i+j]
+				if bc >= 'A' && bc <= 'Z' {
+					bc += 32
+				}
+				if bc != subLower[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasGenericSecret(b []byte) bool {
+	for _, target := range secretFoldTargets {
+		if bytesContainsFoldStatic(b, target.lower, target.firstLower, target.firstUpper) {
+			return true
+		}
+	}
+	return false
+}
+
 // ScanAndRedactSecrets inspects request payloads for confidential secrets and masks them before sending to LLMs.
+// Uses fast-path substring checks so multi-megabyte payloads bypass expensive regex scans when no matching tokens exist.
 func ScanAndRedactSecrets(body []byte) ([]byte, int) {
 	if len(body) < 16 {
+		return body, 0
+	}
+
+	hasPrivateKey := bytes.Contains(body, []byte("PRIVATE KEY"))
+	hasAWS := bytes.Contains(body, []byte("AKIA"))
+	hasGitHub := bytes.Contains(body, []byte("ghp_")) || bytes.Contains(body, []byte("github_pat_"))
+	hasAnthropic := bytes.Contains(body, []byte("sk-ant-"))
+	hasOpenAI := bytes.Contains(body, []byte("sk-"))
+	hasGoogle := bytes.Contains(body, []byte("AIzaSy"))
+	hasDB := bytes.Contains(body, []byte("://")) && (bytes.Contains(body, []byte("postgres")) || bytes.Contains(body, []byte("mysql")) || bytes.Contains(body, []byte("mongodb")) || bytes.Contains(body, []byte("redis")))
+	hasGeneric := hasGenericSecret(body)
+
+	if !hasPrivateKey && !hasAWS && !hasGitHub && !hasAnthropic && !hasOpenAI && !hasGoogle && !hasDB && !hasGeneric {
 		return body, 0
 	}
 
@@ -27,45 +101,45 @@ func ScanAndRedactSecrets(body []byte) ([]byte, int) {
 	redactionCount := 0
 
 	// 1. Redact Private Keys
-	if privateKeyRe.MatchString(text) {
+	if hasPrivateKey && privateKeyRe.MatchString(text) {
 		text = privateKeyRe.ReplaceAllString(text, "[REDACTED_PRIVATE_KEY]")
 		redactionCount++
 	}
 
 	// 2. Redact AWS Access Keys
-	if awsKeyRe.MatchString(text) {
+	if hasAWS && awsKeyRe.MatchString(text) {
 		text = awsKeyRe.ReplaceAllString(text, "[REDACTED_AWS_KEY]")
 		redactionCount++
 	}
 
 	// 3. Redact GitHub Tokens
-	if githubTokenRe.MatchString(text) {
+	if hasGitHub && githubTokenRe.MatchString(text) {
 		text = githubTokenRe.ReplaceAllString(text, "[REDACTED_GITHUB_TOKEN]")
 		redactionCount++
 	}
 
 	// 4. Redact OpenAI / Anthropic / Google Keys inside prompts
-	if anthropicKeyRe.MatchString(text) {
+	if hasAnthropic && anthropicKeyRe.MatchString(text) {
 		text = anthropicKeyRe.ReplaceAllString(text, "[REDACTED_ANTHROPIC_KEY]")
 		redactionCount++
 	}
-	if openAIKeyRe.MatchString(text) {
+	if hasOpenAI && openAIKeyRe.MatchString(text) {
 		text = openAIKeyRe.ReplaceAllString(text, "[REDACTED_OPENAI_KEY]")
 		redactionCount++
 	}
-	if googleKeyRe.MatchString(text) {
+	if hasGoogle && googleKeyRe.MatchString(text) {
 		text = googleKeyRe.ReplaceAllString(text, "[REDACTED_GOOGLE_KEY]")
 		redactionCount++
 	}
 
 	// 5. Redact DB Passwords
-	if dbURLRe.MatchString(text) {
+	if hasDB && dbURLRe.MatchString(text) {
 		text = dbURLRe.ReplaceAllString(text, "${1}:[REDACTED_DB_PASSWORD]@")
 		redactionCount++
 	}
 
 	// 6. Redact Generic Secrets
-	if genericSecretRe.MatchString(text) {
+	if hasGeneric && genericSecretRe.MatchString(text) {
 		text = genericSecretRe.ReplaceAllStringFunc(text, func(m string) string {
 			redactionCount++
 			if idx := strings.IndexAny(m, ":="); idx != -1 {
