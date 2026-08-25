@@ -31,17 +31,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.4] - 2026-08-25
 
-### Fixed & Hardened (Full-Stack Concurrency, Memory & Performance)
+### Fixed & Hardened (Full-Stack Concurrency, Memory & High-Performance CPU Optimization)
+- **High-Efficiency AST Diffing & No-Op Save Bypass**:
+  - Implemented 0ns hash-equality bypass (`prev.Hash == next.Hash`) in `ast.Diff`, eliminating redundant line-diff splits and LCS matrix calculations for unchanged file states.
+  - Added fast SHA-256 pre-check in `Engine.HandleFileChange` to skip full Tree-sitter AST parsing and AST diffing completely when files are touched without content modifications.
+- **Session Transcript Watcher & Re-Parse Cascade Prevention**:
+  - Replaced random eviction in `SessionWatcher.PollOnce` with structured `fileState` tracking (`offset`, `size`, `modTime`), eliminating catastrophic polling cascades where thousands of transcript files were re-read and parsed from offset 0.
+- **Zero-Allocation Rune Truncation & String Slicing**:
+  - Refactored `runeSafeTruncate` in both `internal/ingest` and `internal/proxy` to use UTF-8 range index counting, eliminating large `[]rune` array heap allocations on prompt and transcript inspection paths.
+- **Precomputed Symbol Signatures & Parser Throughput**:
+  - Cached lexical symbol signatures inside `FileSnapshot.sortedSigs` during snapshot creation, converting repeated signature sorting into instant O(1) slice access across Code Atlas and AST diffing.
+  - Added snapshot hash verification to `PrimeDirectory` to skip Tree-sitter grammar parsing for already-indexed files.
+- **Fast-Path SQLite Datetime Parsing**:
+  - Optimized `parseDBTime` with length-based branch switching for standard SQLite datetime (`len=19`) and RFC3339 (`len=20`), avoiding layout array scans across high-volume analytical records.
 - **Thread-Safe Store Access & Race Condition Elimination**:
   - Replaced direct `e.cfg.Store` accesses in `ReportRun`, `VacuumDB`, and `ClearStale` with thread-safe `e.Store()` accessor, eliminating data race conditions and nil pointer dereference risks during concurrent project switching (`SwitchActiveProject`).
 - **Guardrail Lock Contention & Deadlock Prevention**:
   - Implemented `isFileLockedUnlocked` internal lock evaluation to avoid duplicate lock acquisitions and eliminate lock contention between `CheckGuardrail` and `FileHealth`.
 - **Global Quota Limiter Budget Enforcement**:
   - Fixed budget tracking in `QuotaLimiter` (`CheckSpend`, `CheckAndRecordSpend`, and `RecordSpend`) to accurately account for the `"global"` daily spend limit across distinct agents and projects without isolation leaks.
-- **AI Gateway Cache Savings Accounting**:
+- **AI Gateway Cache Savings Accounting & Streaming Optimization**:
   - Fixed `ResponseCache.Stats()` to accumulate and accurately report `totalSaved` USD upon LRU cache hits.
-- **Secret Scanner Hot-Path CPU Optimization**:
-  - Added short-payload fast-path early exit to `ScanAndRedactSecrets` in `internal/proxy/scanner.go`, reducing heap string allocations and CPU overhead during streaming LLM proxying.
+  - Streamlined SSE stream handling in gateway proxy by removing redundant multi-megabyte JSON unmarshaling attempts on raw event-stream buffers.
 - **Dashboard WebSocket Debounce & Memory Leak Fix**:
   - Refactored `useEffect` debounce mechanism in `web/src/pages/Dashboard.tsx` with stable reference map (`refetchMapRef`), eliminating debounce timer leaks, stale closures, and render churn during high-frequency WebSocket event bursts.
 - **Comprehensive Test Suite & High Statement Coverage**:
