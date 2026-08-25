@@ -17,6 +17,7 @@ import (
 	treeGo "github.com/smacker/go-tree-sitter/golang"
 	treeJS "github.com/smacker/go-tree-sitter/javascript"
 	treePython "github.com/smacker/go-tree-sitter/python"
+	treeTSX "github.com/smacker/go-tree-sitter/typescript/tsx"
 )
 
 // NodeKind classifies an AST node for the dashboard and DB.
@@ -34,7 +35,9 @@ const (
 type Node struct {
 	Signature string   // e.g. "func:auth.ValidateToken(string)"
 	Kind      NodeKind // function | method | class | struct | arrow_function
-	Body      string   // raw source slice (used for hashing only)
+	Body      string   // fallback body for generic parsers and synthetic tests
+	StartByte uint32   // byte range in FileSnapshot.RawContent (native parsers)
+	EndByte   uint32
 	StartLine uint32
 	EndLine   uint32
 	Hash      string // SHA256 over the normalized body
@@ -81,7 +84,7 @@ func NewEngine() (*Engine, error) {
 	}
 	for lang, fn := range map[Language]func() *sitter.Language{
 		LangGo:         treeGo.GetLanguage,
-		LangTypeScript: nil, // TS shares the JS grammar in this binding; handled in Parse.
+		LangTypeScript: treeTSX.GetLanguage,
 		LangJavaScript: treeJS.GetLanguage,
 		LangPython:     treePython.GetLanguage,
 	} {
@@ -127,10 +130,7 @@ func (e *Engine) parserFor(lang Language) *sitter.Parser {
 	if e.closed || e.parsers == nil {
 		return nil
 	}
-	p, ok := e.parsers[lang]
-	if !ok && lang == LangTypeScript {
-		p = e.parsers[LangJavaScript]
-	}
+	p := e.parsers[lang]
 	return p
 }
 
@@ -434,18 +434,18 @@ func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out
 	kind, ok := classifyNode(lang, kindStr, node)
 	if ok {
 		sig := buildSignature(lang, file, kind, node, src)
-		rawBody := sliceText(node, src)
 		a, b := node.StartByte(), node.EndByte()
 		var nodeHash string
 		if a <= b && b <= uint32(len(src)) {
 			nodeHash = hashNormalizedBodyBytes(src[a:b], lang)
 		} else {
-			nodeHash = hashNormalizedBody(rawBody, lang)
+			nodeHash = hashNormalizedBody(sliceText(node, src), lang)
 		}
 		out.Nodes[sig] = Node{
 			Signature: sig,
 			Kind:      kind,
-			Body:      rawBody,
+			StartByte: a,
+			EndByte:   b,
 			StartLine: node.StartPoint().Row + 1,
 			EndLine:   node.EndPoint().Row + 1,
 			Hash:      nodeHash,
@@ -527,8 +527,26 @@ func buildSignature(lang Language, file string, kind NodeKind, n *sitter.Node, s
 		}
 		return fmt.Sprintf("%s:%s::%s", kind, file, name)
 	default:
+		if scope := enclosingTypeName(n, src); scope != "" && kind != NodeClass {
+			name = scope + "." + name
+		}
 		return fmt.Sprintf("%s:%s::%s", kind, file, name)
 	}
+}
+
+// enclosingTypeName disambiguates same-named methods declared in different
+// classes. Walking parents is allocation-free and avoids the much more costly
+// global symbol-table pass for this common collision case.
+func enclosingTypeName(n *sitter.Node, src []byte) string {
+	for parent := n.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.Type() {
+		case "class_declaration", "class_definition":
+			if name := parent.ChildByFieldName("name"); name != nil {
+				return string(src[name.StartByte():name.EndByte()])
+			}
+		}
+	}
+	return ""
 }
 
 // extractName returns the best-available identifier for a declaration: the

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { Navbar } from '../components/Navbar';
 import { WrongStackBanner } from '../components/WrongStackBanner';
 import { MetricsOverview } from '../components/MetricsOverview';
@@ -9,22 +10,28 @@ import { ModelIntelligenceMatrix } from '../components/ModelIntelligenceMatrix';
 import { ModelFrictionMatrix } from '../components/ModelFrictionMatrix';
 import { LiveEventFeed } from '../components/LiveEventFeed';
 import { ROIAnalysis } from '../components/ROIAnalysis';
-import { CodeAtlas } from '../components/CodeAtlas';
-import { DiffInspectorView } from '../components/DiffInspectorView';
-import { AgentSessionsView } from '../components/AgentSessionsView';
-import { ProfilerTracesView } from '../components/ProfilerTracesView';
-import { ProxyRoutingView } from '../components/ProxyRoutingView';
-import { SettingsView } from '../components/SettingsView';
-import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas, useProxyTraffic, useProfilerTraces, useProjects } from '../hooks/useMetrics';
+import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas, useProjects } from '../hooks/useMetrics';
 import { useWebSocket } from '../hooks/useWebSocket';
+import type { WSMessage } from '../types';
 
 const EMPTY_ARRAY: any[] = [];
 
+const CodeAtlas = lazy(() => import('../components/CodeAtlas').then((m) => ({ default: m.CodeAtlas })));
+const DiffInspectorView = lazy(() => import('../components/DiffInspectorView').then((m) => ({ default: m.DiffInspectorView })));
+const AgentSessionsView = lazy(() => import('../components/AgentSessionsView').then((m) => ({ default: m.AgentSessionsView })));
+const ProfilerTracesView = lazy(() => import('../components/ProfilerTracesView').then((m) => ({ default: m.ProfilerTracesView })));
+const ProxyRoutingView = lazy(() => import('../components/ProxyRoutingView').then((m) => ({ default: m.ProxyRoutingView })));
+const SettingsView = lazy(() => import('../components/SettingsView').then((m) => ({ default: m.SettingsView })));
+
+function TabFallback() {
+	return <div className="py-16 text-center text-xs font-mono text-slate-500">Loading view…</div>;
+}
+
 // Dashboard is the single-page surface for WrongTrace. It loads via TanStack
-// Query and is incrementally refreshed by both HTTP polling and a single
-// WebSocket subscription. The WebSocket hook supplies incremental updates;
-// React Query handles full snapshot refetch on focus / interval.
+// Query and is incrementally refreshed by a single WebSocket subscription.
+// Only time-decaying health/overview snapshots retain a slow safety poll.
 export function Dashboard() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'atlas' | 'diffs' | 'sessions' | 'profiler' | 'gateway' | 'settings'>('dashboard');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 
@@ -38,89 +45,105 @@ export function Dashboard() {
   }, [projects, selectedProjectId]);
 
   const activeProjId = currentProject?.id ?? null;
+  const dashboardVisible = activeTab === 'dashboard';
+  const recentVisible = dashboardVisible || activeTab === 'atlas' || activeTab === 'diffs' || activeTab === 'sessions';
+  const modelsVisible = dashboardVisible || activeTab === 'sessions';
+  const recentLimit = activeTab === 'diffs' ? 500 : 250;
 
   const overview = useOverview(activeProjId);
-  const thrashing = useThrashing(activeProjId);
-  const models = useModels(activeProjId);
-  const recent = useRecentEvents(activeProjId);
-  const atlas = useAtlas(activeProjId);
-  const proxyTraffic = useProxyTraffic(activeProjId);
-  const profilerTraces = useProfilerTraces(50, activeProjId);
-  const ws = useWebSocket();
-
-  const { refetch: refetchOverview } = overview;
-  const { refetch: refetchThrashing } = thrashing;
-  const { refetch: refetchModels } = models;
-  const { refetch: refetchRecent } = recent;
-  const { refetch: refetchAtlas } = atlas;
-  const { refetch: refetchProxyTraffic } = proxyTraffic;
-  const { refetch: refetchProfilerTraces } = profilerTraces;
-
-  const refetchMapRef = useRef({
-    refetchRecent,
-    refetchAtlas,
-    refetchOverview,
-    refetchProxyTraffic,
-    refetchProfilerTraces,
-    refetchThrashing,
-    refetchModels,
-  });
-
-  useEffect(() => {
-    refetchMapRef.current = {
-      refetchRecent,
-      refetchAtlas,
-      refetchOverview,
-      refetchProxyTraffic,
-      refetchProfilerTraces,
-      refetchThrashing,
-      refetchModels,
-    };
-  });
+  const thrashing = useThrashing(activeProjId, dashboardVisible);
+  const models = useModels(activeProjId, modelsVisible);
+  const recent = useRecentEvents(activeProjId, recentLimit, recentVisible);
+  const atlas = useAtlas(activeProjId, activeTab === 'atlas');
 
   const wsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingWsTypesRef = useRef(new Set<WSMessage['type']>());
+	const seenHelloRef = useRef(false);
 
-  // When the WS receives a code_event, proxy_traffic, or project_switched we invalidate the caches
-  // with a small trailing debounce to avoid high-frequency refetch storms that spike CPU & RAM.
-  useEffect(() => {
-    if (!ws.lastMessage) return;
-    const msgType = ws.lastMessage.type;
-
-    if (wsTimerRef.current) {
-      clearTimeout(wsTimerRef.current);
-    }
+  // Aggregate socket notifications without putting every frame into React
+  // state. One burst triggers at most one render-independent cache refresh,
+  // and inactive tab queries stay stale without fetching until they are shown.
+  const handleSocketMessage = useCallback((message: WSMessage) => {
+	if (message.type === 'hello') {
+		if (seenHelloRef.current) {
+			// A second hello means the socket reconnected. Refresh only mounted
+			// queries to close any event gap while the connection was down.
+			void queryClient.invalidateQueries({ refetchType: 'active' });
+		}
+		seenHelloRef.current = true;
+		return;
+	}
+    pendingWsTypesRef.current.add(message.type);
+    if (wsTimerRef.current) return;
 
     wsTimerRef.current = setTimeout(() => {
-      const handlers = refetchMapRef.current;
-      if (msgType === 'code_event') {
-        handlers.refetchRecent();
-        handlers.refetchAtlas();
-      } else if (msgType === 'run_reported') {
-        handlers.refetchOverview();
-        handlers.refetchAtlas();
-      } else if (msgType === 'proxy_traffic') {
-        handlers.refetchProxyTraffic();
-        handlers.refetchOverview();
-      } else if (msgType === 'profiler_trace') {
-        handlers.refetchProfilerTraces();
-      } else if (msgType === 'project_switched') {
-        handlers.refetchOverview();
-        handlers.refetchThrashing();
-        handlers.refetchModels();
-        handlers.refetchRecent();
-        handlers.refetchAtlas();
-        handlers.refetchProxyTraffic();
-        handlers.refetchProfilerTraces();
+      wsTimerRef.current = null;
+      const pending = pendingWsTypesRef.current;
+      pendingWsTypesRef.current = new Set();
+      const invalidate = (queryKey: string[], refetchType: 'active' | 'none' = 'active') => {
+        void queryClient.invalidateQueries({ queryKey, refetchType });
+      };
+
+      if (pending.has('code_event')) {
+        invalidate(['recent']);
+		invalidate(['overview']);
+		invalidate(['thrashing']);
+		invalidate(['models']);
+		invalidate(['model_friction']);
+		invalidate(['recent_file_events']);
+		invalidate(['symbol_history']);
+		invalidate(['file_model_activity']);
+        // The full symbol graph can be several MB. Mark it stale, but let its
+		// next tab entry or explicit Refresh button perform the fetch.
+        invalidate(['atlas'], 'none');
+      }
+      if (pending.has('run_reported')) {
+        invalidate(['overview']);
+		invalidate(['models']);
+      }
+      if (pending.has('proxy_traffic')) {
+        invalidate(['proxy_traffic']);
+        invalidate(['overview']);
+      }
+      if (pending.has('profiler_trace')) {
+        invalidate(['profiler_traces']);
+        invalidate(['profiler_hotspots']);
+        invalidate(['profiler_overview']);
+      }
+	  if (pending.has('file_read_event')) {
+		invalidate(['recent_reads']);
+		invalidate(['file_read_stats']);
+		invalidate(['file_read_heatmap']);
+	  }
+	  if (pending.has('index_progress')) {
+		invalidate(['atlas_status']);
+		invalidate(['atlas'], 'none');
+	  }
+	  if (pending.has('ipc_traffic')) {
+		invalidate(['ipc_traffic']);
+	  }
+	  if (pending.has('metrics_refresh')) {
+		invalidate(['overview']);
+		invalidate(['thrashing']);
+		invalidate(['models']);
+	  }
+      if (pending.has('project_switched')) {
+        ['projects', 'overview', 'thrashing', 'models', 'recent', 'atlas', 'proxy_traffic', 'profiler_traces'].forEach((key) => invalidate([key]));
       }
     }, 250);
+  }, [queryClient]);
 
+  const ws = useWebSocket(handleSocketMessage);
+
+  useEffect(() => {
     return () => {
       if (wsTimerRef.current) {
         clearTimeout(wsTimerRef.current);
         wsTimerRef.current = null;
       }
+      pendingWsTypesRef.current.clear();
     };
-  }, [ws.lastMessage]);
+  }, []);
 
   // Socket path as REPORTED BY THE DAEMON (/api/health socket_path), so a
   // custom --socket is shown correctly on every platform. Falls back to a
@@ -190,43 +213,55 @@ export function Dashboard() {
         )}
 
         {activeTab === 'atlas' && (
-          <CodeAtlas
-            atlas={atlas.data}
-            recentEvents={recent.data}
-            loading={atlas.isLoading}
-            onRefresh={() => atlas.refetch()}
-          />
+		  <Suspense fallback={<TabFallback />}>
+			<CodeAtlas
+			  atlas={atlas.data}
+			  recentEvents={recent.data}
+			  loading={atlas.isLoading}
+			  onRefresh={() => atlas.refetch()}
+			/>
+		  </Suspense>
         )}
 
         {activeTab === 'diffs' && (
-          <DiffInspectorView
-            events={recent.data ?? []}
-            loading={recent.isLoading}
-            currentProject={currentProject}
-          />
+		  <Suspense fallback={<TabFallback />}>
+			<DiffInspectorView
+			  events={recent.data ?? []}
+			  loading={recent.isLoading}
+			  currentProject={currentProject}
+			/>
+		  </Suspense>
         )}
 
         {activeTab === 'sessions' && (
-          <AgentSessionsView
-            activeRuns={overview.data?.active_runs ?? []}
-            models={models.data ?? []}
-            overview={overview.data?.overview}
-            recentEvents={recent.data ?? []}
-            loading={overview.isLoading}
-            currentProject={currentProject}
-          />
+		  <Suspense fallback={<TabFallback />}>
+			<AgentSessionsView
+			  activeRuns={overview.data?.active_runs ?? []}
+			  models={models.data ?? []}
+			  overview={overview.data?.overview}
+			  recentEvents={recent.data ?? []}
+			  loading={overview.isLoading}
+			  currentProject={currentProject}
+			/>
+		  </Suspense>
         )}
 
         {activeTab === 'profiler' && (
-          <ProfilerTracesView />
+		  <Suspense fallback={<TabFallback />}>
+			<ProfilerTracesView />
+		  </Suspense>
         )}
 
         {activeTab === 'gateway' && (
-          <ProxyRoutingView currentProject={currentProject} />
+		  <Suspense fallback={<TabFallback />}>
+			<ProxyRoutingView currentProject={currentProject} />
+		  </Suspense>
         )}
 
         {activeTab === 'settings' && (
-          <SettingsView />
+		  <Suspense fallback={<TabFallback />}>
+			<SettingsView />
+		  </Suspense>
         )}
 
         {/* Global Footer with WrongStack Ecosystem Link */}

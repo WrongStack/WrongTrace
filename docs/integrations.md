@@ -250,7 +250,9 @@ MCP-capable client at that command pair.
 ## Recommended workflow per task
 
 1. **Report the run** (`report_telemetry` / `telemetry/report_run`) *before*
-   editing — correlation is time-windowed, last-reported run wins.
+   editing. When the integration exposes a target file, WrongTrace correlates
+   by canonical path. A single active run is retained only as a lower-confidence
+   fallback; concurrent runs without a path match remain unattributed.
 2. **Check fragility** (`get_file_health_score`) on files you're about to
    touch — a low score means the file is being thrashed right now.
 3. **Edit normally.** The watcher debounces, parses, and diffs; events appear

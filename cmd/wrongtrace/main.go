@@ -240,6 +240,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	ipcServer := ipc.NewServer(ipc.Config{
 		SocketPath: socketPath,
 		Engine:     engine,
+		Version:    version,
 	})
 	if err := ipcServer.Start(); err != nil {
 		log.Printf("ipc: disabled (%v) — HTTP API and watching continue", err)
@@ -273,6 +274,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 				projectID = proj.ID
 				projectSlug = proj.Name
 			}
+			engine.RegisterFileOperation(ev.TargetFile, ev.SessionID, ev.OccurredAt)
 		}
 		_ = engine.ReportRun(ipc.TelemetryReport{
 			RunID:            ev.SessionID,
@@ -314,6 +316,9 @@ func runStart(cmd *cobra.Command, _ []string) error {
 			ReadTime:       rev.OccurredAt,
 		})
 	})
+	if err := sessionWatcher.EnablePersistentOffsets(filepath.Join(dataDir, "ingest-offsets.json")); err != nil {
+		log.Printf("ingest: offset checkpoint reset: %v", err)
+	}
 	sessionWatcher.DiscoverAgentDirs(abs)
 	sessionWatcher.DiscoverGlobalAgentDirs()
 	sessionWatcher.StartPolling(ctx, 25*time.Second)
@@ -407,20 +412,6 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// Periodic memory recycler: returns unused pages back to the OS kernel
-	go func() {
-		ticker := time.NewTicker(15 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				debug.FreeOSMemory()
-			}
-		}
-	}()
-
 	// Graceful shutdown ONLY on explicit user interruption (SIGINT, SIGTERM, Ctrl+C)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
@@ -455,6 +446,7 @@ func runMCP(cmd *cobra.Command, _ []string) error {
 		Store:    store,
 		AST:      nil, // MCP mode never parses files; only reports/queries telemetry.
 	})
+	mcp.SetVersion(version)
 	return mcp.ServeStdio(engine)
 }
 

@@ -464,3 +464,12 @@ func TestExtendedIPCMethods(t *testing.T) {
 		t.Errorf("expected nil error to NOT be client disconnect")
 	}
 }
+
+func TestRPCDiscoverReportsConfiguredVersion(t *testing.T) {
+	srv := NewServer(Config{Engine: &fakeSink{}, Version: "v0.3.7"})
+	resp := srv.dispatch(&Request{Method: "rpc.discover", ID: 1})
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok || result["version"] != "v0.3.7" {
+		t.Fatalf("rpc.discover version = %#v", resp.Result)
+	}
+}

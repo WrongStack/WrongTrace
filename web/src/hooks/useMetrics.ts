@@ -24,27 +24,28 @@ export function useOverview(projectId?: string | null) {
     queryKey: ['overview', projectId || 'active'],
     queryFn: ({ signal }) => jget<MetricsSnapshot>(`${base}/metrics/overview${q}`, signal),
     staleTime: 5_000,
-    refetchInterval: 15_000,
+	refetchInterval: 60_000,
   });
 }
 
-export function useThrashing(projectId?: string | null) {
+export function useThrashing(projectId?: string | null, enabled: boolean = true) {
   const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<ThrashingRow[]>({
     queryKey: ['thrashing', projectId || 'active'],
     queryFn: ({ signal }) => jget<ThrashingRow[]>(`${base}/metrics/thrashing${q}`, signal),
+    enabled,
     staleTime: 5_000,
-    refetchInterval: 15_000,
+	refetchInterval: 60_000,
   });
 }
 
-export function useModels(projectId?: string | null) {
+export function useModels(projectId?: string | null, enabled: boolean = true) {
   const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<ModelRow[]>({
     queryKey: ['models', projectId || 'active'],
     queryFn: ({ signal }) => jget<ModelRow[]>(`${base}/metrics/models${q}`, signal),
+    enabled,
     staleTime: 5_000,
-    refetchInterval: 20_000,
   });
 }
 
@@ -53,7 +54,7 @@ export function useModels(projectId?: string | null) {
 // deduped by event_id, and capped at the page size, so consumers see the
 // same shape the old full poll produced while the daemon ships a handful of
 // rows per tick instead of re-serializing all 500.
-export function useRecentEvents(projectId?: string | null, limit: number = 500) {
+export function useRecentEvents(projectId?: string | null, limit: number = 500, enabled: boolean = true) {
   const queryClient = useQueryClient();
   const pParam = projectId ? `project_id=${encodeURIComponent(projectId)}` : '';
   const lParam = `limit=${limit}`;
@@ -80,8 +81,8 @@ export function useRecentEvents(projectId?: string | null, limit: number = 500) 
       merged.sort((a, b) => b.event_time.localeCompare(a.event_time) || a.event_id.localeCompare(b.event_id));
       return merged.slice(0, limit);
     },
+    enabled,
     staleTime: 3_000,
-    refetchInterval: 10_000,
   });
 }
 
@@ -92,7 +93,7 @@ export function useHealth() {
     // The socket path never changes during a daemon's lifetime; the refetch
     // interval only re-syncs the navbar after a daemon restart.
     staleTime: 60_000,
-    refetchInterval: 30_000,
+	refetchInterval: 60_000,
   });
 }
 
@@ -105,13 +106,16 @@ export function useFileHealth(path: string | null) {
   });
 }
 
-export function useAtlas(projectId?: string | null) {
+export function useAtlas(projectId?: string | null, enabled: boolean = true) {
   const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<AtlasSnapshot>({
     queryKey: ['atlas', projectId || 'active'],
     queryFn: ({ signal }) => jget<AtlasSnapshot>(`${base}/atlas${q}`, signal),
+    enabled,
     staleTime: 5_000,
-    refetchInterval: 20_000,
+    // Full symbol graphs can be several MB. Refresh on tab entry, project
+    // switches, or the Atlas refresh button instead of parsing them on a timer.
+    refetchInterval: false,
   });
 }
 
@@ -136,7 +140,6 @@ export function useProxyRoutes() {
     queryKey: ['proxy_routes'],
     queryFn: ({ signal }) => jget<import('../types').ProxyRoute[]>(`${base}/proxy/routes`, signal),
     staleTime: 5_000,
-    refetchInterval: 15_000,
   });
 }
 
@@ -145,7 +148,6 @@ export function useProjects() {
     queryKey: ['projects'],
     queryFn: ({ signal }) => jget<import('../types').Project[]>(`${base}/projects`, signal),
     staleTime: 5_000,
-    refetchInterval: 15_000,
   });
 }
 
@@ -153,9 +155,17 @@ export function useProxyTraffic(projectId?: string | null) {
   const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<import('../types').ProxyTrafficRecord[]>({
     queryKey: ['proxy_traffic', projectId || 'active'],
-    queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic${q}`, signal),
+    queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic${q}${q ? '&' : '?'}detail=false`, signal),
     staleTime: 2_000,
-    refetchInterval: 6_000,
+  });
+}
+
+export function useProxyTrafficDetail(id?: string | null) {
+  return useQuery<import('../types').ProxyTrafficRecord>({
+    queryKey: ['proxy_traffic_detail', id],
+    queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord>(`${base}/proxy/traffic/${encodeURIComponent(id ?? '')}`, signal),
+    enabled: !!id,
+    staleTime: 60_000,
   });
 }
 
@@ -173,7 +183,6 @@ export function useProfilerTraces(limit: number = 50, projectId?: string | null)
     queryKey: ['profiler_traces', limit, projectId || 'active'],
     queryFn: ({ signal }) => jget<import('../types').RuntimeTrace[]>(`${base}/profiler/traces?limit=${limit}${pParam}`, signal),
     staleTime: 3_000,
-    refetchInterval: 10_000,
   });
 }
 
@@ -181,7 +190,6 @@ export function useProfilerHotspots(limit: number = 25) {
   return useQuery<import('../types').ProfilerHotspot[]>({
     queryKey: ['profiler_hotspots', limit],
     queryFn: ({ signal }) => jget<import('../types').ProfilerHotspot[]>(`${base}/profiler/hotspots?limit=${limit}`, signal),
-    refetchInterval: 10_000,
   });
 }
 
@@ -189,7 +197,6 @@ export function useProfilerOverview() {
   return useQuery<import('../types').ProfilerOverview>({
     queryKey: ['profiler_overview'],
     queryFn: ({ signal }) => jget<import('../types').ProfilerOverview>(`${base}/profiler/overview`, signal),
-    refetchInterval: 10_000,
   });
 }
 
@@ -199,7 +206,6 @@ export function useAtlasStatus(projectId?: string | null) {
     queryKey: ['atlas_status', projectId || 'active'],
     queryFn: ({ signal }) => jget<import('../types').IndexProgress>(`${base}/atlas/status${q}`, signal),
     staleTime: 2_000,
-    refetchInterval: 6_000,
   });
 }
 
@@ -209,7 +215,6 @@ export function useRecentReads(limit: number = 50, projectId?: string | null) {
     queryKey: ['recent_reads', limit, projectId || 'active'],
     queryFn: ({ signal }) => jget<import('../types').FileReadRecord[]>(`${base}/reads/recent?limit=${limit}${pParam}`, signal),
     staleTime: 3_000,
-    refetchInterval: 10_000,
   });
 }
 
@@ -219,7 +224,6 @@ export function useFileReadStats(path: string | null) {
     queryFn: ({ signal }) => jget<import('../types').FileReadStats>(`${base}/files/reads?path=${encodeURIComponent(path ?? '')}`, signal),
     enabled: !!path,
     staleTime: 5_000,
-    refetchInterval: 15_000,
   });
 }
 
@@ -229,7 +233,6 @@ export function useFileReadHeatmap(path: string | null) {
     queryFn: ({ signal }) => jget<import('../types').LineReadHeatmap[]>(`${base}/files/heatmap?path=${encodeURIComponent(path ?? '')}`, signal),
     enabled: !!path,
     staleTime: 5_000,
-    refetchInterval: 15_000,
   });
 }
 
@@ -239,7 +242,6 @@ export function useRecentFileEvents(filePath: string | null, limit: number = 50)
     queryFn: ({ signal }) => jget<EventRecord[]>(`${base}/metrics/recent?file_path=${encodeURIComponent(filePath ?? '')}&limit=${limit}`, signal),
     enabled: !!filePath,
     staleTime: 3_000,
-    refetchInterval: 10_000,
   });
 }
 
@@ -253,7 +255,6 @@ export function useSymbolHistory(filePath: string | null, signature: string | nu
     queryFn: ({ signal }) => jget<import('../types').SymbolHistoryRecord[]>(`${base}/symbol/history?${queryStr}`, signal),
     enabled: !!(filePath || signature),
     staleTime: 3_000,
-    refetchInterval: 10_000,
   });
 }
 
@@ -263,7 +264,6 @@ export function useFileModelActivity(filePath: string | null) {
     queryFn: ({ signal }) => jget<import('../types').ModelActivitySummary[]>(`${base}/files/activity?path=${encodeURIComponent(filePath ?? '')}`, signal),
     enabled: !!filePath,
     staleTime: 5_000,
-    refetchInterval: 15_000,
   });
 }
 
@@ -272,7 +272,6 @@ export function useModelFriction(limit: number = 200) {
     queryKey: ['model_friction', limit],
     queryFn: ({ signal }) => jget<import('../types').InterAgentFrictionReport>(`${base}/metrics/friction?limit=${limit}`, signal),
     staleTime: 5_000,
-    refetchInterval: 15_000,
   });
 }
 
@@ -282,7 +281,6 @@ export function useIPCTraffic(enabled: boolean = true) {
     queryFn: ({ signal }) => jget<import('../types').IPCTrafficRecord[]>(`${base}/ipc/traffic`, signal),
     enabled,
     staleTime: 2_000,
-    refetchInterval: 5_000,
   });
 }
 

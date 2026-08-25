@@ -41,6 +41,48 @@ func newStoreAt(t *testing.T) *db.Store {
 	return store
 }
 
+func TestLoopbackCORSRejectsForeignOriginBeforeHandler(t *testing.T) {
+	called := false
+	h := loopbackCORS(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	foreign := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:3444/proxy/http://169.254.169.254/latest", strings.NewReader("{}"))
+	foreign.Header.Set("Origin", "https://attacker.example")
+	foreignResult := httptest.NewRecorder()
+	h.ServeHTTP(foreignResult, foreign)
+	if foreignResult.Code != http.StatusForbidden || called {
+		t.Fatalf("foreign origin code=%d called=%v", foreignResult.Code, called)
+	}
+
+	sameOrigin := httptest.NewRequest(http.MethodPost, "http://wrongtrace.example/api/settings", strings.NewReader("{}"))
+	sameOrigin.Header.Set("Origin", "http://wrongtrace.example")
+	sameOriginResult := httptest.NewRecorder()
+	h.ServeHTTP(sameOriginResult, sameOrigin)
+	if sameOriginResult.Code != http.StatusNoContent || !called {
+		t.Fatalf("same-origin request code=%d called=%v", sameOriginResult.Code, called)
+	}
+}
+
+func TestProxyTrafficLimit(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		want  int
+	}{
+		{"", 25},
+		{"?limit=7", 7},
+		{"?limit=1000", 100},
+		{"?limit=invalid", 25},
+		{"?limit=0", 25},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/proxy/traffic"+tc.query, nil)
+		if got := proxyTrafficLimit(req); got != tc.want {
+			t.Errorf("query %q: limit=%d, want %d", tc.query, got, tc.want)
+		}
+	}
+}
+
 func (f *failingEngine) Metrics(...string) (core.MetricsSnapshot, error) {
 	return core.MetricsSnapshot{}, errForced
 }

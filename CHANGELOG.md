@@ -11,6 +11,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.7] - 2026-08-25
+
+### Added
+- **Confidence-Aware AI Code Attribution**:
+  - Added path-scoped tool-operation correlation with persisted attribution source and confidence fields.
+  - Concurrent agents targeting the same file now remain unattributed instead of assigning authorship to the last observed run.
+- **Durable Incremental Transcript Cursors**:
+  - Persisted JSONL offsets across daemon restarts, coalesced checkpoint writes, and forced a final checkpoint during graceful shutdown.
+
+### Changed
+- **Byte-Preserving Gateway Observation**:
+  - Proxy observation is non-mutating by default. Secret redaction, quota blocking, OpenAI usage injection, and terminal-marker repair require `X-WrongTrace-Policy: enforce`.
+  - Exact response caching is explicit via `X-WrongTrace-Cache: allow` and isolated by credential, project, agent, session, run, and query-auth scope.
+- **Event-Driven Dashboard Refresh**:
+  - Replaced high-frequency API polling with targeted WebSocket cache invalidation, retaining only slow safety polls for time-decaying health snapshots.
+  - Lazy-loaded inactive Atlas, diff, session, profiler, gateway, and settings views; React Flow no longer participates in initial dashboard preload.
+- **Truthful Model Semantics**:
+  - Unknown models remain `unknown-model`; low-confidence attribution is excluded from inter-model friction analytics.
+
+### Fixed
+- **AST Identity and TypeScript Parsing**:
+  - Switched TypeScript/TSX parsing to the native TSX grammar and qualified class methods to prevent same-name symbol collisions.
+- **Streaming and Cache Telemetry**:
+  - Retained final usage events from long SSE streams with bounded memory, measured full stream duration, preserved unique cache-hit traffic IDs, and stopped marking truncated streams as complete.
+  - Bounded non-stream responses and sanitized stored prompt/header telemetry without mutating transparently relayed bytes.
+- **Gateway Route Determinism**:
+  - Most-specific dynamic routes now win consistently; route and settings files use owner-only permissions where supported.
+
+### Security
+- Rejected foreign browser origins before handlers execute, closing browser-driven CSRF/SSRF access to local proxy routes.
+- Prevented response-cache reuse across credentials and query-authenticated providers, and masked secrets in stored telemetry and upstream URL headers.
+
+### Performance
+- Removed forced 15-minute memory scavenges and enabled the existing retention setting as low-frequency daily maintenance.
+- Reduced the initial dashboard application chunk from 311.8 kB to 96.4 kB and removed React Flow from initial preload.
+- Verified steady-state transcript polling at approximately 0.97 ms per 25-second interval on the benchmark fixture.
+
+---
+
 ## [0.3.6] - 2026-08-25
 
 ### Added

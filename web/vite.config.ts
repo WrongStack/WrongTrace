@@ -51,6 +51,13 @@ export default defineConfig({
               name: 'vendor-charts',
               test: /[\\/]node_modules[\\/](recharts|d3|d3-[a-z0-9-]+|victory-vendor|react-smooth|internmap)[\\/]/,
             },
+			{
+			  // React Flow is only needed by the lazy-loaded Code Atlas tab.
+			  // Keeping it out of the catch-all vendor group prevents an eager
+			  // modulepreload on every dashboard visit.
+			  name: 'vendor-atlas',
+			  test: /[\\/]node_modules[\\/]@xyflow[\\/]/,
+			},
             {
               name: 'vendor',
               test: /[\\/]node_modules[\\/]/,

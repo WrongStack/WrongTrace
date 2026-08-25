@@ -197,11 +197,25 @@ func TestSessionWatcher_GlobalDiscoveryAndFileReads(t *testing.T) {
 
 func TestSessionWatcher_StartPollingLifecycle(t *testing.T) {
 	sw := NewSessionWatcher(nil)
+	checkpoint := filepath.Join(t.TempDir(), "offsets.json")
+	if err := sw.EnablePersistentOffsets(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	sw.mu.Lock()
+	sw.seenOffsets["session.jsonl"] = 42
+	sw.cursorDirty = true
+	sw.cursorVersion++
+	sw.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
-	sw.StartPolling(ctx, 20*time.Millisecond)
-	time.Sleep(50 * time.Millisecond)
+	sw.StartPolling(ctx, time.Hour)
 	cancel()
-	time.Sleep(20 * time.Millisecond)
+	deadline := time.Now().Add(time.Second)
+	for !fileExists(checkpoint) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !fileExists(checkpoint) {
+		t.Fatal("poller shutdown did not persist final offsets")
+	}
 }
 
 func TestIngest_DirAndFileExistsHelpers(t *testing.T) {

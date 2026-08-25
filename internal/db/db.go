@@ -104,6 +104,8 @@ func (s *Store) Migrate() error {
 		"ALTER TABLE code_node_events ADD COLUMN diff_snippet TEXT DEFAULT ''",
 		"ALTER TABLE code_node_events ADD COLUMN added_lines INTEGER DEFAULT 0",
 		"ALTER TABLE code_node_events ADD COLUMN deleted_lines INTEGER DEFAULT 0",
+		"ALTER TABLE code_node_events ADD COLUMN attribution_source VARCHAR DEFAULT 'unknown'",
+		"ALTER TABLE code_node_events ADD COLUMN attribution_confidence DOUBLE DEFAULT 0.0",
 	} {
 		if _, err := s.db.ExecContext(context.Background(), col); err != nil {
 			if strings.Contains(err.Error(), "duplicate column name") {

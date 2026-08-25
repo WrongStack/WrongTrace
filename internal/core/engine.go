@@ -60,6 +60,8 @@ type Engine struct {
 	runMu      sync.Mutex
 	activeRuns map[string]runMeta
 	correlate  time.Duration
+	opMu       sync.Mutex
+	pendingOps map[string][]pendingFileOperation
 
 	lockMu          sync.RWMutex
 	lockedFiles     map[string]LockInfo
@@ -104,6 +106,11 @@ type runMeta struct {
 	StartedAt   time.Time
 	LastSeen    time.Time
 	TaskID      string
+}
+
+type pendingFileOperation struct {
+	RunID      string
+	ObservedAt time.Time
 }
 
 // NewEngine constructs an Engine. Pass a nil AST to skip file parsing (the MCP
@@ -157,6 +164,7 @@ func NewEngine(cfg Config) *Engine {
 		hub:             NewHub(),
 		activeRuns:      make(map[string]runMeta),
 		correlate:       10 * time.Minute,
+		pendingOps:      make(map[string][]pendingFileOperation),
 		lockedFiles:     make(map[string]LockInfo),
 		projects:        loadedProjects,
 		activeProjectID: activeProjID,
@@ -269,7 +277,23 @@ func (e *Engine) handleFileGone(_ context.Context, path string) {
 // run_id is back-filled from the most recent active run when one exists within
 // the correlation window.
 func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
-	runID := e.recentRunID()
+	var runID, attributionSource string
+	var attributionConfidence float64
+	if len(res.Events) > 0 {
+		runID = e.fileOperationRunID(res.Events[0].FilePath, res.Events[0].OccurredAt)
+	}
+	if runID != "" {
+		attributionSource = "tool_path"
+		attributionConfidence = 0.95
+	} else {
+		runID = e.recentRunID()
+		if runID != "" {
+			attributionSource = "single_active_run"
+			attributionConfidence = 0.60
+		} else {
+			attributionSource = "unknown"
+		}
+	}
 	for _, ev := range res.Events {
 		if runID != "" && ev.RunID == "" {
 			ev.RunID = runID
@@ -282,21 +306,23 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 			repo = p.Name
 		}
 		rec := db.EventRecord{
-			EventID:      newID(),
-			RunID:        ev.RunID,
-			RepoName:     repo,
-			FilePath:     ev.FilePath,
-			Signature:    ev.Signature,
-			NodeType:     string(ev.NodeType),
-			Action:       string(ev.Action),
-			BodyHash:     ev.BodyHash,
-			LOC:          ev.LOC,
-			StartLine:    ev.StartLine,
-			EndLine:      ev.EndLine,
-			DiffSnippet:  ev.DiffSnippet,
-			AddedLines:   ev.AddedLines,
-			DeletedLines: ev.DeletedLines,
-			OccurredAt:   ev.OccurredAt,
+			EventID:               newID(),
+			RunID:                 ev.RunID,
+			RepoName:              repo,
+			FilePath:              ev.FilePath,
+			Signature:             ev.Signature,
+			NodeType:              string(ev.NodeType),
+			Action:                string(ev.Action),
+			BodyHash:              ev.BodyHash,
+			LOC:                   ev.LOC,
+			StartLine:             ev.StartLine,
+			EndLine:               ev.EndLine,
+			DiffSnippet:           ev.DiffSnippet,
+			AddedLines:            ev.AddedLines,
+			DeletedLines:          ev.DeletedLines,
+			AttributionSource:     attributionSource,
+			AttributionConfidence: attributionConfidence,
+			OccurredAt:            ev.OccurredAt,
 		}
 		store := e.Store()
 		if store != nil {
@@ -412,16 +438,31 @@ func (e *Engine) shouldSkip(path string) bool {
 	return ignoredPathSegment(rel)
 }
 
-// Run periodically prunes expired active runs until ctx is done.
+// Run performs lightweight in-memory cleanup and low-frequency retention
+// maintenance until ctx is done. Go's runtime owns GC pacing; this loop does
+// not force collections or memory scavenges.
 func (e *Engine) Run(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
+	runTicker := time.NewTicker(2 * time.Minute)
+	retentionTicker := time.NewTicker(24 * time.Hour)
+	defer runTicker.Stop()
+	defer retentionTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-runTicker.C:
 			e.pruneActiveRuns()
+		case <-retentionTicker.C:
+			days := e.GetSettings().AutoPruneDays
+			if days <= 0 {
+				continue
+			}
+			deleted, err := e.ClearStale(days)
+			if err != nil {
+				log.Printf("retention: prune telemetry older than %d days: %v", days, err)
+			} else if deleted > 0 {
+				log.Printf("retention: pruned %d telemetry rows older than %d days", deleted, days)
+			}
 		}
 	}
 }
@@ -458,21 +499,7 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 	}
 
 	if p.ModelName == "" || models.IsJunkModel(p.ModelName) {
-		lowerAgent := strings.ToLower(p.AgentName)
-		switch {
-		case strings.Contains(lowerAgent, "antigravity") || strings.Contains(lowerAgent, "gemini"):
-			p.ModelName = "gemini-3.7-flash"
-		case strings.Contains(lowerAgent, "claude"):
-			p.ModelName = "claude-3-7-sonnet"
-		case strings.Contains(lowerAgent, "aider"):
-			p.ModelName = "gpt-4o"
-		case strings.Contains(lowerAgent, "cline") || strings.Contains(lowerAgent, "roo"):
-			p.ModelName = "claude-3-7-sonnet"
-		case strings.Contains(lowerAgent, "cursor") || strings.Contains(lowerAgent, "windsurf") || strings.Contains(lowerAgent, "trae") || strings.Contains(lowerAgent, "wrongstack"):
-			p.ModelName = "claude-3-7-sonnet"
-		default:
-			p.ModelName = "claude-3-7-sonnet"
-		}
+		p.ModelName = "unknown-model"
 	}
 
 	// Auto-compute cost if not explicitly passed by agent but tokens are provided
@@ -647,7 +674,7 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 		}
 	}
 	if rec.ModelName == "" || models.IsJunkModel(rec.ModelName) {
-		rec.ModelName = "claude-3-7-sonnet"
+		rec.ModelName = "unknown-model"
 	}
 	if rec.CostUSD <= 0 && rec.PromptTokens > 0 {
 		rec.CostUSD = models.Global.CalculateCost(rec.ModelName, rec.PromptTokens, 0)
@@ -851,26 +878,28 @@ func (e *Engine) GetIPCTraffic() []ipc.IPCTrafficRecord {
 	return out
 }
 
-// recentRunID returns the most recently seen run_id within the correlation
-// window. "Last-seen wins" is the right heuristic: watcher events arrive
-// serially and the window is short.
+// recentRunID returns a run only when exactly one run is active in the
+// correlation window. With concurrent agents, "last seen wins" silently
+// assigns another model's edit to the newest telemetry report; ambiguous
+// events must remain unattributed unless a path-scoped tool hint exists.
 func (e *Engine) recentRunID() string {
 	e.runMu.Lock()
 	defer e.runMu.Unlock()
 	cutoff := time.Now().Add(-e.correlate)
-	var bestID string
-	var bestTS time.Time
+	var onlyID string
+	active := 0
 	for id, meta := range e.activeRuns {
 		if meta.LastSeen.Before(cutoff) {
 			delete(e.activeRuns, id)
 			continue
 		}
-		if meta.LastSeen.After(bestTS) {
-			bestTS = meta.LastSeen
-			bestID = id
-		}
+		active++
+		onlyID = id
 	}
-	return bestID
+	if active == 1 {
+		return onlyID
+	}
+	return ""
 }
 
 // newID returns a random 16-byte hex identifier for DB primary keys.

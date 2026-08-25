@@ -1,9 +1,12 @@
 package core
 
 import (
+	"path/filepath"
 	"strings"
 	"time"
 )
+
+const fileOperationWindow = 2 * time.Minute
 
 // ActiveRun is the dashboard-facing view of a currently-tracked agent run.
 // The correlation window is short (10 minutes by default), so anything older
@@ -53,4 +56,108 @@ func (e *Engine) ActiveRuns() []ActiveRun {
 		})
 	}
 	return out
+}
+
+// RegisterFileOperation records a path-scoped tool intent. Filesystem events
+// use this hint instead of attributing an edit to whichever unrelated agent
+// happened to report telemetry most recently.
+func (e *Engine) RegisterFileOperation(filePath, runID string, observedAt time.Time) {
+	if strings.TrimSpace(filePath) == "" || strings.TrimSpace(runID) == "" {
+		return
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	key := e.correlationPath(filePath)
+	if key == "" {
+		return
+	}
+
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	cutoff := time.Now().UTC().Add(-fileOperationWindow)
+	for path, ops := range e.pendingOps {
+		fresh := ops[:0]
+		for _, op := range ops {
+			if !op.ObservedAt.Before(cutoff) {
+				fresh = append(fresh, op)
+			}
+		}
+		if len(fresh) == 0 {
+			delete(e.pendingOps, path)
+		} else {
+			e.pendingOps[path] = fresh
+		}
+	}
+	if len(e.pendingOps) >= 2048 {
+		var oldestPath string
+		var oldest time.Time
+		for path, ops := range e.pendingOps {
+			if len(ops) > 0 && (oldest.IsZero() || ops[0].ObservedAt.Before(oldest)) {
+				oldestPath, oldest = path, ops[0].ObservedAt
+			}
+		}
+		delete(e.pendingOps, oldestPath)
+	}
+	ops := e.pendingOps[key]
+	if len(ops) >= 8 {
+		copy(ops, ops[len(ops)-7:])
+		ops = ops[:7]
+	}
+	e.pendingOps[key] = append(ops, pendingFileOperation{RunID: runID, ObservedAt: observedAt.UTC()})
+}
+
+func (e *Engine) fileOperationRunID(filePath string, eventAt time.Time) string {
+	key := e.correlationPath(filePath)
+	if key == "" {
+		return ""
+	}
+	if eventAt.IsZero() {
+		eventAt = time.Now().UTC()
+	}
+
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	cutoff := time.Now().UTC().Add(-fileOperationWindow)
+	ops := e.pendingOps[key]
+	delete(e.pendingOps, key) // a filesystem diff consumes the path hint
+	var matchedRun string
+	for _, op := range ops {
+		if op.ObservedAt.Before(cutoff) || absDuration(eventAt.Sub(op.ObservedAt)) > fileOperationWindow {
+			continue
+		}
+		if matchedRun == "" {
+			matchedRun = op.RunID
+			continue
+		}
+		if matchedRun != op.RunID {
+			// Multiple agents announced the same path before a filesystem event.
+			// Choosing the latest would fabricate authorship, so leave it unknown.
+			return ""
+		}
+	}
+	return matchedRun
+}
+
+func (e *Engine) correlationPath(filePath string) string {
+	p := strings.TrimSpace(strings.ReplaceAll(filePath, "\\", "/"))
+	if p == "" {
+		return ""
+	}
+	if !filepath.IsAbs(p) {
+		if root := e.WatchRoot(); root != "" {
+			p = filepath.Join(root, filepath.FromSlash(p))
+		}
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	return strings.ToLower(filepath.ToSlash(filepath.Clean(p)))
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }

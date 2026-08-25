@@ -579,21 +579,8 @@ func detectAgentFromPath(p string) string {
 }
 
 func detectAgentDefaultModel(agentName string) string {
-	lower := strings.ToLower(agentName)
-	switch {
-	case strings.Contains(lower, "antigravity") || strings.Contains(lower, "gemini"):
-		return "gemini-3.7-flash"
-	case strings.Contains(lower, "claude"):
-		return "claude-3-7-sonnet"
-	case strings.Contains(lower, "aider"):
-		return "gpt-4o"
-	case strings.Contains(lower, "cline") || strings.Contains(lower, "roo"):
-		return "claude-3-7-sonnet"
-	case strings.Contains(lower, "cursor") || strings.Contains(lower, "windsurf") || strings.Contains(lower, "trae") || strings.Contains(lower, "wrongstack"):
-		return "claude-3-7-sonnet"
-	default:
-		return "claude-3-7-sonnet"
-	}
+	_ = agentName
+	return "unknown-model"
 }
 
 func runeSafeTruncate(s string, maxRunes int) string {

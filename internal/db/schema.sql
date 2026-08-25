@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS code_node_events (
     diff_snippet     TEXT DEFAULT '',
     added_lines      INTEGER DEFAULT 0,
     deleted_lines    INTEGER DEFAULT 0,
+    attribution_source VARCHAR DEFAULT 'unknown',
+    attribution_confidence DOUBLE DEFAULT 0.0,
     event_time       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -91,4 +93,3 @@ CREATE INDEX IF NOT EXISTS idx_read_time       ON file_read_events(read_time);
 CREATE INDEX IF NOT EXISTS idx_read_file_time  ON file_read_events(file_path, read_time DESC);
 CREATE INDEX IF NOT EXISTS idx_read_repo       ON file_read_events(repo_name);
 CREATE INDEX IF NOT EXISTS idx_read_lines      ON file_read_events(file_path, start_line, end_line);
-

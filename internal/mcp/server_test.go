@@ -148,6 +148,9 @@ func wireResult(t *testing.T, resp jsonRPCResponse) map[string]interface{} {
 }
 
 func TestDispatch_Initialize(t *testing.T) {
+	previousVersion := serverVersion
+	SetVersion("v0.3.7")
+	t.Cleanup(func() { serverVersion = previousVersion })
 	resp := dispatch(&fakeSink{}, &jsonRPCRequest{JSONRPC: "2.0", ID: 1, Method: "initialize",
 		Params: params(t, `{"protocolVersion":"2024-11-05"}`)})
 	if resp.Error != nil {
@@ -160,6 +163,9 @@ func TestDispatch_Initialize(t *testing.T) {
 	info, _ := res["serverInfo"].(map[string]interface{})
 	if info == nil || info["name"] != "wrongtrace" {
 		t.Errorf("serverInfo = %#v", res["serverInfo"])
+	}
+	if info["version"] != "v0.3.7" {
+		t.Errorf("serverInfo.version = %#v", info["version"])
 	}
 	caps, _ := res["capabilities"].(map[string]interface{})
 	if caps == nil {

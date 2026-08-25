@@ -34,16 +34,18 @@ func seedRun(t *testing.T, s *Store, r RunRecord) {
 func seedEvent(t *testing.T, s *Store, id, runID, sig, action string, at time.Time) {
 	t.Helper()
 	err := s.InsertEvent(EventRecord{
-		EventID:    id,
-		RunID:      runID,
-		RepoName:   "test",
-		FilePath:   "f.go",
-		Signature:  sig,
-		NodeType:   "function",
-		Action:     action,
-		BodyHash:   "h" + id,
-		LOC:        3,
-		OccurredAt: at,
+		EventID:               id,
+		RunID:                 runID,
+		RepoName:              "test",
+		FilePath:              "f.go",
+		Signature:             sig,
+		NodeType:              "function",
+		Action:                action,
+		BodyHash:              "h" + id,
+		LOC:                   3,
+		AttributionSource:     "tool_path",
+		AttributionConfidence: 0.95,
+		OccurredAt:            at,
 	})
 	if err != nil {
 		t.Fatalf("seed event %s: %v", id, err)
@@ -459,5 +461,37 @@ func TestStore_ComprehensiveCoverage(t *testing.T) {
 	// 7. DB accessor & health
 	if s.DB() == nil {
 		t.Errorf("DB() should not be nil")
+	}
+}
+
+func TestModelFrictionMatrix_IgnoresLowConfidenceAttribution(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	seedRun(t, s, RunRecord{RunID: "run-author", ModelName: "model-a", CreatedAt: now})
+	seedRun(t, s, RunRecord{RunID: "run-overwriter", ModelName: "model-b", CreatedAt: now})
+	seedEvent(t, s, "ev-author", "run-author", "func:Work", "ADDED", now)
+
+	if err := s.InsertEvent(EventRecord{
+		EventID:               "ev-ambiguous",
+		RunID:                 "run-overwriter",
+		RepoName:              "test",
+		FilePath:              "f.go",
+		Signature:             "func:Work",
+		NodeType:              "function",
+		Action:                "MODIFIED",
+		BodyHash:              "ambiguous",
+		AttributionSource:     "single_active_run",
+		AttributionConfidence: 0.60,
+		OccurredAt:            now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := s.ModelFrictionMatrix(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.TotalCollisions != 0 {
+		t.Fatalf("low-confidence attribution produced %d collision(s)", report.TotalCollisions)
 	}
 }

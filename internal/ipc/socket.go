@@ -69,6 +69,7 @@ type FileHealthReply struct {
 type Config struct {
 	SocketPath string
 	Engine     EngineSink
+	Version    string
 }
 
 // Server is the agent-facing IPC endpoint.
@@ -477,6 +478,10 @@ func (s *Server) dispatch(req *Request) Response {
 		resp.Result = map[string]interface{}{"events": events, "count": len(events)}
 
 	case "rpc.discover", "system.listMethods", "rpc.listMethods", "tools/list":
+		serverVersion := s.cfg.Version
+		if serverVersion == "" {
+			serverVersion = "dev"
+		}
 		resp.Result = map[string]interface{}{
 			"methods": []string{
 				"telemetry/report_run",
@@ -499,7 +504,7 @@ func (s *Server) dispatch(req *Request) Response {
 				"system.listMethods",
 			},
 			"server":  "wrongtrace",
-			"version": "0.3.6",
+			"version": serverVersion,
 		}
 
 	case "ping":

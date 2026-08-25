@@ -154,18 +154,31 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // proxies API calls server-side.
 func loopbackCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if origin := r.Header.Get("Origin"); origin != "" && isLoopbackOrigin(origin) {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
-			w.Header().Set("Access-Control-Max-Age", "300")
-			if r.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusNoContent)
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if isLoopbackOrigin(origin) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
+				w.Header().Set("Access-Control-Max-Age", "300")
+				if r.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			} else if !isSameOriginRequest(origin, r) {
+				http.Error(w, "cross-origin request rejected", http.StatusForbidden)
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isSameOriginRequest(origin string, r *http.Request) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || r == nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 func isLoopbackOrigin(origin string) bool {
@@ -243,6 +256,9 @@ func (s *Server) buildRouter() chi.Router {
 			OnTraffic: func(rec proxy.ProxyTrafficRecord) {
 				if s.cfg.Engine != nil {
 					for _, tc := range rec.ToolCalls {
+						if tc.TargetFile != "" && ingest.IsFileModifyingTool(tc.Name) {
+							s.cfg.Engine.RegisterFileOperation(tc.TargetFile, rec.RunID, rec.Timestamp)
+						}
 						if tc.TargetFile != "" && ingest.IsFileReadingTool(tc.Name) {
 							var args map[string]interface{}
 							_ = json.Unmarshal([]byte(tc.Arguments), &args)
@@ -269,9 +285,17 @@ func (s *Server) buildRouter() chi.Router {
 						}
 					}
 					if s.cfg.Engine.Hub() != nil {
+						// The browser only uses this event as an invalidation signal.
+						// Broadcasting full prompt/response bodies here duplicated the
+						// subsequent HTTP fetch and transiently pinned large LLM payloads.
 						s.cfg.Engine.Hub().Broadcast(core.WSEvent{
-							Type:    "proxy_traffic",
-							Payload: rec,
+							Type: "proxy_traffic",
+							Payload: map[string]interface{}{
+								"id":           rec.ID,
+								"timestamp":    rec.Timestamp,
+								"project_id":   rec.ProjectID,
+								"project_slug": rec.ProjectSlug,
+							},
 						})
 					}
 				}
@@ -328,6 +352,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Post("/proxy/routes", h.UpsertProxyRoute)
 		r.Delete("/proxy/routes/{id}", h.DeleteProxyRoute)
 		r.Get("/proxy/traffic", h.ListProxyTraffic)
+		r.Get("/proxy/traffic/{id}", h.GetProxyTraffic)
 		r.Delete("/proxy/traffic", h.ClearProxyTraffic)
 
 		r.Get("/projects", h.ListProjects)

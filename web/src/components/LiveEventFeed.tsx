@@ -217,6 +217,22 @@ export function LiveEventFeed({ events, loading }: LiveEventFeedProps) {
                     </span>
                     <span className="text-slate-600">·</span>
                     <span className="text-[10px] text-slate-400">{e.node_type}</span>
+                    <span
+                      className={`text-[10px] font-mono px-1 py-0.2 rounded border ${
+                        e.attribution_source === 'tool_path'
+                          ? 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10'
+                          : e.attribution_source === 'single_active_run'
+                            ? 'text-amber-300 border-amber-500/30 bg-amber-500/10'
+                            : 'text-slate-500 border-white/10 bg-slate-800/50'
+                      }`}
+                      title={`Attribution source: ${e.attribution_source ?? 'unknown'}; confidence: ${Math.round((e.attribution_confidence ?? 0) * 100)}%`}
+                    >
+                      {e.attribution_source === 'tool_path'
+                        ? `model ${Math.round((e.attribution_confidence ?? 0) * 100)}%`
+                        : e.attribution_source === 'single_active_run'
+                          ? 'model inferred'
+                          : 'unattributed'}
+                    </span>
                   </div>
                 </div>
 

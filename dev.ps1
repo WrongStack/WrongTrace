@@ -74,6 +74,87 @@ New-Item -ItemType Directory -Force $wrongtraceHome | Out-Null
 $daemonLog = Join-Path $wrongtraceHome 'daemon.log'
 $daemonOut = Join-Path $wrongtraceHome 'daemon-out.log'
 
+function Get-DaemonLogColor {
+    param([Parameter(Mandatory)][string]$Line)
+
+    # Severity wins over source: a proxy/API failure must stay red instead of
+    # being swallowed by the broader source color. Successful proxy phases use
+    # direction-aware colors so request, response, cache, and completion lines
+    # are distinguishable at a glance.
+    $color = switch -Regex ($Line) {
+        'error|FATAL|PANIC|HTTP [45][0-9][0-9]' { [ConsoleColor]::Red; break }
+        '\[PROXY\].*security guardrail'        { [ConsoleColor]::Yellow; break }
+        '\[PROXY\].*CACHE HIT'                 { [ConsoleColor]::Green; break }
+        '\[PROXY\].*\s->\s'                   { [ConsoleColor]::Cyan; break }
+        '\[PROXY\].*\s<-\s'                   { [ConsoleColor]::Blue; break }
+        '\[PROXY\].*COMPLETED HTTP 2[0-9][0-9]' { [ConsoleColor]::DarkGreen; break }
+        '\[PROXY\]'                            { [ConsoleColor]::DarkMagenta; break }
+        '\[API\]|http:'                        { [ConsoleColor]::Cyan; break }
+        '\[OTLP\]|profiler:'                   { [ConsoleColor]::Yellow; break }
+        '\[WS\]|ws:'                           { [ConsoleColor]::Blue; break }
+        'ipc:'                                  { [ConsoleColor]::Green; break }
+        'watcher:'                              { [ConsoleColor]::DarkYellow; break }
+        'ingest:'                               { [ConsoleColor]::DarkCyan; break }
+        'engine:|models\.dev'                   { [ConsoleColor]::DarkGreen; break }
+        'pprof:'                                { [ConsoleColor]::DarkBlue; break }
+        'daemon:|wrongtrace .*starting|received signal|stopped gracefully' { [ConsoleColor]::White; break }
+        default                                 { [ConsoleColor]::DarkGray }
+    }
+    return $color
+}
+
+$script:DaemonLogTokenPattern = '(?i)(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}|\[(?:PROXY|API|OTLP|WS)\]|\[[0-9a-z_-]{6,}\]|CACHE HIT|COMPLETED|security guardrail|FATAL|PANIC|error|HTTP\s+[1-5][0-9][0-9]|\s(?:->|<-)\s|https?://\S+|\$[0-9]+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?\s*(?:ms|s|tok|tokens?|bytes?))'
+
+function Get-DaemonLogTokenColor {
+    param(
+        [Parameter(Mandatory)][string]$Token,
+        [Parameter(Mandatory)][ConsoleColor]$BaseColor
+    )
+
+    $color = switch -Regex ($Token) {
+        '^\d{4}/\d{2}/\d{2}'                  { [ConsoleColor]::DarkGray; break }
+        '^\[PROXY\]$'                         { [ConsoleColor]::Magenta; break }
+        '^\[API\]$'                           { [ConsoleColor]::Cyan; break }
+        '^\[OTLP\]$'                          { [ConsoleColor]::Yellow; break }
+        '^\[WS\]$'                            { [ConsoleColor]::Blue; break }
+        '^\[[0-9a-z_-]{6,}\]$'                { [ConsoleColor]::Gray; break }
+        'FATAL|PANIC|error|HTTP\s+[45][0-9][0-9]' { [ConsoleColor]::Red; break }
+        'HTTP\s+3[0-9][0-9]|security guardrail' { [ConsoleColor]::Yellow; break }
+        'HTTP\s+2[0-9][0-9]|CACHE HIT|COMPLETED' { [ConsoleColor]::Green; break }
+        '->|<-'                                { [ConsoleColor]::White; break }
+        '^https?://'                           { [ConsoleColor]::Blue; break }
+        '^\$'                                  { [ConsoleColor]::Green; break }
+        '(?:ms|s|tok|tokens?|bytes?)$'         { [ConsoleColor]::Yellow; break }
+        default                                { $BaseColor }
+    }
+    return $color
+}
+
+function Write-ColorizedDaemonLog {
+    param([Parameter(Mandatory)][string]$Line)
+
+    $baseColor = Get-DaemonLogColor $Line
+    $matches = [regex]::Matches($Line, $script:DaemonLogTokenPattern)
+    if ($matches.Count -eq 0) {
+        Write-Host $Line -ForegroundColor $baseColor
+        return
+    }
+
+    $offset = 0
+    foreach ($match in $matches) {
+        if ($match.Index -gt $offset) {
+            Write-Host $Line.Substring($offset, $match.Index - $offset) -NoNewline -ForegroundColor $baseColor
+        }
+        $tokenColor = Get-DaemonLogTokenColor $match.Value $baseColor
+        Write-Host $match.Value -NoNewline -ForegroundColor $tokenColor
+        $offset = $match.Index + $match.Length
+    }
+    if ($offset -lt $Line.Length) {
+        Write-Host $Line.Substring($offset) -NoNewline -ForegroundColor $baseColor
+    }
+    Write-Host
+}
+
 try {
     Write-Host "==> starting daemon on :$daemonPort (multi-project workspace hub)" -ForegroundColor Cyan
     $daemonArgs = @(
@@ -158,21 +239,7 @@ try {
                     $reader = New-Object System.IO.StreamReader($file)
                     while (-not $reader.EndOfStream) {
                         $line = $reader.ReadLine()
-                        if ($line -match '\[PROXY\]') {
-                            Write-Host $line -ForegroundColor Magenta
-                        } elseif ($line -match 'proxy:') {
-                            Write-Host $line -ForegroundColor DarkMagenta
-                        } elseif ($line -match '\[API\]') {
-                            Write-Host $line -ForegroundColor Cyan
-                        } elseif ($line -match '\[OTLP\]') {
-                            Write-Host $line -ForegroundColor Yellow
-                        } elseif ($line -match '\[WS\]') {
-                            Write-Host $line -ForegroundColor Blue
-                        } elseif ($line -match 'error|FATAL|PANIC') {
-                            Write-Host $line -ForegroundColor Red
-                        } else {
-                            Write-Host $line -ForegroundColor DarkGray
-                        }
+                        Write-ColorizedDaemonLog $line
                     }
                     $logOffset = $file.Position
                 }

@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import {
   Network,
   Plus,
@@ -51,7 +51,7 @@ import {
   Cell,
 } from 'recharts';
 import type { ProxyRoute, ProxyTrafficRecord, Project } from '../types';
-import { useProxyRoutes, useModelCatalog, useProxyTraffic } from '../hooks/useMetrics';
+import { useProxyRoutes, useModelCatalog, useProxyTraffic, useProxyTrafficDetail } from '../hooks/useMetrics';
 
 interface ProxyRoutingViewProps {
   currentProject?: Project | null;
@@ -334,7 +334,15 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
     }));
   }, [traffic]);
 
-  const activeSelectedTraffic = selectedTraffic || (filteredTraffic.length > 0 ? filteredTraffic[0] : null);
+  useEffect(() => {
+    if (!selectedTraffic && filteredTraffic.length > 0) {
+      setSelectedTraffic(filteredTraffic[0]);
+    }
+  }, [filteredTraffic, selectedTraffic]);
+
+  const selectedTrafficSummary = selectedTraffic;
+  const selectedTrafficDetail = useProxyTrafficDetail(selectedTrafficSummary?.id);
+  const activeSelectedTraffic = selectedTrafficDetail.data ?? selectedTrafficSummary;
 
   const handleCopy = (id: string, text: string) => {
     navigator.clipboard.writeText(text);

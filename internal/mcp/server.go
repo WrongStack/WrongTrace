@@ -10,12 +10,24 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/wrongstack/wrongtrace/internal/core"
 	"github.com/wrongstack/wrongtrace/internal/db"
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 )
+
+var serverVersion = "dev"
+
+// SetVersion supplies the release version injected into the CLI via ldflags.
+// Keeping the default preserves source/test builds while release binaries
+// report one consistent version across CLI, IPC, and MCP discovery surfaces.
+func SetVersion(v string) {
+	if v = strings.TrimSpace(v); v != "" {
+		serverVersion = v
+	}
+}
 
 // EngineSink is the subset of the core Engine used by the MCP server.
 type EngineSink interface {
@@ -130,7 +142,7 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			"protocolVersion": "2024-11-05",
 			"serverInfo": map[string]string{
 				"name":    "wrongtrace",
-				"version": "dev",
+				"version": serverVersion,
 			},
 			"capabilities": map[string]interface{}{
 				"tools": map[string]interface{}{},

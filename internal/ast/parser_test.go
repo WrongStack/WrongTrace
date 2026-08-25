@@ -266,15 +266,18 @@ func TestParse_MultiLanguage(t *testing.T) {
 	if _, ok := py.Nodes["class:app.py::Bar"]; !ok {
 		t.Errorf("python class missing; got %+v", py.SortedSignatures())
 	}
+	if _, ok := py.Nodes["function:app.py::Bar.m"]; !ok {
+		t.Errorf("python class method missing scoped identity; got %+v", py.SortedSignatures())
+	}
 
-	ts := parseOrFatal(t, eng, "mod.ts", "export function bar() { return 1 }\n\nclass Qux {\n  m() { return 2 }\n}\nconst h = () => 3\n")
+	ts := parseOrFatal(t, eng, "mod.ts", "export function bar(input: string): number { return input.length }\n\nclass Qux {\n  m(): number { return 2 }\n}\nconst h = (value: number): number => value + 3\n")
 	if _, ok := ts.Nodes["function:mod.ts::bar"]; !ok {
 		t.Errorf("ts function missing; got %+v", ts.SortedSignatures())
 	}
 	if _, ok := ts.Nodes["class:mod.ts::Qux"]; !ok {
 		t.Errorf("ts class missing; got %+v", ts.SortedSignatures())
 	}
-	if _, ok := ts.Nodes["method:mod.ts::m"]; !ok {
+	if _, ok := ts.Nodes["method:mod.ts::Qux.m"]; !ok {
 		t.Errorf("ts method missing; got %+v", ts.SortedSignatures())
 	}
 	if _, ok := ts.Nodes["arrow_function:mod.ts::h"]; !ok {

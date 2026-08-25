@@ -75,7 +75,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 
 		for _, sig := range next.SortedSignatures() {
 			n := next.Nodes[sig]
-			diff, added, deleted := formatAddedDiff(n.Body)
+			diff, added, deleted := formatAddedDiff(nodeBody(next, n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -106,7 +106,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 
 		for _, sig := range prev.SortedSignatures() {
 			n := prev.Nodes[sig]
-			diff, added, deleted := formatDeletedDiff(n.Body)
+			diff, added, deleted := formatDeletedDiff(nodeBody(prev, n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     prev.Path,
@@ -148,7 +148,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	for _, sig := range prevSigs {
 		if _, ok := nextSet[sig]; !ok {
 			n := prev.Nodes[sig]
-			diff, added, deleted := formatDeletedDiff(n.Body)
+			diff, added, deleted := formatDeletedDiff(nodeBody(prev, n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     prev.Path,
@@ -172,7 +172,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	for _, sig := range nextSigs {
 		newNode := next.Nodes[sig]
 		if _, existed := prevSet[sig]; !existed {
-			diff, added, deleted := formatAddedDiff(newNode.Body)
+			diff, added, deleted := formatAddedDiff(nodeBody(next, newNode))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -192,7 +192,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		}
 		oldNode := prev.Nodes[sig]
 		if oldNode.Hash != newNode.Hash {
-			diff, added, deleted := generateLineDiff(oldNode.Body, newNode.Body)
+			diff, added, deleted := generateLineDiff(nodeBody(prev, oldNode), nodeBody(next, newNode))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -218,6 +218,17 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 
 	res.NewSnap = next
 	return res
+}
+
+// nodeBody resolves a native parser node directly from the snapshot's single
+// raw source allocation. Generic parsers and hand-built test snapshots retain
+// Body as a compatibility fallback. This avoids keeping a second string copy
+// for every function/class in large workspaces.
+func nodeBody(snap *FileSnapshot, n Node) string {
+	if snap != nil && n.EndByte > n.StartByte && n.EndByte <= uint32(len(snap.RawContent)) {
+		return snap.RawContent[n.StartByte:n.EndByte]
+	}
+	return n.Body
 }
 
 func actionRank(a Action) int {

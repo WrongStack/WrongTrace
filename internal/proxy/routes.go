@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,10 +41,22 @@ func NewRouteManager() *RouteManager {
 func (rm *RouteManager) AllRoutes() []ProxyRoute {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
+	return rm.sortedRoutesLocked()
+}
+
+func (rm *RouteManager) sortedRoutesLocked() []ProxyRoute {
 	out := make([]ProxyRoute, 0, len(rm.routes))
 	for _, r := range rm.routes {
 		out = append(out, r)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		left := len(strings.Trim(out[i].PathPrefix, "/"))
+		right := len(strings.Trim(out[j].PathPrefix, "/"))
+		if left != right {
+			return left > right
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -53,7 +66,7 @@ func (rm *RouteManager) UpsertRoute(r ProxyRoute) ProxyRoute {
 	defer rm.mu.Unlock()
 
 	if r.ID == "" {
-		r.ID = "route-" + randomID("")
+		r.ID = randomID("route")
 	}
 	if !strings.HasPrefix(r.PathPrefix, "/") {
 		r.PathPrefix = "/" + r.PathPrefix
@@ -84,7 +97,7 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 	normPath := "/" + strings.Trim(filepath.ToSlash(path), "/")
 	lowerPath := strings.ToLower(normPath)
 
-	for _, r := range rm.routes {
+	for _, r := range rm.sortedRoutesLocked() {
 		if !r.Enabled {
 			continue
 		}
@@ -155,14 +168,13 @@ func (rm *RouteManager) saveDisk() {
 	p := routesJSONPath()
 	_ = os.MkdirAll(filepath.Dir(p), 0o755)
 
-	list := make([]ProxyRoute, 0, len(rm.routes))
-	for _, r := range rm.routes {
-		list = append(list, r)
-	}
+	list := rm.sortedRoutesLocked()
 
 	data, err := json.MarshalIndent(map[string]interface{}{"routes": list}, "", "  ")
 	if err == nil {
-		_ = os.WriteFile(p, data, 0o644)
+		if os.WriteFile(p, data, 0o600) == nil {
+			_ = os.Chmod(p, 0o600)
+		}
 	}
 }
 

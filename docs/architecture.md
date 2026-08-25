@@ -74,9 +74,10 @@ flowchart TD
 
 ### 4. Transparent AI Gateway Proxy (`internal/proxy/`)
 * **Live Ingestion**: Intercepts OpenAI, Anthropic, Gemini, DeepSeek, Groq, Mistral, and custom endpoints.
-* **Exact Response Caching (`internal/proxy/cache.go`)**: Deterministic SHA-256 hash-keyed LRU cache. Returns identical cached completions in `<2ms` at **$0 token cost**, boosting throughput and saving API budgets.
-* **Real-time Secret & Leak Scanner (`internal/proxy/scanner.go`)**: Masks AWS keys, GitHub tokens, database connection credentials, and `.env` private keys before outgoing payloads reach cloud LLMs.
-* **Token Budget & Quota Guardrail (`internal/proxy/quota.go`)**: Enforces daily spending limits per project/agent with `429 Quota Exceeded` protection.
+* **Opt-in Scoped Response Caching (`internal/proxy/cache.go`)**: Requests must send `X-WrongTrace-Cache: allow`. Deterministic SHA-256 keys include a one-way credential/project/agent/session scope so cached completions cannot cross those boundaries.
+* **Explicit Policy Mode**: Normal proxying is byte-preserving. `X-WrongTrace-Policy: enforce` enables all mutating/interrupting behavior, including secret redaction, quota blocking, OpenAI usage-option injection, and missing terminal-marker repair.
+* **Real-time Secret & Leak Scanner (`internal/proxy/scanner.go`)**: In policy mode, masks AWS keys, GitHub tokens, database connection credentials, and `.env` private keys before outgoing payloads reach cloud LLMs.
+* **Token Budget & Quota Guardrail (`internal/proxy/quota.go`)**: In policy mode, enforces daily spending limits per project/agent with `429 Quota Exceeded` protection.
 * **Deep Wire Telemetry**: Extracts token usage, thinking blocks (`<think>`), tool calls, and prompt cache hit rates (`cache_read_input_tokens`).
 
 ---

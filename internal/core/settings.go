@@ -36,7 +36,7 @@ var (
 		CostAlertUSD:       25.0,
 		AutoPruneDays:      90,
 		DefaultProvider:    "OpenAI",
-		Version:            "0.3.6",
+		Version:            "0.3.7",
 	}
 )
 
@@ -89,7 +89,9 @@ func saveSettingsToDisk(s AppSettings) {
 	path := settingsFilePath()
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	if data, err := json.MarshalIndent(s, "", "  "); err == nil {
-		_ = os.WriteFile(path, data, 0o644)
+		if os.WriteFile(path, data, 0o600) == nil {
+			_ = os.Chmod(path, 0o600)
+		}
 	}
 }
 

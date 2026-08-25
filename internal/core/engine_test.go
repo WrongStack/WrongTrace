@@ -89,7 +89,7 @@ func TestReportRun_RegistersAndPersists(t *testing.T) {
 	}
 }
 
-func TestRecentRunID_LastSeenWins(t *testing.T) {
+func TestRecentRunID_ConcurrentRunsAreAmbiguous(t *testing.T) {
 	e, _ := newTestEngine(t)
 
 	if got := e.recentRunID(); got != "" {
@@ -104,12 +104,43 @@ func TestRecentRunID_LastSeenWins(t *testing.T) {
 		t.Fatalf("report r-second: %v", err)
 	}
 
-	if got := e.recentRunID(); got != "r-second" {
-		t.Errorf("recentRunID = %q, want r-second (last-seen wins)", got)
+	if got := e.recentRunID(); got != "" {
+		t.Errorf("recentRunID = %q, want empty for concurrent runs", got)
 	}
 	// Both stay active within the window.
 	if n := len(e.ActiveRuns()); n != 2 {
 		t.Errorf("active runs = %d, want 2", n)
+	}
+}
+
+func TestFileOperationRunID_PathScoped(t *testing.T) {
+	e, _ := newTestEngine(t)
+	now := time.Now().UTC()
+	e.RegisterFileOperation("src/a.go", "run-a", now)
+	e.RegisterFileOperation("src/b.go", "run-b", now)
+
+	if got := e.fileOperationRunID("src/a.go", now.Add(time.Second)); got != "run-a" {
+		t.Fatalf("a.go attribution = %q, want run-a", got)
+	}
+	if got := e.fileOperationRunID("src/b.go", now.Add(time.Second)); got != "run-b" {
+		t.Fatalf("b.go attribution = %q, want run-b", got)
+	}
+	if got := e.fileOperationRunID("src/c.go", now.Add(time.Second)); got != "" {
+		t.Fatalf("unregistered path attribution = %q, want empty", got)
+	}
+}
+
+func TestFileOperationRunID_AmbiguousSamePathIsUnknownAndConsumed(t *testing.T) {
+	e, _ := newTestEngine(t)
+	now := time.Now().UTC()
+	e.RegisterFileOperation("src/shared.go", "run-a", now)
+	e.RegisterFileOperation("src/shared.go", "run-b", now.Add(time.Millisecond))
+
+	if got := e.fileOperationRunID("src/shared.go", now.Add(time.Second)); got != "" {
+		t.Fatalf("ambiguous same-path operations attributed to %q", got)
+	}
+	if got := e.fileOperationRunID("src/shared.go", now.Add(2*time.Second)); got != "" {
+		t.Fatalf("consumed ambiguous hint was reused as %q", got)
 	}
 }
 

@@ -86,23 +86,25 @@ type RunRecord struct {
 // types (no sql.Null*) keep JSON serialization clean; NULL handling happens
 // locally inside the scan/insert helpers.
 type EventRecord struct {
-	EventID      string    `json:"event_id"`
-	RunID        string    `json:"run_id"`
-	RepoName     string    `json:"repo_name"`
-	FilePath     string    `json:"file_path"`
-	Signature    string    `json:"node_signature"`
-	NodeType     string    `json:"node_type"`
-	Action       string    `json:"action"`
-	BodyHash     string    `json:"ast_content_hash"`
-	LOC          int       `json:"lines_of_code"`
-	StartLine    uint32    `json:"start_line"`
-	EndLine      uint32    `json:"end_line"`
-	DiffSnippet  string    `json:"diff_snippet"`
-	AddedLines   int       `json:"added_lines"`
-	DeletedLines int       `json:"deleted_lines"`
-	AuthorModel  string    `json:"author_model,omitempty"`
-	OccurredAt   time.Time `json:"event_time"`
-	Timestamp    time.Time `json:"timestamp,omitempty"`
+	EventID               string    `json:"event_id"`
+	RunID                 string    `json:"run_id"`
+	RepoName              string    `json:"repo_name"`
+	FilePath              string    `json:"file_path"`
+	Signature             string    `json:"node_signature"`
+	NodeType              string    `json:"node_type"`
+	Action                string    `json:"action"`
+	BodyHash              string    `json:"ast_content_hash"`
+	LOC                   int       `json:"lines_of_code"`
+	StartLine             uint32    `json:"start_line"`
+	EndLine               uint32    `json:"end_line"`
+	DiffSnippet           string    `json:"diff_snippet"`
+	AddedLines            int       `json:"added_lines"`
+	DeletedLines          int       `json:"deleted_lines"`
+	AttributionSource     string    `json:"attribution_source"`
+	AttributionConfidence float64   `json:"attribution_confidence"`
+	AuthorModel           string    `json:"author_model,omitempty"`
+	OccurredAt            time.Time `json:"event_time"`
+	Timestamp             time.Time `json:"timestamp,omitempty"`
 }
 
 // UpsertRun inserts an agent_run, replacing any existing row with the same
@@ -152,8 +154,8 @@ func (s *Store) InsertEvent(e EventRecord) error {
 		INSERT INTO code_node_events
 			(event_id, run_id, repo_name, file_path, node_signature, node_type, action,
 			 ast_content_hash, lines_of_code, start_line, end_line, diff_snippet,
-			 added_lines, deleted_lines, event_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+			 added_lines, deleted_lines, attribution_source, attribution_confidence, event_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
 	`
 	var runID any
 	if e.RunID != "" {
@@ -163,10 +165,13 @@ func (s *Store) InsertEvent(e EventRecord) error {
 	if e.BodyHash != "" {
 		bodyHash = e.BodyHash
 	}
+	if e.AttributionSource == "" {
+		e.AttributionSource = "unknown"
+	}
 	_, err := s.db.ExecContext(ctx, q,
 		e.EventID, runID, e.RepoName, e.FilePath, e.Signature, e.NodeType,
 		e.Action, bodyHash, e.LOC, e.StartLine, e.EndLine, e.DiffSnippet,
-		e.AddedLines, e.DeletedLines, fmtDBTime(e.OccurredAt),
+		e.AddedLines, e.DeletedLines, e.AttributionSource, e.AttributionConfidence, fmtDBTime(e.OccurredAt),
 	)
 	if err != nil {
 		return fmt.Errorf("insert event %s: %w", e.EventID, err)
@@ -226,6 +231,7 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 		       e.action, COALESCE(e.ast_content_hash, ''), e.lines_of_code,
 		       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
 		       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
+		       COALESCE(e.attribution_source, 'unknown'), COALESCE(e.attribution_confidence, 0.0),
 		       COALESCE(r.model_name, 'unknown') AS author_model
 		FROM code_node_events e
 		LEFT JOIN agent_runs r ON e.run_id = r.run_id
@@ -252,6 +258,7 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 		if err := rows.Scan(&e.EventID, runID, &e.RepoName, &e.FilePath,
 			&e.Signature, &e.NodeType, &e.Action, bodyHash, &e.LOC,
 			&e.StartLine, &e.EndLine, &e.DiffSnippet, &e.AddedLines, &e.DeletedLines, &ts,
+			&e.AttributionSource, &e.AttributionConfidence,
 			&e.AuthorModel); err != nil {
 			return nil, fmt.Errorf("scan recent event: %w", err)
 		}
@@ -1663,6 +1670,9 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 				LAG(e.event_time) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time) AS author_time
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+			WHERE e.run_id IS NOT NULL
+			  AND e.run_id <> ''
+			  AND COALESCE(e.attribution_confidence, 0.0) >= 0.8
 		)
 		SELECT 
 			event_id, file_path, node_signature, action, added_lines, deleted_lines,

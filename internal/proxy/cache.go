@@ -53,10 +53,19 @@ func NewResponseCache(maxEntries int, defaultTTL time.Duration) *ResponseCache {
 
 // ComputeKey calculates a deterministic SHA-256 hash of the provider, model, and sanitized request body.
 func ComputeKey(provider, model string, body []byte) string {
+	return ComputeScopedKey(provider, model, "", body)
+}
+
+// ComputeScopedKey isolates identical prompts sent by different projects,
+// agents, or credentials. The scope passed by the gateway is already a hash;
+// no authorization material is retained in cache keys or traffic records.
+func ComputeScopedKey(provider, model, scope string, body []byte) string {
 	hasher := sha256.New()
 	_, _ = io.WriteString(hasher, provider)
 	_, _ = io.WriteString(hasher, ":")
 	_, _ = io.WriteString(hasher, model)
+	_, _ = io.WriteString(hasher, ":")
+	_, _ = io.WriteString(hasher, scope)
 	_, _ = io.WriteString(hasher, ":")
 	hasher.Write(body)
 	return hex.EncodeToString(hasher.Sum(nil))

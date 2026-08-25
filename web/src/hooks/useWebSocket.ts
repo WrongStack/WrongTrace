@@ -4,16 +4,17 @@ import type { WSMessage } from '../types';
 // useWebSocket subscribes to /api/ws and emits parsed messages. It
 // auto-reconnects with exponential backoff (capped at 8s) so transient
 // daemon restarts do not require a page refresh.
-export function useWebSocket(): {
+export function useWebSocket(onMessage?: (message: WSMessage) => void): {
   connected: boolean;
-  lastMessage: WSMessage | null;
 } {
   const [connected, setConnected] = useState(false);
-  const [lastMessage, setLastMessage] = useState<WSMessage | null>(null);
+  const onMessageRef = useRef(onMessage);
   const retryRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedRef = useRef(false);
+
+  onMessageRef.current = onMessage;
 
   useEffect(() => {
     stoppedRef.current = false;
@@ -32,7 +33,7 @@ export function useWebSocket(): {
       ws.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data) as WSMessage;
-          setLastMessage(data);
+          onMessageRef.current?.(data);
         } catch {
           // ignore malformed frames
         }
@@ -68,5 +69,5 @@ export function useWebSocket(): {
     };
   }, []);
 
-  return { connected, lastMessage };
+  return { connected };
 }

@@ -4,10 +4,10 @@
 
 **Universal AI Observability, AST Churn Intelligence, and Model Telemetry Hub for Autonomous Coding Agents.**
 
-Watches your code with Tree-sitter, correlates AST-level edits with the agent runs that produced them, ingests OpenTelemetry/profiler runtime traces, tracks inter-agent code collisions ("Who Broke Whose Code?"), provides an interactive Code Atlas with full-screen graph visualization, serves an embedded React dashboard, and operates a transparent AI Gateway — all from a single, high-performance Go binary.
+Watches your code with Tree-sitter, correlates AST-level edits with path-scoped agent tool operations, ingests OpenTelemetry/profiler runtime traces, tracks inter-agent code collisions ("Who Broke Whose Code?"), provides an interactive Code Atlas with full-screen graph visualization, serves an embedded React dashboard, and operates an AI Gateway observer — all from a single, high-performance Go binary.
 
-[![Version](https://img.shields.io/badge/Version-0.3.6-blue.svg?style=flat)](CHANGELOG.md)
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Version](https://img.shields.io/badge/Version-0.3.7-blue.svg?style=flat)](CHANGELOG.md)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-purple.svg)](LICENSE)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat&logo=react)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-7.0-3178C6?style=flat&logo=typescript)](https://www.typescriptlang.org)
@@ -28,7 +28,7 @@ Watches your code with Tree-sitter, correlates AST-level edits with the agent ru
 6. **🔍 Semantic AST Churn & Accurate Multi-Line Diffing** — Tracks code transformations via Tree-sitter AST diffing across 11+ languages with exact `+AddedLines / -DeletedLines` granularity, filtering out cosmetic formatting churn.
 7. **🤖 Universal Auto-Discovery for 20+ Coding Agents** — Zero-config transcript ingestion for WrongStack, Antigravity, Claude Code, Cursor, Windsurf, Cline/Roo, MiniMax Code, Kimi Code (Moonshot), ZCode, Devin, Trae, Goose, OpenHands, GitHub Copilot, Aider, Continue, and more.
 8. **🛡️ Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, `unlock_file`, `report_file_read`, and `get_file_read_stats`.
-9. **🌐 Transparent AI Gateway & Wire Telemetry** — Intercepts and analyzes raw LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens, budget quotas, and prompt cache savings.
+9. **🌐 AI Gateway & Wire Telemetry** — Relays and analyzes LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens, budget quotas, and optional scoped response-cache savings.
 10. **⚡ Universal Profiler & Runtime Traces** — Ingests OpenTelemetry (OTLP) traces, pprof profiles, and test execution latencies, correlating runtime hotspots directly with AI code changes.
 
 ---
@@ -179,6 +179,14 @@ export ANTHROPIC_BASE_URL="http://localhost:3444/proxy/api.anthropic.com"
 export GEMINI_API_BASE="http://localhost:3444/proxy/generativelanguage.googleapis.com"
 ```
 
+Response caching is disabled unless a request explicitly sends
+`X-WrongTrace-Cache: allow`. Cache keys are isolated by credential, project,
+agent, and session scope; authorization material itself is never stored.
+
+The gateway is byte-preserving by default. Secret redaction, quota blocking,
+OpenAI usage-option injection, and missing terminal-marker repair are mutating
+guardrails and require `X-WrongTrace-Policy: enforce`.
+
 ---
 
 ## 📄 License & Commercial Terms
@@ -190,5 +198,3 @@ WrongTrace is licensed under the **[Business Source License 1.1 (BUSL-1.1)](LICE
 * **Automatic Open Source Conversion**: Converts automatically to standard **Apache License, Version 2.0** on `2030-01-01`.
 
 For enterprise licensing and hosted deployment inquiries, visit **[github.com/wrongstack](https://github.com/wrongstack)**.
-
-

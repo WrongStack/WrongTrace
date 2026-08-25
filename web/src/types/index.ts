@@ -69,13 +69,8 @@ export function formatCleanModel(modelName?: string | null, agentName?: string |
   if (!isJunkModel(modelName) && modelName) {
     return modelName;
   }
-  const ag = (agentName || '').toLowerCase();
-  if (ag.includes('antigravity') || ag.includes('gemini')) return 'gemini-3.7-flash';
-  if (ag.includes('claude')) return 'claude-3-7-sonnet';
-  if (ag.includes('aider')) return 'gpt-4o';
-  if (ag.includes('cline') || ag.includes('roo')) return 'claude-3-7-sonnet';
-  if (ag.includes('cursor') || ag.includes('windsurf') || ag.includes('trae') || ag.includes('wrongstack')) return 'claude-3-7-sonnet';
-  return 'claude-3-7-sonnet';
+  void agentName;
+  return 'unknown-model';
 }
 
 export interface EventRecord {
@@ -93,6 +88,9 @@ export interface EventRecord {
   diff_snippet?: string;
   added_lines?: number;
   deleted_lines?: number;
+  attribution_source?: 'tool_path' | 'single_active_run' | 'unknown';
+  attribution_confidence?: number;
+  author_model?: string;
   event_time: string;
 }
 
@@ -185,6 +183,9 @@ export type WSMessage =
   | { type: 'project_switched'; payload: Project; at?: string }
   | { type: 'proxy_traffic'; payload: ProxyTrafficRecord; at?: string }
   | { type: 'profiler_trace'; payload: RuntimeTrace; at?: string }
+	| { type: 'file_read_event'; payload: FileReadRecord; event_id?: string; at?: string }
+	| { type: 'index_progress'; payload: IndexProgress; at?: string }
+	| { type: 'ipc_traffic'; payload: IPCTrafficRecord; event_id?: string; at?: string }
   | { type: 'metrics_refresh'; payload: MetricsSnapshot; at: string };
 
 export interface WsCodeEvent {

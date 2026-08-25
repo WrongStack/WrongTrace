@@ -3,8 +3,10 @@ package proxy
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -138,10 +140,10 @@ func NewGatewayProxy(cfg Config) *GatewayProxy {
 		},
 		providers:  providers,
 		Routes:     NewRouteManager(),
-		Cache:      NewResponseCache(500, 24*time.Hour),
+		Cache:      NewResponseCache(128, 24*time.Hour),
 		Quotas:     NewQuotaLimiter(),
 		trafficLog: make([]ProxyTrafficRecord, 0, 100),
-		maxTraffic: 200,
+		maxTraffic: 100,
 		sessions:   make(map[string]*proxySessionTracker),
 	}
 }
@@ -159,6 +161,35 @@ func (p *GatewayProxy) AllTraffic(limit int) []ProxyTrafficRecord {
 		out[i] = p.trafficLog[len(p.trafficLog)-1-i]
 	}
 	return out
+}
+
+// TrafficSummaries returns recent records without the large request/response
+// payload fields. The dashboard list and charts only need metadata; full wire
+// content is fetched for the single record opened in the inspector.
+func (p *GatewayProxy) TrafficSummaries(limit int) []ProxyTrafficRecord {
+	out := p.AllTraffic(limit)
+	for i := range out {
+		out[i].RequestHeaders = nil
+		out[i].RequestBody = ""
+		out[i].ResponseHeaders = nil
+		out[i].ResponseBody = ""
+		out[i].AssistantReply = ""
+		out[i].Reasoning = ""
+		out[i].SystemPrompt = ""
+	}
+	return out
+}
+
+// Traffic returns one full traffic record by ID for the detail inspector.
+func (p *GatewayProxy) Traffic(id string) (ProxyTrafficRecord, bool) {
+	p.trafficMu.RLock()
+	defer p.trafficMu.RUnlock()
+	for i := len(p.trafficLog) - 1; i >= 0; i-- {
+		if p.trafficLog[i].ID == id {
+			return p.trafficLog[i], true
+		}
+	}
+	return ProxyTrafficRecord{}, false
 }
 
 // ClearTraffic empties the in-memory traffic ring buffer.
@@ -473,10 +504,16 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Real-time Secret Scanner: sanitize leaked API keys or passwords before sending to cloud LLMs
-	reqBody, redactedSecrets := ScanAndRedactSecrets(reqBody)
-	if redactedSecrets > 0 {
-		log.Printf("[PROXY] [%s] security guardrail redacted %d secret(s) in outgoing payload to %s", reqID, redactedSecrets, provider)
+	// Observation is byte-preserving by default. Mutating guardrails are an
+	// explicit policy mode so the gateway can also operate as a transparent
+	// recorder in front of arbitrary provider protocols.
+	policyEnabled := strings.EqualFold(r.Header.Get("X-WrongTrace-Policy"), "enforce")
+	if policyEnabled {
+		var redactedSecrets int
+		reqBody, redactedSecrets = ScanAndRedactSecrets(reqBody)
+		if redactedSecrets > 0 {
+			log.Printf("[PROXY] [%s] security guardrail redacted %d secret(s) in outgoing payload to %s", reqID, redactedSecrets, provider)
+		}
 	}
 	r.Body = io.NopCloser(bytes.NewReader(reqBody))
 
@@ -551,17 +588,19 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if quotaKey == "" {
 		quotaKey = agentName
 	}
-	if allowed, _, quotaMsg := p.Quotas.CheckSpend(quotaKey, 0.0); !allowed {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": quotaMsg,
-				"type":    "quota_exceeded_error",
-				"code":    429,
-			},
-		})
-		return
+	if policyEnabled {
+		if allowed, _, quotaMsg := p.Quotas.CheckSpend(quotaKey, 0.0); !allowed {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": quotaMsg,
+					"type":    "quota_exceeded_error",
+					"code":    429,
+				},
+			})
+			return
+		}
 	}
 
 	// Automatically inject stream_options.include_usage for OpenAI-compatible
@@ -569,7 +608,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// cache key is hashed from the forwarded body, so mutating it afterwards
 	// stored entries under a key no lookup could ever hit.
 	isStream := parsedReq.Stream || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
-	if isStream && bytes.Contains(reqBody, []byte(`"stream"`)) && !bytes.Contains(reqBody, []byte(`"stream_options"`)) {
+	if policyEnabled && isStream && bytes.Contains(reqBody, []byte(`"stream"`)) && !bytes.Contains(reqBody, []byte(`"stream_options"`)) {
 		var reqMap map[string]interface{}
 		if err := json.Unmarshal(reqBody, &reqMap); err == nil {
 			reqMap["stream_options"] = map[string]interface{}{
@@ -582,8 +621,9 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Exact Response Cache Lookup (on the final forwarded body)
-	bypassCache := r.Header.Get("Cache-Control") == "no-cache" || r.Header.Get("X-Bypass-Cache") == "true"
-	cacheKey := ComputeKey(provider, modelName, reqBody)
+	cacheEnabled := strings.EqualFold(r.Header.Get("X-WrongTrace-Cache"), "allow") || strings.EqualFold(r.Header.Get("X-WrongTrace-Cache"), "true")
+	bypassCache := !cacheEnabled || r.Header.Get("Cache-Control") == "no-cache" || r.Header.Get("X-Bypass-Cache") == "true"
+	cacheKey := ComputeScopedKey(provider, modelName, requestCacheScope(r), reqBody)
 
 	if !bypassCache && p.Cache != nil {
 		if cached, hit := p.Cache.Get(cacheKey); hit {
@@ -623,7 +663,30 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				CacheHitRate:    100.0,
 				CostUSD:         0.0, // $0 cost because served from exact cache!
 				CacheSavingsUSD: cached.CostSavedUSD,
-				AssistantReply:  userIntent,
+			}
+			analysis := AnalyzeWirePayloads(reqBody, cached.Body, cached.IsStream)
+			if analysis.WireModel != "" && (rec.Model == "" || rec.Model == "unknown-model") {
+				rec.Model = analysis.WireModel
+			}
+			// A cached provider payload reuses the original wire ID. Keep this
+			// request's px-* ID unique so traffic detail links are unambiguous.
+			if analysis.PromptTokens > 0 || analysis.CompletionTokens > 0 {
+				rec.PromptTokens = analysis.PromptTokens
+				rec.CompletionTokens = analysis.CompletionTokens
+				rec.TotalTokens = analysis.PromptTokens + analysis.CompletionTokens
+				rec.CachedTokens = rec.TotalTokens
+			}
+			rec.ReasoningTokens = analysis.ReasoningTokens
+			rec.ToolCalls = analysis.ToolCalls
+			rec.ToolCount = analysis.ToolCount
+			rec.AssistantReply = analysis.AssistantReply
+			rec.Reasoning = analysis.Reasoning
+			rec.SystemPrompt = analysis.SystemPrompt
+			rec.MessageCount = analysis.MessageCount
+			rec.FinishReason = analysis.FinishReason
+			runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, rec.PromptTokens, rec.CompletionTokens, 0, userIntent)
+			if runID != "" {
+				rec.RunID = runID
 			}
 			p.recordTraffic(rec)
 			return
@@ -723,9 +786,9 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	baseRecord.IsStream = isStream
 
 	if isStream {
-		p.handleStreamingResponse(w, resp.Body, baseRecord, userIntent, cacheKey)
+		p.handleStreamingResponse(w, resp.Body, baseRecord, userIntent, cacheKey, cacheEnabled, policyEnabled)
 	} else {
-		p.handleJSONResponse(w, resp.Body, baseRecord, userIntent, cacheKey)
+		p.handleJSONResponse(w, resp.Body, baseRecord, userIntent, cacheKey, cacheEnabled)
 	}
 }
 
@@ -774,10 +837,17 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 // the exchange. cacheKey is the lookup-time response-cache key; reusing it for
 // the store (instead of recomputing from rec.RequestBody/rec.Model, which
 // analysis may have rewritten) is what makes future lookups actually hit.
-func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent, cacheKey string) {
-	respBytes, err := io.ReadAll(body)
+func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent, cacheKey string, cacheEnabled bool) {
+	const maxResponseBytes = 32 * 1024 * 1024
+	respBytes, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
 	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
+		w.Header().Del("Content-Length")
+		http.Error(w, "cannot read upstream response", http.StatusBadGateway)
+		return
+	}
+	if len(respBytes) > maxResponseBytes {
+		w.Header().Del("Content-Length")
+		http.Error(w, "upstream response exceeds 32MB limit", http.StatusBadGateway)
 		return
 	}
 	w.WriteHeader(rec.StatusCode)
@@ -871,19 +941,23 @@ func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader,
 	}
 
 	// Save to response cache if successful
-	if rec.StatusCode == http.StatusOK && p.Cache != nil && len(respBytes) > 0 && cacheKey != "" {
+	if cacheEnabled && rec.StatusCode == http.StatusOK && p.Cache != nil && len(respBytes) > 0 && cacheKey != "" {
 		p.Cache.Set(cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, respBytes, false, promptTokens+completionTokens, costUSD, 24*time.Hour)
 	}
 }
 
-func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent, cacheKey string) {
+func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent, cacheKey string, cacheEnabled, policyEnabled bool) {
 	w.WriteHeader(rec.StatusCode)
 	flusher, isFlusher := w.(http.Flusher)
 	buf := make([]byte, 4096)
 
 	var promptTokens, completionTokens int64
-	var capturedBuffer strings.Builder
-	const maxCapturedBytes = 1024 * 1024 // 1MB cap for in-memory analysis buffer
+	var capturedHead bytes.Buffer
+	var capturedTail []byte
+	const maxCapturedBytes = 1024 * 1024
+	const capturedHeadBytes = maxCapturedBytes * 3 / 4
+	const capturedTailBytes = maxCapturedBytes - capturedHeadBytes
+	cleanEOF := false
 
 	for {
 		n, err := body.Read(buf)
@@ -895,26 +969,33 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 			if isFlusher {
 				flusher.Flush()
 			}
-			if capturedBuffer.Len()+n <= maxCapturedBytes {
-				capturedBuffer.Write(buf[:n])
+			chunk := buf[:n]
+			if capturedHead.Len() < capturedHeadBytes {
+				keep := capturedHeadBytes - capturedHead.Len()
+				if keep > len(chunk) {
+					keep = len(chunk)
+				}
+				capturedHead.Write(chunk[:keep])
+				chunk = chunk[keep:]
 			}
+			capturedTail = appendCappedTail(capturedTail, chunk, capturedTailBytes)
 		}
 		if err != nil {
+			cleanEOF = errors.Is(err, io.EOF)
 			break
 		}
 	}
 
-	fullSSE := capturedBuffer.String()
+	fullSSE := streamAnalysisPayload(capturedHead.Bytes(), capturedTail)
 
 	// Guarantee terminal marker: if upstream closed stream cleanly without [DONE], emit terminal marker
-	if strings.Contains(fullSSE, "data:") && !strings.Contains(fullSSE, "[DONE]") {
+	if policyEnabled && cleanEOF && expectsDoneMarker(rec) && strings.Contains(fullSSE, "data:") && !strings.Contains(fullSSE, "[DONE]") {
 		terminalMarker := []byte("data: [DONE]\n\n")
 		_, _ = w.Write(terminalMarker)
 		if isFlusher {
 			flusher.Flush()
 		}
-		capturedBuffer.Write(terminalMarker)
-		fullSSE = capturedBuffer.String()
+		fullSSE += string(terminalMarker)
 	}
 
 	// Perform deep wire traffic analysis on streamed response (SSE chunks + usage metadata)
@@ -948,6 +1029,7 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 	}
 
 	rec.ResponseBody = fullSSE
+	rec.DurationMs = time.Since(rec.Timestamp).Milliseconds()
 	rec.PromptTokens = promptTokens
 	rec.CompletionTokens = completionTokens
 	rec.TotalTokens = promptTokens + completionTokens
@@ -995,7 +1077,7 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 	}
 
 	// Save to response cache if successful
-	if rec.StatusCode == http.StatusOK && p.Cache != nil && len(fullSSE) > 0 && cacheKey != "" {
+	if cacheEnabled && rec.StatusCode == http.StatusOK && p.Cache != nil && len(fullSSE) > 0 && cacheKey != "" {
 		p.Cache.Set(cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, []byte(fullSSE), true, promptTokens+completionTokens, costUSD, 24*time.Hour)
 	}
 }
@@ -1015,10 +1097,71 @@ func maskHeaders(h http.Header) map[string]string {
 	return out
 }
 
+func requestCacheScope(r *http.Request) string {
+	if r == nil {
+		return "anonymous"
+	}
+	parts := []string{
+		r.Header.Get("Authorization"),
+		r.Header.Get("X-API-Key"),
+		r.Header.Get("X-Goog-Api-Key"),
+		r.Header.Get("Api-Key"),
+		r.Header.Get("Cookie"),
+		r.URL.Query().Get("key"),
+		r.URL.Query().Get("api_key"),
+		r.URL.Query().Get("access_token"),
+		r.Header.Get("X-Project-ID"),
+		r.Header.Get("X-Project-Slug"),
+		r.Header.Get("X-Agent-Name"),
+		r.Header.Get("X-Session-ID"),
+		r.Header.Get("X-Run-ID"),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
+func appendCappedTail(tail, chunk []byte, limit int) []byte {
+	if limit <= 0 || len(chunk) == 0 {
+		return tail
+	}
+	if len(chunk) >= limit {
+		return append(tail[:0], chunk[len(chunk)-limit:]...)
+	}
+	tail = append(tail, chunk...)
+	if len(tail) > limit {
+		copy(tail, tail[len(tail)-limit:])
+		tail = tail[:limit]
+	}
+	return tail
+}
+
+func streamAnalysisPayload(head, tail []byte) string {
+	if len(tail) == 0 {
+		return string(head)
+	}
+	// The tail can start in the middle of an SSE record. Drop that fragment so
+	// the final usage/message_stop records remain independently parseable.
+	if idx := bytes.IndexByte(tail, '\n'); idx >= 0 && idx+1 < len(tail) {
+		tail = tail[idx+1:]
+	}
+	return string(head) + "\n" + string(tail)
+}
+
+func expectsDoneMarker(rec ProxyTrafficRecord) bool {
+	path := strings.ToLower(rec.IncomingPath)
+	if strings.Contains(path, "/messages") || strings.Contains(path, "generatecontent") || strings.Contains(path, "streamgeneratecontent") {
+		return false
+	}
+	return strings.Contains(path, "chat/completions") || strings.Contains(path, "/responses")
+}
+
 // maskSecretValue redacts credential-bearing header values, keeping a short
 // prefix/suffix so operators can still identify which key was used.
 func maskSecretValue(k, val string) string {
 	lowerK := strings.ToLower(k)
+	if lowerK == "x-target-upstream" || lowerK == "x-upstream-base" || lowerK == "location" || lowerK == "referer" {
+		return sanitizeURLForRecord(val)
+	}
 	switch lowerK {
 	case "authorization", "x-api-key", "api-key", "x-goog-api-key",
 		"proxy-authorization", "cookie", "set-cookie", "x-auth-token", "x-session-token",
@@ -1125,7 +1268,8 @@ func maskJSONValue(v interface{}) interface{} {
 		}
 		return arr
 	case string:
-		return truncateRecordString(t)
+		redacted, _ := ScanAndRedactSecrets([]byte(t))
+		return truncateRecordString(string(redacted))
 	default:
 		return v
 	}
@@ -1169,7 +1313,8 @@ func maskNonJSONBody(body string) string {
 				}
 			}
 		}
-		b.WriteString(scrubErrorString(line))
+		redacted, _ := ScanAndRedactSecrets([]byte(scrubErrorString(line)))
+		b.Write(redacted)
 	}
 	return b.String()
 }

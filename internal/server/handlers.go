@@ -698,12 +698,41 @@ func (h *Handlers) DeleteProxyRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListProxyTraffic returns captured raw proxy traffic logs.
-func (h *Handlers) ListProxyTraffic(w http.ResponseWriter, _ *http.Request) {
+func (h *Handlers) ListProxyTraffic(w http.ResponseWriter, r *http.Request) {
 	if h.Proxy == nil {
 		writeJSON(w, http.StatusOK, []proxy.ProxyTrafficRecord{})
 		return
 	}
-	writeJSON(w, http.StatusOK, h.Proxy.AllTraffic(100))
+	limit := proxyTrafficLimit(r)
+	if r.URL.Query().Get("detail") == "false" {
+		writeJSON(w, http.StatusOK, h.Proxy.TrafficSummaries(limit))
+		return
+	}
+	writeJSON(w, http.StatusOK, h.Proxy.AllTraffic(limit))
+}
+
+// GetProxyTraffic returns the full wire payload for one selected traffic row.
+func (h *Handlers) GetProxyTraffic(w http.ResponseWriter, r *http.Request) {
+	if h.Proxy == nil {
+		writeError(w, http.StatusNotFound, "proxy traffic record not found")
+		return
+	}
+	record, ok := h.Proxy.Traffic(chi.URLParam(r, "id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "proxy traffic record not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, record)
+}
+
+func proxyTrafficLimit(r *http.Request) int {
+	limit := 25
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = min(parsed, 100)
+		}
+	}
+	return limit
 }
 
 // ClearProxyTraffic clears captured proxy traffic logs.

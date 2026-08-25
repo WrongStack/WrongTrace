@@ -18,12 +18,16 @@ type fileState struct {
 
 // SessionWatcher continuously scans or tails session logs in well-known agent directories.
 type SessionWatcher struct {
-	mu          sync.Mutex
-	watchPaths  []string
-	seenFiles   map[string]fileState
-	seenOffsets map[string]int64
-	onToolCall  func(ToolCallEvent)
-	onReadEvent func(FileReadEvent)
+	mu             sync.Mutex
+	watchPaths     []string
+	seenFiles      map[string]fileState
+	seenOffsets    map[string]int64
+	cursorPath     string
+	cursorDirty    bool
+	cursorVersion  uint64
+	lastCursorSave time.Time
+	onToolCall     func(ToolCallEvent)
+	onReadEvent    func(FileReadEvent)
 }
 
 // NewSessionWatcher creates a watcher for agent log files.
@@ -292,6 +296,8 @@ func (sw *SessionWatcher) PollOnce() {
 				size:    currentSize,
 				modTime: modTime,
 			}
+			sw.cursorDirty = true
+			sw.cursorVersion++
 
 			// Smart pruning: only purge entries when capacity is huge (> 25000), and only purge nonexistent paths first
 			if len(sw.seenFiles) > 25000 {
@@ -324,6 +330,9 @@ func (sw *SessionWatcher) PollOnce() {
 			return nil
 		})
 	}
+	if err := sw.saveOffsets(false); err != nil {
+		log.Printf("ingest: save offset checkpoint: %v", err)
+	}
 }
 
 // StartPolling runs a background loop polling session logs every interval.
@@ -332,6 +341,11 @@ func (sw *SessionWatcher) StartPolling(ctx context.Context, interval time.Durati
 		interval = 5 * time.Second
 	}
 	go func() {
+		defer func() {
+			if err := sw.saveOffsets(true); err != nil {
+				log.Printf("ingest: save final offset checkpoint: %v", err)
+			}
+		}()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 

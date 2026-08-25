@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,19 @@ import (
 
 type fakeReporter struct {
 	reports []ipc.TelemetryReport
+}
+
+type dataThenErrorReader struct {
+	data []byte
+}
+
+func (r *dataThenErrorReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, errors.New("upstream stream reset")
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, errors.New("upstream stream reset")
 }
 
 func (f *fakeReporter) ReportRun(p ipc.TelemetryReport) error {
@@ -33,11 +47,13 @@ func TestMaskHeaders_SecretsRedacted(t *testing.T) {
 	bearerSecret := fakeTok("sk-ant-", "verysecret", "key1234567890")
 	apiKeySecret := fakeTok("sk-", "1234567890", "abcdef")
 	googleSecret := fakeTok("AIzaSy", "VerySecret", "GoogleKey987654321")
+	querySecret := fakeTok("query-", "credential-", "123")
 
 	h := http.Header{}
 	h.Set("Authorization", fakeTok("Bearer", " ", bearerSecret))
 	h.Set("X-Api-Key", apiKeySecret)
 	h.Set("X-Goog-Api-Key", googleSecret)
+	h.Set("X-Target-Upstream", "https://api.example.test/v1?key="+querySecret)
 	h.Set("Content-Type", "application/json")
 
 	masked := maskHeaders(h)
@@ -56,6 +72,9 @@ func TestMaskHeaders_SecretsRedacted(t *testing.T) {
 		if !ok || v == "" || v == h.Get(k) || strings.Contains(v, secret) {
 			t.Errorf("%s not redacted: %q", k, v)
 		}
+	}
+	if v := masked["X-Target-Upstream"]; strings.Contains(v, querySecret) || !strings.Contains(v, "redacted") {
+		t.Errorf("upstream URL header not redacted: %q", v)
 	}
 }
 
@@ -644,6 +663,7 @@ func TestGatewayProxy_StreamingTerminalMarker(t *testing.T) {
 	reqBody := `{"model":"zai-coding-plan","stream":true,"messages":[{"role":"user","content":"generate code"}]}`
 	req, _ := http.NewRequest("POST", proxyServer.URL+"/proxy/mockstream/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-WrongTrace-Policy", "enforce")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -667,6 +687,64 @@ func TestGatewayProxy_StreamingTerminalMarker(t *testing.T) {
 		if !traffic[0].IsStream {
 			t.Errorf("expected IsStream=true, got false")
 		}
+	}
+}
+
+func TestGatewayProxy_ObserveModePreservesRequestAndStream(t *testing.T) {
+	const upstreamStream = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"
+	const secret = "sk-abcdef12345678901234567890"
+	requestBody := `{"model":"observe-model","stream":true,"messages":[{"role":"user","content":"OPENAI_KEY=` + secret + `"}]}`
+	var forwardedBody string
+
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		forwardedBody = string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(upstreamStream))
+	}))
+	defer mockUpstream.Close()
+
+	proxy := NewGatewayProxy(Config{CustomUpstreams: map[string]string{"observe": mockUpstream.URL}})
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, proxyServer.URL+"/proxy/observe/v1/chat/completions", strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST to observing proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	responseBody, _ := io.ReadAll(resp.Body)
+
+	if forwardedBody != requestBody {
+		t.Fatalf("observe mode mutated request body:\nwant: %s\n got: %s", requestBody, forwardedBody)
+	}
+	if string(responseBody) != upstreamStream {
+		t.Fatalf("observe mode mutated stream:\nwant: %q\n got: %q", upstreamStream, responseBody)
+	}
+	traffic := proxy.AllTraffic(1)
+	if len(traffic) != 1 || strings.Contains(traffic[0].RequestBody, secret) {
+		t.Fatalf("stored observe-mode telemetry leaked a prompt credential: %+v", traffic)
+	}
+}
+
+func TestGatewayProxy_EnforceModeDoesNotHideTruncatedStream(t *testing.T) {
+	p := NewGatewayProxy(Config{})
+	w := httptest.NewRecorder()
+	reader := &dataThenErrorReader{data: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")}
+	p.handleStreamingResponse(w, reader, ProxyTrafficRecord{
+		ID:           "px-truncated",
+		Timestamp:    time.Now().UTC(),
+		IncomingPath: "/v1/chat/completions",
+		StatusCode:   http.StatusOK,
+		Model:        "test-model",
+		RequestBody:  `{"model":"test-model","stream":true}`,
+	}, "", "", false, true)
+
+	if strings.Contains(w.Body.String(), "[DONE]") {
+		t.Fatalf("truncated upstream stream was falsely marked complete: %q", w.Body.String())
 	}
 }
 
@@ -721,6 +799,7 @@ func TestGatewayProxy_StreamingChunkDeliveredBeforeUpstreamCompletes(t *testing.
 	reqBody := `{"model":"stream-timing-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	req, _ := http.NewRequest("POST", proxyServer.URL+"/proxy/mockstream/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-WrongTrace-Policy", "enforce")
 
 	// Phase 1 — response headers. http.Client.Do returns only once response
 	// HEADERS arrive, and Go's server writes headers lazily (first body
@@ -824,6 +903,7 @@ func TestResponseCache_ExactHit(t *testing.T) {
 	// 1st request -> Cache Miss, hits upstream
 	req1, _ := http.NewRequest("POST", proxyServer.URL+"/proxy/cached_mock/v1/chat/completions", strings.NewReader(reqPayload))
 	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-WrongTrace-Cache", "allow")
 	resp1, err := http.DefaultClient.Do(req1)
 	if err != nil {
 		t.Fatalf("req1 failed: %v", err)
@@ -839,6 +919,7 @@ func TestResponseCache_ExactHit(t *testing.T) {
 	// 2nd request -> Exact Cache Hit, upstream not called!
 	req2, _ := http.NewRequest("POST", proxyServer.URL+"/proxy/cached_mock/v1/chat/completions", strings.NewReader(reqPayload))
 	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-WrongTrace-Cache", "allow")
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatalf("req2 failed: %v", err)
@@ -850,6 +931,63 @@ func TestResponseCache_ExactHit(t *testing.T) {
 	}
 	if upstreamCalls != 1 {
 		t.Errorf("expected upstream calls to remain 1 on cache hit, got %d", upstreamCalls)
+	}
+	cachedTraffic := proxy.AllTraffic(10)
+	if len(cachedTraffic) != 2 || cachedTraffic[0].ID == cachedTraffic[1].ID {
+		t.Fatalf("cache hit did not retain a unique traffic ID: %+v", cachedTraffic)
+	}
+
+	// Cache is an explicit policy, not transparent-proxy behavior.
+	req3, _ := http.NewRequest("POST", proxyServer.URL+"/proxy/cached_mock/v1/chat/completions", strings.NewReader(reqPayload))
+	req3.Header.Set("Content-Type", "application/json")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatalf("req3 failed: %v", err)
+	}
+	defer resp3.Body.Close()
+	if resp3.Header.Get("X-WrongTrace-Cache") == "HIT" || upstreamCalls != 2 {
+		t.Fatalf("non-opted request used cache: header=%q upstreamCalls=%d", resp3.Header.Get("X-WrongTrace-Cache"), upstreamCalls)
+	}
+}
+
+func TestComputeScopedKey_IsolatesCredentialsAndProjects(t *testing.T) {
+	body := []byte(`{"model":"gpt-4o","messages":[]}`)
+	a := ComputeScopedKey("OpenAI", "gpt-4o", "credential-a|project-a", body)
+	b := ComputeScopedKey("OpenAI", "gpt-4o", "credential-b|project-a", body)
+	c := ComputeScopedKey("OpenAI", "gpt-4o", "credential-a|project-b", body)
+	if a == b || a == c || b == c {
+		t.Fatalf("scoped cache keys collided: a=%s b=%s c=%s", a, b, c)
+	}
+}
+
+func TestRequestCacheScope_IncludesQueryCredentialsWithoutLeakingThem(t *testing.T) {
+	a := httptest.NewRequest(http.MethodPost, "/proxy/gemini?key=secret-a", nil)
+	b := httptest.NewRequest(http.MethodPost, "/proxy/gemini?key=secret-b", nil)
+	scopeA := requestCacheScope(a)
+	scopeB := requestCacheScope(b)
+	if scopeA == scopeB {
+		t.Fatal("query-authenticated requests shared a cache scope")
+	}
+	if strings.Contains(scopeA, "secret-a") || strings.Contains(scopeB, "secret-b") {
+		t.Fatal("raw query credential leaked into cache scope")
+	}
+}
+
+func TestStreamAnalysisPayload_RetainsFinalUsage(t *testing.T) {
+	head := []byte("data: " + strings.Repeat("x", 1024) + "\n\n")
+	tail := []byte("partial\nevent: message_delta\ndata: {\"usage\":{\"output_tokens\":77}}\n\n")
+	got := streamAnalysisPayload(head, tail)
+	if !strings.Contains(got, `"output_tokens":77`) || strings.Contains(got, "partial") {
+		t.Fatalf("analysis payload did not preserve a clean final usage event: %q", got)
+	}
+}
+
+func TestExpectsDoneMarker_ProtocolAware(t *testing.T) {
+	if expectsDoneMarker(ProxyTrafficRecord{IncomingPath: "/v1/messages"}) {
+		t.Fatal("Anthropic messages stream must not receive an OpenAI [DONE] marker")
+	}
+	if !expectsDoneMarker(ProxyTrafficRecord{IncomingPath: "/v1/chat/completions"}) {
+		t.Fatal("OpenAI-compatible chat stream should receive a missing [DONE] marker")
 	}
 }
 
@@ -1222,6 +1360,21 @@ func TestRouteManager_MatchRoute_PathBoundary(t *testing.T) {
 	}
 }
 
+func TestRouteManager_MatchPrefersMostSpecificPrefix(t *testing.T) {
+	rm := &RouteManager{routes: map[string]ProxyRoute{
+		"broad": {
+			ID: "broad", Name: "broad", PathPrefix: "/proxy/team", TargetUpstream: "https://broad.example", Enabled: true,
+		},
+		"specific": {
+			ID: "specific", Name: "specific", PathPrefix: "/proxy/team/coding", TargetUpstream: "https://specific.example", Enabled: true,
+		},
+	}}
+	route, remaining := rm.MatchRoute("/proxy/team/coding/v1/chat/completions")
+	if route == nil || route.ID != "specific" || remaining != "/v1/chat/completions" {
+		t.Fatalf("non-deterministic route match: route=%+v remaining=%q", route, remaining)
+	}
+}
+
 func TestProxy_CacheAndQuotasAndTraffic(t *testing.T) {
 	p := NewGatewayProxy(Config{})
 
@@ -1267,6 +1420,42 @@ func TestProxy_CacheAndQuotasAndTraffic(t *testing.T) {
 	_, _, _ = ql.CheckAndRecordSpend("task-1", 0.80)
 	if allowed, _, _ := ql.CheckSpend("task-1", 0.50); allowed {
 		t.Errorf("expected quota exceeded (allowed=false)")
+	}
+}
+
+func TestGatewayProxy_TrafficSummaryAndDetail(t *testing.T) {
+	p := NewGatewayProxy(Config{})
+	p.recordTraffic(ProxyTrafficRecord{
+		ID:              "tr-detail",
+		Model:           "gpt-4o",
+		RequestHeaders:  map[string]string{"content-type": "application/json"},
+		RequestBody:     `{"messages":[{"content":"hello"}]}`,
+		ResponseHeaders: map[string]string{"content-type": "application/json"},
+		ResponseBody:    `{"answer":"world"}`,
+		AssistantReply:  "world",
+		Reasoning:       "private reasoning",
+		SystemPrompt:    "system prompt",
+	})
+
+	summaries := p.TrafficSummaries(10)
+	if len(summaries) != 1 {
+		t.Fatalf("summaries len = %d, want 1", len(summaries))
+	}
+	if summaries[0].RequestBody != "" || summaries[0].ResponseBody != "" ||
+		summaries[0].RequestHeaders != nil || summaries[0].ResponseHeaders != nil ||
+		summaries[0].AssistantReply != "" || summaries[0].Reasoning != "" || summaries[0].SystemPrompt != "" {
+		t.Fatalf("summary retained heavy fields: %+v", summaries[0])
+	}
+	if summaries[0].ID != "tr-detail" || summaries[0].Model != "gpt-4o" {
+		t.Fatalf("summary lost list metadata: %+v", summaries[0])
+	}
+
+	detail, ok := p.Traffic("tr-detail")
+	if !ok || detail.RequestBody == "" || detail.ResponseBody == "" || detail.AssistantReply != "world" {
+		t.Fatalf("full detail unavailable: ok=%v detail=%+v", ok, detail)
+	}
+	if _, ok := p.Traffic("missing"); ok {
+		t.Fatal("missing traffic ID unexpectedly resolved")
 	}
 }
 
