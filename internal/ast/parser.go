@@ -174,6 +174,7 @@ func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
 		LOC:        strings.Count(raw, "\n") + 1,
 	}
 	collectNodes(root, src, lang, filepath.Base(path), snap)
+	snap.SortedSignatures()
 	return snap, nil
 }
 
@@ -281,6 +282,7 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 		}
 	}
 
+	snap.SortedSignatures()
 	return snap
 }
 

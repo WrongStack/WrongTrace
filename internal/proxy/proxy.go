@@ -917,19 +917,6 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 		fullSSE = capturedBuffer.String()
 	}
 
-	// Parse SSE usage chunks if available
-	if strings.Contains(fullSSE, "usage") {
-		var sseObj struct {
-			Usage struct {
-				PromptTokens     int64 `json:"prompt_tokens"`
-				CompletionTokens int64 `json:"completion_tokens"`
-			} `json:"usage"`
-		}
-		_ = json.Unmarshal([]byte(fullSSE), &sseObj)
-		promptTokens = sseObj.Usage.PromptTokens
-		completionTokens = sseObj.Usage.CompletionTokens
-	}
-
 	// Perform deep wire traffic analysis on streamed response (SSE chunks + usage metadata)
 	analysis := AnalyzeWirePayloads([]byte(rec.RequestBody), []byte(fullSSE), true)
 	if analysis.PromptTokens > 0 {

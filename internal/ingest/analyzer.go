@@ -590,9 +590,15 @@ func detectAgentDefaultModel(agentName string) string {
 }
 
 func runeSafeTruncate(s string, maxRunes int) string {
-	runes := []rune(s)
-	if len(runes) <= maxRunes {
-		return s
+	if maxRunes <= 0 {
+		return ""
 	}
-	return string(runes[:maxRunes]) + "…"
+	count := 0
+	for i := range s {
+		if count == maxRunes {
+			return s[:i] + "…"
+		}
+		count++
+	}
+	return s
 }

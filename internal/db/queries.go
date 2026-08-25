@@ -26,9 +26,14 @@ func parseDBTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
 	}
-	if len(s) == 19 {
+	switch len(s) {
+	case 19: // "2006-01-02 15:04:05"
 		if t, err := time.ParseInLocation(time.DateTime, s, time.UTC); err == nil {
 			return t
+		}
+	case 20: // "2006-01-02T15:04:05Z"
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t.UTC()
 		}
 	}
 	for _, l := range dbTimeLayouts {

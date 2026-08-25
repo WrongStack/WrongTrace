@@ -127,6 +127,11 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		return res
 	}
 
+	if prev.Hash != "" && next.Hash != "" && prev.Hash == next.Hash {
+		res.NewSnap = next
+		return res
+	}
+
 	if prev.RawContent != "" || next.RawContent != "" {
 		fileDiff, fileAdded, fileDeleted := generateLineDiff(prev.RawContent, next.RawContent)
 		res.FileDiff = fileDiff
