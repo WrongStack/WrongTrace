@@ -19,6 +19,12 @@ type MetricsSnapshot struct {
 	ActiveRuns   []ActiveRun       `json:"active_runs"`
 }
 
+type cachedMetrics struct {
+	gen      uint64
+	cachedAt time.Time
+	snapshot MetricsSnapshot
+}
+
 // Metrics assembles a fresh snapshot from the underlying store, optionally filtered by repo_name.
 func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 	var filter string
@@ -29,6 +35,13 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 	} else {
 		filter = e.repoName()
 	}
+
+	e.cacheMu.RLock()
+	if cached, ok := e.metricsCache[filter]; ok && cached.gen == e.cacheGen && time.Since(cached.cachedAt) < 2*time.Second {
+		e.cacheMu.RUnlock()
+		return cached.snapshot, nil
+	}
+	e.cacheMu.RUnlock()
 
 	store := e.Store()
 	if store == nil {
@@ -55,7 +68,7 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
-	return MetricsSnapshot{
+	res := MetricsSnapshot{
 		Repo:         filter,
 		GeneratedAt:  time.Now().UTC(),
 		Overview:     overview,
@@ -63,7 +76,20 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 		Models:       models,
 		RecentEvents: recent,
 		ActiveRuns:   e.ActiveRuns(),
-	}, nil
+	}
+
+	e.cacheMu.Lock()
+	if e.metricsCache == nil {
+		e.metricsCache = make(map[string]cachedMetrics)
+	}
+	e.metricsCache[filter] = cachedMetrics{
+		gen:      e.cacheGen,
+		cachedAt: time.Now(),
+		snapshot: res,
+	}
+	e.cacheMu.Unlock()
+
+	return res, nil
 }
 
 // WSEvent is the wire format pushed to all dashboard WebSocket clients. The

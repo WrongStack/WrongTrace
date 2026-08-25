@@ -1,9 +1,11 @@
 package core
 
 import (
+	"context"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -93,6 +95,18 @@ func (e *Engine) PrimeDirectory(dir string) {
 	// The primed tree doubles as the ignore-scoping root when Config.WatchDir
 	// was not supplied.
 	e.adoptWatchRoot(dir)
+
+	// Single-flight indexing: cancel previous active indexing job if still running
+	e.primeMu.Lock()
+	if e.primeCancel != nil {
+		e.primeCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	e.primeCancel = cancel
+	e.primeMu.Unlock()
+
+	defer cancel()
+
 	start := time.Now()
 
 	e.indexMu.Lock()
@@ -105,6 +119,9 @@ func (e *Engine) PrimeDirectory(dir string) {
 	lastUpdate := time.Now()
 
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return filepath.SkipAll
+		}
 		if err != nil || d == nil {
 			return nil
 		}
@@ -124,12 +141,28 @@ func (e *Engine) PrimeDirectory(dir string) {
 			return nil
 		}
 
+		// Protect against giant non-code files (e.g. 50MB minified bundles, data dumps)
+		if info, sErr := d.Info(); sErr == nil && info.Size() > 1024*1024 {
+			skipped++
+			return nil
+		}
+
 		eligible++
 		src, rerr := os.ReadFile(path)
 		if rerr != nil {
 			failed++
 			return nil
 		}
+
+		// Fast-path: if existing snapshot matches file hash, skip Tree-sitter AST parsing
+		if existing, ok := e.cfg.AST.Snapshot(path); ok && existing != nil && existing.Hash == ast.HashBytes(src) {
+			indexed++
+			if indexed%50 == 0 {
+				runtime.Gosched()
+			}
+			return nil
+		}
+
 		snap, perr := e.cfg.AST.Parse(path, src)
 		if perr != nil || snap == nil {
 			failed++
@@ -138,8 +171,13 @@ func (e *Engine) PrimeDirectory(dir string) {
 		e.cfg.AST.SetSnapshot(snap)
 		indexed++
 
-		// Throttle progress updates to avoid lock contention (every 50 files or 150ms)
-		if indexed%50 == 0 || time.Since(lastUpdate) > 150*time.Millisecond {
+		// Yield CPU periodically
+		if indexed%25 == 0 {
+			runtime.Gosched()
+		}
+
+		// Throttle progress updates to avoid lock contention (every 50 files or 250ms)
+		if indexed%50 == 0 || time.Since(lastUpdate) > 250*time.Millisecond {
 			e.indexMu.Lock()
 			e.indexStatus.TotalDiscovered = discovered
 			e.indexStatus.EligibleFiles = eligible
@@ -157,6 +195,11 @@ func (e *Engine) PrimeDirectory(dir string) {
 		return nil
 	})
 
+	if ctx.Err() != nil {
+		// Job was superseded by a newer project switch or cancelled
+		return
+	}
+
 	e.indexMu.Lock()
 	e.indexStatus.IsIndexing = false
 	e.indexStatus.DurationMs = time.Since(start).Milliseconds()
@@ -173,6 +216,7 @@ func (e *Engine) PrimeDirectory(dir string) {
 		e.indexStatus.Percentage = 100.0
 	}
 	e.indexMu.Unlock()
+	e.BumpCacheGen()
 
 	if e.hub != nil {
 		e.hub.Broadcast(WSEvent{
@@ -180,6 +224,12 @@ func (e *Engine) PrimeDirectory(dir string) {
 			Payload: e.IndexStatus(),
 		})
 	}
+}
+
+type cachedAtlas struct {
+	gen      uint64
+	cachedAt time.Time
+	snapshot AtlasSnapshot
 }
 
 // Atlas aggregates the full Code Atlas graph containing packages, files, and symbols, optionally filtered by repo_name.
@@ -192,6 +242,13 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	} else {
 		filter = e.repoName()
 	}
+
+	e.cacheMu.RLock()
+	if cached, ok := e.atlasCache[filter]; ok && cached.gen == e.cacheGen && time.Since(cached.cachedAt) < 3*time.Second {
+		e.cacheMu.RUnlock()
+		return cached.snapshot, nil
+	}
+	e.cacheMu.RUnlock()
 
 	snap := AtlasSnapshot{
 		Repo:        filter,
@@ -213,14 +270,6 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 		allHealth = make(map[string]db.FileHealth)
 	}
 
-	var snapshots map[string]*ast.FileSnapshot
-	if e.cfg.AST != nil {
-		snapshots = e.cfg.AST.AllSnapshots()
-	}
-	if snapshots == nil {
-		snapshots = make(map[string]*ast.FileSnapshot)
-	}
-
 	activeProj := e.GetActiveProject()
 	var activePath string
 	if filter != "" {
@@ -238,113 +287,119 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 
 	// Check if activePath matches loaded snapshots
 	var hasActivePathMatch bool
-	if activePath != "" {
-		for p := range snapshots {
-			if strings.HasPrefix(strings.ToLower(filepath.Clean(p)), strings.ToLower(activePath)) {
+	if activePath != "" && e.cfg.AST != nil {
+		activeLower := strings.ToLower(activePath)
+		e.cfg.AST.ForEachSnapshot(func(p string, _ *ast.FileSnapshot) bool {
+			if strings.HasPrefix(strings.ToLower(filepath.Clean(p)), activeLower) {
 				hasActivePathMatch = true
-				break
+				return false
 			}
-		}
+			return true
+		})
 	}
 
 	// Group files by top-level package scope (prevents granular subfolder explosion)
 	pkgMap := make(map[string]*AtlasPackage)
 
-	for path, fileSnap := range snapshots {
-		cleanPath := filepath.Clean(path)
-		if hasActivePathMatch && !strings.HasPrefix(strings.ToLower(cleanPath), strings.ToLower(activePath)) {
-			continue
-		}
-
-		relPath := cleanPath
-		if hasActivePathMatch {
-			if r, err := filepath.Rel(activePath, cleanPath); err == nil && !strings.HasPrefix(r, "..") {
-				relPath = r
-			}
-		}
-		relPath = filepath.ToSlash(relPath)
-		pkgPath, pkgName, ws := resolvePackageScope(relPath)
-
-		pkg, exists := pkgMap[pkgPath]
-		if !exists {
-			pkg = &AtlasPackage{
-				Path:      pkgPath,
-				Name:      pkgName,
-				Workspace: ws,
-				Files:     []AtlasFile{},
-				TotalLOC:  0,
-			}
-			pkgMap[pkgPath] = pkg
-		}
-
-		lang := ast.DetectLanguage(path).String()
-		af := AtlasFile{
-			Path:        relPath,
-			Name:        filepath.Base(path),
-			Language:    lang,
-			HealthScore: 100,
-			Symbols:     []AtlasSymbol{},
-		}
-
-		// Fast in-memory health lookup from batch query with normalized and relative path fallback
-		h, ok := allHealth[relPath]
-		if !ok {
-			h, ok = allHealth[cleanPath]
-		}
-		if !ok {
-			h, ok = allHealth[filepath.ToSlash(cleanPath)]
-		}
-		if !ok {
-			h, ok = allHealth[path]
-		}
-		if ok {
-			af.HealthScore = h.HealthScore
-			af.IsFragile = h.IsFragile
-			af.RecentThrashingCount = h.RecentThrashingCount
-			if h.IsFragile {
-				pkg.IsFragile = true
-			}
-		}
-
-		// Collect symbols
-		for _, sig := range fileSnap.SortedSignatures() {
-			n := fileSnap.Nodes[sig]
-			sym := AtlasSymbol{
-				Signature: sig,
-				Name:      symbolShortName(sig),
-				Kind:      string(n.Kind),
-				StartLine: n.StartLine,
-				EndLine:   n.EndLine,
-				LOC:       n.LOC,
-				Status:    "ACTIVE",
-				Hash:      n.Hash,
+	if e.cfg.AST != nil {
+		activeLower := strings.ToLower(activePath)
+		e.cfg.AST.ForEachSnapshot(func(path string, fileSnap *ast.FileSnapshot) bool {
+			cleanPath := filepath.Clean(path)
+			if hasActivePathMatch && !strings.HasPrefix(strings.ToLower(cleanPath), activeLower) {
+				return true
 			}
 
-			if stat, ok := nodeStats[sig]; ok {
-				sym.EditCount = stat.EditCount
-				sym.LastAction = stat.LastAction
-				sym.LastModel = stat.LastModel
-				sym.LastEventAt = stat.LastEventAt
-				if stat.LastAction == "MODIFIED" {
-					sym.Status = "MODIFIED"
-				} else if stat.LastAction == "DELETED" {
-					sym.Status = "DELETED"
+			relPath := cleanPath
+			if hasActivePathMatch {
+				if r, err := filepath.Rel(activePath, cleanPath); err == nil && !strings.HasPrefix(r, "..") {
+					relPath = r
+				}
+			}
+			relPath = filepath.ToSlash(relPath)
+			pkgPath, pkgName, ws := resolvePackageScope(relPath)
+
+			pkg, exists := pkgMap[pkgPath]
+			if !exists {
+				pkg = &AtlasPackage{
+					Path:      pkgPath,
+					Name:      pkgName,
+					Workspace: ws,
+					Files:     []AtlasFile{},
+					TotalLOC:  0,
+				}
+				pkgMap[pkgPath] = pkg
+			}
+
+			lang := ast.DetectLanguage(path).String()
+			af := AtlasFile{
+				Path:        relPath,
+				Name:        filepath.Base(path),
+				Language:    lang,
+				HealthScore: 100,
+				Symbols:     []AtlasSymbol{},
+			}
+
+			// Fast in-memory health lookup from batch query with normalized and relative path fallback
+			h, ok := allHealth[relPath]
+			if !ok {
+				h, ok = allHealth[cleanPath]
+			}
+			if !ok {
+				h, ok = allHealth[filepath.ToSlash(cleanPath)]
+			}
+			if !ok {
+				h, ok = allHealth[path]
+			}
+			if ok {
+				af.HealthScore = h.HealthScore
+				af.IsFragile = h.IsFragile
+				af.RecentThrashingCount = h.RecentThrashingCount
+				if h.IsFragile {
+					pkg.IsFragile = true
 				}
 			}
 
-			af.TotalLOC += sym.LOC
-			af.Symbols = append(af.Symbols, sym)
-		}
+			// Collect symbols
+			for _, sig := range fileSnap.SortedSignatures() {
+				n := fileSnap.Nodes[sig]
+				sym := AtlasSymbol{
+					Signature: sig,
+					Name:      symbolShortName(sig),
+					Kind:      string(n.Kind),
+					StartLine: n.StartLine,
+					EndLine:   n.EndLine,
+					LOC:       n.LOC,
+					Status:    "ACTIVE",
+					Hash:      n.Hash,
+				}
 
-		pkg.TotalLOC += af.TotalLOC
-		pkg.Files = append(pkg.Files, af)
-		pkg.FileCount++
-		if af.IsFragile {
-			pkg.FragileCount++
-		}
-		snap.TotalFiles++
-		snap.TotalLOC += af.TotalLOC
-		snap.TotalNodes += len(af.Symbols)
+				if stat, ok := nodeStats[sig]; ok {
+					sym.EditCount = stat.EditCount
+					sym.LastAction = stat.LastAction
+					sym.LastModel = stat.LastModel
+					sym.LastEventAt = stat.LastEventAt
+					if stat.LastAction == "MODIFIED" {
+						sym.Status = "MODIFIED"
+					} else if stat.LastAction == "DELETED" {
+						sym.Status = "DELETED"
+					}
+				}
+
+				af.TotalLOC += sym.LOC
+				af.Symbols = append(af.Symbols, sym)
+			}
+
+			pkg.TotalLOC += af.TotalLOC
+			pkg.Files = append(pkg.Files, af)
+			pkg.FileCount++
+			if af.IsFragile {
+				pkg.FragileCount++
+			}
+			snap.TotalFiles++
+			snap.TotalLOC += af.TotalLOC
+			snap.TotalNodes += len(af.Symbols)
+			return true
+		})
 	}
 
 	// Sort packages and files deterministically
@@ -382,6 +437,17 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 		}
 		sort.Strings(snap.Workspaces)
 	}
+
+	e.cacheMu.Lock()
+	if e.atlasCache == nil {
+		e.atlasCache = make(map[string]cachedAtlas)
+	}
+	e.atlasCache[filter] = cachedAtlas{
+		gen:      e.cacheGen,
+		cachedAt: time.Now(),
+		snapshot: snap,
+	}
+	e.cacheMu.Unlock()
 
 	return snap, nil
 }

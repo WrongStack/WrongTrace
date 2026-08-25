@@ -23,7 +23,8 @@ export function useOverview(projectId?: string | null) {
   return useQuery<MetricsSnapshot>({
     queryKey: ['overview', projectId || 'active'],
     queryFn: ({ signal }) => jget<MetricsSnapshot>(`${base}/metrics/overview${q}`, signal),
-    refetchInterval: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
   });
 }
 
@@ -32,7 +33,8 @@ export function useThrashing(projectId?: string | null) {
   return useQuery<ThrashingRow[]>({
     queryKey: ['thrashing', projectId || 'active'],
     queryFn: ({ signal }) => jget<ThrashingRow[]>(`${base}/metrics/thrashing${q}`, signal),
-    refetchInterval: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
   });
 }
 
@@ -41,7 +43,8 @@ export function useModels(projectId?: string | null) {
   return useQuery<ModelRow[]>({
     queryKey: ['models', projectId || 'active'],
     queryFn: ({ signal }) => jget<ModelRow[]>(`${base}/metrics/models${q}`, signal),
-    refetchInterval: 15_000,
+    staleTime: 5_000,
+    refetchInterval: 20_000,
   });
 }
 
@@ -52,7 +55,8 @@ export function useRecentEvents(projectId?: string | null, limit: number = 500) 
   return useQuery<EventRecord[]>({
     queryKey: ['recent', projectId || 'active', limit],
     queryFn: ({ signal }) => jget<EventRecord[]>(`${base}/metrics/recent?${q}`, signal),
-    refetchInterval: 5_000,
+    staleTime: 3_000,
+    refetchInterval: 10_000,
   });
 }
 
@@ -81,7 +85,8 @@ export function useAtlas(projectId?: string | null) {
   return useQuery<AtlasSnapshot>({
     queryKey: ['atlas', projectId || 'active'],
     queryFn: ({ signal }) => jget<AtlasSnapshot>(`${base}/atlas${q}`, signal),
-    refetchInterval: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 20_000,
   });
 }
 
@@ -105,7 +110,8 @@ export function useProxyRoutes() {
   return useQuery<import('../types').ProxyRoute[]>({
     queryKey: ['proxy_routes'],
     queryFn: ({ signal }) => jget<import('../types').ProxyRoute[]>(`${base}/proxy/routes`, signal),
-    refetchInterval: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
   });
 }
 
@@ -113,7 +119,8 @@ export function useProjects() {
   return useQuery<import('../types').Project[]>({
     queryKey: ['projects'],
     queryFn: ({ signal }) => jget<import('../types').Project[]>(`${base}/projects`, signal),
-    refetchInterval: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
   });
 }
 
@@ -122,7 +129,8 @@ export function useProxyTraffic(projectId?: string | null) {
   return useQuery<import('../types').ProxyTrafficRecord[]>({
     queryKey: ['proxy_traffic', projectId || 'active'],
     queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic${q}`, signal),
-    refetchInterval: 3_000,
+    staleTime: 2_000,
+    refetchInterval: 6_000,
   });
 }
 
@@ -139,7 +147,8 @@ export function useProfilerTraces(limit: number = 50, projectId?: string | null)
   return useQuery<import('../types').RuntimeTrace[]>({
     queryKey: ['profiler_traces', limit, projectId || 'active'],
     queryFn: ({ signal }) => jget<import('../types').RuntimeTrace[]>(`${base}/profiler/traces?limit=${limit}${pParam}`, signal),
-    refetchInterval: 5_000,
+    staleTime: 3_000,
+    refetchInterval: 10_000,
   });
 }
 
@@ -164,7 +173,8 @@ export function useAtlasStatus(projectId?: string | null) {
   return useQuery<import('../types').IndexProgress>({
     queryKey: ['atlas_status', projectId || 'active'],
     queryFn: ({ signal }) => jget<import('../types').IndexProgress>(`${base}/atlas/status${q}`, signal),
-    refetchInterval: 3_000,
+    staleTime: 2_000,
+    refetchInterval: 6_000,
   });
 }
 
@@ -173,7 +183,8 @@ export function useRecentReads(limit: number = 50, projectId?: string | null) {
   return useQuery<import('../types').FileReadRecord[]>({
     queryKey: ['recent_reads', limit, projectId || 'active'],
     queryFn: ({ signal }) => jget<import('../types').FileReadRecord[]>(`${base}/reads/recent?limit=${limit}${pParam}`, signal),
-    refetchInterval: 5_000,
+    staleTime: 3_000,
+    refetchInterval: 10_000,
   });
 }
 
@@ -182,7 +193,8 @@ export function useFileReadStats(path: string | null) {
     queryKey: ['file_read_stats', path],
     queryFn: ({ signal }) => jget<import('../types').FileReadStats>(`${base}/files/reads?path=${encodeURIComponent(path ?? '')}`, signal),
     enabled: !!path,
-    refetchInterval: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
   });
 }
 
@@ -191,7 +203,8 @@ export function useFileReadHeatmap(path: string | null) {
     queryKey: ['file_read_heatmap', path],
     queryFn: ({ signal }) => jget<import('../types').LineReadHeatmap[]>(`${base}/files/heatmap?path=${encodeURIComponent(path ?? '')}`, signal),
     enabled: !!path,
-    refetchInterval: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
   });
 }
 
@@ -200,7 +213,8 @@ export function useRecentFileEvents(filePath: string | null, limit: number = 50)
     queryKey: ['recent_file_events', filePath, limit],
     queryFn: ({ signal }) => jget<EventRecord[]>(`${base}/metrics/recent?file_path=${encodeURIComponent(filePath ?? '')}&limit=${limit}`, signal),
     enabled: !!filePath,
-    refetchInterval: 5_000,
+    staleTime: 3_000,
+    refetchInterval: 10_000,
   });
 }
 
@@ -213,7 +227,8 @@ export function useSymbolHistory(filePath: string | null, signature: string | nu
     queryKey: ['symbol_history', filePath, signature, limit],
     queryFn: ({ signal }) => jget<import('../types').SymbolHistoryRecord[]>(`${base}/symbol/history?${queryStr}`, signal),
     enabled: !!(filePath || signature),
-    refetchInterval: 5_000,
+    staleTime: 3_000,
+    refetchInterval: 10_000,
   });
 }
 
@@ -222,7 +237,8 @@ export function useFileModelActivity(filePath: string | null) {
     queryKey: ['file_model_activity', filePath],
     queryFn: ({ signal }) => jget<import('../types').ModelActivitySummary[]>(`${base}/files/activity?path=${encodeURIComponent(filePath ?? '')}`, signal),
     enabled: !!filePath,
-    refetchInterval: 10_000,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
   });
 }
 
@@ -230,7 +246,8 @@ export function useModelFriction(limit: number = 200) {
   return useQuery<import('../types').InterAgentFrictionReport>({
     queryKey: ['model_friction', limit],
     queryFn: ({ signal }) => jget<import('../types').InterAgentFrictionReport>(`${base}/metrics/friction?limit=${limit}`, signal),
-    refetchInterval: 5_000,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
   });
 }
 
@@ -239,7 +256,8 @@ export function useIPCTraffic(enabled: boolean = true) {
     queryKey: ['ipc_traffic'],
     queryFn: ({ signal }) => jget<import('../types').IPCTrafficRecord[]>(`${base}/ipc/traffic`, signal),
     enabled,
-    refetchInterval: 2_500,
+    staleTime: 2_000,
+    refetchInterval: 5_000,
   });
 }
 

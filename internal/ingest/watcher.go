@@ -10,10 +10,17 @@ import (
 	"time"
 )
 
+type fileState struct {
+	offset  int64
+	size    int64
+	modTime time.Time
+}
+
 // SessionWatcher continuously scans or tails session logs in well-known agent directories.
 type SessionWatcher struct {
 	mu          sync.Mutex
 	watchPaths  []string
+	seenFiles   map[string]fileState
 	seenOffsets map[string]int64
 	onToolCall  func(ToolCallEvent)
 	onReadEvent func(FileReadEvent)
@@ -22,6 +29,7 @@ type SessionWatcher struct {
 // NewSessionWatcher creates a watcher for agent log files.
 func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 	return &SessionWatcher{
+		seenFiles:   make(map[string]fileState),
 		seenOffsets: make(map[string]int64),
 		onToolCall:  onToolCall,
 	}
@@ -220,13 +228,24 @@ func (sw *SessionWatcher) PollOnce() {
 				return nil
 			}
 
-			sw.mu.Lock()
-			lastOffset, seen := sw.seenOffsets[path]
 			currentSize := info.Size()
-			if seen && currentSize <= lastOffset {
+			modTime := info.ModTime()
+
+			sw.mu.Lock()
+			st, seen := sw.seenFiles[path]
+			if !seen {
+				if off, ok := sw.seenOffsets[path]; ok {
+					st = fileState{offset: off, size: currentSize, modTime: modTime}
+					seen = true
+				}
+			}
+
+			if seen && currentSize <= st.offset && !modTime.After(st.modTime) {
 				sw.mu.Unlock()
 				return nil
 			}
+
+			lastOffset := st.offset
 			if currentSize < lastOffset {
 				lastOffset = 0 // File truncated or rewritten
 			}
@@ -255,14 +274,23 @@ func (sw *SessionWatcher) PollOnce() {
 
 			sw.mu.Lock()
 			sw.seenOffsets[path] = newOffset
-			// Prevent seenOffsets map unbounded growth
-			if len(sw.seenOffsets) > 2000 {
-				count := 0
-				for k := range sw.seenOffsets {
-					delete(sw.seenOffsets, k)
-					count++
-					if count > 1000 {
-						break
+			sw.seenFiles[path] = fileState{
+				offset:  newOffset,
+				size:    currentSize,
+				modTime: modTime,
+			}
+
+			// Smart pruning: only purge entries when capacity is huge (> 25000), and only purge nonexistent paths first
+			if len(sw.seenFiles) > 25000 {
+				pruned := 0
+				for k := range sw.seenFiles {
+					if !fileExists(k) {
+						delete(sw.seenFiles, k)
+						delete(sw.seenOffsets, k)
+						pruned++
+						if pruned >= 5000 {
+							break
+						}
 					}
 				}
 			}

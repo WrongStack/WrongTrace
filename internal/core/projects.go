@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wrongstack/wrongtrace/internal/db"
@@ -206,6 +207,7 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 		}
 	}
 
+	e.BumpCacheGen()
 	e.hub.Broadcast(WSEvent{Type: "project_switched", Payload: target})
 
 	return &target, nil
@@ -355,8 +357,10 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	watcher := e.watcher
 	e.lockMu.Unlock()
 
-	// Prime atlas directory
-	go e.PrimeDirectory(absPath)
+	// Prime atlas directory for the active project only; non-active projects are primed on demand when switched to
+	if proj.IsActive {
+		go e.PrimeDirectory(absPath)
+	}
 
 	// Add to live watcher
 	if watcher != nil {
@@ -720,6 +724,16 @@ func (e *Engine) RescanAllProjects() []ProjectProfile {
 	return out
 }
 
+var (
+	sessScanMu    sync.RWMutex
+	sessScanCache = make(map[string]cachedSessScan)
+)
+
+type cachedSessScan struct {
+	counts    map[string]int
+	scannedAt time.Time
+}
+
 // ScanAgentSessions inspects workspace and global application directories for coding agent artifacts and logs specifically belonging to the target root workspace.
 func ScanAgentSessions(root string) map[string]int {
 	counts := make(map[string]int)
@@ -728,6 +742,18 @@ func ScanAgentSessions(root string) map[string]int {
 	}
 	normRoot := strings.ToLower(filepath.Clean(root))
 	rootBase := strings.ToLower(filepath.Base(root))
+
+	sessScanMu.RLock()
+	if c, ok := sessScanCache[normRoot]; ok && time.Since(c.scannedAt) < 30*time.Second {
+		res := make(map[string]int, len(c.counts))
+		for k, v := range c.counts {
+			res[k] = v
+		}
+		sessScanMu.RUnlock()
+		return res
+	}
+	sessScanMu.RUnlock()
+
 	homeDir, _ := os.UserHomeDir()
 	appData := os.Getenv("APPDATA")
 	if appData == "" && homeDir != "" {
@@ -1018,6 +1044,13 @@ func ScanAgentSessions(root string) map[string]int {
 		counts["openhands"] = 1
 	}
 
+	sessScanMu.Lock()
+	sessScanCache[normRoot] = cachedSessScan{
+		counts:    counts,
+		scannedAt: time.Now(),
+	}
+	sessScanMu.Unlock()
+
 	return counts
 }
 
@@ -1104,7 +1137,7 @@ func DetectPrimaryLanguage(root string) string {
 			return nil
 		}
 		scannedFiles++
-		if scannedFiles > 2000 {
+		if scannedFiles > 300 {
 			return filepath.SkipAll
 		}
 		ext := strings.ToLower(filepath.Ext(d.Name()))

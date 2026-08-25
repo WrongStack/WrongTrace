@@ -1,6 +1,7 @@
 package ast
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -48,6 +49,7 @@ type FileSnapshot struct {
 	Hash       string          // SHA256 of the file's full text
 	RawContent string          // raw source content for whole-file line diffs
 	LOC        int             // total lines of code
+	sortedSigs []string        // cached pre-sorted signatures
 }
 
 // Engine owns the Tree-sitter parser pool and the snapshot cache. All
@@ -62,6 +64,13 @@ type Engine struct {
 	parseMu sync.Mutex
 	parsers map[Language]*sitter.Parser
 	closed  bool
+}
+
+var hashBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
 }
 
 // NewEngine initializes Tree-sitter parsers for all supported languages.
@@ -258,8 +267,7 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 			}
 
 			fullBody := strings.Join(bodyLines, "\n")
-			normalizedBody := normalizeForHash(fullBody, lang)
-			hash := sha256.Sum256([]byte(normalizedBody))
+			nodeHash := hashNormalizedBody(fullBody, lang)
 
 			snap.Nodes[sig] = Node{
 				Signature: sig,
@@ -267,7 +275,7 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 				Body:      fullBody,
 				StartLine: uint32(startLine),
 				EndLine:   uint32(endLine),
-				Hash:      hex.EncodeToString(hash[:]),
+				Hash:      nodeHash,
 				LOC:       endLine - startLine + 1,
 			}
 		}
@@ -360,6 +368,27 @@ func (e *Engine) AllSnapshots() map[string]*FileSnapshot {
 	return out
 }
 
+// ForEachSnapshot invokes fn for each cached snapshot under a read lock without allocating a map copy.
+func (e *Engine) ForEachSnapshot(fn func(path string, snap *FileSnapshot) bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.snapshots == nil {
+		return
+	}
+	for k, v := range e.snapshots {
+		if !fn(k, v) {
+			break
+		}
+	}
+}
+
+// SnapshotCount returns the number of files currently cached in memory.
+func (e *Engine) SnapshotCount() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.snapshots)
+}
+
 // SetSnapshot stores a freshly-parsed snapshot for diffing on the next
 // event. A no-op after Close: the map is dropped then, and assigning into a
 // nil map would panic.
@@ -404,15 +433,14 @@ func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out
 	if ok {
 		sig := buildSignature(lang, file, kind, node, src)
 		rawBody := sliceText(node, src)
-		normalized := normalizeForHash(rawBody, lang)
-		hash := sha256.Sum256([]byte(normalized))
+		nodeHash := hashNormalizedBody(rawBody, lang)
 		out.Nodes[sig] = Node{
 			Signature: sig,
 			Kind:      kind,
 			Body:      rawBody,
 			StartLine: node.StartPoint().Row + 1,
 			EndLine:   node.EndPoint().Row + 1,
-			Hash:      hex.EncodeToString(hash[:]),
+			Hash:      nodeHash,
 			LOC:       int(node.EndPoint().Row-node.StartPoint().Row) + 1,
 		}
 	}
@@ -596,19 +624,24 @@ func sliceText(n *sitter.Node, src []byte) string {
 	return string(src[a:b])
 }
 
-// normalizeForHash strips comments and collapses whitespace so cosmetic-only
-// edits (formatting, comment tweaks) do not register as semantic changes.
-// It is intentionally conservative: it never rewrites identifiers, strings,
-// or numeric literals. '#' is treated as a line-comment ONLY for Python:
-// in JS/TS '#' is the private-field prefix (class A { #x = 1 }) and must be
-// preserved verbatim.
-func normalizeForHash(s string, lang Language) string {
-	var b strings.Builder
-	b.Grow(len(s))
+// hashNormalizedBody strips comments and collapses whitespace directly in a pooled byte buffer
+// and returns the hex-encoded SHA256 without intermediate string allocations.
+func hashNormalizedBody(s string, lang Language) string {
+	bufPtr := hashBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+	if cap(buf) < len(s) {
+		buf = make([]byte, 0, len(s))
+	}
+	defer func() {
+		*bufPtr = buf
+		hashBufPool.Put(bufPtr)
+	}()
+
 	prevSpace := false
 	inLineComment := false
 	inBlockComment := false
 	inString := byte(0)
+
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if inLineComment {
@@ -625,7 +658,7 @@ func normalizeForHash(s string, lang Language) string {
 			continue
 		}
 		if inString != 0 {
-			b.WriteByte(c)
+			buf = append(buf, c)
 			if c == inString {
 				backslashes := 0
 				for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
@@ -658,25 +691,115 @@ func normalizeForHash(s string, lang Language) string {
 			}
 		case '"', '\'', '`':
 			inString = c
-			b.WriteByte(c)
+			buf = append(buf, c)
 			continue
 		}
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
 			if !prevSpace {
-				b.WriteByte(' ')
+				buf = append(buf, ' ')
 				prevSpace = true
 			}
 			continue
 		}
-		b.WriteByte(c)
+		buf = append(buf, c)
 		prevSpace = false
 	}
-	return strings.TrimSpace(b.String())
+
+	trimmed := bytes.TrimSpace(buf)
+	sum := sha256.Sum256(trimmed)
+	return hex.EncodeToString(sum[:])
+}
+
+// normalizeForHash strips comments and collapses whitespace so cosmetic-only
+// edits (formatting, comment tweaks) do not register as semantic changes.
+func normalizeForHash(s string, lang Language) string {
+	bufPtr := hashBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+	if cap(buf) < len(s) {
+		buf = make([]byte, 0, len(s))
+	}
+	defer func() {
+		*bufPtr = buf
+		hashBufPool.Put(bufPtr)
+	}()
+
+	prevSpace := false
+	inLineComment := false
+	inBlockComment := false
+	inString := byte(0)
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inLineComment {
+			if c == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if c == '*' && i+1 < len(s) && s[i+1] == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+		if inString != 0 {
+			buf = append(buf, c)
+			if c == inString {
+				backslashes := 0
+				for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+					backslashes++
+				}
+				if backslashes%2 == 0 {
+					inString = 0
+				}
+			}
+			continue
+		}
+		switch c {
+		case '/':
+			if i+1 < len(s) && s[i+1] == '/' {
+				inLineComment = true
+				i++
+				continue
+			}
+			if i+1 < len(s) && s[i+1] == '*' {
+				inBlockComment = true
+				i++
+				continue
+			}
+		case '#':
+			if lang == LangPython {
+				inLineComment = true
+				continue
+			}
+		case '"', '\'', '`':
+			inString = c
+			buf = append(buf, c)
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			if !prevSpace {
+				buf = append(buf, ' ')
+				prevSpace = true
+			}
+			continue
+		}
+		buf = append(buf, c)
+		prevSpace = false
+	}
+
+	return string(bytes.TrimSpace(buf))
+}
+
+// HashBytes computes the SHA256 hex digest for arbitrary byte content.
+func HashBytes(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func hashBytes(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	return HashBytes(b)
 }
 
 // SortedSignatures returns the signatures of a snapshot in lexical order.
@@ -685,10 +808,14 @@ func (s *FileSnapshot) SortedSignatures() []string {
 	if s == nil {
 		return nil
 	}
+	if s.sortedSigs != nil && len(s.sortedSigs) == len(s.Nodes) {
+		return s.sortedSigs
+	}
 	out := make([]string, 0, len(s.Nodes))
 	for k := range s.Nodes {
 		out = append(out, k)
 	}
 	sort.Strings(out)
+	s.sortedSigs = out
 	return out
 }

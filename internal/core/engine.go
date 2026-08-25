@@ -71,11 +71,26 @@ type Engine struct {
 	indexMu     sync.RWMutex
 	indexStatus IndexProgress
 
+	primeMu     sync.Mutex
+	primeCancel context.CancelFunc
+
 	ipcMu      sync.RWMutex
 	ipcTraffic []ipc.IPCTrafficRecord
 
 	rootMu    sync.RWMutex
 	watchRoot string
+
+	cacheMu      sync.RWMutex
+	cacheGen     uint64
+	atlasCache   map[string]cachedAtlas
+	metricsCache map[string]cachedMetrics
+}
+
+// BumpCacheGen increments the cache generation counter, invalidating in-memory Atlas and Metrics caches.
+func (e *Engine) BumpCacheGen() {
+	e.cacheMu.Lock()
+	e.cacheGen++
+	e.cacheMu.Unlock()
 }
 
 // runMeta is the metadata kept for an active (or recently-seen) agent run —
@@ -210,11 +225,17 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 		log.Printf("engine: read %s: %v", path, err)
 		return
 	}
+
+	// Fast-path: if file was touched without content changes, skip AST parse and Diff entirely
+	prev, _ := e.cfg.AST.Snapshot(path)
+	if prev != nil && prev.Hash == ast.HashBytes(src) {
+		return
+	}
+
 	snap, err := e.cfg.AST.Parse(path, src)
 	if err != nil || snap == nil {
 		return
 	}
-	prev, _ := e.cfg.AST.Snapshot(path)
 	res := ast.Diff(repoName, prev, snap)
 	e.cfg.AST.SetSnapshot(snap)
 
@@ -284,6 +305,9 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 			}
 		}
 		e.hub.Broadcast(WSEvent{Type: "code_event", Payload: ev, EventID: rec.EventID})
+	}
+	if len(res.Events) > 0 {
+		e.BumpCacheGen()
 	}
 }
 
@@ -512,6 +536,7 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 		TaskID:      p.TaskID,
 	}
 	e.runMu.Unlock()
+	e.BumpCacheGen()
 	e.hub.Broadcast(WSEvent{Type: "run_reported", Payload: rec})
 	return nil
 }
@@ -639,6 +664,7 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 			return fmt.Errorf("insert read event: %w", err)
 		}
 	}
+	e.BumpCacheGen()
 	e.hub.Broadcast(WSEvent{Type: "file_read_event", Payload: rec, EventID: rec.ReadID})
 	return nil
 }

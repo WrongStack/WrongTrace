@@ -201,6 +201,52 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 	return true
 }
 
+type sseToolCallItem struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type sseDeltaItem struct {
+	Content          string            `json:"content"`
+	ReasoningContent string            `json:"reasoning_content"`
+	ToolCalls        []sseToolCallItem `json:"tool_calls"`
+	Type             string            `json:"type"`
+	Text             string            `json:"text"`
+	PartialJSON      string            `json:"partial_json"`
+	StopReason       string            `json:"stop_reason"`
+}
+
+type sseChoiceItem struct {
+	Index        int          `json:"index"`
+	FinishReason string       `json:"finish_reason"`
+	Delta        sseDeltaItem `json:"delta"`
+}
+
+type sseStreamChunk struct {
+	ID            string                 `json:"id"`
+	Model         string                 `json:"model"`
+	Type          string                 `json:"type"`
+	Index         int                    `json:"index"`
+	Choices       []sseChoiceItem        `json:"choices"`
+	Usage         map[string]interface{} `json:"usage"`
+	UsageMetadata map[string]interface{} `json:"usageMetadata"`
+	Message       *struct {
+		ID    string                 `json:"id"`
+		Model string                 `json:"model"`
+		Usage map[string]interface{} `json:"usage"`
+	} `json:"message"`
+	ContentBlock *struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"content_block"`
+	Delta *sseDeltaItem `json:"delta"`
+}
+
 func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 	var textBuilder strings.Builder
 	var reasoningBuilder strings.Builder
@@ -231,127 +277,102 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 			continue
 		}
 
-		var chunk map[string]interface{}
+		var chunk sseStreamChunk
 		if err := json.Unmarshal(jsonPart, &chunk); err != nil {
 			continue
 		}
 
-		if id, ok := chunk["id"].(string); ok && id != "" {
-			pa.WireID = id
+		if chunk.ID != "" {
+			pa.WireID = chunk.ID
 		}
-		if model, ok := chunk["model"].(string); ok && model != "" {
-			pa.WireModel = model
+		if chunk.Model != "" {
+			pa.WireModel = chunk.Model
 		}
 
 		// 1. Direct OpenAI / DeepSeek / Groq chunk usage
-		if usageMap, ok := chunk["usage"].(map[string]interface{}); ok {
-			pa.extractUsage(usageMap)
+		if chunk.Usage != nil {
+			pa.extractUsage(chunk.Usage)
 		}
 
 		// 2. Anthropic message_start usage
-		if msg, ok := chunk["message"].(map[string]interface{}); ok {
-			if id, ok := msg["id"].(string); ok && id != "" {
-				pa.WireID = id
+		if chunk.Message != nil {
+			if chunk.Message.ID != "" {
+				pa.WireID = chunk.Message.ID
 			}
-			if model, ok := msg["model"].(string); ok && model != "" {
-				pa.WireModel = model
+			if chunk.Message.Model != "" {
+				pa.WireModel = chunk.Message.Model
 			}
-			if uMap, ok := msg["usage"].(map[string]interface{}); ok {
-				pa.extractUsage(uMap)
+			if chunk.Message.Usage != nil {
+				pa.extractUsage(chunk.Message.Usage)
 			}
 		}
 
 		// 3. Gemini usageMetadata
-		if meta, ok := chunk["usageMetadata"].(map[string]interface{}); ok {
-			pa.extractUsage(meta)
+		if chunk.UsageMetadata != nil {
+			pa.extractUsage(chunk.UsageMetadata)
 		}
 
 		// OpenAI SSE format
-		if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
-			if firstChoice, ok := choices[0].(map[string]interface{}); ok {
-				if fr, ok := firstChoice["finish_reason"].(string); ok && fr != "" {
-					pa.FinishReason = fr
-				}
-				if delta, ok := firstChoice["delta"].(map[string]interface{}); ok {
-					if c, ok := delta["content"].(string); ok {
-						textBuilder.WriteString(c)
-					}
-					if rc, ok := delta["reasoning_content"].(string); ok {
-						reasoningBuilder.WriteString(rc)
-					}
+		if len(chunk.Choices) > 0 {
+			firstChoice := chunk.Choices[0]
+			if firstChoice.FinishReason != "" {
+				pa.FinishReason = firstChoice.FinishReason
+			}
+			if firstChoice.Delta.Content != "" {
+				textBuilder.WriteString(firstChoice.Delta.Content)
+			}
+			if firstChoice.Delta.ReasoningContent != "" {
+				reasoningBuilder.WriteString(firstChoice.Delta.ReasoningContent)
+			}
 
-					// SSE delta.tool_calls
-					if tcArr, ok := delta["tool_calls"].([]interface{}); ok {
-						for _, tc := range tcArr {
-							if tcMap, ok := tc.(map[string]interface{}); ok {
-								idx := 0
-								if idxFloat, ok := tcMap["index"].(float64); ok {
-									idx = int(idxFloat)
-								}
-								buf, exists := toolMap[idx]
-								if !exists {
-									buf = &toolBuffer{}
-									toolMap[idx] = buf
-								}
-								if id, ok := tcMap["id"].(string); ok && id != "" {
-									buf.id = id
-								}
-								if fn, ok := tcMap["function"].(map[string]interface{}); ok {
-									if name, ok := fn["name"].(string); ok && name != "" {
-										buf.name = name
-									}
-									if argsChunk, ok := fn["arguments"].(string); ok {
-										buf.args.WriteString(argsChunk)
-									}
-								}
-							}
-						}
+			// SSE delta.tool_calls
+			if len(firstChoice.Delta.ToolCalls) > 0 {
+				for _, tc := range firstChoice.Delta.ToolCalls {
+					idx := tc.Index
+					buf, exists := toolMap[idx]
+					if !exists {
+						buf = &toolBuffer{}
+						toolMap[idx] = buf
+					}
+					if tc.ID != "" {
+						buf.id = tc.ID
+					}
+					if tc.Function.Name != "" {
+						buf.name = tc.Function.Name
+					}
+					if tc.Function.Arguments != "" {
+						buf.args.WriteString(tc.Function.Arguments)
 					}
 				}
 			}
 		}
 
 		// Anthropic content_block_delta tool parsing
-		if cType, ok := chunk["type"].(string); ok {
-			if cType == "content_block_start" {
-				if cb, ok := chunk["content_block"].(map[string]interface{}); ok {
-					if cbType, _ := cb["type"].(string); cbType == "tool_use" {
-						idx := 0
-						if idxFloat, ok := chunk["index"].(float64); ok {
-							idx = int(idxFloat)
-						}
-						idStr, _ := cb["id"].(string)
-						nameStr, _ := cb["name"].(string)
-						buf := &toolBuffer{
-							id:   idStr,
-							name: nameStr,
-						}
-						toolMap[idx] = buf
+		if chunk.Type != "" {
+			if chunk.Type == "content_block_start" && chunk.ContentBlock != nil {
+				if chunk.ContentBlock.Type == "tool_use" {
+					idx := chunk.Index
+					toolMap[idx] = &toolBuffer{
+						id:   chunk.ContentBlock.ID,
+						name: chunk.ContentBlock.Name,
 					}
 				}
-			} else if cType == "content_block_delta" {
-				if delta, ok := chunk["delta"].(map[string]interface{}); ok {
-					if dType, _ := delta["type"].(string); dType == "input_json_delta" {
-						idx := 0
-						if idxFloat, ok := chunk["index"].(float64); ok {
-							idx = int(idxFloat)
+			} else if chunk.Type == "content_block_delta" && chunk.Delta != nil {
+				if chunk.Delta.Type == "input_json_delta" {
+					idx := chunk.Index
+					if buf, exists := toolMap[idx]; exists {
+						if chunk.Delta.PartialJSON != "" {
+							buf.args.WriteString(chunk.Delta.PartialJSON)
 						}
-						if buf, exists := toolMap[idx]; exists {
-							if pJson, ok := delta["partial_json"].(string); ok {
-								buf.args.WriteString(pJson)
-							}
-						}
-					} else if dType == "text_delta" {
-						if t, ok := delta["text"].(string); ok {
-							textBuilder.WriteString(t)
-						}
+					}
+				} else if chunk.Delta.Type == "text_delta" {
+					if chunk.Delta.Text != "" {
+						textBuilder.WriteString(chunk.Delta.Text)
 					}
 				}
-			} else if cType == "message_delta" {
-				if delta, ok := chunk["delta"].(map[string]interface{}); ok {
-					if stopReason, ok := delta["stop_reason"].(string); ok {
-						pa.FinishReason = stopReason
-					}
+			} else if chunk.Type == "message_delta" && chunk.Delta != nil {
+				if chunk.Delta.StopReason != "" {
+					pa.FinishReason = chunk.Delta.StopReason
 				}
 			}
 		}

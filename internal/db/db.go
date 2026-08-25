@@ -118,6 +118,9 @@ func (s *Store) Migrate() error {
 		"CREATE INDEX IF NOT EXISTS idx_node_sig_time ON code_node_events(file_path, node_signature, event_time DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_node_repo_time ON code_node_events(repo_name, event_time DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_node_action_time ON code_node_events(action, event_time DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_node_sig_max ON code_node_events(node_signature, event_time DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_node_repo_sig ON code_node_events(repo_name, node_signature, event_time DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_node_time_repo_file ON code_node_events(event_time DESC, repo_name, file_path, node_signature)",
 		"CREATE INDEX IF NOT EXISTS idx_runs_created ON agent_runs(created_at DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_read_file_time ON file_read_events(file_path, read_time DESC)",
 	} {

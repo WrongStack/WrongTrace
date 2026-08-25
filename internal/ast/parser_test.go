@@ -467,3 +467,27 @@ end
 		t.Errorf("expected 0 snapshots after reset, got %d", len(all))
 	}
 }
+
+func TestSortedSignatures_Caching(t *testing.T) {
+	eng := newTestEngine(t)
+	src := `package main
+func B() {}
+func A() {}
+func C() {}
+`
+	snap := parseOrFatal(t, eng, "main.go", src)
+	sigs1 := snap.SortedSignatures()
+	sigs2 := snap.SortedSignatures()
+	if len(sigs1) != 3 {
+		t.Fatalf("expected 3 signatures, got %d", len(sigs1))
+	}
+	if sigs1[0] != sigs2[0] || sigs1[1] != sigs2[1] || sigs1[2] != sigs2[2] {
+		t.Errorf("cached signatures mismatch: %+v vs %+v", sigs1, sigs2)
+	}
+
+	h1 := HashBytes([]byte(src))
+	h2 := HashBytes([]byte(src))
+	if h1 != h2 || h1 == "" {
+		t.Errorf("hash mismatch or empty: %s vs %s", h1, h2)
+	}
+}

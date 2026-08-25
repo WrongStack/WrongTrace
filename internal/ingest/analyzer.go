@@ -156,6 +156,20 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 
 		trimmed := bytes.TrimSpace(lineBytes)
 		if len(trimmed) > 0 {
+			// Fast pre-filter: skip JSON unmarshaling for lines that cannot contain tool calls, user input, model info, or usage
+			if !bytes.Contains(trimmed, []byte(`"tool`)) &&
+				!bytes.Contains(trimmed, []byte(`"USER_INPUT"`)) &&
+				!bytes.Contains(trimmed, []byte(`"model"`)) &&
+				!bytes.Contains(trimmed, []byte(`"Model"`)) &&
+				!bytes.Contains(trimmed, []byte(`"usage"`)) &&
+				!bytes.Contains(trimmed, []byte(`"selectedModel"`)) &&
+				!bytes.Contains(trimmed, []byte(`"planner_model"`)) {
+				if !complete {
+					break
+				}
+				continue
+			}
+
 			var row map[string]interface{}
 			if uErr := json.Unmarshal(trimmed, &row); uErr == nil {
 				// Dynamically extract model from deep json structures
