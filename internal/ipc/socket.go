@@ -499,7 +499,7 @@ func (s *Server) dispatch(req *Request) Response {
 				"system.listMethods",
 			},
 			"server":  "wrongtrace",
-			"version": "0.3.5",
+			"version": "0.3.6",
 		}
 
 	case "ping":

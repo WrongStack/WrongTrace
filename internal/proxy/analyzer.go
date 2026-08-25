@@ -543,8 +543,21 @@ func EstimatePromptTokens(reqBody []byte) int64 {
 	// 3. Tools definitions
 	if tools, ok := reqMap["tools"].([]interface{}); ok {
 		for _, t := range tools {
-			if tb, err := json.Marshal(t); err == nil {
-				charCount += len(tb)
+			if tMap, ok := t.(map[string]interface{}); ok {
+				if fn, ok := tMap["function"].(map[string]interface{}); ok {
+					if fnName, ok := fn["name"].(string); ok {
+						charCount += len(fnName)
+					}
+					if fnDesc, ok := fn["description"].(string); ok {
+						charCount += len(fnDesc)
+					}
+				}
+				if name, ok := tMap["name"].(string); ok {
+					charCount += len(name)
+				}
+				if desc, ok := tMap["description"].(string); ok {
+					charCount += len(desc)
+				}
 			}
 		}
 	}

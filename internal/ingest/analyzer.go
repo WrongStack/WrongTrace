@@ -27,6 +27,14 @@ var (
 	startLineKeys = []string{"StartLine", "start_line", "startLine", "offset", "line_start", "lineStart", "from_line", "fromLine", "start"}
 	endLineKeys   = []string{"EndLine", "end_line", "endLine", "line_end", "lineEnd", "to_line", "toLine", "end"}
 	countLineKeys = []string{"lines", "line_count", "count", "num_lines", "limit"}
+
+	bTool          = []byte(`"tool`)
+	bUserInput     = []byte(`"USER_INPUT"`)
+	bModelLower    = []byte(`"model"`)
+	bModelUpper    = []byte(`"Model"`)
+	bUsage         = []byte(`"usage"`)
+	bSelectedModel = []byte(`"selectedModel"`)
+	bPlannerModel  = []byte(`"planner_model"`)
 )
 
 // ExtractTargetFile attempts to extract the destination file path from a tool call payload.
@@ -157,13 +165,13 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 		trimmed := bytes.TrimSpace(lineBytes)
 		if len(trimmed) > 0 {
 			// Fast pre-filter: skip JSON unmarshaling for lines that cannot contain tool calls, user input, model info, or usage
-			if !bytes.Contains(trimmed, []byte(`"tool`)) &&
-				!bytes.Contains(trimmed, []byte(`"USER_INPUT"`)) &&
-				!bytes.Contains(trimmed, []byte(`"model"`)) &&
-				!bytes.Contains(trimmed, []byte(`"Model"`)) &&
-				!bytes.Contains(trimmed, []byte(`"usage"`)) &&
-				!bytes.Contains(trimmed, []byte(`"selectedModel"`)) &&
-				!bytes.Contains(trimmed, []byte(`"planner_model"`)) {
+			if !bytes.Contains(trimmed, bTool) &&
+				!bytes.Contains(trimmed, bUserInput) &&
+				!bytes.Contains(trimmed, bModelLower) &&
+				!bytes.Contains(trimmed, bModelUpper) &&
+				!bytes.Contains(trimmed, bUsage) &&
+				!bytes.Contains(trimmed, bSelectedModel) &&
+				!bytes.Contains(trimmed, bPlannerModel) {
 				if !complete {
 					break
 				}
@@ -428,8 +436,7 @@ func extractModelFromRow(m map[string]interface{}) string {
 
 	// Extract from content text (e.g. Antigravity settings changes or prompt headers)
 	if content, ok := m["content"].(string); ok && content != "" {
-		lowerContent := strings.ToLower(content)
-		if strings.Contains(lowerContent, "model") || strings.Contains(content, "<!--") {
+		if strings.Contains(content, "model") || strings.Contains(content, "Model") || strings.Contains(content, "MODEL") || strings.Contains(content, "<!--") {
 			if match := modelSelectionRe.FindStringSubmatch(content); len(match) > 1 {
 				extracted := strings.TrimSpace(match[1])
 				if extracted != "" && !strings.EqualFold(extracted, "none") {

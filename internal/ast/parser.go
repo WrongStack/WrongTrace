@@ -435,7 +435,13 @@ func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out
 	if ok {
 		sig := buildSignature(lang, file, kind, node, src)
 		rawBody := sliceText(node, src)
-		nodeHash := hashNormalizedBody(rawBody, lang)
+		a, b := node.StartByte(), node.EndByte()
+		var nodeHash string
+		if a <= b && b <= uint32(len(src)) {
+			nodeHash = hashNormalizedBodyBytes(src[a:b], lang)
+		} else {
+			nodeHash = hashNormalizedBody(rawBody, lang)
+		}
 		out.Nodes[sig] = Node{
 			Signature: sig,
 			Kind:      kind,
@@ -629,10 +635,16 @@ func sliceText(n *sitter.Node, src []byte) string {
 // hashNormalizedBody strips comments and collapses whitespace directly in a pooled byte buffer
 // and returns the hex-encoded SHA256 without intermediate string allocations.
 func hashNormalizedBody(s string, lang Language) string {
+	return hashNormalizedBodyBytes([]byte(s), lang)
+}
+
+// hashNormalizedBodyBytes strips comments and collapses whitespace directly from a byte slice into a pooled buffer
+// and returns the hex-encoded SHA256 without string allocations.
+func hashNormalizedBodyBytes(b []byte, lang Language) string {
 	bufPtr := hashBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
-	if cap(buf) < len(s) {
-		buf = make([]byte, 0, len(s))
+	if cap(buf) < len(b) {
+		buf = make([]byte, 0, len(b))
 	}
 	defer func() {
 		*bufPtr = buf
@@ -644,8 +656,8 @@ func hashNormalizedBody(s string, lang Language) string {
 	inBlockComment := false
 	inString := byte(0)
 
-	for i := 0; i < len(s); i++ {
-		c := s[i]
+	for i := 0; i < len(b); i++ {
+		c := b[i]
 		if inLineComment {
 			if c == '\n' {
 				inLineComment = false
@@ -653,7 +665,7 @@ func hashNormalizedBody(s string, lang Language) string {
 			continue
 		}
 		if inBlockComment {
-			if c == '*' && i+1 < len(s) && s[i+1] == '/' {
+			if c == '*' && i+1 < len(b) && b[i+1] == '/' {
 				inBlockComment = false
 				i++
 			}
@@ -663,7 +675,7 @@ func hashNormalizedBody(s string, lang Language) string {
 			buf = append(buf, c)
 			if c == inString {
 				backslashes := 0
-				for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+				for j := i - 1; j >= 0 && b[j] == '\\'; j-- {
 					backslashes++
 				}
 				if backslashes%2 == 0 {
@@ -674,12 +686,12 @@ func hashNormalizedBody(s string, lang Language) string {
 		}
 		switch c {
 		case '/':
-			if i+1 < len(s) && s[i+1] == '/' {
+			if i+1 < len(b) && b[i+1] == '/' {
 				inLineComment = true
 				i++
 				continue
 			}
-			if i+1 < len(s) && s[i+1] == '*' {
+			if i+1 < len(b) && b[i+1] == '*' {
 				inBlockComment = true
 				i++
 				continue

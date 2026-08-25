@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import type { FileHealth, HealthResponse, MetricsSnapshot, ModelRow, ThrashingRow, EventRecord, AtlasSnapshot } from '../types';
 
 const base = '/api';
@@ -48,13 +48,38 @@ export function useModels(projectId?: string | null) {
   });
 }
 
+// Cursor-based recent-events fetch: one full page on mount, then only rows
+// at-or-after the newest event_time already held. Rows are merged locally,
+// deduped by event_id, and capped at the page size, so consumers see the
+// same shape the old full poll produced while the daemon ships a handful of
+// rows per tick instead of re-serializing all 500.
 export function useRecentEvents(projectId?: string | null, limit: number = 500) {
+  const queryClient = useQueryClient();
   const pParam = projectId ? `project_id=${encodeURIComponent(projectId)}` : '';
   const lParam = `limit=${limit}`;
-  const q = [pParam, lParam].filter(Boolean).join('&');
+  const baseQ = [pParam, lParam].filter(Boolean).join('&');
+
   return useQuery<EventRecord[]>({
     queryKey: ['recent', projectId || 'active', limit],
-    queryFn: ({ signal }) => jget<EventRecord[]>(`${base}/metrics/recent?${q}`, signal),
+    queryFn: async ({ signal }) => {
+      const previous = queryClient.getQueryData<EventRecord[]>(['recent', projectId || 'active', limit]);
+      let q = baseQ;
+      if (previous && previous.length > 0) {
+        const cursor = previous.reduce((a, e) => (e.event_time > a ? e.event_time : a), previous[0].event_time);
+        q = `${baseQ}&since=${encodeURIComponent(cursor)}`;
+      }
+      const fresh = await jget<EventRecord[]>(`${base}/metrics/recent?${q}`, signal);
+      if (!previous || previous.length === 0) return fresh;
+      if (fresh.length === 0) return previous;
+      // fresh is newest-first from the server; keep any older rows it did not
+      // replace, then cap at the page size.
+      const seen = new Set(fresh.map((e) => e.event_id));
+      const merged = [...fresh, ...previous.filter((e) => !seen.has(e.event_id))];
+      // Both inputs are newest-first, but equal-timestamp rows can flip order
+      // between polls and defensive re-sorting keeps the cap deterministic.
+      merged.sort((a, b) => b.event_time.localeCompare(a.event_time) || a.event_id.localeCompare(b.event_id));
+      return merged.slice(0, limit);
+    },
     staleTime: 3_000,
     refetchInterval: 10_000,
   });

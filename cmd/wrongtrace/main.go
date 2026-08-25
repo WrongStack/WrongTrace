@@ -318,6 +318,9 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	sessionWatcher.DiscoverGlobalAgentDirs()
 	sessionWatcher.StartPolling(ctx, 25*time.Second)
 
+	// Optional pprof listener; no-op unless WRONGTRACE_PPROF=1.
+	server.StartDebugServer(ctx)
+
 	// Resilient HTTP Server Loop: never drops daemon on temporary listener issues
 	go func() {
 		for {

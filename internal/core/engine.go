@@ -84,9 +84,10 @@ type Engine struct {
 	cacheGen     uint64
 	atlasCache   map[string]cachedAtlas
 	metricsCache map[string]cachedMetrics
+	recentCache  map[string]cachedRecent
 }
 
-// BumpCacheGen increments the cache generation counter, invalidating in-memory Atlas and Metrics caches.
+// BumpCacheGen increments the cache generation counter, invalidating in-memory Atlas, Metrics, and RecentEvents caches.
 func (e *Engine) BumpCacheGen() {
 	e.cacheMu.Lock()
 	e.cacheGen++
@@ -693,13 +694,48 @@ func (e *Engine) GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRec
 	return store.RecentEvents(limit, filter)
 }
 
+// cachedRecent memoizes one since-less, file-less RecentEventsFiltered result
+// per (limit, repo) key, mirroring the Metrics/Atlas gen+TTL pattern: the
+// dashboard's every-10s recent-events polls stop re-running the 500-row SQL
+// while nothing changed. Cursored (since) or file-scoped queries always hit
+// the store directly so incremental fetches stay exact.
+type cachedRecent struct {
+	gen      uint64
+	cachedAt time.Time
+	events   []db.EventRecord
+}
+
+const recentCacheTTL = 2 * time.Second
+
 // GetRecentEventsFiltered queries recent events with flexible repository, file, and timestamp constraints.
 func (e *Engine) GetRecentEventsFiltered(limit int, repo string, filePath string, since time.Time) ([]db.EventRecord, error) {
 	store := e.Store()
 	if store == nil {
 		return nil, nil
 	}
-	return store.RecentEventsFiltered(limit, repo, filePath, since)
+	cacheable := filePath == "" && since.IsZero()
+	key := fmt.Sprintf("%d\x00%s", limit, repo)
+	if cacheable {
+		e.cacheMu.RLock()
+		if cached, ok := e.recentCache[key]; ok && cached.gen == e.cacheGen && time.Since(cached.cachedAt) < recentCacheTTL {
+			e.cacheMu.RUnlock()
+			return cached.events, nil
+		}
+		e.cacheMu.RUnlock()
+	}
+	events, err := store.RecentEventsFiltered(limit, repo, filePath, since)
+	if err != nil {
+		return nil, err
+	}
+	if cacheable {
+		e.cacheMu.Lock()
+		if e.recentCache == nil {
+			e.recentCache = make(map[string]cachedRecent)
+		}
+		e.recentCache[key] = cachedRecent{gen: e.cacheGen, cachedAt: time.Now(), events: events}
+		e.cacheMu.Unlock()
+	}
+	return events, nil
 }
 
 // GetRecentFileEvents returns recent diff and AST events specifically matching a file.

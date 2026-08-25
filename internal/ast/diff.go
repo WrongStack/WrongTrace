@@ -305,6 +305,9 @@ func formatDeletedDiff(body string) (string, int, int) {
 }
 
 func generateLineDiff(oldText, newText string) (string, int, int) {
+	if oldText == newText {
+		return "", 0, 0
+	}
 	oldLines := splitLines(oldText)
 	newLines := splitLines(newText)
 

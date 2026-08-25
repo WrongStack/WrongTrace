@@ -26,14 +26,28 @@ func parseDBTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
 	}
-	switch len(s) {
-	case 19: // "2006-01-02 15:04:05"
-		if t, err := time.ParseInLocation(time.DateTime, s, time.UTC); err == nil {
-			return t
+	// Fast zero-allocation path for "YYYY-MM-DD HH:MM:SS" (19 chars)
+	if len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' && s[13] == ':' && s[16] == ':' {
+		y := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
+		m := time.Month(int(s[5]-'0')*10 + int(s[6]-'0'))
+		d := int(s[8]-'0')*10 + int(s[9]-'0')
+		h := int(s[11]-'0')*10 + int(s[12]-'0')
+		min := int(s[14]-'0')*10 + int(s[15]-'0')
+		sec := int(s[17]-'0')*10 + int(s[18]-'0')
+		if y >= 1970 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31 && h >= 0 && h <= 23 && min >= 0 && min <= 59 && sec >= 0 && sec <= 60 {
+			return time.Date(y, m, d, h, min, sec, 0, time.UTC)
 		}
-	case 20: // "2006-01-02T15:04:05Z"
-		if t, err := time.Parse(time.RFC3339, s); err == nil {
-			return t.UTC()
+	}
+	// Fast zero-allocation path for "YYYY-MM-DDTHH:MM:SSZ" (20 chars)
+	if len(s) == 20 && s[4] == '-' && s[7] == '-' && s[10] == 'T' && s[13] == ':' && s[16] == ':' && s[19] == 'Z' {
+		y := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
+		m := time.Month(int(s[5]-'0')*10 + int(s[6]-'0'))
+		d := int(s[8]-'0')*10 + int(s[9]-'0')
+		h := int(s[11]-'0')*10 + int(s[12]-'0')
+		min := int(s[14]-'0')*10 + int(s[15]-'0')
+		sec := int(s[17]-'0')*10 + int(s[18]-'0')
+		if y >= 1970 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31 && h >= 0 && h <= 23 && min >= 0 && min <= 59 && sec >= 0 && sec <= 60 {
+			return time.Date(y, m, d, h, min, sec, 0, time.UTC)
 		}
 	}
 	for _, l := range dbTimeLayouts {

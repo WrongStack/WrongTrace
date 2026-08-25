@@ -228,6 +228,16 @@ func (w *Watcher) scopedPath(p string) string {
 	if w.root == "" {
 		return p
 	}
+	if len(p) >= len(w.root) {
+		if strings.HasPrefix(p, w.root) {
+			if len(p) == len(w.root) {
+				return ""
+			}
+			if p[len(w.root)] == filepath.Separator || p[len(w.root)] == '/' {
+				return p[len(w.root)+1:]
+			}
+		}
+	}
 	rel, err := filepath.Rel(w.root, p)
 	if err != nil {
 		return p

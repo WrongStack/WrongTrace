@@ -148,21 +148,22 @@ func (sw *SessionWatcher) DiscoverGlobalAgentDirs() {
 	}
 }
 
+var ignoredLogDirMap = map[string]struct{}{
+	".git": {}, "node_modules": {}, "cache": {}, "gpucache": {}, "code cache": {}, "cachestorage": {},
+	"temp": {}, "tmp": {}, "extensions": {}, "dist": {}, "build": {}, "bin": {}, "obj": {}, "venv": {}, ".venv": {},
+	"__pycache__": {}, "crashpad": {}, "dawngraphitecache": {}, "grshadercache": {}, "shadercache": {},
+	"indexeddb": {}, "local storage": {}, "session storage": {}, "blob_storage": {}, "service worker": {},
+	"dictionaries": {}, "webrtc": {}, "packaged-extensions": {}, "state.vscdb.backup": {}, "backup": {},
+	"assets": {}, "images": {}, "videos": {}, "media": {}, "thumbnails": {}, "coverage": {}, ".turbo": {},
+	".next": {}, ".svelte-kit": {}, ".nuxt": {}, "out": {}, ".idea": {}, ".npm": {}, ".yarn": {}, ".cargo": {},
+	"scratch": {}, "plans": {}, "artifacts": {}, "snapshots": {}, "diffs": {}, "checkpoints": {}, "storage": {},
+}
+
 // isIgnoredLogDir reports whether a directory segment should be skipped during walk.
 func isIgnoredLogDir(name string) bool {
 	lower := strings.ToLower(name)
-	switch lower {
-	case ".git", "node_modules", "cache", "gpucache", "code cache", "cachestorage",
-		"temp", "tmp", "extensions", "dist", "build", "bin", "obj", "venv", ".venv",
-		"__pycache__", "crashpad", "dawngraphitecache", "grshadercache", "shadercache",
-		"indexeddb", "local storage", "session storage", "blob_storage", "service worker",
-		"dictionaries", "webrtc", "packaged-extensions", "state.vscdb.backup", "backup",
-		"assets", "images", "videos", "media", "thumbnails", "coverage", ".turbo",
-		".next", ".svelte-kit", ".nuxt", "out", ".idea", ".npm", ".yarn", ".cargo",
-		"scratch", "plans", "artifacts", "snapshots", "diffs", "checkpoints", "storage":
-		return true
-	}
-	return false
+	_, ok := ignoredLogDirMap[lower]
+	return ok
 }
 
 // PollOnce inspects watched directories and incrementally processes new transcript lines.
@@ -209,14 +210,26 @@ func (sw *SessionWatcher) PollOnce() {
 				return nil
 			}
 
-			ext := filepath.Ext(name)
-			if ext != ".jsonl" && ext != ".json" && name != ".aider.chat.history.md" {
+			isJSONL := strings.HasSuffix(name, ".jsonl")
+			isJSON := !isJSONL && strings.HasSuffix(name, ".json")
+			isAider := name == ".aider.chat.history.md"
+
+			if !isJSONL && !isJSON && !isAider {
 				return nil
 			}
 
 			// For .json files, only process known task files (Cline/Roo tasks)
-			if ext == ".json" {
-				parent := filepath.Base(filepath.Dir(path))
+			if isJSON {
+				// Fast extraction of parent dir name without allocating filepath.Dir
+				dirOnly := path[:len(path)-len(name)]
+				if len(dirOnly) > 0 && (dirOnly[len(dirOnly)-1] == '/' || dirOnly[len(dirOnly)-1] == '\\') {
+					dirOnly = dirOnly[:len(dirOnly)-1]
+				}
+				lastSep := strings.LastIndexAny(dirOnly, "/\\")
+				parent := dirOnly
+				if lastSep != -1 {
+					parent = dirOnly[lastSep+1:]
+				}
 				if parent != "tasks" && parent != "cline" && parent != "sessions" && parent != "conversations" {
 					return nil
 				}
@@ -257,12 +270,12 @@ func (sw *SessionWatcher) PollOnce() {
 			var newOffset int64
 			var parseErr error
 
-			if ext == ".jsonl" {
+			if isJSONL {
 				events, readEvents, newOffset, parseErr = ParseJSONLTranscriptFromOffset(path, lastOffset)
-			} else if ext == ".json" {
+			} else if isJSON {
 				events, parseErr = ParseClineTask(path)
 				newOffset = currentSize
-			} else if name == ".aider.chat.history.md" {
+			} else if isAider {
 				events, parseErr = ParseAiderHistory(path)
 				newOffset = currentSize
 			}

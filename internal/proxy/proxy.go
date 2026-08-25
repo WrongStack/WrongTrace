@@ -1073,6 +1073,14 @@ func sanitizeBodyForRecord(body string) string {
 		return body
 	}
 
+	// Early head/tail truncation if the incoming body is massive (e.g. 500KB - 5MB SSE stream)
+	// to avoid unmarshaling and regex scanning megabytes of discarded lines
+	if len(body) > maxRecordBodyLen*2 {
+		head := runeSafePrefix(body, maxRecordBodyLen*3/4)
+		tail := runeSafeSuffix(body, maxRecordBodyLen/4)
+		return sanitizeBodyForRecord(head) + "\n…[body truncated " + strconv.Itoa(len(body)-len(head)-len(tail)) + " chars]…\n" + sanitizeBodyForRecord(tail)
+	}
+
 	var out string
 	trimmed := strings.TrimSpace(body)
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
@@ -1127,8 +1135,25 @@ func maskJSONValue(v interface{}) interface{} {
 // JSON chunk is walked like a JSON body (per-chunk masking keeps the stream
 // structure intact); other lines get the credential regex scrub.
 func maskNonJSONBody(body string) string {
-	lines := strings.Split(body, "\n")
-	for i, line := range lines {
+	var b strings.Builder
+	b.Grow(len(body))
+
+	rem := body
+	first := true
+	for len(rem) > 0 {
+		var line string
+		if idx := strings.IndexByte(rem, '\n'); idx >= 0 {
+			line = rem[:idx]
+			rem = rem[idx+1:]
+		} else {
+			line = rem
+			rem = ""
+		}
+		if !first {
+			b.WriteByte('\n')
+		}
+		first = false
+
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "data:") {
 			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
@@ -1136,16 +1161,17 @@ func maskNonJSONBody(body string) string {
 				(strings.HasPrefix(payload, "{") || strings.HasPrefix(payload, "[")) {
 				var v interface{}
 				if err := json.Unmarshal([]byte(payload), &v); err == nil {
-					if b, err := json.Marshal(maskJSONValue(v)); err == nil {
-						lines[i] = "data: " + string(b)
+					if mBytes, err := json.Marshal(maskJSONValue(v)); err == nil {
+						b.WriteString("data: ")
+						b.Write(mBytes)
 						continue
 					}
 				}
 			}
 		}
-		lines[i] = scrubErrorString(line)
+		b.WriteString(scrubErrorString(line))
 	}
-	return strings.Join(lines, "\n")
+	return b.String()
 }
 
 // truncateRecordString keeps the head (3/4) and tail (1/4) of an overly long

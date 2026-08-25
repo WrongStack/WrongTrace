@@ -77,6 +77,21 @@ func hasGenericSecret(b []byte) bool {
 	return false
 }
 
+var (
+	bPrivKey    = []byte("PRIVATE KEY")
+	bAKIA       = []byte("AKIA")
+	bGhp        = []byte("ghp_")
+	bGithubPat  = []byte("github_pat_")
+	bSkAnt      = []byte("sk-ant-")
+	bSk         = []byte("sk-")
+	bAIzaSy     = []byte("AIzaSy")
+	bColonSlash = []byte("://")
+	bPostgres   = []byte("postgres")
+	bMysql      = []byte("mysql")
+	bMongo      = []byte("mongodb")
+	bRedis      = []byte("redis")
+)
+
 // ScanAndRedactSecrets inspects request payloads for confidential secrets and masks them before sending to LLMs.
 // Uses fast-path substring checks so multi-megabyte payloads bypass expensive regex scans when no matching tokens exist.
 func ScanAndRedactSecrets(body []byte) ([]byte, int) {
@@ -84,13 +99,13 @@ func ScanAndRedactSecrets(body []byte) ([]byte, int) {
 		return body, 0
 	}
 
-	hasPrivateKey := bytes.Contains(body, []byte("PRIVATE KEY"))
-	hasAWS := bytes.Contains(body, []byte("AKIA"))
-	hasGitHub := bytes.Contains(body, []byte("ghp_")) || bytes.Contains(body, []byte("github_pat_"))
-	hasAnthropic := bytes.Contains(body, []byte("sk-ant-"))
-	hasOpenAI := bytes.Contains(body, []byte("sk-"))
-	hasGoogle := bytes.Contains(body, []byte("AIzaSy"))
-	hasDB := bytes.Contains(body, []byte("://")) && (bytes.Contains(body, []byte("postgres")) || bytes.Contains(body, []byte("mysql")) || bytes.Contains(body, []byte("mongodb")) || bytes.Contains(body, []byte("redis")))
+	hasPrivateKey := bytes.Contains(body, bPrivKey)
+	hasAWS := bytes.Contains(body, bAKIA)
+	hasGitHub := bytes.Contains(body, bGhp) || bytes.Contains(body, bGithubPat)
+	hasAnthropic := bytes.Contains(body, bSkAnt)
+	hasOpenAI := bytes.Contains(body, bSk)
+	hasGoogle := bytes.Contains(body, bAIzaSy)
+	hasDB := bytes.Contains(body, bColonSlash) && (bytes.Contains(body, bPostgres) || bytes.Contains(body, bMysql) || bytes.Contains(body, bMongo) || bytes.Contains(body, bRedis))
 	hasGeneric := hasGenericSecret(body)
 
 	if !hasPrivateKey && !hasAWS && !hasGitHub && !hasAnthropic && !hasOpenAI && !hasGoogle && !hasDB && !hasGeneric {

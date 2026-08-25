@@ -1089,6 +1089,14 @@ var alwaysIgnoredDirs = []string{
 	".idea", ".vscode", ".svelte-kit", ".astro",
 }
 
+var alwaysIgnoredMap = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(alwaysIgnoredDirs))
+	for _, d := range alwaysIgnoredDirs {
+		m[strings.ToLower(d)] = struct{}{}
+	}
+	return m
+}()
+
 // isIgnoredDir reports whether a directory base name is excluded from all
 // recursive walks: the ignore_patterns setting plus alwaysIgnoredDirs.
 // Case-insensitive (EqualFold) because Windows roots arrive with mixed
@@ -1097,13 +1105,11 @@ var alwaysIgnoredDirs = []string{
 // do not inline pattern lists in walkers.
 func isIgnoredDir(base string) bool {
 	baseLower := strings.ToLower(base)
-	for _, ig := range alwaysIgnoredDirs {
-		if baseLower == ig || strings.EqualFold(baseLower, ig) {
-			return true
-		}
+	if _, ok := alwaysIgnoredMap[baseLower]; ok {
+		return true
 	}
 	for _, ig := range ignorePatterns() {
-		if baseLower == ig || strings.EqualFold(baseLower, ig) {
+		if baseLower == strings.ToLower(ig) {
 			return true
 		}
 	}

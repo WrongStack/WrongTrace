@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.6] - 2026-08-25
+
+### Added
+- **Opt-in pprof Debug Profiler Listener**:
+  - Integrated `server.StartDebugServer` with loopback pprof endpoints triggered via `WRONGTRACE_PPROF=1` (customizable via `WRONGTRACE_PPROF_ADDR`), keeping unauthenticated public API routes strictly free of profiling endpoints.
+- **Cursor-Based Incremental Metrics Streaming**:
+  - Implemented cursor pagination in React query `useRecentEvents` using `since` timestamps and client-side merge deduplication, reducing background serialization load from 500 rows to delta increments per poll.
+  - Added in-memory generation & TTL cached results for `Engine.GetRecentEventsFiltered` (`recentCache`).
+
+### Optimized & Hardened
+- **Zero-Allocation String & Datetime Processing**:
+  - Handled fixed SQLite datetime (`len=19`) and RFC3339 (`len=20`) layouts via instant zero-allocation integer parsing in `parseDBTime`.
+  - Replaced runtime dynamic slice allocations in `resolvePackageScope` and `SessionWatcher` directory parsing with zero-allocation index splitting.
+  - Pre-allocated static byte patterns across `internal/proxy/scanner.go` and `internal/ingest/analyzer.go` to eliminate runtime byte slice conversion allocations.
+  - Added O(1) hash map `alwaysIgnoredMap` for rapid path ignore checks during recursive project traversals.
+- **Gateway Proxy Streaming Assertion**:
+  - Verified true incremental SSE stream chunk delivery before upstream completion with dedicated integration testing.
+- **Dashboard UI & Shell Integration**:
+  - Restored full dark mode application layout and CSS imports in embedded distribution bundle (`web/dist/index.html`).
+
+---
+
 ## [0.3.5] - 2026-08-25
 
 ### Fixed & Hardened (Ingest Resiliency, Concurrency, Security & High-Performance CPU Optimization)

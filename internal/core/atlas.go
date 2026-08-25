@@ -453,27 +453,39 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 }
 
 func resolvePackageScope(filePath string) (pkgPath string, pkgName string, workspace string) {
-	dir := filepath.ToSlash(filepath.Dir(filePath))
-	clean := filepath.ToSlash(filepath.Clean(dir))
+	lastSlash := strings.LastIndexByte(filePath, '/')
+	if lastSlash == -1 {
+		lastSlash = strings.LastIndexByte(filePath, '\\')
+	}
+	if lastSlash <= 0 {
+		return "root", "root", "root"
+	}
+	clean := filepath.ToSlash(filePath[:lastSlash])
 	if clean == "." || clean == "" || clean == "root" {
 		return "root", "root", "root"
 	}
 
-	parts := strings.Split(clean, "/")
-	if len(parts) == 1 {
-		return parts[0], parts[0], parts[0]
+	firstSlash := strings.IndexByte(clean, '/')
+	if firstSlash == -1 {
+		return clean, clean, clean
 	}
 
-	first := parts[0]
+	first := clean[:firstSlash]
+	rest := clean[firstSlash+1:]
+	second := rest
+	if secondSlash := strings.IndexByte(rest, '/'); secondSlash != -1 {
+		second = rest[:secondSlash]
+	}
+
 	// Monorepo containers: packages/xyz, apps/xyz, services/xyz, libs/xyz, modules/xyz
 	if first == "packages" || first == "apps" || first == "services" || first == "libs" || first == "modules" {
-		ws := first + "/" + parts[1]
-		return ws, parts[1], ws
+		ws := first + "/" + second
+		return ws, second, ws
 	}
 
 	// Standard Go layout: internal/<subpkg>, cmd/<subpkg>, pkg/<subpkg>
 	if first == "internal" || first == "cmd" || first == "pkg" {
-		return first + "/" + parts[1], parts[1], first
+		return first + "/" + second, second, first
 	}
 
 	// Web / Frontend apps: web/src/components, web/src/pages -> group into "web"
@@ -482,7 +494,7 @@ func resolvePackageScope(filePath string) (pkgPath string, pkgName string, works
 	}
 
 	// Default: 2 levels max (e.g. docs/api, test/e2e)
-	return parts[0] + "/" + parts[1], parts[1], parts[0]
+	return first + "/" + second, second, first
 }
 
 func symbolShortName(sig string) string {

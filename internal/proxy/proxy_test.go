@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -666,6 +667,131 @@ func TestGatewayProxy_StreamingTerminalMarker(t *testing.T) {
 		if !traffic[0].IsStream {
 			t.Errorf("expected IsStream=true, got false")
 		}
+	}
+}
+
+// TestGatewayProxy_StreamingChunkDeliveredBeforeUpstreamCompletes pins the
+// incremental-relay behavior of handleStreamingResponse: the mock upstream
+// writes ONE SSE chunk, flushes it, then holds the stream open on a channel
+// only the test closes. The client must receive that chunk while the upstream
+// is still blocked — if the proxy buffered the stream until completion, one
+// of the two bounded phases below times out, because upstream completion is
+// test-controlled and deliberately withheld.
+func TestGatewayProxy_StreamingChunkDeliveredBeforeUpstreamCompletes(t *testing.T) {
+	const chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"first-token\"}}]}\n\n"
+
+	release := make(chan struct{}) // closed to let the upstream finish
+	// releaseUpstream is sync.Once-guarded so the explicit release below and
+	// the deferred one can both call it safely. Its defer is deliberately
+	// registered AFTER the server-close defers — LIFO ordering is
+	// load-bearing for the failure path; see the comment there.
+	var releaseOnce sync.Once
+	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+	upstreamDone := make(chan struct{})
+
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(upstreamDone)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(chunk))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // chunk goes on the wire now, not at handler return
+		}
+		<-release // hold the stream open indefinitely
+	}))
+	defer mockUpstream.Close()
+
+	proxy := NewGatewayProxy(Config{
+		CustomUpstreams: map[string]string{
+			"mockstream": mockUpstream.URL,
+		},
+	})
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	// Registered after the server-close defers above so LIFO cleanup runs
+	// it before them: on a t.Fatal the parked upstream handler must be
+	// released BEFORE proxyServer.Close()/mockUpstream.Close() block
+	// waiting on in-flight handlers, or a clean failure becomes a hang
+	// until the package timeout. (defer resp.Body.Close() below registers
+	// later and runs first — harmless: it aborts the client side only and
+	// never waits on the upstream handler.)
+	defer releaseUpstream()
+
+	reqBody := `{"model":"stream-timing-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req, _ := http.NewRequest("POST", proxyServer.URL+"/proxy/mockstream/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	// Phase 1 — response headers. http.Client.Do returns only once response
+	// HEADERS arrive, and Go's server writes headers lazily (first body
+	// Write/Flush) — so a fully-buffering proxy never sends them and Do
+	// would block until the package timeout. Bound it: a regression must
+	// fail cleanly in 5s, not hang 10m with a goroutine dump.
+	type doResult struct {
+		resp *http.Response
+		err  error
+	}
+	doDone := make(chan doResult, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		doDone <- doResult{resp: resp, err: err}
+	}()
+
+	var resp *http.Response
+	select {
+	case res := <-doDone:
+		if res.err != nil {
+			t.Fatalf("POST to streaming proxy: %v", res.err)
+		}
+		resp = res.resp
+		defer resp.Body.Close() // success path only: resp is nil on the timeout branch
+	case <-time.After(5 * time.Second):
+		t.Fatal("no response headers within 5s while the upstream stream was still open — proxy is buffering instead of streaming")
+	}
+
+	// Bounded read in a goroutine: io.ReadAll would block until EOF and
+	// defeat the timing assertion. Buffered channel so the goroutine can
+	// always send, even on the timeout path after resp.Body.Close().
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, len(chunk))
+		n, err := io.ReadFull(resp.Body, buf)
+		readDone <- readResult{data: buf[:n], err: err}
+	}()
+
+	select {
+	case res := <-readDone:
+		if res.err != nil {
+			t.Fatalf("client read failed: %v", res.err)
+		}
+		if !strings.Contains(string(res.data), "first-token") {
+			t.Fatalf("expected first SSE chunk relayed, got %q", res.data)
+		}
+		// The timing proof: delivery happened while upstream was still
+		// blocked. If upstream had already completed, the pass above would
+		// be consistent with full buffering and prove nothing.
+		select {
+		case <-upstreamDone:
+			t.Fatal("chunk arrived only after upstream completed — not incremental relay")
+		default:
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not receive the first SSE chunk within 5s while the upstream stream was still open — proxy is buffering instead of streaming")
+	}
+
+	// Release the upstream and drain: the proxy must append its terminal
+	// marker since the upstream ends without sending [DONE].
+	releaseUpstream()
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("draining rest of stream: %v", err)
+	}
+	if !strings.Contains(string(rest), "[DONE]") {
+		t.Errorf("expected terminal [DONE] marker after upstream completed, got tail:\n%s", rest)
 	}
 }
 
