@@ -9,29 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **Ingest: read events silently dropped** — `ReadID` was derived from a per-batch counter over a base-name-only session ID, so every poll after the first (and every session sharing the file name `transcript.jsonl`) collided on the `file_read_events` primary key and was discarded via `ON CONFLICT DO NOTHING`. IDs are now derived from the session directory + line byte offset (stable across re-reads, unique per session), and session IDs include the parent directory so distinct agent sessions no longer merge into one `agent_runs` row.
-- **Ingest: events lost on mid-write polls** — the incremental JSONL parser committed its offset past an unterminated (partially written) trailing line, permanently losing every event on it. The parser now only advances the committed offset through the last newline; an unterminated tail is parsed best-effort but re-read on the next poll once complete.
-- **Proxy: response cache never hit for streaming traffic** — the cache lookup key was computed before `stream_options.include_usage` was injected into the request body, while the store key was computed after (and with the analysis-rewritten model), so stored entries were unreachable. The key is now computed once on the final forwarded body and reused for both lookup and store.
-- **Proxy: oversized bodies silently truncated** — request bodies over 32 MiB were truncated by `io.LimitReader` and forwarded upstream as corrupt JSON; they are now rejected with `413 Request Entity Too Large`.
-- **Server: daemon bound all interfaces with `*` CORS and unrestricted WebSocket origins** — an unauthenticated, single-user daemon was readable from any webpage (telemetry exfiltration) and from the LAN. It now binds `127.0.0.1` by default (`--bind 0.0.0.0` restores the old behavior), CORS is limited to loopback origins, and WebSocket upgrades reject non-loopback origins. The WebSocket greeting write also gained the deadline every other write already had, so a stalled client cannot pin the handler goroutine.
-- **Lock: single-instance enforcement was check-then-act only** — no OS-level lock was ever taken, so two daemons started concurrently (or on different ports) both ran, corrupting PID files and double-ingesting. `daemon.lock` is now held via `LockFileEx` (Windows) / `flock` (POSIX), released automatically on crash; the lock file is no longer unlinked on release (inode race).
-- **Core: data race on active repo name** — `Engine.cfg.RepoName` was written under `lockMu` during project switches but read unlocked on watcher/ingest/HTTP paths; all reads now snapshot it under the same mutex.
-- **Core: project operations held `lockMu` across filesystem scans** — `UpdateProject`/`RescanProject`/`RescanAllProjects` walked agent session directories (seconds on Windows) while holding the lock that synchronous IPC guardrail checks need; scans now run outside the lock.
-- **Core: concurrent `AddProject` both marked active** — the `isFirst` decision moved under `lockMu`.
-- **DB: `Migrate` swallowed real schema errors** — `ALTER TABLE`/`CREATE INDEX` failures (locked DB, full disk) returned success and surfaced later on every insert; only the expected "duplicate column"/"already exists" no-ops are tolerated now.
-- **DB: `ClearStale` pruned partially on failure** — the four per-table DELETEs now run in a single transaction.
-- **Profiler: 32-bit trace IDs collided on the primary key** — IDs widened to 128 bits; swallowed `InsertTrace` errors are now logged.
-- **CLI: `trace` ignored `WRONGTRACE_PORT`/`PORT`** — port resolution now matches `start`, so traces reach the running daemon instead of silently writing to the default database.
+---
+
+## [0.3.5] - 2026-08-25
+
+### Fixed & Hardened (Ingest Resiliency, Concurrency, Security & High-Performance CPU Optimization)
+- **High-Efficiency AST Diffing & No-Op Save Bypass**:
+  - Implemented 0ns hash-equality bypass (`prev.Hash == next.Hash`) in `ast.Diff`, eliminating redundant line-diff splits and LCS matrix calculations for unchanged file states.
+  - Added fast SHA-256 pre-check in `Engine.HandleFileChange` to skip full Tree-sitter AST parsing and AST diffing completely when files are touched without content modifications.
+- **Session Transcript Watcher & Re-Parse Cascade Prevention**:
+  - Replaced random eviction in `SessionWatcher.PollOnce` with structured `fileState` tracking (`offset`, `size`, `modTime`), eliminating catastrophic polling cascades where thousands of transcript files were re-read and parsed from offset 0.
+- **Zero-Allocation Rune Truncation & String Slicing**:
+  - Refactored `runeSafeTruncate` in both `internal/ingest` and `internal/proxy` to use UTF-8 range index counting, eliminating large `[]rune` array heap allocations on prompt and transcript inspection paths.
+- **Precomputed Symbol Signatures & Parser Throughput**:
+  - Cached lexical symbol signatures inside `FileSnapshot.sortedSigs` during snapshot creation, converting repeated signature sorting into instant O(1) slice access across Code Atlas and AST diffing.
+  - Added snapshot hash verification to `PrimeDirectory` to skip Tree-sitter grammar parsing for already-indexed files.
+- **Fast-Path SQLite Datetime Parsing**:
+  - Optimized `parseDBTime` with length-based branch switching for standard SQLite datetime (`len=19`) and RFC3339 (`len=20`), avoiding layout array scans across high-volume analytical records.
+- **Ingest: Read Events Deduplication & Mid-Write Resiliency**:
+  - Derived `ReadID` from session directory + line byte offset to eliminate primary key collisions on `file_read_events`.
+  - Incremental JSONL parser now only commits offsets through the last newline, preventing event loss on partial mid-write reads.
+- **Proxy: Streaming Cache & Body Validation**:
+  - Unified cache lookup and store keys on the final forwarded body to ensure cache hits for streaming traffic.
+  - Rejected bodies over 32 MiB with `413 Request Entity Too Large` instead of silent truncation.
+  - Streamlined SSE stream handling by removing redundant multi-megabyte JSON unmarshaling attempts on raw event-stream buffers.
+- **Security & Concurrency Hardening**:
+  - Daemon binds `127.0.0.1` by default with loopback CORS and origin-restricted WebSockets to prevent telemetry exfiltration.
+  - Enforced single-instance daemon exclusivity via OS-level `LockFileEx` (Windows) / `flock` (POSIX).
+  - Snapshot active repo name under `lockMu` to eliminate data races during project switching.
+  - Moved filesystem directory scans outside `lockMu` in project operations (`UpdateProject`, `RescanProject`, `RescanAllProjects`) to eliminate latency stalls on synchronous IPC guardrails.
+  - Fixed database migration error handling and atomic multi-table deletions in `ClearStale`.
+  - Widened profiler trace IDs to 128 bits to eliminate primary key collisions.
 
 ### Changed
-- `go.mod`: direct dependencies are no longer mislabeled `// indirect` (ran `go mod tidy`).
+- `go.mod`: Cleaned and verified direct dependency labels.
 
 ---
 
 ## [0.3.4] - 2026-08-25
 
-### Fixed & Hardened (Full-Stack Concurrency, Memory & High-Performance CPU Optimization)
+### Fixed & Hardened (Full-Stack Concurrency, Memory & Performance)
 - **High-Efficiency AST Diffing & No-Op Save Bypass**:
   - Implemented 0ns hash-equality bypass (`prev.Hash == next.Hash`) in `ast.Diff`, eliminating redundant line-diff splits and LCS matrix calculations for unchanged file states.
   - Added fast SHA-256 pre-check in `Engine.HandleFileChange` to skip full Tree-sitter AST parsing and AST diffing completely when files are touched without content modifications.
