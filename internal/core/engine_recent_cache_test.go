@@ -84,3 +84,25 @@ func TestGetRecentEventsFiltered_Cache(t *testing.T) {
 		t.Fatalf("fileScoped: got %d events, want 3", len(fileScoped))
 	}
 }
+
+func TestBumpCacheGenReleasesStalePayloads(t *testing.T) {
+	eng, _ := newTestEngine(t)
+	eng.atlasCache = map[string]cachedAtlas{"old-project": {gen: eng.cacheGen}}
+	eng.metricsCache = map[string]cachedMetrics{"old-project": {gen: eng.cacheGen}}
+	eng.recentCache = map[string]cachedRecent{
+		"500\x00old-project": {
+			gen:    eng.cacheGen,
+			events: make([]db.EventRecord, 500),
+		},
+	}
+
+	before := eng.cacheGen
+	eng.BumpCacheGen()
+
+	if eng.cacheGen != before+1 {
+		t.Fatalf("cache generation = %d, want %d", eng.cacheGen, before+1)
+	}
+	if eng.atlasCache != nil || eng.metricsCache != nil || eng.recentCache != nil {
+		t.Fatal("generation bump retained stale cache payloads")
+	}
+}

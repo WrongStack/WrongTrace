@@ -6,7 +6,7 @@
 
 Watches your code with Tree-sitter, correlates AST-level edits with path-scoped agent tool operations, ingests OpenTelemetry/profiler runtime traces, tracks inter-agent code collisions ("Who Broke Whose Code?"), provides an interactive Code Atlas with full-screen graph visualization, serves an embedded React dashboard, and operates an AI Gateway observer — all from a single, high-performance Go binary.
 
-[![Version](https://img.shields.io/badge/Version-0.3.7-blue.svg?style=flat)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-0.3.8-blue.svg?style=flat)](CHANGELOG.md)
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-purple.svg)](LICENSE)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat&logo=react)](https://react.dev)
@@ -186,6 +186,34 @@ agent, and session scope; authorization material itself is never stored.
 The gateway is byte-preserving by default. Secret redaction, quota blocking,
 OpenAI usage-option injection, and missing terminal-marker repair are mutating
 guardrails and require `X-WrongTrace-Policy: enforce`.
+
+---
+
+## ⚙️ Performance & Resource Tuning
+
+WrongTrace is a background observer and is tuned to stay out of the way: the
+daemon caps itself at four OS threads, paces workspace indexing to half of one
+core, keeps cached file source compressed under a byte budget, and skips
+re-enumerating agent log directories that have been dormant for a day. Defaults
+suit an interactive workstation; every knob below is an environment variable
+read at startup.
+
+| Variable | Default | Effect |
+|:---|:---|:---|
+| `WRONGTRACE_MAX_PROCS` | `min(NumCPU, 4)` | `GOMAXPROCS` ceiling. Also bounds the GC's dedicated workers, which are sized from it. |
+| `WRONGTRACE_GC_PERCENT` | `50` | `GOGC`. Lower trades a little more GC CPU for a smaller resident heap. |
+| `WRONGTRACE_MEMORY_LIMIT_MB` | `512` | Soft heap ceiling the GC paces against. |
+| `WRONGTRACE_INDEX_CPU` | `50` | Percent of one core the workspace indexer may use. `100` disables pacing for batch/CI runs. |
+| `WRONGTRACE_AST_CACHE_MB` | `48` | Compressed-source budget for the AST snapshot cache. `0` retains no source (node-level diffs only, minimum footprint). |
+| `WRONGTRACE_PPROF` | *unset* | Set to `1` to expose loopback pprof endpoints on `127.0.0.1:6060` (override with `WRONGTRACE_PPROF_ADDR`). |
+
+Raise `WRONGTRACE_INDEX_CPU` and `WRONGTRACE_AST_CACHE_MB` on a dedicated
+machine to index large monorepos faster; lower `WRONGTRACE_MEMORY_LIMIT_MB` and
+set `WRONGTRACE_AST_CACHE_MB=0` for the leanest possible long-running daemon.
+
+> [!NOTE]
+> Transcript discovery descends at most five directories below each watched
+> root. Deeply nested subagent trees beyond that depth are not ingested.
 
 ---
 

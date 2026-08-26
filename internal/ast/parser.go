@@ -47,12 +47,17 @@ type Node struct {
 // FileSnapshot captures the parsed state of a single file at one point in time.
 // The Engine holds the previous snapshot per file to compute semantic diffs.
 type FileSnapshot struct {
-	Path       string
-	Nodes      map[string]Node // keyed by signature
-	Hash       string          // SHA256 of the file's full text
-	RawContent string          // raw source content for whole-file line diffs
-	LOC        int             // total lines of code
-	sortedSigs []string        // cached pre-sorted signatures
+	Path  string
+	Nodes map[string]Node // keyed by signature
+	Hash  string          // SHA256 of the file's full text
+	// RawContent is the source as parsed. It is live only until the snapshot
+	// enters the Engine cache, which compresses it into packed. Read the text
+	// through Source(), never through this field -- see cache.go.
+	RawContent string
+	LOC        int      // total lines of code
+	packed     []byte   // DEFLATE-compressed RawContent once cached
+	rawLen     int      // uncompressed length, for decode buffer sizing
+	sortedSigs []string // cached pre-sorted signatures
 }
 
 // Engine owns the Tree-sitter parser pool and the snapshot cache. All
@@ -63,6 +68,7 @@ type FileSnapshot struct {
 type Engine struct {
 	mu        sync.RWMutex
 	snapshots map[string]*FileSnapshot // abs path -> last snapshot
+	lru       *sourceLRU               // recency + byte accounting for retained source
 
 	parseMu sync.Mutex
 	parsers map[Language]*sitter.Parser
@@ -80,6 +86,7 @@ var hashBufPool = sync.Pool{
 func NewEngine() (*Engine, error) {
 	e := &Engine{
 		snapshots: make(map[string]*FileSnapshot),
+		lru:       newSourceLRU(),
 		parsers:   make(map[Language]*sitter.Parser),
 	}
 	for lang, fn := range map[Language]func() *sitter.Language{
@@ -110,6 +117,7 @@ func (e *Engine) Close() {
 	e.closed = true
 	e.parsers = nil
 	e.snapshots = nil
+	e.lru = nil
 }
 
 // Reset drops all cached file snapshots. Used when switching active projects.
@@ -118,6 +126,9 @@ func (e *Engine) Reset() {
 	defer e.mu.Unlock()
 	if e.snapshots != nil {
 		e.snapshots = make(map[string]*FileSnapshot)
+	}
+	if e.lru != nil {
+		e.lru.reset()
 	}
 }
 
@@ -403,13 +414,29 @@ func (e *Engine) SetSnapshot(s *FileSnapshot) {
 	if e.snapshots == nil {
 		return
 	}
+	// Compress before retention and charge the delta against the byte budget.
+	// Replacing an existing snapshot must refund the outgoing one first, or a
+	// file edited in a loop would inflate the accounting without bound.
+	if prev, ok := e.snapshots[s.Path]; ok && e.lru != nil {
+		e.lru.remove(s.Path, prev.retainedBytes())
+	}
+	s.pack()
 	e.snapshots[s.Path] = s
+	if e.lru != nil {
+		e.lru.touch(s.Path, s.retainedBytes())
+		e.lru.evictTo(sourceBudgetBytes, e.snapshots)
+	}
 }
 
 // Forget removes the cached snapshot for a deleted file.
 func (e *Engine) Forget(path string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.lru != nil {
+		if snap, ok := e.snapshots[path]; ok {
+			e.lru.remove(path, snap.retainedBytes())
+		}
+	}
 	delete(e.snapshots, path)
 }
 

@@ -1151,10 +1151,23 @@ func (h *Handlers) GetFileReadHeatmap(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetIPCTraffic returns recent recorded IPC interactions from connected AI agents.
-func (h *Handlers) GetIPCTraffic(w http.ResponseWriter, _ *http.Request) {
+func (h *Handlers) GetIPCTraffic(w http.ResponseWriter, r *http.Request) {
 	traffic := h.Engine.GetIPCTraffic()
+	if r.URL.Query().Get("detail") == "false" {
+		traffic = h.Engine.GetIPCTrafficSummaries()
+	}
 	if traffic == nil {
 		traffic = []ipc.IPCTrafficRecord{}
 	}
 	writeJSON(w, http.StatusOK, traffic)
+}
+
+// GetIPCTrafficRecord returns one bounded request/response pair on demand.
+func (h *Handlers) GetIPCTrafficRecord(w http.ResponseWriter, r *http.Request) {
+	record, ok := h.Engine.GetIPCTrafficRecord(chi.URLParam(r, "id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "IPC traffic record not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, record)
 }

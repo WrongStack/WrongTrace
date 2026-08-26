@@ -75,6 +75,8 @@ type EngineAPI interface {
 	GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error)
 	GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, error)
 	GetIPCTraffic() []ipc.IPCTrafficRecord
+	GetIPCTrafficSummaries() []ipc.IPCTrafficRecord
+	GetIPCTrafficRecord(id string) (ipc.IPCTrafficRecord, bool)
 	IndexStatus() core.IndexProgress
 	Hub() *core.Hub
 	Store() *db.Store
@@ -126,6 +128,8 @@ func (s *Server) Start() error {
 		Addr:              addr,
 		Handler:           s.router,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	s.setHS(hs)
 	log.Printf("http: listening on http://%s", addr)
@@ -341,6 +345,7 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/files/activity", h.FileModelActivity)
 		r.Get("/file/activity", h.FileModelActivity)
 		r.Get("/ipc/traffic", h.GetIPCTraffic)
+		r.Get("/ipc/traffic/{id}", h.GetIPCTrafficRecord)
 
 		// AST Symbol History & Evolution Lineage
 		r.Get("/symbol/history", h.SymbolHistory)

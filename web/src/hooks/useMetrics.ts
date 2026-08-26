@@ -83,6 +83,7 @@ export function useRecentEvents(projectId?: string | null, limit: number = 500, 
     },
     enabled,
     staleTime: 3_000,
+    gcTime: 60_000,
   });
 }
 
@@ -113,6 +114,7 @@ export function useAtlas(projectId?: string | null, enabled: boolean = true) {
     queryFn: ({ signal }) => jget<AtlasSnapshot>(`${base}/atlas${q}`, signal),
     enabled,
     staleTime: 5_000,
+    gcTime: 30_000,
     // Full symbol graphs can be several MB. Refresh on tab entry, project
     // switches, or the Atlas refresh button instead of parsing them on a timer.
     refetchInterval: false,
@@ -166,6 +168,7 @@ export function useProxyTrafficDetail(id?: string | null) {
     queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord>(`${base}/proxy/traffic/${encodeURIComponent(id ?? '')}`, signal),
     enabled: !!id,
     staleTime: 60_000,
+    gcTime: 15_000,
   });
 }
 
@@ -278,9 +281,19 @@ export function useModelFriction(limit: number = 200) {
 export function useIPCTraffic(enabled: boolean = true) {
   return useQuery<import('../types').IPCTrafficRecord[]>({
     queryKey: ['ipc_traffic'],
-    queryFn: ({ signal }) => jget<import('../types').IPCTrafficRecord[]>(`${base}/ipc/traffic`, signal),
+    queryFn: ({ signal }) => jget<import('../types').IPCTrafficRecord[]>(`${base}/ipc/traffic?detail=false`, signal),
     enabled,
     staleTime: 2_000,
+  });
+}
+
+export function useIPCTrafficDetail(id?: string | null) {
+  return useQuery<import('../types').IPCTrafficRecord>({
+    queryKey: ['ipc_traffic_detail', id],
+    queryFn: ({ signal }) => jget<import('../types').IPCTrafficRecord>(`${base}/ipc/traffic/${encodeURIComponent(id ?? '')}`, signal),
+    enabled: !!id,
+    staleTime: 60_000,
+    gcTime: 15_000,
   });
 }
 

@@ -14,6 +14,48 @@ var dpPool = sync.Pool{
 	},
 }
 
+const (
+	maxDiffSnippetBytes = 64 * 1024
+	diffContextLines    = 3
+)
+
+type boundedDiffBuilder struct {
+	b         strings.Builder
+	first     bool
+	bounded   bool
+	truncated bool
+}
+
+func (b *boundedDiffBuilder) emit(prefix, line string) {
+	if b.truncated {
+		return
+	}
+	required := len(prefix) + len(line)
+	if !b.first {
+		required++
+	}
+	// Leave room for the truncation marker so the persisted/WebSocket payload
+	// always remains below the advertised cap.
+	const marker = "\n  … diff snippet truncated …"
+	if b.bounded && b.b.Len()+required+len(marker) > maxDiffSnippetBytes {
+		b.truncated = true
+		return
+	}
+	if !b.first {
+		b.b.WriteByte('\n')
+	}
+	b.first = false
+	b.b.WriteString(prefix)
+	b.b.WriteString(line)
+}
+
+func (b *boundedDiffBuilder) String() string {
+	if b.truncated {
+		b.b.WriteString("\n  … diff snippet truncated …")
+	}
+	return b.b.String()
+}
+
 // Action is the lifecycle state transition produced by a semantic diff.
 type Action string
 
@@ -65,9 +107,16 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	if prev == nil && next == nil {
 		return res
 	}
+
+	// Cached snapshots hold their source compressed, so inflate each side at
+	// most once here. nodeBody slices these strings; calling Source() per node
+	// would decompress the whole file once per declaration.
+	prevSrc := prev.Source()
+	nextSrc := next.Source()
+
 	if prev == nil {
-		if next.RawContent != "" {
-			fileDiff, fileAdded, fileDeleted := formatAddedDiff(next.RawContent)
+		if nextSrc != "" {
+			fileDiff, fileAdded, fileDeleted := formatAddedDiff(nextSrc)
 			res.FileDiff = fileDiff
 			res.FileAdded = fileAdded
 			res.FileDeleted = fileDeleted
@@ -75,7 +124,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 
 		for _, sig := range next.SortedSignatures() {
 			n := next.Nodes[sig]
-			diff, added, deleted := formatAddedDiff(nodeBody(next, n))
+			diff, added, deleted := formatAddedDiff(nodeBody(nextSrc, n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -97,8 +146,8 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		return res
 	}
 	if next == nil {
-		if prev.RawContent != "" {
-			fileDiff, fileAdded, fileDeleted := formatDeletedDiff(prev.RawContent)
+		if prevSrc != "" {
+			fileDiff, fileAdded, fileDeleted := formatDeletedDiff(prevSrc)
 			res.FileDiff = fileDiff
 			res.FileAdded = fileAdded
 			res.FileDeleted = fileDeleted
@@ -106,7 +155,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 
 		for _, sig := range prev.SortedSignatures() {
 			n := prev.Nodes[sig]
-			diff, added, deleted := formatDeletedDiff(nodeBody(prev, n))
+			diff, added, deleted := formatDeletedDiff(nodeBody(prevSrc, n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     prev.Path,
@@ -132,8 +181,8 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		return res
 	}
 
-	if prev.RawContent != "" || next.RawContent != "" {
-		fileDiff, fileAdded, fileDeleted := generateLineDiff(prev.RawContent, next.RawContent)
+	if prevSrc != "" || nextSrc != "" {
+		fileDiff, fileAdded, fileDeleted := generateLineDiff(prevSrc, nextSrc)
 		res.FileDiff = fileDiff
 		res.FileAdded = fileAdded
 		res.FileDeleted = fileDeleted
@@ -148,7 +197,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	for _, sig := range prevSigs {
 		if _, ok := nextSet[sig]; !ok {
 			n := prev.Nodes[sig]
-			diff, added, deleted := formatDeletedDiff(nodeBody(prev, n))
+			diff, added, deleted := formatDeletedDiff(nodeBody(prevSrc, n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     prev.Path,
@@ -172,7 +221,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	for _, sig := range nextSigs {
 		newNode := next.Nodes[sig]
 		if _, existed := prevSet[sig]; !existed {
-			diff, added, deleted := formatAddedDiff(nodeBody(next, newNode))
+			diff, added, deleted := formatAddedDiff(nodeBody(nextSrc, newNode))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -192,7 +241,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		}
 		oldNode := prev.Nodes[sig]
 		if oldNode.Hash != newNode.Hash {
-			diff, added, deleted := generateLineDiff(nodeBody(prev, oldNode), nodeBody(next, newNode))
+			diff, added, deleted := generateLineDiff(nodeBody(prevSrc, oldNode), nodeBody(nextSrc, newNode))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -224,9 +273,9 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 // raw source allocation. Generic parsers and hand-built test snapshots retain
 // Body as a compatibility fallback. This avoids keeping a second string copy
 // for every function/class in large workspaces.
-func nodeBody(snap *FileSnapshot, n Node) string {
-	if snap != nil && n.EndByte > n.StartByte && n.EndByte <= uint32(len(snap.RawContent)) {
-		return snap.RawContent[n.StartByte:n.EndByte]
+func nodeBody(src string, n Node) string {
+	if n.EndByte > n.StartByte && n.EndByte <= uint32(len(src)) {
+		return src[n.StartByte:n.EndByte]
 	}
 	return n.Body
 }
@@ -286,14 +335,13 @@ func formatAddedDiff(body string) (string, int, int) {
 	if len(lines) == 0 {
 		return "", 0, 0
 	}
-	var b strings.Builder
-	b.Grow(len(body) + len(lines)*3)
-	for i, l := range lines {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString("+ ")
-		b.WriteString(l)
+	var b boundedDiffBuilder
+	b.first = true
+	estimated := len(body) + len(lines)*3
+	b.bounded = estimated > maxDiffSnippetBytes
+	b.b.Grow(min(estimated, maxDiffSnippetBytes))
+	for _, l := range lines {
+		b.emit("+ ", l)
 	}
 	return b.String(), len(lines), 0
 }
@@ -303,14 +351,13 @@ func formatDeletedDiff(body string) (string, int, int) {
 	if len(lines) == 0 {
 		return "", 0, 0
 	}
-	var b strings.Builder
-	b.Grow(len(body) + len(lines)*3)
-	for i, l := range lines {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString("- ")
-		b.WriteString(l)
+	var b boundedDiffBuilder
+	b.first = true
+	estimated := len(body) + len(lines)*3
+	b.bounded = estimated > maxDiffSnippetBytes
+	b.b.Grow(min(estimated, maxDiffSnippetBytes))
+	for _, l := range lines {
+		b.emit("- ", l)
 	}
 	return b.String(), 0, len(lines)
 }
@@ -332,26 +379,24 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 		return formatDeletedDiff(oldText)
 	}
 
-	var b strings.Builder
-	b.Grow(len(oldText) + len(newText) + (len(oldLines)+len(newLines))*3)
+	var b boundedDiffBuilder
+	b.first = true
 	added := 0
 	deleted := 0
 
-	first := true
-	emit := func(prefix, line string) {
-		if !first {
-			b.WriteByte('\n')
-		}
-		first = false
-		b.WriteString(prefix)
-		b.WriteString(line)
-	}
-
-	// 1. Strip and emit common prefix
+	// 1. Strip the common prefix. Only nearby context belongs in a snippet;
+	// emitting an unchanged 20k-line prefix made a one-line edit allocate and
+	// persist almost the entire file.
 	prefixLen := 0
 	for prefixLen < len(oldLines) && prefixLen < len(newLines) && oldLines[prefixLen] == newLines[prefixLen] {
-		emit("  ", oldLines[prefixLen])
 		prefixLen++
+	}
+	prefixStart := max(0, prefixLen-diffContextLines)
+	if prefixStart > 0 {
+		b.emit("  ", "… unchanged lines omitted …")
+	}
+	for i := prefixStart; i < prefixLen; i++ {
+		b.emit("  ", oldLines[i])
 	}
 
 	// 2. Strip common suffix
@@ -365,15 +410,22 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 	midNew := newLines[prefixLen : len(newLines)-suffixLen]
 
 	m, n := len(midOld), len(midNew)
+	estimated := len(oldText) + len(newText) + (len(oldLines)+len(newLines))*3
+	b.bounded = estimated > maxDiffSnippetBytes
+	grow := 4 * 1024
+	if m*n > 200000 {
+		grow = min(estimated, maxDiffSnippetBytes)
+	}
+	b.b.Grow(min(grow, maxDiffSnippetBytes-b.b.Len()))
 
 	// Memory guard: for huge un-aligned diffs (> 200,000 cells), emit straightforward deletion then addition
 	if m*n > 200000 {
 		for _, l := range midOld {
-			emit("- ", l)
+			b.emit("- ", l)
 			deleted++
 		}
 		for _, l := range midNew {
-			emit("+ ", l)
+			b.emit("+ ", l)
 			added++
 		}
 	} else if m > 0 || n > 0 {
@@ -431,34 +483,39 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 		currOld, currNew := 0, 0
 		for _, mat := range matches {
 			for currOld < mat.oldIdx {
-				emit("- ", midOld[currOld])
+				b.emit("- ", midOld[currOld])
 				deleted++
 				currOld++
 			}
 			for currNew < mat.newIdx {
-				emit("+ ", midNew[currNew])
+				b.emit("+ ", midNew[currNew])
 				added++
 				currNew++
 			}
-			emit("  ", midOld[currOld])
+			b.emit("  ", midOld[currOld])
 			currOld++
 			currNew++
 		}
 		for currOld < len(midOld) {
-			emit("- ", midOld[currOld])
+			b.emit("- ", midOld[currOld])
 			deleted++
 			currOld++
 		}
 		for currNew < len(midNew) {
-			emit("+ ", midNew[currNew])
+			b.emit("+ ", midNew[currNew])
 			added++
 			currNew++
 		}
 	}
 
-	// 3. Emit common suffix
-	for s := len(oldLines) - suffixLen; s < len(oldLines); s++ {
-		emit("  ", oldLines[s])
+	// 3. Emit only nearby common suffix context.
+	suffixStart := len(oldLines) - suffixLen
+	suffixEnd := min(len(oldLines), suffixStart+diffContextLines)
+	for s := suffixStart; s < suffixEnd; s++ {
+		b.emit("  ", oldLines[s])
+	}
+	if suffixLen > diffContextLines {
+		b.emit("  ", "… unchanged lines omitted …")
 	}
 
 	return b.String(), added, deleted

@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -117,6 +116,7 @@ func (e *Engine) PrimeDirectory(dir string) {
 
 	var discovered, eligible, indexed, skipped, failed int
 	lastUpdate := time.Now()
+	pacer := newIndexPacer()
 
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if ctx.Err() != nil {
@@ -157,9 +157,7 @@ func (e *Engine) PrimeDirectory(dir string) {
 		// Fast-path: if existing snapshot matches file hash, skip Tree-sitter AST parsing
 		if existing, ok := e.cfg.AST.Snapshot(path); ok && existing != nil && existing.Hash == ast.HashBytes(src) {
 			indexed++
-			if indexed%50 == 0 {
-				runtime.Gosched()
-			}
+			pacer.step()
 			return nil
 		}
 
@@ -171,10 +169,9 @@ func (e *Engine) PrimeDirectory(dir string) {
 		e.cfg.AST.SetSnapshot(snap)
 		indexed++
 
-		// Yield CPU periodically
-		if indexed%25 == 0 {
-			runtime.Gosched()
-		}
+		// Bound the indexer to a share of one core so a cold start never
+		// competes with the editor the user is typing in.
+		pacer.step()
 
 		// Throttle progress updates to avoid lock contention (every 50 files or 250ms)
 		if indexed%50 == 0 || time.Since(lastUpdate) > 250*time.Millisecond {
@@ -217,6 +214,9 @@ func (e *Engine) PrimeDirectory(dir string) {
 	}
 	e.indexMu.Unlock()
 	e.BumpCacheGen()
+
+	// Return the parse arena to the OS now that the burst is over.
+	releaseIndexMemory()
 
 	if e.hub != nil {
 		e.hub.Broadcast(WSEvent{

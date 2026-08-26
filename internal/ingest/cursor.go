@@ -49,6 +49,10 @@ func (sw *SessionWatcher) EnablePersistentOffsets(path string) error {
 	}
 
 	sw.mu.Lock()
+	// A continuous observer should not replay an unbounded lifetime of agent
+	// logs for paths absent from its checkpoint. PollOnce will baseline old
+	// files and retain a bounded tail of recently active JSONL transcripts.
+	sw.baselineBefore = time.Now()
 	for file, offset := range loaded.Offsets {
 		if offset >= 0 {
 			sw.seenOffsets[file] = offset

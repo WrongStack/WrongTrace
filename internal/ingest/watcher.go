@@ -12,9 +12,15 @@ import (
 
 type fileState struct {
 	offset  int64
-	size    int64
 	modTime time.Time
 }
+
+const missingFilePruneInterval = time.Hour
+
+const (
+	initialBackfillWindow = 24 * time.Hour
+	maxInitialBackfill    = int64(4 * 1024 * 1024)
+)
 
 // SessionWatcher continuously scans or tails session logs in well-known agent directories.
 type SessionWatcher struct {
@@ -26,8 +32,17 @@ type SessionWatcher struct {
 	cursorDirty    bool
 	cursorVersion  uint64
 	lastCursorSave time.Time
+	lastStatePrune time.Time
+	baselineBefore time.Time
 	onToolCall     func(ToolCallEvent)
 	onReadEvent    func(FileReadEvent)
+
+	// dirCache remembers what each directory looked like on the previous poll
+	// so dormant ones can be skipped. It has its own mutex because directory
+	// enumeration runs outside mu, where event delivery happens. See scan.go.
+	dirMu    sync.Mutex
+	dirCache map[string]dirState
+	pollGen  uint64
 }
 
 // NewSessionWatcher creates a watcher for agent log files.
@@ -170,169 +185,156 @@ func isIgnoredLogDir(name string) bool {
 	return ok
 }
 
-// PollOnce inspects watched directories and incrementally processes new transcript lines.
+// PollOnce inspects watched directories and incrementally processes new
+// transcript lines. See scan.go for how the walk itself is kept cheap.
 func (sw *SessionWatcher) PollOnce() {
 	sw.mu.Lock()
 	paths := make([]string, len(sw.watchPaths))
 	copy(paths, sw.watchPaths)
+	sw.pollGen++
+	gen := sw.pollGen
 	sw.mu.Unlock()
 
+	now := time.Now()
 	for _, rootDir := range paths {
-		cleanRoot := filepath.Clean(rootDir)
-		_ = filepath.WalkDir(cleanRoot, func(path string, d os.DirEntry, err error) error {
-			if err != nil || d == nil {
-				return nil
-			}
-
-			name := d.Name()
-
-			if d.IsDir() {
-				if path != cleanRoot {
-					if isIgnoredLogDir(name) {
-						return filepath.SkipDir
-					}
-					// Depth limit: count path separators without allocations
-					rel := path[len(cleanRoot):]
-					if len(rel) > 0 && (rel[0] == '/' || rel[0] == '\\') {
-						rel = rel[1:]
-					}
-					depth := 0
-					for i := 0; i < len(rel); i++ {
-						if rel[i] == '/' || rel[i] == '\\' {
-							depth++
-						}
-					}
-					if depth >= 5 {
-						return filepath.SkipDir
-					}
-				}
-				return nil
-			}
-
-			// Skip transcript_full.jsonl when transcript.jsonl exists (compact version is sufficient)
-			if name == "transcript_full.jsonl" {
-				return nil
-			}
-
-			isJSONL := strings.HasSuffix(name, ".jsonl")
-			isJSON := !isJSONL && strings.HasSuffix(name, ".json")
-			isAider := name == ".aider.chat.history.md"
-
-			if !isJSONL && !isJSON && !isAider {
-				return nil
-			}
-
-			// For .json files, only process known task files (Cline/Roo tasks)
-			if isJSON {
-				// Fast extraction of parent dir name without allocating filepath.Dir
-				dirOnly := path[:len(path)-len(name)]
-				if len(dirOnly) > 0 && (dirOnly[len(dirOnly)-1] == '/' || dirOnly[len(dirOnly)-1] == '\\') {
-					dirOnly = dirOnly[:len(dirOnly)-1]
-				}
-				lastSep := strings.LastIndexAny(dirOnly, "/\\")
-				parent := dirOnly
-				if lastSep != -1 {
-					parent = dirOnly[lastSep+1:]
-				}
-				if parent != "tasks" && parent != "cline" && parent != "sessions" && parent != "conversations" {
-					return nil
-				}
-			}
-
-			// Fast file metadata lookup only for matched candidates
-			info, err := d.Info()
-			if err != nil || info == nil {
-				return nil
-			}
-
-			currentSize := info.Size()
-			modTime := info.ModTime()
-
-			sw.mu.Lock()
-			st, seen := sw.seenFiles[path]
-			if !seen {
-				if off, ok := sw.seenOffsets[path]; ok {
-					st = fileState{offset: off, size: currentSize, modTime: modTime}
-					seen = true
-				}
-			}
-
-			if seen && currentSize <= st.offset && !modTime.After(st.modTime) {
-				sw.mu.Unlock()
-				return nil
-			}
-
-			lastOffset := st.offset
-			if currentSize < lastOffset {
-				lastOffset = 0 // File truncated or rewritten
-			}
-			sw.mu.Unlock()
-
-			// Incrementally parse file from lastOffset
-			var events []ToolCallEvent
-			var readEvents []FileReadEvent
-			var newOffset int64
-			var parseErr error
-
-			if isJSONL {
-				events, readEvents, newOffset, parseErr = ParseJSONLTranscriptFromOffset(path, lastOffset)
-			} else if isJSON {
-				events, parseErr = ParseClineTask(path)
-				newOffset = currentSize
-			} else if isAider {
-				events, parseErr = ParseAiderHistory(path)
-				newOffset = currentSize
-			}
-
-			if parseErr != nil {
-				log.Printf("ingest: parse %s: %v", path, parseErr)
-				return nil
-			}
-
-			sw.mu.Lock()
-			sw.seenOffsets[path] = newOffset
-			sw.seenFiles[path] = fileState{
-				offset:  newOffset,
-				size:    currentSize,
-				modTime: modTime,
-			}
-			sw.cursorDirty = true
-			sw.cursorVersion++
-
-			// Smart pruning: only purge entries when capacity is huge (> 25000), and only purge nonexistent paths first
-			if len(sw.seenFiles) > 25000 {
-				pruned := 0
-				for k := range sw.seenFiles {
-					if !fileExists(k) {
-						delete(sw.seenFiles, k)
-						delete(sw.seenOffsets, k)
-						pruned++
-						if pruned >= 5000 {
-							break
-						}
-					}
-				}
-			}
-			sw.mu.Unlock()
-
-			for _, ev := range events {
-				if sw.onToolCall != nil {
-					sw.onToolCall(ev)
-				}
-			}
-
-			for _, rev := range readEvents {
-				if sw.onReadEvent != nil {
-					sw.onReadEvent(rev)
-				}
-			}
-
-			return nil
-		})
+		sw.scanRoot(filepath.Clean(rootDir), gen, now)
 	}
+
+	sw.pruneDirCache(gen)
+	sw.pruneMissingFiles(now)
 	if err := sw.saveOffsets(false); err != nil {
 		log.Printf("ingest: save offset checkpoint: %v", err)
 	}
+}
+
+// processFile advances one transcript's cursor and emits whatever the new
+// bytes contained. It is a no-op when the file has not grown since the offset
+// recorded for it.
+func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize int64, modTime time.Time) {
+	if kind == kindNone {
+		return
+	}
+	sw.mu.Lock()
+	st, seen := sw.seenFiles[path]
+	if !seen {
+		if off, ok := sw.seenOffsets[path]; ok {
+			st = fileState{offset: off, modTime: modTime}
+			seen = true
+		} else if off, baseline := initialTranscriptOffset(currentSize, modTime, sw.baselineBefore, kind == kindJSONL); baseline {
+			st = fileState{offset: off, modTime: modTime}
+			sw.seenOffsets[path] = off
+			sw.seenFiles[path] = st
+			sw.cursorDirty = true
+			sw.cursorVersion++
+			seen = true
+		}
+	}
+
+	if seen && currentSize <= st.offset && !modTime.After(st.modTime) {
+		sw.mu.Unlock()
+		return
+	}
+
+	lastOffset := st.offset
+	if currentSize < lastOffset {
+		lastOffset = 0 // File truncated or rewritten
+	}
+	sw.mu.Unlock()
+
+	var events []ToolCallEvent
+	var readEvents []FileReadEvent
+	var newOffset int64
+	var parseErr error
+
+	switch kind {
+	case kindJSONL:
+		events, readEvents, newOffset, parseErr = ParseJSONLTranscriptFromOffset(path, lastOffset)
+	case kindJSON:
+		events, parseErr = ParseClineTask(path)
+		newOffset = currentSize
+	case kindAider:
+		events, parseErr = ParseAiderHistory(path)
+		newOffset = currentSize
+	}
+
+	if parseErr != nil {
+		log.Printf("ingest: parse %s: %v", path, parseErr)
+		return
+	}
+
+	sw.mu.Lock()
+	sw.seenOffsets[path] = newOffset
+	sw.seenFiles[path] = fileState{offset: newOffset, modTime: modTime}
+	sw.cursorDirty = true
+	sw.cursorVersion++
+	onToolCall := sw.onToolCall
+	onReadEvent := sw.onReadEvent
+	sw.mu.Unlock()
+
+	for _, ev := range events {
+		if onToolCall != nil {
+			onToolCall(ev)
+		}
+	}
+	for _, rev := range readEvents {
+		if onReadEvent != nil {
+			onReadEvent(rev)
+		}
+	}
+}
+
+// initialTranscriptOffset bounds the first scan after a fresh install. Old
+// history is baselined at EOF; recent JSONL keeps a small tail so the current
+// session remains visible. Once a persistent cursor exists this path is never
+// used, and files created after startup still ingest from byte zero.
+func initialTranscriptOffset(size int64, modTime, baselineBefore time.Time, isJSONL bool) (int64, bool) {
+	if baselineBefore.IsZero() || modTime.After(baselineBefore) {
+		return 0, false
+	}
+	if !isJSONL || modTime.Before(baselineBefore.Add(-initialBackfillWindow)) {
+		return size, true
+	}
+	return max(0, size-maxInitialBackfill), true
+}
+
+// pruneMissingFiles prevents the persisted cursor and its in-memory maps from
+// growing forever as agents rotate transcript files. The filesystem walk
+// already dominates polling, so the extra existence pass is deliberately
+// infrequent and runs without holding the watcher mutex.
+func (sw *SessionWatcher) pruneMissingFiles(now time.Time) {
+	sw.mu.Lock()
+	if !sw.lastStatePrune.IsZero() && now.Sub(sw.lastStatePrune) < missingFilePruneInterval {
+		sw.mu.Unlock()
+		return
+	}
+	sw.lastStatePrune = now
+	paths := make([]string, 0, len(sw.seenOffsets))
+	for path := range sw.seenOffsets {
+		paths = append(paths, path)
+	}
+	sw.mu.Unlock()
+
+	missing := make([]string, 0)
+	for _, path := range paths {
+		if !fileExists(path) {
+			missing = append(missing, path)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+
+	sw.mu.Lock()
+	for _, path := range missing {
+		// A file may have been recreated while the stat pass was running.
+		if !fileExists(path) {
+			delete(sw.seenFiles, path)
+			delete(sw.seenOffsets, path)
+			sw.cursorDirty = true
+			sw.cursorVersion++
+		}
+	}
+	sw.mu.Unlock()
 }
 
 // StartPolling runs a background loop polling session logs every interval.

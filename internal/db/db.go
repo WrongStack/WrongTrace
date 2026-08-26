@@ -40,8 +40,13 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
+	// cache_size is PER CONNECTION, so the pool multiplies it. 8 MiB across up
+	// to eight connections reserved 64 MiB of page cache for a database that is
+	// usually a few megabytes; 4 MiB across four connections covers the same
+	// working set at a quarter of the footprint. mmap_size caps the memory-
+	// mapped window, which the OS reclaims under pressure.
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-8192)&_pragma=mmap_size(67108864)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)",
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-4096)&_pragma=mmap_size(33554432)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)",
 		path,
 	)
 	conn, err := sql.Open("sqlite", dsn)
@@ -49,19 +54,22 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("sql.Open: %w", err)
 	}
 
-	// In WAL mode, SQLite supports multiple concurrent readers alongside single-writer serialization.
-	// Cap connections to prevent unbounded cache memory consumption.
+	// In WAL mode SQLite serves concurrent readers alongside a single writer,
+	// and every dashboard query is an indexed lookup over a small table. Four
+	// readers saturate that; more only multiply per-connection page cache.
 	maxConns := runtime.NumCPU()
 	if maxConns < 2 {
 		maxConns = 2
 	}
-	if maxConns > 8 {
-		maxConns = 8
+	if maxConns > 4 {
+		maxConns = 4
 	}
 	conn.SetMaxOpenConns(maxConns)
-	conn.SetMaxIdleConns(maxConns)
+	// Keep only a small warm set idle. A closed dashboard should not leave the
+	// daemon holding a page cache per core for hours.
+	conn.SetMaxIdleConns(2)
 	conn.SetConnMaxLifetime(1 * time.Hour)
-	conn.SetConnMaxIdleTime(15 * time.Minute)
+	conn.SetConnMaxIdleTime(2 * time.Minute)
 
 	if err := conn.PingContext(context.Background()); err != nil {
 		_ = conn.Close()

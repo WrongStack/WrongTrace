@@ -218,6 +218,43 @@ func TestSessionWatcher_StartPollingLifecycle(t *testing.T) {
 	}
 }
 
+func TestSessionWatcher_PrunesMissingCursorState(t *testing.T) {
+	sw := NewSessionWatcher(nil)
+	missing := filepath.Join(t.TempDir(), "rotated-session.jsonl")
+	sw.seenOffsets[missing] = 123
+	sw.seenFiles[missing] = fileState{offset: 123, modTime: time.Now()}
+
+	sw.pruneMissingFiles(time.Now())
+
+	if _, ok := sw.seenOffsets[missing]; ok {
+		t.Fatal("missing transcript offset was retained")
+	}
+	if _, ok := sw.seenFiles[missing]; ok {
+		t.Fatal("missing transcript state was retained")
+	}
+	if !sw.cursorDirty || sw.cursorVersion == 0 {
+		t.Fatal("cursor checkpoint was not marked dirty after pruning")
+	}
+}
+
+func TestInitialTranscriptOffsetBoundsColdStartBackfill(t *testing.T) {
+	baseline := time.Now()
+	size := int64(10 * 1024 * 1024)
+
+	if got, ok := initialTranscriptOffset(size, baseline.Add(-48*time.Hour), baseline, true); !ok || got != size {
+		t.Fatalf("old JSONL offset = %d, baseline=%v; want EOF %d", got, ok, size)
+	}
+	if got, ok := initialTranscriptOffset(size, baseline.Add(-time.Hour), baseline, true); !ok || got != size-maxInitialBackfill {
+		t.Fatalf("recent JSONL offset = %d, baseline=%v; want bounded tail", got, ok)
+	}
+	if got, ok := initialTranscriptOffset(size, baseline.Add(-time.Hour), baseline, false); !ok || got != size {
+		t.Fatalf("existing JSON offset = %d, baseline=%v; want EOF %d", got, ok, size)
+	}
+	if got, ok := initialTranscriptOffset(size, baseline.Add(time.Second), baseline, true); ok || got != 0 {
+		t.Fatalf("new JSONL offset = %d, baseline=%v; want normal ingestion", got, ok)
+	}
+}
+
 func TestIngest_DirAndFileExistsHelpers(t *testing.T) {
 	tempDir := t.TempDir()
 	if !dirExists(tempDir) {

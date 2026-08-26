@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+const maxAliasCacheEntries = 2048
+
 // ModelInfo captures metadata and token pricing for an LLM model under a specific provider.
 type ModelInfo struct {
 	ID                 string  `json:"id"`                     // Unique key e.g. "anthropic/claude-3-7-sonnet" or "openrouter/deepseek-r1"
@@ -255,8 +257,15 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 		}
 		r.mu.Lock()
 		if r.aliasCache != nil {
-			r.aliasCache[raw] = res
-			r.aliasCache[norm] = res
+			// Model IDs arrive from proxy traffic and can be attacker-controlled.
+			// Keep successful fuzzy aliases bounded instead of retaining every
+			// version-stamped spelling for the lifetime of the daemon.
+			if len(r.aliasCache) < maxAliasCacheEntries {
+				r.aliasCache[raw] = res
+			}
+			if norm != raw && len(r.aliasCache) < maxAliasCacheEntries {
+				r.aliasCache[norm] = res
+			}
 		}
 		r.mu.Unlock()
 		return res, true

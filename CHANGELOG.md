@@ -11,6 +11,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.8] - 2026-08-26
+
+### Performance
+
+CPU-bound and memory-bound work in the long-running daemon was profiled rather
+than guessed at. Steady-state CPU was dominated by the transcript poll loop
+re-enumerating every watched agent directory on every tick; resident memory was
+dominated by the AST snapshot cache pinning the full source text of every
+indexed file for the lifetime of the process. Both are addressed at the source.
+
+- **Dormant-Directory Tiered Transcript Scanning**:
+  - Replaced the `filepath.WalkDir` poll with a purpose-built traversal that reads directories unsorted, classifies entries by name before assembling a path, and takes file size/mtime from the directory entry instead of a separate `stat`.
+  - Added per-directory tiering: a directory whose own mtime is unchanged and whose newest transcript has been untouched for 24 hours is skipped after a single `stat` instead of being fully enumerated, with a forced re-read every 20 polls. Creating, renaming, or removing an entry moves its directory's mtime, so discovery of new sessions keeps full cadence — only an in-place append to a day-old transcript is deferred.
+  - Measured on a real workstation tree (28,879 files across 9,611 directories): steady-state poll **~260 ms → ~110 ms**, allocations **1.70 MB → 744 KB** per poll. Ingest output is byte-for-byte unchanged (verified over 8 polls: identical tool calls, read events, sessions, files parsed, and bytes parsed).
+- **Compressed, Budgeted AST Source Cache**:
+  - Cached file source is now DEFLATE-compressed and governed by a byte budget with LRU eviction (`WRONGTRACE_AST_CACHE_MB`, default 48 MiB; `0` disables source retention entirely).
+  - Eviction is graceful: a snapshot that loses its source keeps its node map, so signature- and body-hash-level diffing stays exact and only the line-level `diff_snippet` degrades for long-cold files.
+  - `ast.Diff` inflates each side at most once per call rather than per node.
+  - Measured on this repository: retained source **4.47 MiB → 1.42 MiB**.
+- **Paced Workspace Indexing**:
+  - `PrimeDirectory` is bounded to a share of one core (`WRONGTRACE_INDEX_CPU`, default 50) by a duty-cycle pacer that actually sleeps. The previous `runtime.Gosched()` only offered the scheduler a switch and left a free core fully saturated during cold start.
+  - The parse arena is returned to the OS once indexing completes.
+- **Runtime Footprint Controls**:
+  - `GOMAXPROCS` is capped at 4, `GOGC` lowered to 50, and the soft memory limit reduced from 1 GiB to 512 MiB. All three are overridable via `WRONGTRACE_MAX_PROCS`, `WRONGTRACE_GC_PERCENT`, and `WRONGTRACE_MEMORY_LIMIT_MB`.
+  - Added a low-frequency idle scavenger that returns unused heap spans to the OS after bursts, skipped entirely unless there is a meaningful amount to reclaim.
+  - Measured in isolation (same binary, tuning knobs on vs. off): peak RSS **71.2 MB → 57.0 MB**.
+- **Memoized Watcher Ignore Decisions**:
+  - `watcher.pathIgnored` results are cached in a bounded map. An editor save-burst or a dependency install replays the same paths through the filter thousands of times, and each miss previously cost four string allocations plus a `filepath.Match` against every `.gitignore` line.
+  - `core.isIgnoredDir` no longer lowercases the settings pattern list once per directory judged; the lowercased set is built once and revalidated against the live patterns, so direct settings writes cannot serve a stale ignore list.
+- **SQLite Pool Right-Sizing**:
+  - `cache_size` is per connection, so the pool multiplied it. Reduced from 8 MiB across up to eight connections to 4 MiB across at most four, with `mmap_size` halved to 32 MiB and idle connections capped at two with a 2-minute idle timeout.
+- **Adaptive Dashboard Refresh Coalescing**:
+  - The WebSocket invalidation window now widens from 250 ms to 1 s under sustained traffic. A busy agent run previously triggered four full refresh storms per second, each re-running roughly eight queries and re-rendering the dashboard.
+  - A hidden tab performs no fetches at all and issues a single catch-up refresh when brought forward.
+
+- **Bounded In-Memory Retention Across Long-Lived Caches**:
+  - `BumpCacheGen` now drops the Atlas, metrics, and recent-event maps outright instead of leaving multi-megabyte stale payloads resident until each key happens to be requested again.
+  - The model alias cache is capped at 2,048 entries. Model IDs arrive from proxy traffic and can be attacker-controlled, so every version-stamped spelling was previously retained for the lifetime of the daemon.
+  - The session-scan cache gained an explicit TTL constant and a 128-entry ceiling with eviction.
+  - `SyncModelsDev` reads through a 64 MiB bounded reader instead of an unbounded `io.ReadAll`.
+- **Bounded Diff Snippets**:
+  - Persisted `diff_snippet` payloads are built through a bounded builder capped at 64 KiB with 3 lines of context, so a single large-file rewrite can no longer write an unbounded blob per event.
+- **Ring-Buffered SSE Tail Capture**:
+  - The streaming tail sample is retained in a fixed ring buffer that overwrites the oldest bytes, replacing a per-chunk re-shift of the entire tail and linearizing once when stream analysis begins.
+- **Metadata-Only IPC Traffic Listing**:
+  - `GET /api/ipc/traffic?detail=false` returns summary rows; `GET /api/ipc/traffic/{id}` fetches one bounded request/response pair on demand. The dashboard inspector now lists metadata and loads payloads only for the row a user expands.
+  - Retained IPC records compact oversized JSON-RPC values into a scalar summary with an explicit byte count instead of pinning up to the protocol's 16 MiB frame limit.
+- **Bounded Webhook Delivery Concurrency**:
+  - Alert dispatch is capped at 16 concurrent deliveries and drops beyond that. A broken or slow endpoint could previously turn a burst of guardrail checks into an unbounded goroutine and request-body backlog.
+- **HTTP Server Limits**:
+  - Added an explicit 90-second idle timeout and a 1 MiB header ceiling to the embedded server.
+
+### Added
+- `GET /api/ipc/traffic/{id}` returns a single bounded IPC request/response record; `GET /api/ipc/traffic?detail=false` returns metadata-only rows.
+- `ast.Engine.CachedSourceBytes` reports the compressed source currently retained across all snapshots.
+- Regression tests covering append detection under directory-timestamp pruning, transcript discovery in already-walked directories, source round-trip through compression, LRU eviction order, and budget accounting across repeated rewrites.
+- `BenchmarkPollOnce_SteadyState` and `BenchmarkWalkDirBaseline` pin the steady-state poll cost against a bare directory walk over the same tree.
+
+### Known Limitations
+- Transcripts nested more than five directories below a watched root are not ingested. On a WrongStack workspace this excludes `sessions/<date>/<session>/subagents/<date>/<session>/*.jsonl`. This bound predates this release and is unchanged by it; raising it increases scan cost proportionally.
+
+---
+
 ## [0.3.7] - 2026-08-25
 
 ### Added

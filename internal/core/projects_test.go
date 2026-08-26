@@ -1,9 +1,11 @@
 package core
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/wrongstack/wrongtrace/internal/ast"
 	"github.com/wrongstack/wrongtrace/internal/db"
@@ -175,5 +177,32 @@ func TestProjectLifecycle(t *testing.T) {
 	// Remove
 	if err := engine.RemoveProject(proj.ID); err != nil {
 		t.Fatalf("remove project failed: %v", err)
+	}
+}
+
+func TestSessionScanCacheIsBoundedAndPrunesExpired(t *testing.T) {
+	sessScanMu.Lock()
+	previous := sessScanCache
+	sessScanCache = make(map[string]cachedSessScan)
+	sessScanMu.Unlock()
+	t.Cleanup(func() {
+		sessScanMu.Lock()
+		sessScanCache = previous
+		sessScanMu.Unlock()
+	})
+
+	now := time.Now()
+	storeSessScan("expired", map[string]int{"old": 1}, now.Add(-2*sessScanCacheTTL))
+	for i := 0; i < maxSessScanCacheEntries+20; i++ {
+		storeSessScan(fmt.Sprintf("root-%03d", i), map[string]int{"test": i}, now.Add(time.Duration(i)*time.Millisecond))
+	}
+
+	sessScanMu.RLock()
+	defer sessScanMu.RUnlock()
+	if _, ok := sessScanCache["expired"]; ok {
+		t.Fatal("expired session scan remained cached")
+	}
+	if got := len(sessScanCache); got > maxSessScanCacheEntries {
+		t.Fatalf("session scan cache grew to %d entries, cap is %d", got, maxSessScanCacheEntries)
 	}
 }

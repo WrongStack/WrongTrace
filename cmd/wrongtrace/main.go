@@ -162,8 +162,9 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		defer logFile.Close()
 	}
 
-	// Soft memory limit for Go GC to prevent runaway footprint while avoiding excessive GC thrashing on large LLM payloads
-	debug.SetMemoryLimit(1024 * 1024 * 1024)
+	// GC pacing, heap ceiling, and parallelism caps. See runtime_tuning.go for
+	// why each default is what it is and which env var overrides it.
+	tuneRuntime()
 
 	watchDir, _ := cmd.Flags().GetString("watch")
 	port := resolvePort(cmd)
@@ -259,6 +260,9 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Hand idle heap back to the OS after bursts instead of sitting at peak RSS.
+	startScavenger(ctx.Done())
 
 	// Automatic Session Log & Tool Call Ingestor.
 	sessionWatcher := ingest.NewSessionWatcher(func(ev ingest.ToolCallEvent) {

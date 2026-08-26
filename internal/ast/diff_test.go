@@ -142,3 +142,45 @@ func TestLineDiffGeneration(t *testing.T) {
 		t.Error("formatDeletedDiff on empty string failed")
 	}
 }
+
+func TestDiffSnippetIsBoundedAndKeepsCounts(t *testing.T) {
+	line := strings.Repeat("x", 1024)
+	body := strings.Repeat(line+"\n", 200)
+
+	diff, added, deleted := formatAddedDiff(body)
+	if added != 200 || deleted != 0 {
+		t.Fatalf("counts = +%d -%d, want +200 -0", added, deleted)
+	}
+	if len(diff) > maxDiffSnippetBytes {
+		t.Fatalf("diff snippet grew to %d bytes", len(diff))
+	}
+	if !strings.Contains(diff, "diff snippet truncated") {
+		t.Fatal("bounded diff did not disclose truncation")
+	}
+}
+
+func TestLineDiffOmitsDistantUnchangedContext(t *testing.T) {
+	prefix := make([]string, 1000)
+	for i := range prefix {
+		prefix[i] = "unchanged"
+	}
+	oldCode := strings.Join(append(append([]string{}, prefix...), "old", "tail"), "\n")
+	newCode := strings.Join(append(append([]string{}, prefix...), "new", "tail"), "\n")
+
+	diff, added, deleted := generateLineDiff(oldCode, newCode)
+	if added != 1 || deleted != 1 {
+		t.Fatalf("counts = +%d -%d, want +1 -1", added, deleted)
+	}
+	contextLines := 0
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.TrimSpace(line) == "unchanged" {
+			contextLines++
+		}
+	}
+	if contextLines > diffContextLines {
+		t.Fatalf("diff retained distant unchanged context:\n%s", diff)
+	}
+	if !strings.Contains(diff, "unchanged lines omitted") {
+		t.Fatal("diff did not mark omitted context")
+	}
+}

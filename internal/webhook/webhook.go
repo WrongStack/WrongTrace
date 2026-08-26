@@ -43,7 +43,10 @@ type Dispatcher struct {
 	cfg        Config
 	httpClient *http.Client
 	mu         sync.RWMutex
+	inFlight   chan struct{}
 }
+
+const maxConcurrentDeliveries = 16
 
 // NewDispatcher constructs a Dispatcher.
 func NewDispatcher(cfg Config) *Dispatcher {
@@ -56,6 +59,7 @@ func NewDispatcher(cfg Config) *Dispatcher {
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
+		inFlight: make(chan struct{}, maxConcurrentDeliveries),
 	}
 }
 
@@ -81,8 +85,16 @@ func (d *Dispatcher) Dispatch(p Payload) {
 	if slackURL == "" && discordURL == "" && genericURL == "" {
 		return
 	}
+	select {
+	case d.inFlight <- struct{}{}:
+	default:
+		// Alerts are best-effort. A broken/slow endpoint must not turn a burst of
+		// guardrail checks into an unbounded goroutine and request-body backlog.
+		return
+	}
 
 	go func() {
+		defer func() { <-d.inFlight }()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 

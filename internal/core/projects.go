@@ -729,6 +729,11 @@ var (
 	sessScanCache = make(map[string]cachedSessScan)
 )
 
+const (
+	sessScanCacheTTL        = 30 * time.Second
+	maxSessScanCacheEntries = 128
+)
+
 type cachedSessScan struct {
 	counts    map[string]int
 	scannedAt time.Time
@@ -744,7 +749,7 @@ func ScanAgentSessions(root string) map[string]int {
 	rootBase := strings.ToLower(filepath.Base(root))
 
 	sessScanMu.RLock()
-	if c, ok := sessScanCache[normRoot]; ok && time.Since(c.scannedAt) < 30*time.Second {
+	if c, ok := sessScanCache[normRoot]; ok && time.Since(c.scannedAt) < sessScanCacheTTL {
 		res := make(map[string]int, len(c.counts))
 		for k, v := range c.counts {
 			res[k] = v
@@ -1044,14 +1049,35 @@ func ScanAgentSessions(root string) map[string]int {
 		counts["openhands"] = 1
 	}
 
-	sessScanMu.Lock()
-	sessScanCache[normRoot] = cachedSessScan{
-		counts:    counts,
-		scannedAt: time.Now(),
-	}
-	sessScanMu.Unlock()
+	storeSessScan(normRoot, counts, time.Now())
 
 	return counts
+}
+
+func storeSessScan(root string, counts map[string]int, scannedAt time.Time) {
+	sessScanMu.Lock()
+	defer sessScanMu.Unlock()
+
+	cutoff := scannedAt.Add(-sessScanCacheTTL)
+	for key, cached := range sessScanCache {
+		if cached.scannedAt.Before(cutoff) {
+			delete(sessScanCache, key)
+		}
+	}
+	for len(sessScanCache) >= maxSessScanCacheEntries {
+		var oldestKey string
+		var oldestAt time.Time
+		for key, cached := range sessScanCache {
+			if oldestAt.IsZero() || cached.scannedAt.Before(oldestAt) {
+				oldestKey, oldestAt = key, cached.scannedAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(sessScanCache, oldestKey)
+	}
+	sessScanCache[root] = cachedSessScan{counts: counts, scannedAt: scannedAt}
 }
 
 func dirExists(p string) bool {
@@ -1104,16 +1130,79 @@ var alwaysIgnoredMap = func() map[string]struct{} {
 // shared by DetectPrimaryLanguage, PrimeDirectory, and any future walk —
 // do not inline pattern lists in walkers.
 func isIgnoredDir(base string) bool {
-	baseLower := strings.ToLower(base)
+	baseLower := lowerASCII(base)
 	if _, ok := alwaysIgnoredMap[baseLower]; ok {
 		return true
 	}
-	for _, ig := range ignorePatterns() {
-		if baseLower == strings.ToLower(ig) {
-			return true
+	_, ok := settingsIgnoreSet()[baseLower]
+	return ok
+}
+
+// lowerASCII lowercases a directory base name without allocating when it is
+// already lowercase -- which it is for nearly every directory on disk. The old
+// unconditional strings.ToLower ran once per directory per walk, and
+// PrimeDirectory plus DetectPrimaryLanguage walk whole workspaces.
+func lowerASCII(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			return strings.ToLower(s)
 		}
 	}
-	return false
+	return s
+}
+
+// settingsIgnoreSet returns the configured ignore patterns as a lowercased
+// set. isIgnoredDir used to re-lowercase every pattern for every directory it
+// judged, allocating once per pattern per directory across whole-workspace
+// walks; the set is now built once and reused.
+//
+// Validity is checked against the live pattern list rather than a change
+// counter: settings are written through UpdateSettings, through the settings
+// file loader, and directly by tests, and a cache that only tracked one of
+// those paths would silently serve a stale ignore list.
+var (
+	ignoreSetMu    sync.RWMutex
+	ignoreSetSrc   []string
+	ignoreSetCache map[string]struct{}
+)
+
+func settingsIgnoreSet() map[string]struct{} {
+	patterns := ignorePatterns()
+
+	ignoreSetMu.RLock()
+	if ignoreSetCache != nil && sameStrings(ignoreSetSrc, patterns) {
+		set := ignoreSetCache
+		ignoreSetMu.RUnlock()
+		return set
+	}
+	ignoreSetMu.RUnlock()
+
+	set := make(map[string]struct{}, len(patterns))
+	for _, ig := range patterns {
+		set[strings.ToLower(ig)] = struct{}{}
+	}
+	src := make([]string, len(patterns))
+	copy(src, patterns)
+
+	ignoreSetMu.Lock()
+	ignoreSetCache = set
+	ignoreSetSrc = src
+	ignoreSetMu.Unlock()
+	return set
+}
+
+// sameStrings reports element-wise equality. Comparing a handful of short
+// pattern strings is far cheaper than the allocations it replaces.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // DetectPrimaryLanguage infers the predominant language by counting source file extensions.

@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,25 @@ func newTestEngine(t *testing.T) (*Engine, *db.Store) {
 		t.Fatalf("migrate: %v", err)
 	}
 	return NewEngine(Config{RepoName: "test-repo", Store: store}), store
+}
+
+func TestReadModelsDevResponseIsBounded(t *testing.T) {
+	data, err := readModelsDevResponse(strings.NewReader(`{"provider":{"models":{}}}`))
+	if err != nil || len(data) == 0 {
+		t.Fatalf("small response: len=%d err=%v", len(data), err)
+	}
+
+	tooLarge := io.LimitReader(zeroReader{}, 65)
+	if _, err := readBoundedResponse(tooLarge, 64); err == nil {
+		t.Fatal("oversized response was accepted")
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }
 
 func reportFor(runID string) ipc.TelemetryReport {

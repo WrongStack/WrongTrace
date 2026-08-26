@@ -69,7 +69,7 @@ var DefaultIgnoreDirs = []string{
 
 // Watcher is a debouncing filesystem observer rooted at a single directory.
 type Watcher struct {
-	cfg           Config
+	cfg Config
 	// root is cfg.Dir made absolute and clean. Ignore rules are evaluated
 	// against paths relative to it so directories ABOVE the project never
 	// participate in matching.
@@ -80,7 +80,20 @@ type Watcher struct {
 	patternsNorm  []string
 	patternsLower []string
 	ignoreSet     map[string]struct{}
+
+	// decisions memoizes pathIgnored. An editor save-burst, a build, or a
+	// dependency install replays the SAME handful of paths through the filter
+	// thousands of times, and each miss cost four string allocations plus a
+	// filepath.Match against every .gitignore line. The map is capped and
+	// cleared wholesale rather than evicted per-entry: the answer for a path
+	// never changes while the watcher lives, so any survivor is equally valid.
+	decisionMu sync.RWMutex
+	decisions  map[string]bool
 }
+
+// maxIgnoreDecisions caps the memo. Large enough to cover a real repository's
+// working set, small enough that the map itself is never the leak.
+const maxIgnoreDecisions = 8192
 
 // New constructs and primes a Watcher. It does not start the event loop; call
 // Run from a goroutine.
@@ -120,6 +133,7 @@ func New(cfg Config) (*Watcher, error) {
 		patternsNorm:  patternsNorm,
 		patternsLower: patternsLower,
 		ignoreSet:     ignoreSet,
+		decisions:     make(map[string]bool, 256),
 	}
 	if err := w.addRecursive(cfg.Dir); err != nil {
 		_ = fw.Close()
@@ -252,8 +266,31 @@ func (w *Watcher) scopedPath(p string) string {
 	return rel
 }
 
-// pathIgnored is a fast-path filter for events and directory walking.
+// pathIgnored is a fast-path filter for events and directory walking. The
+// decision is memoized; only a cache miss pays for normalization and pattern
+// matching.
 func (w *Watcher) pathIgnored(p string) bool {
+	w.decisionMu.RLock()
+	cached, ok := w.decisions[p]
+	w.decisionMu.RUnlock()
+	if ok {
+		return cached
+	}
+
+	verdict := w.computePathIgnored(p)
+
+	w.decisionMu.Lock()
+	if len(w.decisions) >= maxIgnoreDecisions {
+		w.decisions = make(map[string]bool, 256)
+	}
+	w.decisions[p] = verdict
+	w.decisionMu.Unlock()
+	return verdict
+}
+
+// computePathIgnored is the uncached filter: ignore-directory segments first
+// (O(1) per segment), then .gitignore patterns.
+func (w *Watcher) computePathIgnored(p string) bool {
 	scoped := w.scopedPath(p)
 	if scoped == "" {
 		return false
@@ -346,8 +383,16 @@ func (w *Watcher) Run(ctx context.Context) {
 			if t, exists := pending[path]; exists && t != nil {
 				t.Stop()
 			}
-			pending[path] = time.AfterFunc(w.debounce, func() {
+			var timer *time.Timer
+			timer = time.AfterFunc(w.debounce, func() {
 				pendingMu.Lock()
+				// Stop can lose a race with a callback that is already runnable.
+				// Only the newest timer for this path may consume the entry and
+				// trigger an expensive parse/diff/database cycle.
+				if pending[path] != timer {
+					pendingMu.Unlock()
+					return
+				}
 				delete(pending, path)
 				pendingMu.Unlock()
 				if ctx.Err() != nil {
@@ -355,6 +400,7 @@ func (w *Watcher) Run(ctx context.Context) {
 				}
 				w.cfg.Engine.HandleFileChange(ctx, path)
 			})
+			pending[path] = timer
 			pendingMu.Unlock()
 		case err, ok := <-w.fs.Errors:
 			if !ok {

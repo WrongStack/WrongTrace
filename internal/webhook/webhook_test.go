@@ -105,3 +105,26 @@ func TestDispatcher_AllChannelsAndErrors(t *testing.T) {
 		t.Errorf("expected at least 3 generic payloads, got %d", len(receivedGeneric))
 	}
 }
+
+func TestDispatcherBoundsConcurrentDeliveries(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	disp := NewDispatcher(Config{GenericURL: srv.URL, Timeout: time.Second})
+	for i := 0; i < maxConcurrentDeliveries*4; i++ {
+		disp.Dispatch(Payload{EventType: EventGuardrailBlock})
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for len(disp.inFlight) < maxConcurrentDeliveries && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(disp.inFlight); got != maxConcurrentDeliveries {
+		t.Fatalf("in-flight deliveries = %d, want bounded capacity %d", got, maxConcurrentDeliveries)
+	}
+}

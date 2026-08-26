@@ -953,10 +953,10 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 
 	var promptTokens, completionTokens int64
 	var capturedHead bytes.Buffer
-	var capturedTail []byte
 	const maxCapturedBytes = 1024 * 1024
 	const capturedHeadBytes = maxCapturedBytes * 3 / 4
 	const capturedTailBytes = maxCapturedBytes - capturedHeadBytes
+	capturedTail := newCappedTailBuffer(capturedTailBytes)
 	cleanEOF := false
 
 	for {
@@ -978,7 +978,7 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 				capturedHead.Write(chunk[:keep])
 				chunk = chunk[keep:]
 			}
-			capturedTail = appendCappedTail(capturedTail, chunk, capturedTailBytes)
+			capturedTail.Write(chunk)
 		}
 		if err != nil {
 			cleanEOF = errors.Is(err, io.EOF)
@@ -986,7 +986,7 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 		}
 	}
 
-	fullSSE := streamAnalysisPayload(capturedHead.Bytes(), capturedTail)
+	fullSSE := streamAnalysisPayload(capturedHead.Bytes(), capturedTail.Bytes())
 
 	// Guarantee terminal marker: if upstream closed stream cleanly without [DONE], emit terminal marker
 	if policyEnabled && cleanEOF && expectsDoneMarker(rec) && strings.Contains(fullSSE, "data:") && !strings.Contains(fullSSE, "[DONE]") {
@@ -1120,19 +1120,62 @@ func requestCacheScope(r *http.Request) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func appendCappedTail(tail, chunk []byte, limit int) []byte {
-	if limit <= 0 || len(chunk) == 0 {
-		return tail
+// cappedTailBuffer retains the newest bytes without shifting the whole tail
+// for every streamed chunk. Once full, writes overwrite the oldest bytes in a
+// ring; Bytes linearizes the sample once when stream analysis begins.
+type cappedTailBuffer struct {
+	buf   []byte
+	limit int
+	start int
+	size  int
+}
+
+func newCappedTailBuffer(limit int) *cappedTailBuffer {
+	return &cappedTailBuffer{limit: max(0, limit)}
+}
+
+func (b *cappedTailBuffer) Write(chunk []byte) {
+	if b == nil || b.limit == 0 || len(chunk) == 0 {
+		return
 	}
-	if len(chunk) >= limit {
-		return append(tail[:0], chunk[len(chunk)-limit:]...)
+	if len(chunk) >= b.limit {
+		if b.buf == nil {
+			b.buf = make([]byte, b.limit)
+		}
+		copy(b.buf, chunk[len(chunk)-b.limit:])
+		b.start = 0
+		b.size = b.limit
+		return
 	}
-	tail = append(tail, chunk...)
-	if len(tail) > limit {
-		copy(tail, tail[len(tail)-limit:])
-		tail = tail[:limit]
+	if b.buf == nil {
+		b.buf = make([]byte, b.limit)
 	}
-	return tail
+
+	for len(chunk) > 0 {
+		if b.size < b.limit {
+			writeAt := (b.start + b.size) % b.limit
+			n := min(len(chunk), min(b.limit-b.size, b.limit-writeAt))
+			copy(b.buf[writeAt:writeAt+n], chunk[:n])
+			b.size += n
+			chunk = chunk[n:]
+			continue
+		}
+		n := min(len(chunk), b.limit-b.start)
+		copy(b.buf[b.start:b.start+n], chunk[:n])
+		b.start = (b.start + n) % b.limit
+		chunk = chunk[n:]
+	}
+}
+
+func (b *cappedTailBuffer) Bytes() []byte {
+	if b == nil || b.size == 0 {
+		return nil
+	}
+	out := make([]byte, b.size)
+	first := min(b.size, b.limit-b.start)
+	copy(out, b.buf[b.start:b.start+first])
+	copy(out[first:], b.buf[:b.size-first])
+	return out
 }
 
 func streamAnalysisPayload(head, tail []byte) string {

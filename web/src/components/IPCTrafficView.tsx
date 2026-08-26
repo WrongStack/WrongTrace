@@ -10,7 +10,7 @@ import {
   CheckCircle2,
   AlertCircle,
 } from 'lucide-react';
-import { useIPCTraffic } from '../hooks/useMetrics';
+import { useIPCTraffic, useIPCTrafficDetail } from '../hooks/useMetrics';
 import type { IPCTrafficRecord } from '../types';
 
 interface IPCTrafficViewProps {
@@ -33,6 +33,7 @@ export function IPCTrafficView({ limit = 100 }: IPCTrafficViewProps) {
   const [methodFilter, setMethodFilter] = useState<string>('ALL');
   const [search, setSearch] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const trafficDetail = useIPCTrafficDetail(expandedId);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -131,7 +132,8 @@ export function IPCTrafficView({ limit = 100 }: IPCTrafficViewProps) {
         <div className="divide-y divide-white/5 font-mono text-xs max-h-[520px] overflow-y-auto">
           {filtered.map((item: IPCTrafficRecord) => {
             const isExp = expandedId === item.id;
-            const hasError = !!item.error;
+            const displayItem = isExp && trafficDetail.data?.id === item.id ? trafficDetail.data : item;
+            const hasError = !!displayItem.error;
             const paramPath = item.params?.file_path || item.params?.path;
             const paramRunId = item.params?.run_id;
             const paramModel = item.params?.model_name || item.params?.model;
@@ -213,7 +215,7 @@ export function IPCTrafficView({ limit = 100 }: IPCTrafficViewProps) {
                         JSON-RPC Request & Response Details
                       </span>
                       <button
-                        onClick={(e) => handleCopy(item.id, JSON.stringify(item, null, 2), e)}
+                        onClick={(e) => handleCopy(item.id, JSON.stringify(displayItem, null, 2), e)}
                         className="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200 bg-slate-900 border border-white/10 px-2 py-0.5 rounded"
                       >
                         {copiedId === item.id ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
@@ -228,7 +230,7 @@ export function IPCTrafficView({ limit = 100 }: IPCTrafficViewProps) {
                           Incoming Request Params
                         </div>
                         <pre className="text-[11px] text-cyan-300 font-mono overflow-x-auto whitespace-pre-wrap max-h-48">
-                          {JSON.stringify(item.params || {}, null, 2)}
+                          {trafficDetail.isLoading ? 'Loading detail…' : JSON.stringify(displayItem.params || {}, null, 2)}
                         </pre>
                       </div>
 
@@ -238,7 +240,7 @@ export function IPCTrafficView({ limit = 100 }: IPCTrafficViewProps) {
                           {hasError ? 'RPC Error Output' : 'Daemon Result Returned'}
                         </div>
                         <pre className={`text-[11px] font-mono overflow-x-auto whitespace-pre-wrap max-h-48 ${hasError ? 'text-red-400' : 'text-emerald-300'}`}>
-                          {JSON.stringify(item.error || item.result || {}, null, 2)}
+                          {trafficDetail.isLoading ? 'Loading detail…' : JSON.stringify(displayItem.error || displayItem.result || {}, null, 2)}
                         </pre>
                       </div>
                     </div>

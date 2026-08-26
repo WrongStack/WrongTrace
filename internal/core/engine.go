@@ -93,6 +93,13 @@ type Engine struct {
 func (e *Engine) BumpCacheGen() {
 	e.cacheMu.Lock()
 	e.cacheGen++
+	// Cached atlas snapshots can retain several megabytes of source-derived
+	// symbol data per project. A generation bump makes every entry unusable, so
+	// drop the maps immediately instead of retaining stale payloads until each
+	// individual key happens to be requested and overwritten again.
+	e.atlasCache = nil
+	e.metricsCache = nil
+	e.recentCache = nil
 	e.cacheMu.Unlock()
 }
 
@@ -602,12 +609,29 @@ func (e *Engine) SyncModelsDev() (int, error) {
 		return 0, fmt.Errorf("models.dev returned status %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := readModelsDevResponse(resp.Body)
 	if err != nil {
 		return 0, fmt.Errorf("read response body: %w", err)
 	}
 
 	return models.Global.ImportModelsDevJSON(data)
+}
+
+const maxModelsDevResponseBytes = 64 * 1024 * 1024
+
+func readModelsDevResponse(r io.Reader) ([]byte, error) {
+	return readBoundedResponse(r, maxModelsDevResponseBytes)
+}
+
+func readBoundedResponse(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("models.dev response exceeds %d bytes", limit)
+	}
+	return data, nil
 }
 
 // ReportRunMCP adapts the MCP tool's flat arguments into a full run record,
@@ -843,6 +867,7 @@ func (e *Engine) IndexStatus() IndexProgress {
 
 // RecordIPCTraffic stores and broadcasts a live JSON-RPC interaction from an IPC client (e.g. WrongStack).
 func (e *Engine) RecordIPCTraffic(rec ipc.IPCTrafficRecord) {
+	rec = compactIPCTraffic(rec)
 	e.ipcMu.Lock()
 	if e.ipcTraffic == nil {
 		e.ipcTraffic = make([]ipc.IPCTrafficRecord, 0, 100)
@@ -858,7 +883,7 @@ func (e *Engine) RecordIPCTraffic(rec ipc.IPCTrafficRecord) {
 	if e.hub != nil {
 		e.hub.Broadcast(WSEvent{
 			Type:    "ipc_traffic",
-			Payload: rec,
+			Payload: ipcTrafficSummary(rec),
 		})
 	}
 }

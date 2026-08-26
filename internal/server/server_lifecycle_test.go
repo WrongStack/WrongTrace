@@ -181,10 +181,14 @@ func (f *failingEngine) GetModelFrictionReport(int) (*db.InterAgentFrictionRepor
 func (f *failingEngine) IndexStatus() core.IndexProgress {
 	return core.IndexProgress{}
 }
-func (f *failingEngine) GetIPCTraffic() []ipc.IPCTrafficRecord { return nil }
-func (f *failingEngine) Hub() *core.Hub                        { return f.hub }
-func (f *failingEngine) Store() *db.Store                      { return nil }
-func (f *failingEngine) Repo() string                          { return "failing" }
+func (f *failingEngine) GetIPCTraffic() []ipc.IPCTrafficRecord          { return nil }
+func (f *failingEngine) GetIPCTrafficSummaries() []ipc.IPCTrafficRecord { return nil }
+func (f *failingEngine) GetIPCTrafficRecord(string) (ipc.IPCTrafficRecord, bool) {
+	return ipc.IPCTrafficRecord{}, false
+}
+func (f *failingEngine) Hub() *core.Hub   { return f.hub }
+func (f *failingEngine) Store() *db.Store { return nil }
+func (f *failingEngine) Repo() string     { return "failing" }
 
 // callHandler invokes an http.HandlerFunc directly and returns the recorded
 // response, decoded as a JSON map when a body is present.

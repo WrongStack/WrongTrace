@@ -1,6 +1,7 @@
 package models
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -269,5 +270,22 @@ func TestRegistry_ProvidersAndCacheCalculations(t *testing.T) {
 	// 3. GetWithProvider
 	if m, ok := r.GetWithProvider("google", "gemini-3-7-flash"); !ok || m.Name != "Gemini 3.7 Flash" {
 		t.Errorf("expected Gemini 3.7 Flash: %+v", m)
+	}
+}
+
+func TestRegistry_AliasCacheIsBounded(t *testing.T) {
+	r := NewDefaultRegistry()
+	for i := 0; i < maxAliasCacheEntries+500; i++ {
+		id := fmt.Sprintf("claude-3-7-sonnet-snapshot-%d", i)
+		if _, ok := r.Get(id); !ok {
+			t.Fatalf("fuzzy alias %q did not resolve", id)
+		}
+	}
+
+	r.mu.RLock()
+	got := len(r.aliasCache)
+	r.mu.RUnlock()
+	if got > maxAliasCacheEntries {
+		t.Fatalf("alias cache grew to %d entries, cap is %d", got, maxAliasCacheEntries)
 	}
 }

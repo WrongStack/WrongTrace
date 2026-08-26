@@ -56,9 +56,26 @@ export function Dashboard() {
   const recent = useRecentEvents(activeProjId, recentLimit, recentVisible);
   const atlas = useAtlas(activeProjId, activeTab === 'atlas');
 
+	// useAtlas stays mounted while tabs switch, so React Query would otherwise
+	// keep a multi-megabyte symbol graph "active" indefinitely and gcTime would
+	// never apply. Drop it as soon as the Atlas surface is left; re-entry already
+	// performs an explicit fetch through the enabled flag above.
+	useEffect(() => {
+		if (activeTab !== 'atlas') {
+			queryClient.removeQueries({ queryKey: ['atlas'] });
+		}
+	}, [activeTab, queryClient]);
+
   const wsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingWsTypesRef = useRef(new Set<WSMessage['type']>());
 	const seenHelloRef = useRef(false);
+	// Frames observed inside the current coalescing window, and the window that
+	// observation earned. A fixed 250ms window meant a busy agent run fired four
+	// full refresh storms per second -- roughly thirty requests a second, each
+	// re-rendering the whole dashboard. The window widens under sustained
+	// traffic and snaps back as soon as things go quiet.
+	const wsBurstRef = useRef(0);
+	const missedWhileHiddenRef = useRef(false);
 
   // Aggregate socket notifications without putting every frame into React
   // state. One burst triggers at most one render-independent cache refresh,
@@ -74,10 +91,22 @@ export function Dashboard() {
 		return;
 	}
     pendingWsTypesRef.current.add(message.type);
+    wsBurstRef.current += 1;
+
+    // A hidden tab must not fetch at all: its queries are invisible, and the
+    // browser throttles the timers driving them anyway. Remember that we fell
+    // behind and catch up in one pass when the tab comes back.
+    if (typeof document !== 'undefined' && document.hidden) {
+      missedWhileHiddenRef.current = true;
+      return;
+    }
+
     if (wsTimerRef.current) return;
 
+    const coalesceMs = wsBurstRef.current > 20 ? 1000 : wsBurstRef.current > 5 ? 500 : 250;
     wsTimerRef.current = setTimeout(() => {
       wsTimerRef.current = null;
+      wsBurstRef.current = 0;
       const pending = pendingWsTypesRef.current;
       pendingWsTypesRef.current = new Set();
       const invalidate = (queryKey: string[], refetchType: 'active' | 'none' = 'active') => {
@@ -130,10 +159,24 @@ export function Dashboard() {
       if (pending.has('project_switched')) {
         ['projects', 'overview', 'thrashing', 'models', 'recent', 'atlas', 'proxy_traffic', 'profiler_traces'].forEach((key) => invalidate([key]));
       }
-    }, 250);
+    }, coalesceMs);
   }, [queryClient]);
 
   const ws = useWebSocket(handleSocketMessage);
+
+  // One catch-up refresh when a backgrounded tab is brought forward, instead of
+  // every frame that arrived while nobody was looking.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.hidden || !missedWhileHiddenRef.current) return;
+      missedWhileHiddenRef.current = false;
+      pendingWsTypesRef.current = new Set();
+      wsBurstRef.current = 0;
+      void queryClient.invalidateQueries({ refetchType: 'active' });
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [queryClient]);
 
   useEffect(() => {
     return () => {

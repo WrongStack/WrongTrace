@@ -956,13 +956,22 @@ func TestServer_Enhancements_WrongStackReport(t *testing.T) {
 		ID:         "ipc-test-1",
 		Method:     "telemetry/file_health",
 		Params:     map[string]interface{}{"file_path": "internal/server/server.go"},
+		Result:     map[string]interface{}{"health_score": 92},
 		DurationMs: 0.85,
 		Timestamp:  time.Now().UTC(),
 	})
 	var ipcTraffic []ipc.IPCTrafficRecord
-	getJSON(t, ts.URL+"/api/ipc/traffic", &ipcTraffic)
+	getJSON(t, ts.URL+"/api/ipc/traffic?detail=false", &ipcTraffic)
 	if len(ipcTraffic) == 0 || ipcTraffic[0].Method != "telemetry/file_health" {
 		t.Errorf("expected recorded IPC traffic, got: %+v", ipcTraffic)
+	}
+	if ipcTraffic[0].Result != nil {
+		t.Errorf("IPC summary unexpectedly retained result: %+v", ipcTraffic[0].Result)
+	}
+	var ipcDetail ipc.IPCTrafficRecord
+	getJSON(t, ts.URL+"/api/ipc/traffic/ipc-test-1", &ipcDetail)
+	if ipcDetail.Result == nil || ipcDetail.Params["file_path"] != "internal/server/server.go" {
+		t.Errorf("expected on-demand IPC detail, got: %+v", ipcDetail)
 	}
 
 	// 15. GET /api/atlas?include_symbols=false
