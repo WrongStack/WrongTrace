@@ -160,9 +160,10 @@ func NewEngine(cfg Config) *Engine {
 	}
 
 	dispatcher := webhook.NewDispatcher(webhook.Config{
-		SlackURL:   settings.SlackWebhookURL,
-		DiscordURL: settings.DiscordWebhookURL,
-		GenericURL: settings.CustomWebhookURL,
+		SlackURL:      settings.SlackWebhookURL,
+		DiscordURL:    settings.DiscordWebhookURL,
+		GenericURL:    settings.CustomWebhookURL,
+		SigningSecret: os.Getenv("WRONGTRACE_WEBHOOK_SECRET"),
 	})
 
 	return &Engine{

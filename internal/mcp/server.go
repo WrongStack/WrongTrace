@@ -602,7 +602,3 @@ func toFloat(v interface{}) float64 {
 	}
 	return 0
 }
-
-// deadlineGuard documents that tool handlers are expected to be fast; the
-// sink's own store timeouts bound worst-case latency.
-var _ = time.Second

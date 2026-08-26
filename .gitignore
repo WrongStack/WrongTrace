@@ -29,15 +29,11 @@ vendor/
 !/.wrongstack/
 /.wrongstack/*
 !/.wrongstack/project.json
-.temp_files/
 
+# Dev runner logs (dev.ps1 / dev.sh).
 dev-daemon.log
 dev-daemon-out.log
-
 *.log
-dev-daemon.log
-dev-daemon-out.log
-dev-daemon.log
 
 .dfmt/
 .claude/

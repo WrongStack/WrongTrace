@@ -5,6 +5,9 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,16 +90,27 @@ type EngineAPI interface {
 type Config struct {
 	Port int
 	// Host is the interface the HTTP listener binds to. Empty defaults to
-	// loopback: the dashboard and gateway are single-user, unauthenticated
-	// surfaces, so binding all interfaces ("0.0.0.0") must stay an explicit
-	// opt-in for remote-tail scenarios.
+	// loopback: the dashboard and gateway are single-user surfaces, so binding
+	// all interfaces ("0.0.0.0") must stay an explicit opt-in. Binding a
+	// non-loopback interface without an AuthToken logs a loud warning — the
+	// API can delete projects, rewrite settings, and release guardrail locks.
 	Host   string
 	Engine *core.Engine
 	// SocketPath is the IPC endpoint (UDS / named pipe) the daemon bound, if
 	// any. Reported via /api/health so the dashboard can show agents the real
 	// connect path instead of guessing platform defaults.
 	SocketPath string
+	// AuthToken turns on bearer-token authentication on every non-static
+	// route (/api, /proxy, /v1, WebSocket). Empty keeps the historical
+	// unauthenticated loopback behavior. Falls back to WRONGTRACE_TOKEN when
+	// unset so operators never have to plumb it through code.
+	AuthToken string
 }
+
+// authCookieName carries the per-process session nonce minted by GET /auth so
+// the browser dashboard can authenticate (browsers cannot attach Authorization
+// headers to plain navigation or asset requests).
+const authCookieName = "wrongtrace_session"
 
 // Server bundles the HTTP listener and chi router.
 type Server struct {
@@ -104,6 +118,9 @@ type Server struct {
 	router chi.Router
 	hs     *http.Server
 	hsMu   sync.Mutex
+
+	authToken    string // expected shared secret; empty disables enforcement
+	sessionNonce string // random value accepted as the auth cookie
 }
 
 // New constructs a Server with all routes wired.
@@ -112,6 +129,20 @@ func New(cfg Config) *Server {
 		panic("server: engine is required")
 	}
 	s := &Server{cfg: cfg}
+	s.authToken = cfg.AuthToken
+	if s.authToken == "" {
+		s.authToken = os.Getenv("WRONGTRACE_TOKEN")
+	}
+	if s.authToken != "" {
+		nonce := make([]byte, 24)
+		if _, err := rand.Read(nonce); err == nil {
+			s.sessionNonce = hex.EncodeToString(nonce)
+			log.Printf("http: authentication enabled (token source: %s)",
+				map[bool]string{true: "config", false: "WRONGTRACE_TOKEN"}[cfg.AuthToken != ""])
+		} else {
+			log.Printf("http: session nonce unavailable (%v); header/query token auth still enforced", err)
+		}
+	}
 	s.router = s.buildRouter()
 	return s
 }
@@ -124,6 +155,11 @@ func (s *Server) Start() error {
 		host = "127.0.0.1"
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(s.cfg.Port))
+	if !isLoopbackHost(host) && s.authToken == "" {
+		log.Printf("http: WARNING: binding %s exposes an UNAUTHENTICATED API that can delete projects, "+
+			"rewrite settings, and release guardrail locks to every reachable host. Set WRONGTRACE_TOKEN.",
+			host)
+	}
 	hs := &http.Server{
 		Addr:              addr,
 		Handler:           s.router,
@@ -162,7 +198,7 @@ func loopbackCORS(next http.Handler) http.Handler {
 			if isLoopbackOrigin(origin) {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
+				w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-WrongTrace-Token")
 				w.Header().Set("Access-Control-Max-Age", "300")
 				if r.Method == http.MethodOptions {
 					w.WriteHeader(http.StatusNoContent)
@@ -197,6 +233,98 @@ func isLoopbackOrigin(origin string) bool {
 	return false
 }
 
+// isLoopbackHost reports whether a bind host only accepts local traffic.
+func isLoopbackHost(host string) bool {
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// tokenAuth enforces the shared secret on every non-static route when
+// WRONGTRACE_TOKEN (or Config.AuthToken) is set. Static dashboard files stay
+// open so a browser can load the SPA; the SPA then authenticates its API
+// calls via the session cookie minted by GET /auth.
+func (s *Server) tokenAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.authToken == "" || !routeRequiresAuth(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !s.authorized(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="wrongtrace"`)
+			writeError(w, http.StatusUnauthorized,
+				"authentication required: send Authorization: Bearer <WRONGTRACE_TOKEN>, "+
+					"X-WrongTrace-Token, ?token=, or open /auth?token=<token> once to mint a session cookie")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// routeRequiresAuth covers every data-bearing surface: the JSON API
+// (including WebSocket), the LLM gateway proxy, and OTLP ingest. /api/health
+// stays open — tooling probes it for liveness and it leaks nothing beyond a
+// process marker. "/" and asset paths are exempt so the SPA shell loads.
+func routeRequiresAuth(path string) bool {
+	if path == "/api/health" {
+		return false
+	}
+	return strings.HasPrefix(path, "/api") ||
+		strings.HasPrefix(path, "/proxy") ||
+		strings.HasPrefix(path, "/v1")
+}
+
+// authorized checks, in order of preference: the per-process session cookie,
+// X-WrongTrace-Token, an Authorization: Bearer header, or ?token=. All
+// comparisons are constant-time. The token itself never travels in a cookie.
+func (s *Server) authorized(r *http.Request) bool {
+	if c, err := r.Cookie(authCookieName); err == nil && s.sessionNonce != "" &&
+		subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.sessionNonce)) == 1 {
+		return true
+	}
+	tok := r.Header.Get("X-WrongTrace-Token")
+	if tok == "" {
+		if auth := r.Header.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {
+			tok = strings.TrimSpace(auth[7:])
+		}
+	}
+	if tok == "" {
+		tok = r.URL.Query().Get("token")
+	}
+	if tok == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(tok), []byte(s.authToken)) == 1
+}
+
+// handleAuthLogin validates ?token= against the configured secret and mints
+// the HttpOnly session cookie the browser dashboard uses afterwards.
+func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if s.authToken == "" {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	tok := r.URL.Query().Get("token")
+	if tok == "" || s.sessionNonce == "" ||
+		subtle.ConstantTimeCompare([]byte(tok), []byte(s.authToken)) != 1 {
+		http.Error(w, "invalid or missing token", http.StatusForbidden)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     authCookieName,
+		Value:    s.sessionNonce,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int((7 * 24 * time.Hour).Seconds()),
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 // setHS/currentHS guard the *http.Server handoff between Start (writer) and
 // Shutdown (reader). The unsynchronized field access was a genuine data race
 // surfaced by -race on the CI runner (Start writing s.hs at the same moment
@@ -225,6 +353,9 @@ func (s *Server) buildRouter() chi.Router {
 	// opens read the unauthenticated API (telemetry, traffic records, cost
 	// data) and drive destructive endpoints.
 	r.Use(loopbackCORS)
+	r.Use(s.tokenAuth)
+
+	r.Get("/auth", s.handleAuthLogin)
 
 	var store *db.Store
 	if s.cfg.Engine != nil {

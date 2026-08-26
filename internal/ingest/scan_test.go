@@ -104,6 +104,70 @@ func TestPollOnce_DiscoversNewFileInWalkedDirectory(t *testing.T) {
 	}
 }
 
+// TestPollOnce_ReachWrongStackSubagentDepth pins the discovery of transcripts
+// nested at the depth WrongStack actually produces:
+// sessions/<date>/<session>/subagents/<date>/<session>/sub.jsonl is six
+// directory levels below a watched project root, and the historical bound of
+// five dropped every one of them.
+func TestPollOnce_ReachWrongStackSubagentDepth(t *testing.T) {
+	root := t.TempDir()
+	deep := filepath.Join(root, "sessions", "2026-08-26", "sess-root",
+		"subagents", "2026-08-26", "sess-sub")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeLine(t, filepath.Join(deep, "transcript.jsonl"), "sess-sub", "write_to_file", "deep.go")
+
+	var got collector
+	sw := NewSessionWatcher(got.add)
+	sw.AddWatchDir(root)
+
+	sw.PollOnce()
+	if got.len() != 1 {
+		t.Fatalf("six-levels-deep transcript not ingested: want 1 event, got %d", got.len())
+	}
+}
+
+// TestScanDepth_ConfigurableAndEnforced proves the bound is both overridable
+// (WRONGTRACE_MAX_SCAN_DEPTH reaches construction) and still enforced: with a
+// tiny limit, deeper caches stay unscanned.
+func TestScanDepth_ConfigurableAndEnforced(t *testing.T) {
+	t.Setenv("WRONGTRACE_MAX_SCAN_DEPTH", "2")
+
+	root := t.TempDir()
+	shallow := filepath.Join(root, "level1")
+	mid := filepath.Join(shallow, "level2")
+	deep := filepath.Join(mid, "level3")
+	for _, d := range []string{shallow, mid, deep} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLine(t, filepath.Join(mid, "mid.jsonl"), "m", "write_to_file", "mid.go")
+	writeLine(t, filepath.Join(deep, "deep.jsonl"), "d", "write_to_file", "deep.go")
+
+	var got collector
+	sw := NewSessionWatcher(got.add)
+	if sw.scanDepth != 2 {
+		t.Fatalf("scanDepth = %d, want 2 from WRONGTRACE_MAX_SCAN_DEPTH", sw.scanDepth)
+	}
+	sw.AddWatchDir(root)
+	sw.PollOnce()
+
+	if got.len() != 1 {
+		t.Fatalf("limit=2: want only the level-2 transcript ingested, got %d events", got.len())
+	}
+
+	// Raising the instance's bound picks up everything beneath.
+	wide := NewSessionWatcher(got.add)
+	wide.scanDepth = defaultMaxScanDepth
+	wide.AddWatchDir(root)
+	wide.PollOnce()
+	if got.len() != 3 {
+		t.Fatalf("default depth: want all three events total, got %d", got.len())
+	}
+}
+
 func TestClassifyLogFile(t *testing.T) {
 	cases := []struct {
 		name, parent string

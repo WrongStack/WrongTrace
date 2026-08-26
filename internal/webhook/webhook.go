@@ -3,6 +3,9 @@ package webhook
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,6 +39,11 @@ type Config struct {
 	DiscordURL string
 	GenericURL string
 	Timeout    time.Duration
+	// SigningSecret, when set, stamps every generic-endpoint delivery with
+	// X-WrongTrace-Signature: sha256=<hex HMAC-SHA256 of the exact request
+	// body>. Receivers verify with the shared secret; Slack and Discord have
+	// their own URL-embedded credentials and are left untouched.
+	SigningSecret string
 }
 
 // Dispatcher broadcasts security and thrashing alerts asynchronously.
@@ -120,6 +128,14 @@ func (d *Dispatcher) sendGeneric(ctx context.Context, url string, p Payload) err
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	d.mu.RLock()
+	secret := d.cfg.SigningSecret
+	d.mu.RUnlock()
+	if secret != "" {
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(b)
+		req.Header.Set("X-WrongTrace-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	}
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
 		return err

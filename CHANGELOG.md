@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Deep Subagent Transcript Discovery (`WRONGTRACE_MAX_SCAN_DEPTH`)**:
+  - Raised the transcript scan depth bound from five to eight directories below each watched root. WrongStack nests subagent transcripts at `sessions/<date>/<session>/subagents/<date>/<session>/` — six levels — which the old bound silently dropped entirely.
+  - New env knob `WRONGTRACE_MAX_SCAN_DEPTH` (2–16) overrides the bound; dormant-directory tiering keeps deeper traversal near-free unless transcripts actually live there.
+  - Measured worst case — every level-six directory freshly active, no tiering skip granted: ~18 ms per steady-state poll over a 40-project fixture, against a 25-second tick.
+- **Optional Token Authentication (`WRONGTRACE_TOKEN`)**:
+  - When set, every data-bearing surface (`/api/*` including WebSocket, `/proxy/*`, `/v1/traces`) requires `Authorization: Bearer <token>`, `X-WrongTrace-Token`, or `?token=`; comparisons are constant-time.
+  - `GET /auth?token=<token>` mints an HttpOnly, SameSite=Lax session cookie backed by a per-process random nonce, so the browser dashboard authenticates without headers. `/api/health` and static dashboard files stay open for liveness probes and SPA loading.
+  - Binding a non-loopback interface without a token logs a prominent startup warning instead of failing silently open.
+- **Webhook HMAC Signatures (`WRONGTRACE_WEBHOOK_SECRET`)**:
+  - Generic webhook deliveries now carry `X-WrongTrace-Signature: sha256=<hex HMAC-SHA256>` over the exact request body so receivers can verify authenticity.
+
+### Fixed & Hardened
+- **Silent Migration Failures Surfaced**:
+  - `SwitchActiveProject` no longer swaps in a store that failed to open or migrate; it logs the failure and keeps serving the previous database rather than a half-applied schema.
+  - Per-project registration (`AddProject`) and the offline `trace` command log `db.Open`, `Migrate`, and insert failures that were previously discarded with `_ =`.
+- **Workspace Root Validation**:
+  - Project registration refuses filesystem volume roots (`C:\`, `/`) and WrongTrace's own per-project database tree, preventing accidental full-volume indexing and ingest feedback loops.
+
+### Changed
+- Removed the dead `var _ = time.Second` import guard from the MCP server; deduplicated `.gitignore`.
+
 ---
 
 ## [0.3.8] - 2026-08-26

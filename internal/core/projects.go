@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,23 +169,34 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 	watcher := e.watcher
 	e.lockMu.Unlock()
 
-	// Hot-swap database to target project's dedicated SQLite store
+	// Hot-swap database to target project's dedicated SQLite store. A store
+	// that cannot be opened or migrated is not swapped in: the engine keeps
+	// serving the previous database instead of a half-applied schema.
 	if target.DBPath != "" {
-		if newStore, err := db.Open(target.DBPath); err == nil {
-			_ = newStore.Migrate()
-			e.lockMu.Lock()
-			oldStore := e.cfg.Store
-			e.cfg.Store = newStore
-			e.lockMu.Unlock()
-			if oldStore != nil && oldStore != newStore {
-				// Close now, not on a timer: a lingering handle keeps the
-				// old SQLite file locked on Windows (breaks backup/delete of
-				// the project dir right after a switch). sql.DB.Close does
-				// not cancel queries already running, so only a caller that
-				// fetched Store() microseconds ago and has not started its
-				// query yet can observe "database is closed" — accepted as
-				// the cheaper side of the trade-off.
-				_ = oldStore.Close()
+		newStore, err := db.Open(target.DBPath)
+		switch {
+		case err != nil:
+			log.Printf("projects: open %s: %v (active database not switched)", target.DBPath, err)
+		default:
+			mErr := newStore.Migrate()
+			if mErr != nil {
+				_ = newStore.Close()
+				log.Printf("projects: migrate %s: %v (active database not switched)", target.DBPath, mErr)
+			} else {
+				e.lockMu.Lock()
+				oldStore := e.cfg.Store
+				e.cfg.Store = newStore
+				e.lockMu.Unlock()
+				if oldStore != nil && oldStore != newStore {
+					// Close now, not on a timer: a lingering handle keeps the
+					// old SQLite file locked on Windows (breaks backup/delete of
+					// the project dir right after a switch). sql.DB.Close does
+					// not cancel queries already running, so only a caller that
+					// fetched Store() microseconds ago and has not started its
+					// query yet can observe "database is closed" — accepted as
+					// the cheaper side of the trade-off.
+					_ = oldStore.Close()
+				}
 			}
 		}
 	}
@@ -293,6 +305,40 @@ func LoadProjectsIndex() map[string]ProjectProfile {
 	return res
 }
 
+// pathIsWithin reports whether path equals ancestor or lives underneath it,
+// comparing case-insensitively because Windows paths arrive in mixed case.
+func pathIsWithin(path, ancestor string) bool {
+	lp := strings.ToLower(filepath.Clean(path))
+	la := strings.ToLower(filepath.Clean(ancestor))
+	return lp == la || strings.HasPrefix(lp, la+string(filepath.Separator))
+}
+
+// validateProjectRoot rejects workspace roots whose ingestion is certainly
+// unintended: an entire volume ("C:\\", "/"), WrongTrace's state home itself,
+// and the per-project storage tree under <home>/projects, where the daemon's
+// own continuous SQLite WAL writes would be re-ingested in a feedback loop.
+// Ancestors of those (e.g. watching $HOME) stay permitted; narrowing scope is
+// the operator's call.
+func validateProjectRoot(absPath string) error {
+	cleaned := filepath.Clean(absPath)
+	vol := filepath.VolumeName(cleaned)
+	if vol != "" {
+		if strings.EqualFold(cleaned, vol+string(os.PathSeparator)) {
+			return fmt.Errorf("refusing to watch an entire volume root (%s): point at a project directory instead", cleaned)
+		}
+	} else if cleaned == string(os.PathSeparator) {
+		return fmt.Errorf("refusing to watch the filesystem root: point at a project directory instead")
+	}
+	home := filepath.Clean(UserWrongTraceDir())
+	if strings.EqualFold(cleaned, home) {
+		return fmt.Errorf("refusing to watch %s: it holds WrongTrace's own state", cleaned)
+	}
+	if pathIsWithin(cleaned, UserProjectsDir()) {
+		return fmt.Errorf("refusing to watch %s: it holds WrongTrace's per-project databases", cleaned)
+	}
+	return nil
+}
+
 // AddProject registers a new project workspace, creates its isolated SQLite DB in ~/.wrongtrace/projects/<slug>/,
 // scans for agent session folders, and begins watching its files.
 func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
@@ -303,6 +349,9 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	info, err := os.Stat(absPath)
 	if err != nil || !info.IsDir() {
 		return ProjectProfile{}, fmt.Errorf("directory does not exist: %s", absPath)
+	}
+	if vErr := validateProjectRoot(absPath); vErr != nil {
+		return ProjectProfile{}, vErr
 	}
 
 	if name == "" {
@@ -321,8 +370,12 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	// The handle is opened only to apply the schema; keeping it open would leak
 	// a connection (and on Windows, lock the file) for every project ever added.
 	if projStore, err := db.Open(dbPath); err == nil {
-		_ = projStore.Migrate()
+		if mErr := projStore.Migrate(); mErr != nil {
+			log.Printf("projects: migrate %s: %v", dbPath, mErr)
+		}
 		_ = projStore.Close()
+	} else {
+		log.Printf("projects: open %s: %v", dbPath, err)
 	}
 
 	// Auto-discover agent session paths and language

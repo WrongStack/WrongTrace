@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -50,9 +51,31 @@ import (
 // seconds. Discovery of NEW sessions is not affected at all: a new file moves
 // its directory's mtime, which forces enumeration on the very next poll.
 
-// maxScanDepth bounds how deep below a watched root the scan descends. Agent
-// session layouts are shallow; anything deeper is a cache.
-const maxScanDepth = 5
+// defaultMaxScanDepth bounds how deep below a watched root the scan descends
+// when WRONGTRACE_MAX_SCAN_DEPTH is unset. Agent session layouts are shallow;
+// anything deeper is a cache. The historical bound of five, though, silently
+// dropped exactly WrongStack's nested subagent transcripts at
+// sessions/<date>/<session>/subagents/<date>/<session>/ -- six levels. Eight
+// covers that with a tier to spare; descending deeper costs nothing unless
+// those directories actually exist.
+const defaultMaxScanDepth = 8
+
+const (
+	minScanDepth    = 2
+	maxScanDepthCap = 16
+)
+
+// maxScanDepthFromEnv resolves WRONGTRACE_MAX_SCAN_DEPTH (2-16), falling back
+// to defaultMaxScanDepth on unset or out-of-range values. Resolution happens
+// per construction so t.Setenv-driven tests exercise real paths.
+func maxScanDepthFromEnv() int {
+	if v := os.Getenv("WRONGTRACE_MAX_SCAN_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= minScanDepth && n <= maxScanDepthCap {
+			return n
+		}
+	}
+	return defaultMaxScanDepth
+}
 
 const (
 	// dormantAfter is how long a directory's newest transcript must have gone
@@ -179,7 +202,7 @@ func (sw *SessionWatcher) scanRoot(root string, gen uint64, now time.Time) {
 		dirMod := info.ModTime()
 
 		if subdirs, skip := sw.reuseDirState(cur.dir, dirMod, gen, now); skip {
-			if cur.depth < maxScanDepth {
+			if cur.depth < sw.scanDepth {
 				for _, name := range subdirs {
 					stack = append(stack, frame{dir: joinPath(cur.dir, name), depth: cur.depth + 1})
 				}
@@ -225,7 +248,7 @@ func (sw *SessionWatcher) scanRoot(root string, gen uint64, now time.Time) {
 			seen:       gen,
 		})
 
-		if cur.depth < maxScanDepth {
+		if cur.depth < sw.scanDepth {
 			for _, name := range subdirs {
 				stack = append(stack, frame{dir: joinPath(cur.dir, name), depth: cur.depth + 1})
 			}

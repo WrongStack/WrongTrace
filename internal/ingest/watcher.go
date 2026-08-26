@@ -43,6 +43,11 @@ type SessionWatcher struct {
 	dirMu    sync.Mutex
 	dirCache map[string]dirState
 	pollGen  uint64
+
+	// scanDepth caps how many directory levels below a watched root the walk
+	// descends. It comes from WRONGTRACE_MAX_SCAN_DEPTH (default 8) at
+	// construction; tests override it per instance.
+	scanDepth int
 }
 
 // NewSessionWatcher creates a watcher for agent log files.
@@ -51,6 +56,7 @@ func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 		seenFiles:   make(map[string]fileState),
 		seenOffsets: make(map[string]int64),
 		onToolCall:  onToolCall,
+		scanDepth:   maxScanDepthFromEnv(),
 	}
 }
 

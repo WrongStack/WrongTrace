@@ -189,6 +189,20 @@ guardrails and require `X-WrongTrace-Policy: enforce`.
 
 ---
 
+## 🔐 Security & Access Control
+
+By default the daemon binds `127.0.0.1` and serves a single-user,
+unauthenticated surface — safe as long as the whole machine is trusted.
+
+| Variable | Effect |
+|:---|:---|
+| `WRONGTRACE_TOKEN` | When set, every data-bearing route (`/api/*` incl. WebSocket, `/proxy/*`, `/v1/traces`) requires authentication via `Authorization: Bearer <token>`, `X-WrongTrace-Token`, or `?token=` (handy for WebSocket clients). `/api/health` and the static dashboard shell stay open; open **`/auth?token=<token>`** once in a browser to mint an HttpOnly session cookie for the dashboard. Binding a non-loopback interface without a token logs a loud warning at startup. |
+| `WRONGTRACE_WEBHOOK_SECRET` | When set, generic webhook deliveries carry `X-WrongTrace-Signature: sha256=<hex HMAC-SHA256>` over the exact request body so receivers can verify authenticity. Slack/Discord targets are untouched (their URLs embed credentials). |
+
+Workspace registration (`POST /api/projects`, MCP, IPC) refuses filesystem
+volume roots and WrongTrace's own per-project database tree to prevent
+accidental full-volume indexing and ingest feedback loops.
+
 ## ⚙️ Performance & Resource Tuning
 
 WrongTrace is a background observer and is tuned to stay out of the way: the
@@ -206,14 +220,17 @@ read at startup.
 | `WRONGTRACE_INDEX_CPU` | `50` | Percent of one core the workspace indexer may use. `100` disables pacing for batch/CI runs. |
 | `WRONGTRACE_AST_CACHE_MB` | `48` | Compressed-source budget for the AST snapshot cache. `0` retains no source (node-level diffs only, minimum footprint). |
 | `WRONGTRACE_PPROF` | *unset* | Set to `1` to expose loopback pprof endpoints on `127.0.0.1:6060` (override with `WRONGTRACE_PPROF_ADDR`). |
+| `WRONGTRACE_MAX_SCAN_DEPTH` | `8` | How many directory levels below each watched root transcript discovery descends (2–16). The default covers WrongStack's nested subagent layout at six levels; lower it to shave the walk on shallow setups. |
 
 Raise `WRONGTRACE_INDEX_CPU` and `WRONGTRACE_AST_CACHE_MB` on a dedicated
 machine to index large monorepos faster; lower `WRONGTRACE_MEMORY_LIMIT_MB` and
 set `WRONGTRACE_AST_CACHE_MB=0` for the leanest possible long-running daemon.
 
 > [!NOTE]
-> Transcript discovery descends at most five directories below each watched
-> root. Deeply nested subagent trees beyond that depth are not ingested.
+> Transcript discovery descends at most eight directories below each watched
+> root by default (`WRONGTRACE_MAX_SCAN_DEPTH`). Deeper caches are not
+> ingested; dormant-directory tiering keeps the deeper bound near-free unless
+> transcripts actually live there.
 
 ---
 

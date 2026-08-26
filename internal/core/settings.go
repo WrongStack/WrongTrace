@@ -160,6 +160,9 @@ func (e *Engine) UpdateSettings(s AppSettings) AppSettings {
 			SlackURL:   globalSettings.SlackWebhookURL,
 			DiscordURL: globalSettings.DiscordWebhookURL,
 			GenericURL: globalSettings.CustomWebhookURL,
+			// Env wins over any stored value so the HMAC secret never has to
+			// live in settings.json next to the webhook URLs.
+			SigningSecret: os.Getenv("WRONGTRACE_WEBHOOK_SECRET"),
 		})
 	}
 

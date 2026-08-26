@@ -647,10 +647,14 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	// 2. If daemon is offline, persist directly to local SQLite database
 	if !sentToDaemon {
 		store, err := db.Open(dbPath)
-		if err == nil {
+		if err != nil {
+			log.Printf("trace: open %s: %v (trace not persisted)", dbPath, err)
+		} else {
 			defer store.Close()
-			_ = store.Migrate()
-			_ = store.InsertTrace(db.RuntimeTraceRecord{
+			if err := store.Migrate(); err != nil {
+				log.Printf("trace: migrate %s: %v", dbPath, err)
+			}
+			if iErr := store.InsertTrace(db.RuntimeTraceRecord{
 				TraceID:       fmt.Sprintf("tr-exec-%d", time.Now().UnixNano()),
 				ServiceName:   service,
 				NodeSignature: nodeSig,
@@ -660,7 +664,9 @@ func runTrace(cmd *cobra.Command, args []string) error {
 				ProfilerType:  "test_runner",
 				MetadataJSON:  fmt.Sprintf(`{"command":%q}`, strings.Join(args, " ")),
 				Timestamp:     startTime.UTC(),
-			})
+			}); iErr != nil {
+				log.Printf("trace: insert: %v (trace not persisted)", iErr)
+			}
 		}
 	}
 
