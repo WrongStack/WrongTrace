@@ -36,7 +36,7 @@ var (
 		CostAlertUSD:       25.0,
 		AutoPruneDays:      90,
 		DefaultProvider:    "OpenAI",
-		Version:            "0.3.8",
+		Version:            "0.3.9",
 	}
 )
 
