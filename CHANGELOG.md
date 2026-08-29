@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.3.10] - 2026-08-29
 
 ### Added
 - **File History Timeline panel (Code Atlas)**: git-style commit graph under the Atlas map showing every recorded mutation of a file across its lifetime. Bursts of AST events within 120s collapse into commit-like revisions (ADD/MOD/DEL badges, per-revision `+/-` deltas, model attribution, mutated-symbol counts, LOC-after); a chronological `+/-` sparkline gives the whole lifetime at a glance; nodes expand to per-symbol diffs. Vertical (newest-first, git-log style) and horizontal orientations, with a file picker that auto-follows the file selected on the map. Powered by the existing `GET /api/metrics/recent?file_path=` endpoint (≤1000 events) — no new backend surface.
