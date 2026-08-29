@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **File History Timeline panel (Code Atlas)**: git-style commit graph under the Atlas map showing every recorded mutation of a file across its lifetime. Bursts of AST events within 120s collapse into commit-like revisions (ADD/MOD/DEL badges, per-revision `+/-` deltas, model attribution, mutated-symbol counts, LOC-after); a chronological `+/-` sparkline gives the whole lifetime at a glance; nodes expand to per-symbol diffs. Vertical (newest-first, git-log style) and horizontal orientations, with a file picker that auto-follows the file selected on the map. Powered by the existing `GET /api/metrics/recent?file_path=` endpoint (≤1000 events) — no new backend surface.
+- **`WRONGTRACE_PROXY_LOG` env knob**: set to `0`/`false` to silence `[PROXY]` lifecycle console logging without touching telemetry. Windows console writes are synchronous and can add milliseconds per line to the proxy request path.
+
+### Performance
+- **Proxy finalize pipeline moved off the request path**: wire analysis, run correlation, traffic persistence, quota accounting, and response-cache fill now run on a bounded background worker (queue cap 256, drops counted and logged) after the response bytes have been written and flushed to the client. The request path no longer decodes the full `messages` array (only `model`/`stream` — last-user-message intent is parsed once in the background) and no longer hashes the request body for cache keys unless the response cache is actually opted in. Server shutdown drains the queue so tail telemetry is not lost on restart.
+
+---
+
 ## [0.3.9] - 2026-08-26
 
 ### Added

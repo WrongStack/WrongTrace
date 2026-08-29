@@ -23,6 +23,7 @@ type PayloadAnalysis struct {
 	AssistantReply   string
 	Reasoning        string
 	SystemPrompt     string
+	UserIntent       string
 	MessageCount     int
 	FinishReason     string
 	WireModel        string
@@ -55,6 +56,16 @@ func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysi
 						if role == "system" && analysis.SystemPrompt == "" {
 							if sysContent, ok := mMap["content"].(string); ok {
 								analysis.SystemPrompt = runeSafeTruncate(sysContent, 120)
+							}
+						}
+						// Last user message wins; this used to be derived by a
+						// separate full decode on the request path.
+						if role == "user" {
+							if userContent, ok := mMap["content"].(string); ok {
+								analysis.UserIntent = runeSafePrefix(userContent, 80)
+								if len(userContent) > len(analysis.UserIntent) {
+									analysis.UserIntent += "…"
+								}
 							}
 						}
 					}

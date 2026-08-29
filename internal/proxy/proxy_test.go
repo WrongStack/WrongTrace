@@ -291,6 +291,7 @@ func TestGatewayProxy_LargePromptStoredMaskedButTelemetryExact(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
+	p.waitFinalize()
 
 	// Stored request body must be capped and masked.
 	traffic := p.AllTraffic(0)
@@ -399,6 +400,7 @@ func TestGatewayProxy_TargetUpstreamHeaderStripsMountLabel(t *testing.T) {
 	}
 
 	// The traffic record should also show the clean target URL.
+	p.waitFinalize()
 	traffic := p.AllTraffic(0)
 	if len(traffic) != 1 || !strings.HasSuffix(traffic[0].TargetURL, "/v1/chat/completions") {
 		t.Errorf("traffic TargetURL = %+v, want suffix /v1/chat/completions", traffic)
@@ -537,6 +539,7 @@ func TestGatewayProxy_JSONResponse(t *testing.T) {
 		t.Fatalf("expected 200 OK from proxy, got %d", resp.StatusCode)
 	}
 
+	proxy.waitFinalize()
 	if len(reporter.reports) != 1 {
 		t.Fatalf("expected 1 reported run from proxy, got %d", len(reporter.reports))
 	}
@@ -680,6 +683,7 @@ func TestGatewayProxy_StreamingTerminalMarker(t *testing.T) {
 	}
 
 	// Verify traffic was recorded
+	proxy.waitFinalize()
 	traffic := proxy.AllTraffic(10)
 	if len(traffic) != 1 {
 		t.Errorf("expected 1 traffic record, got %d", len(traffic))
@@ -724,6 +728,7 @@ func TestGatewayProxy_ObserveModePreservesRequestAndStream(t *testing.T) {
 	if string(responseBody) != upstreamStream {
 		t.Fatalf("observe mode mutated stream:\nwant: %q\n got: %q", upstreamStream, responseBody)
 	}
+	proxy.waitFinalize()
 	traffic := proxy.AllTraffic(1)
 	if len(traffic) != 1 || strings.Contains(traffic[0].RequestBody, secret) {
 		t.Fatalf("stored observe-mode telemetry leaked a prompt credential: %+v", traffic)
@@ -734,14 +739,15 @@ func TestGatewayProxy_EnforceModeDoesNotHideTruncatedStream(t *testing.T) {
 	p := NewGatewayProxy(Config{})
 	w := httptest.NewRecorder()
 	reader := &dataThenErrorReader{data: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")}
-	p.handleStreamingResponse(w, reader, ProxyTrafficRecord{
+	p.relayStreamingResponse(w, reader, ProxyTrafficRecord{
 		ID:           "px-truncated",
 		Timestamp:    time.Now().UTC(),
 		IncomingPath: "/v1/chat/completions",
 		StatusCode:   http.StatusOK,
 		Model:        "test-model",
 		RequestBody:  `{"model":"test-model","stream":true}`,
-	}, "", "", false, true)
+	}, nil, "", false, true)
+	p.waitFinalize()
 
 	if strings.Contains(w.Body.String(), "[DONE]") {
 		t.Fatalf("truncated upstream stream was falsely marked complete: %q", w.Body.String())
@@ -915,6 +921,7 @@ func TestResponseCache_ExactHit(t *testing.T) {
 	if upstreamCalls != 1 {
 		t.Fatalf("expected 1 upstream call, got %d", upstreamCalls)
 	}
+	proxy.waitFinalize() // cache fill runs on the finalize pipeline
 
 	// 2nd request -> Exact Cache Hit, upstream not called!
 	req2, _ := http.NewRequest("POST", proxyServer.URL+"/proxy/cached_mock/v1/chat/completions", strings.NewReader(reqPayload))
@@ -932,6 +939,7 @@ func TestResponseCache_ExactHit(t *testing.T) {
 	if upstreamCalls != 1 {
 		t.Errorf("expected upstream calls to remain 1 on cache hit, got %d", upstreamCalls)
 	}
+	proxy.waitFinalize()
 	cachedTraffic := proxy.AllTraffic(10)
 	if len(cachedTraffic) != 2 || cachedTraffic[0].ID == cachedTraffic[1].ID {
 		t.Fatalf("cache hit did not retain a unique traffic ID: %+v", cachedTraffic)
@@ -1062,6 +1070,7 @@ func TestGatewayProxy_SessionGrouping(t *testing.T) {
 		}
 	}
 
+	p.waitFinalize()
 	if len(reporter.reports) != 2 {
 		t.Fatalf("expected 2 reported events, got %d", len(reporter.reports))
 	}
@@ -1107,6 +1116,7 @@ func TestGatewayProxy_ExplicitSessionHeader(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("request failed with code %d", rec.Code)
 	}
+	p.waitFinalize()
 	if len(reporter.reports) != 1 {
 		t.Fatalf("expected 1 report, got %d", len(reporter.reports))
 	}
@@ -1217,6 +1227,7 @@ func TestGatewayProxy_ModelCatalogDetailAndGeminiInferenceDistinguished(t *testi
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("gemini inference status = %d, want 200", rec2.Code)
 	}
+	p.waitFinalize()
 	if len(reporter.reports) == 0 {
 		t.Errorf("gemini-style inference through the path must stay traced (0 reports)")
 	}
@@ -1313,6 +1324,7 @@ func TestGatewayProxy_OllamaTagsRelayedButChatTraced(t *testing.T) {
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("chat status = %d, want 200", rec2.Code)
 	}
+	p.waitFinalize()
 	if len(reporter.reports) == 0 {
 		t.Errorf("native /api/chat inference must stay traced (0 reports)")
 	}

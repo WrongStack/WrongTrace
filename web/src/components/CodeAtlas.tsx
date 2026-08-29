@@ -47,6 +47,7 @@ import {
 import { RichDiffViewer } from './RichDiffViewer';
 import { FileReadDetails } from './FileReadDetails';
 import { SymbolHistoryTimeline } from './SymbolHistoryTimeline';
+import { FileHistoryTimeline } from './FileHistoryTimeline';
 import type { AtlasSnapshot, AtlasPackage, AtlasFile, AtlasSymbol, EventRecord } from '../types';
 
 function FlowAutoArranger({ scopeKey }: { scopeKey: string }) {
@@ -459,6 +460,26 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
     | { level: 'package'; pkg: AtlasPackage }
     | { level: 'file'; pkg: AtlasPackage; file: AtlasFile }
   >({ level: 'all' });
+
+  // File History Timeline panel (below the map): follows the selected file on
+  // the canvas, with a manual picker override for files not rendered as nodes.
+  const [pinnedHistoryFile, setPinnedHistoryFile] = useState('');
+  const historyFilePath = selectedItem?.file?.path || pinnedHistoryFile;
+
+  const atlasFileOptions = useMemo(() => {
+    if (!atlas?.packages) return [] as { path: string; name: string }[];
+    const seen = new Set<string>();
+    const opts: { path: string; name: string }[] = [];
+    atlas.packages.forEach((p) =>
+      p.files.forEach((f) => {
+        if (!seen.has(f.path)) {
+          seen.add(f.path);
+          opts.push({ path: f.path, name: f.name });
+        }
+      }),
+    );
+    return opts.sort((a, b) => a.path.localeCompare(b.path));
+  }, [atlas]);
 
   const [graphLayout, setGraphLayout] = useState<'radial' | 'tree' | 'grid'>('radial');
 
@@ -1632,6 +1653,56 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                 </div>
               </div>
             )}
+          </div>
+        )}
+      </div>
+
+      {/* File Lifetime History Timeline — git-style commit graph below the map */}
+      <div className="panel space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-cyan-500/20 text-cyan-400">
+              <GitCommit className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="font-semibold tracking-tight text-sm flex items-center gap-2">
+                File History Timeline
+                {historyFilePath && (
+                  <span
+                    className="text-[11px] font-mono font-normal text-cyan-300 bg-cyan-500/10 border border-cyan-500/20 px-1.5 py-0.5 rounded truncate max-w-[320px]"
+                    title={historyFilePath}
+                  >
+                    {historyFilePath}
+                  </span>
+                )}
+              </h3>
+              <p className="text-xs text-slate-400">
+                Git-style commit graph of every change across a file's lifetime — vertical or horizontal.
+              </p>
+            </div>
+          </div>
+
+          <select
+            value={historyFilePath}
+            onChange={(e) => setPinnedHistoryFile(e.target.value)}
+            className="text-xs bg-slate-900 border border-cyan-500/30 rounded-lg px-2.5 py-1.5 text-cyan-300 font-mono focus:outline-none focus:border-cyan-400 max-w-[380px]"
+            title="Pick a file to trace its lifetime change history"
+          >
+            <option value="">— select a file —</option>
+            {atlasFileOptions.map((f) => (
+              <option key={f.path} value={f.path}>
+                {f.path}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {historyFilePath ? (
+          <FileHistoryTimeline key={historyFilePath} filePath={historyFilePath} />
+        ) : (
+          <div className="p-6 rounded-xl bg-slate-950/40 border border-dashed border-white/10 text-xs text-slate-500 flex flex-col items-center gap-2 text-center">
+            <GitCommit className="h-6 w-6 text-slate-700" />
+            Select a file on the map (or from the picker) to trace its full change timeline.
           </div>
         )}
       </div>

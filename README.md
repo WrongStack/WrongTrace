@@ -22,7 +22,7 @@ Watches your code with Tree-sitter, correlates AST-level edits with path-scoped 
 
 1. **🕸️ Inter-Agent Friction & Cross-Thrashing Matrix ("Who Broke Whose Code?")** — Uncovers multi-agent code collisions and friction. Tracks which AI model originally authored an AST node and which subsequent model rewrote or deleted it, complete with time-delta durations ($\Delta T$) and inline syntax-highlighted diffs.
 2. **🔍 Live Named Pipe & IPC Inspector (`\\.\pipe\wrongtrace`)** — Real-time telemetry and JSON-RPC wire inspector for WrongStack and local autonomous agents, exposing request payloads, daemon replies, and execution latency.
-3. **🗺️ Interactive Next-Gen Code Atlas** — Full-screen interactive architectural map with Orbital Radial, Hierarchical Tree, and Grid layout algorithms. Features intelligent smooth auto-centering (`FlowAutoArranger`), Health Score heatmaps, Churn Velocity modes, and multi-tab symbol lineage drawers.
+3. **🗺️ Interactive Next-Gen Code Atlas** — Full-screen interactive architectural map with Orbital Radial, Hierarchical Tree, and Grid layout algorithms. Features intelligent smooth auto-centering (`FlowAutoArranger`), Health Score heatmaps, Churn Velocity modes, multi-tab symbol lineage drawers, and a git-style **File History Timeline** panel that charts a file's entire lifetime of changes as commit-like revisions.
 4. **📜 AST Symbol Evolution & Lineage History** — Chronological lifecycle tracking for every function, method, class, and struct. Inspect exact revisions, model attributions, and localized diffs across the entire history of the symbol.
 5. **🧠 Model Intelligence & True Token ROI Matrix** — Grades AI models into Quality Tiers (S/A/B/C) based on 14-day code survival rate %, dollar expenditure per surviving node ($/node), context read-to-write ratio, and longevity.
 6. **🔍 Semantic AST Churn & Accurate Multi-Line Diffing** — Tracks code transformations via Tree-sitter AST diffing across 11+ languages with exact `+AddedLines / -DeletedLines` granularity, filtering out cosmetic formatting churn.
@@ -108,7 +108,7 @@ WrongTrace automatically detects, monitors, and analyzes telemetry from all majo
 | **📊 Overview** | Churn timeline, Net LOC delta, Spend vs. Waste KPI, Thrashing alerts, Live event stream. |
 | **⚔️ Inter-Agent Friction** | Collision Heatmap Grid, "Who Broke Whose Code?" timeline, $\Delta T$ duration, and overwrite diffs. |
 | **🧠 Model Intelligence** | S/A/B/C Quality Tiers, 14-day code survival rate %, True Token ROI ($/node), and Context Read matrix. |
-| **🗺️ Code Atlas** | Full-screen interactive AST graph with smooth auto-centering, Orbit/Tree/Grid layouts, and lineage drawer. |
+| **🗺️ Code Atlas** | Full-screen interactive AST graph with smooth auto-centering, Orbit/Tree/Grid layouts, lineage drawer, and a file lifetime commit-graph timeline (vertical/horizontal, with a whole-history `+/-` sparkline). |
 | **🔍 Diffs & Changes** | Full-page rich diff inspector with syntax highlighting and added/deleted line statistics. |
 | **📜 Symbol Lineage** | Chronological revision timeline for any AST node with author model attribution and historical diffs. |
 | **🤖 Agent Sessions & Catalog** | Multi-agent session monitor, live 2025/2026 model pricing registry, and interactive cost simulator. |
@@ -183,6 +183,13 @@ Response caching is disabled unless a request explicitly sends
 `X-WrongTrace-Cache: allow`. Cache keys are isolated by credential, project,
 agent, and session scope; authorization material itself is never stored.
 
+Wire analysis, run correlation, traffic persistence, quota accounting, and
+response-cache fill all run on a background finalize pipeline **after** the
+client has already received its response bytes — a coding agent's next turn
+never waits on telemetry. Set `WRONGTRACE_PROXY_LOG=0` to silence `[PROXY]`
+console logging (Windows console writes are synchronous and land on the
+request path).
+
 The gateway is byte-preserving by default. Secret redaction, quota blocking,
 OpenAI usage-option injection, and missing terminal-marker repair are mutating
 guardrails and require `X-WrongTrace-Policy: enforce`.
@@ -221,6 +228,7 @@ read at startup.
 | `WRONGTRACE_AST_CACHE_MB` | `48` | Compressed-source budget for the AST snapshot cache. `0` retains no source (node-level diffs only, minimum footprint). |
 | `WRONGTRACE_PPROF` | *unset* | Set to `1` to expose loopback pprof endpoints on `127.0.0.1:6060` (override with `WRONGTRACE_PPROF_ADDR`). |
 | `WRONGTRACE_MAX_SCAN_DEPTH` | `8` | How many directory levels below each watched root transcript discovery descends (2–16). The default covers WrongStack's nested subagent layout at six levels; lower it to shave the walk on shallow setups. |
+| `WRONGTRACE_PROXY_LOG` | `on` | Set to `0`/`false` to silence `[PROXY]` lifecycle console logging. Windows console writes are synchronous and can add milliseconds per line to the proxy request path; telemetry is unaffected. |
 
 Raise `WRONGTRACE_INDEX_CPU` and `WRONGTRACE_AST_CACHE_MB` on a dedicated
 machine to index large monorepos faster; lower `WRONGTRACE_MEMORY_LIMIT_MB` and

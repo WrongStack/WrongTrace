@@ -116,10 +116,11 @@ const authCookieName = "wrongtrace_session"
 
 // Server bundles the HTTP listener and chi router.
 type Server struct {
-	cfg    Config
-	router chi.Router
-	hs     *http.Server
-	hsMu   sync.Mutex
+	cfg      Config
+	router   chi.Router
+	hs       *http.Server
+	hsMu     sync.Mutex
+	handlers *Handlers // kept for shutdown-time proxy finalize draining
 
 	authToken    string // expected shared secret; empty disables enforcement
 	sessionNonce string // random value accepted as the auth cookie
@@ -187,7 +188,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return hs.Shutdown(ctx)
+	err := hs.Shutdown(ctx)
+	// The listener is down and every handler has returned, so no new proxy
+	// finalize jobs can appear; let the queued telemetry finish writing.
+	if s.handlers != nil && s.handlers.Proxy != nil {
+		s.handlers.Proxy.Close()
+	}
+	return err
 }
 
 // loopbackCORS answers preflights and marks responses readable only for
@@ -439,6 +446,7 @@ func (s *Server) buildRouter() chi.Router {
 			},
 		}),
 	}
+	s.handlers = h
 	r.Route("/api", func(r chi.Router) {
 		r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "route not found: "+r.Method+" "+r.URL.Path)

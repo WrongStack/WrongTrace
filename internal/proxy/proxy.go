@@ -13,16 +13,32 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 	"github.com/wrongstack/wrongtrace/internal/models"
 )
+
+// proxyLogEnabled gates [PROXY] lifecycle logging. Console writes on Windows
+// are synchronous and can add milliseconds per line to the request path;
+// WRONGTRACE_PROXY_LOG=0 (or false) silences them without touching telemetry.
+var proxyLogEnabled = func() bool {
+	v := os.Getenv("WRONGTRACE_PROXY_LOG")
+	return v != "0" && !strings.EqualFold(v, "false")
+}()
+
+func proxyLogf(format string, args ...interface{}) {
+	if proxyLogEnabled {
+		log.Printf("[PROXY] "+format, args...)
+	}
+}
 
 // Reporter abstracts the engine method needed to record telemetry.
 type Reporter interface {
@@ -97,6 +113,15 @@ type GatewayProxy struct {
 	maxTraffic int
 	sessionMu  sync.Mutex
 	sessions   map[string]*proxySessionTracker
+
+	// Finalize pipeline: wire analysis, run correlation, traffic persistence,
+	// quota accounting, and cache fill all run OFF the request path, after the
+	// client has already received its response bytes. A coding agent's next
+	// turn must never wait on telemetry.
+	finalizeCh      chan finalizeJob
+	finalizeWG      sync.WaitGroup
+	finalizeDropped atomic.Int64
+	closeOnce       sync.Once
 }
 
 // NewGatewayProxy creates a new GatewayProxy instance with standard provider registries, route manager, cache, and quota limiter.
@@ -132,7 +157,7 @@ func NewGatewayProxy(cfg Config) *GatewayProxy {
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 
-	return &GatewayProxy{
+	p := &GatewayProxy{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Transport: transport,
@@ -145,6 +170,157 @@ func NewGatewayProxy(cfg Config) *GatewayProxy {
 		trafficLog: make([]ProxyTrafficRecord, 0, 100),
 		maxTraffic: 100,
 		sessions:   make(map[string]*proxySessionTracker),
+		finalizeCh: make(chan finalizeJob, finalizeQueueCap),
+	}
+	go p.finalizeWorker()
+	return p
+}
+
+// finalizeJob carries everything the background pipeline needs to analyze and
+// record one exchange after the client has already received its response.
+type finalizeJob struct {
+	rec          ProxyTrafficRecord
+	reqBody      []byte // original request body: analysis + stored record
+	respBytes    []byte // original upstream response: analysis + cache store
+	cacheKey     string
+	cacheEnabled bool
+	isStream     bool
+	analysis     *PayloadAnalysis // precomputed (cache-hit path); nil → analyzed here
+}
+
+const finalizeQueueCap = 256
+
+// enqueueFinalize hands a completed exchange to the background finalize
+// pipeline. The caller must have written AND flushed the response to the
+// client first: nothing here runs on the request's critical path. On a full
+// queue the job is dropped (counted, logged) rather than stalling a coding
+// agent's keep-alive connection — mirroring Hub.Broadcast's drop-for-slow-
+// readers policy.
+func (p *GatewayProxy) enqueueFinalize(job finalizeJob) {
+	p.finalizeWG.Add(1)
+	select {
+	case p.finalizeCh <- job:
+	default:
+		p.finalizeWG.Done()
+		if n := p.finalizeDropped.Add(1); n == 1 || n%100 == 0 {
+			proxyLogf("[%s] telemetry finalize queue full; dropped job #%d (run/traffic record lost)", job.rec.ID, n)
+		}
+	}
+}
+
+func (p *GatewayProxy) finalizeWorker() {
+	for job := range p.finalizeCh {
+		p.finalize(job)
+		p.finalizeWG.Done()
+	}
+}
+
+// waitFinalize blocks until every enqueued finalize job has been processed.
+func (p *GatewayProxy) waitFinalize() { p.finalizeWG.Wait() }
+
+// Close drains the finalize pipeline: no further jobs are accepted and all
+// queued analysis/recording completes before it returns. Call only after the
+// HTTP listener has shut down, so no handler can still enqueue.
+func (p *GatewayProxy) Close() {
+	p.closeOnce.Do(func() { close(p.finalizeCh) })
+	p.finalizeWG.Wait()
+}
+
+// finalize performs wire analysis, run correlation, traffic persistence,
+// quota accounting, and cache fill for one completed exchange. This entire
+// chain used to run synchronously inside ServeHTTP — milliseconds of JSON
+// walking, secret scrubbing, and SQLite writes that delayed the client
+// connection's return to the keep-alive pool and, for sub-4KB responses,
+// delayed the response bytes themselves.
+func (p *GatewayProxy) finalize(job finalizeJob) {
+	rec := job.rec
+	rec.RequestBody = string(job.reqBody)
+
+	if job.analysis != nil {
+		// Cache-hit path: the record is already final ($0 cost, cache-savings
+		// accounting, px-* ID kept unique). Only run correlation and traffic
+		// persistence remain.
+		runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, rec.PromptTokens, rec.CompletionTokens, 0, job.analysis.UserIntent)
+		if runID != "" {
+			rec.RunID = runID
+		}
+		p.recordTraffic(rec)
+		return
+	}
+
+	rec.ResponseBody = string(job.respBytes)
+
+	analysis := AnalyzeWirePayloads(job.reqBody, job.respBytes, job.isStream)
+
+	promptTokens := analysis.PromptTokens
+	completionTokens := analysis.CompletionTokens
+	if analysis.WireModel != "" && (rec.Model == "" || rec.Model == "unknown-model") {
+		rec.Model = analysis.WireModel
+	}
+	if analysis.WireID != "" {
+		rec.ID = analysis.WireID
+	}
+	if promptTokens == 0 {
+		promptTokens = EstimatePromptTokens(job.reqBody)
+	}
+	if completionTokens == 0 && job.isStream {
+		completionTokens = 1
+	}
+	if analysis.CachedTokens > 0 && promptTokens < analysis.CachedTokens {
+		promptTokens += analysis.CachedTokens
+	}
+	rec.PromptTokens = promptTokens
+	rec.CompletionTokens = completionTokens
+	rec.TotalTokens = promptTokens + completionTokens
+	rec.CachedTokens = analysis.CachedTokens
+	rec.ReasoningTokens = analysis.ReasoningTokens
+	if promptTokens > 0 && analysis.CachedTokens > 0 {
+		rate := (float64(analysis.CachedTokens) / float64(promptTokens)) * 100
+		if rate > 100.0 {
+			rate = 100.0
+		}
+		rec.CacheHitRate = rate
+	}
+
+	costUSD, cacheSavingsUSD := models.Global.CalculateCostDetailed(rec.Provider, rec.Model, promptTokens, completionTokens, analysis.CachedTokens)
+	rec.CostUSD = costUSD
+	rec.CacheSavingsUSD = cacheSavingsUSD
+	rec.ToolCalls = analysis.ToolCalls
+	rec.ToolCount = analysis.ToolCount
+	rec.AssistantReply = analysis.AssistantReply
+	rec.Reasoning = analysis.Reasoning
+	rec.SystemPrompt = analysis.SystemPrompt
+	rec.MessageCount = analysis.MessageCount
+	rec.FinishReason = analysis.FinishReason
+
+	intent := analysis.UserIntent
+	if intent == "" && analysis.AssistantReply != "" {
+		intent = runeSafePrefix(analysis.AssistantReply, 80)
+		if len(analysis.AssistantReply) > len(intent) {
+			intent += "…"
+		}
+	}
+
+	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, rec.CostUSD, intent)
+	if runID != "" {
+		rec.RunID = runID
+	}
+	p.recordTraffic(rec)
+
+	if p.Quotas != nil && rec.CostUSD > 0 {
+		quotaKey := rec.ProjectSlug
+		if quotaKey == "" {
+			quotaKey = rec.AgentName
+		}
+		p.Quotas.RecordSpend(quotaKey, rec.CostUSD)
+	}
+
+	// Save to response cache if successful. cacheKey is the lookup-time
+	// response-cache key; reusing it for the store (instead of recomputing
+	// from rec.RequestBody/rec.Model, which analysis may have rewritten) is
+	// what makes future lookups actually hit.
+	if job.cacheEnabled && rec.StatusCode == http.StatusOK && p.Cache != nil && len(job.respBytes) > 0 && job.cacheKey != "" {
+		p.Cache.Set(job.cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, job.respBytes, job.isStream, promptTokens+completionTokens, costUSD, 24*time.Hour)
 	}
 }
 
@@ -216,7 +392,7 @@ func (p *GatewayProxy) recordTraffic(rec ProxyTrafficRecord) {
 	p.trafficMu.Unlock()
 
 	if rec.PromptTokens > 0 || rec.CompletionTokens > 0 || rec.Model != "" {
-		log.Printf("[PROXY] [%s] COMPLETED HTTP %d | model: %s | in: %d tok, out: %d tok, cached: %d | cost: $%.5f | duration: %dms",
+		proxyLogf("[%s] COMPLETED HTTP %d | model: %s | in: %d tok, out: %d tok, cached: %d | cost: $%.5f | duration: %dms",
 			rec.ID, rec.StatusCode, rec.Model, rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens, rec.CostUSD, rec.DurationMs)
 	}
 
@@ -367,9 +543,10 @@ func (p *GatewayProxy) DetectProvider(r *http.Request) (provider string, targetB
 		}
 	}
 
-	// 3. Registered providers from CustomUpstreams
+	// 3. Registered providers from CustomUpstreams (map keys are lowercase)
+	lowerPath := strings.ToLower(path)
 	for k, v := range p.providers {
-		if strings.Contains(strings.ToLower(path), k) {
+		if strings.Contains(lowerPath, k) {
 			return strings.Title(k), v, path
 		}
 	}
@@ -512,35 +689,24 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var redactedSecrets int
 		reqBody, redactedSecrets = ScanAndRedactSecrets(reqBody)
 		if redactedSecrets > 0 {
-			log.Printf("[PROXY] [%s] security guardrail redacted %d secret(s) in outgoing payload to %s", reqID, redactedSecrets, provider)
+			proxyLogf("[%s] security guardrail redacted %d secret(s) in outgoing payload to %s", reqID, redactedSecrets, provider)
 		}
 	}
 	r.Body = io.NopCloser(bytes.NewReader(reqBody))
 
+	// Only model/stream are needed on the request path. Decoding the full
+	// messages array here cost milliseconds per request on coding-agent-sized
+	// payloads; wire analysis (including last-user-message intent) re-parses
+	// the body once in the background finalize pipeline instead.
 	var parsedReq struct {
-		Model    string `json:"model"`
-		Stream   bool   `json:"stream"`
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"messages"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	_ = json.Unmarshal(reqBody, &parsedReq)
 
 	modelName := parsedReq.Model
 	if modelName == "" {
 		modelName = "unknown-model"
-	}
-
-	var userIntent string
-	for i := len(parsedReq.Messages) - 1; i >= 0; i-- {
-		if parsedReq.Messages[i].Role == "user" {
-			userIntent = runeSafePrefix(parsedReq.Messages[i].Content, 80)
-			if len(parsedReq.Messages[i].Content) > len(userIntent) {
-				userIntent += "…"
-			}
-			break
-		}
 	}
 
 	start := time.Now()
@@ -620,12 +786,18 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. Exact Response Cache Lookup (on the final forwarded body)
+	// 3. Exact Response Cache Lookup (on the final forwarded body). The key is
+	// only computed when the cache is actually opted into: hashing the whole
+	// request body on every transparent-proxy request costs milliseconds that
+	// coding agents pay directly.
 	cacheEnabled := strings.EqualFold(r.Header.Get("X-WrongTrace-Cache"), "allow") || strings.EqualFold(r.Header.Get("X-WrongTrace-Cache"), "true")
 	bypassCache := !cacheEnabled || r.Header.Get("Cache-Control") == "no-cache" || r.Header.Get("X-Bypass-Cache") == "true"
-	cacheKey := ComputeScopedKey(provider, modelName, requestCacheScope(r), reqBody)
+	var cacheKey string
+	if !bypassCache {
+		cacheKey = ComputeScopedKey(provider, modelName, requestCacheScope(r), reqBody)
+	}
 
-	if !bypassCache && p.Cache != nil {
+	if !bypassCache && p.Cache != nil && cacheKey != "" {
 		if cached, hit := p.Cache.Get(cacheKey); hit {
 			for k, v := range cached.Headers {
 				w.Header().Set(k, v)
@@ -634,7 +806,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(cached.StatusCode)
 			_, _ = w.Write(cached.Body)
 
-			log.Printf("[PROXY] [%s] CACHE HIT -> returned %d cached tokens in %dms (saved $%.5f)", reqID, cached.TokensSaved, time.Since(start).Milliseconds(), cached.CostSavedUSD)
+			proxyLogf("[%s] CACHE HIT -> returned %d cached tokens in %dms (saved $%.5f)", reqID, cached.TokensSaved, time.Since(start).Milliseconds(), cached.CostSavedUSD)
 
 			rec := ProxyTrafficRecord{
 				ID:              reqID,
@@ -684,11 +856,21 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			rec.SystemPrompt = analysis.SystemPrompt
 			rec.MessageCount = analysis.MessageCount
 			rec.FinishReason = analysis.FinishReason
-			runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, rec.PromptTokens, rec.CompletionTokens, 0, userIntent)
-			if runID != "" {
-				rec.RunID = runID
+			p.enqueueFinalize(finalizeJob{
+				rec:          rec,
+				reqBody:      reqBody,
+				respBytes:    cached.Body,
+				cacheKey:     cacheKey,
+				cacheEnabled: cacheEnabled,
+				isStream:     cached.IsStream,
+				analysis:     &analysis,
+			})
+			// Enqueue BEFORE the flush: once these bytes reach the client the
+			// agent may immediately pipeline its next request, and the wait
+			// primitive must already see the pending job.
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
 			}
-			p.recordTraffic(rec)
 			return
 		}
 	}
@@ -704,7 +886,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyProxyHeaders(outReq, r.Header)
 	outReq.Host = outReq.URL.Host
 
-	log.Printf("[PROXY] [%s] -> %s %s -> %s (provider: %s, model: %s)", reqID, r.Method, r.URL.Path, safeTargetURL, provider, modelName)
+	proxyLogf("[%s] -> %s %s -> %s (provider: %s, model: %s)", reqID, r.Method, r.URL.Path, safeTargetURL, provider, modelName)
 
 	resp, err := p.httpClient.Do(outReq)
 	if err != nil {
@@ -715,10 +897,12 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// form-independent: http.Client re-normalizes the URL inside the
 		// error, so an exact ReplaceAll(targetURL→safeURL) can miss it.
 		safeErr := scrubErrorString(err.Error())
-		log.Printf("[PROXY] [%s] upstream error for %s: %s", reqID, safeTargetURL, safeErr)
+		proxyLogf("[%s] upstream error for %s: %s", reqID, safeTargetURL, safeErr)
 		http.Error(w, "upstream error: "+safeErr, http.StatusBadGateway)
 
-		// Record error traffic
+		// Record error traffic. Stays synchronous: the 502 response bytes
+		// are tiny, and the failure path must be observable even under a
+		// wedged finalize pipeline.
 		p.recordTraffic(ProxyTrafficRecord{
 			ID:             reqID,
 			Timestamp:      start,
@@ -738,7 +922,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	duration := time.Since(start).Milliseconds()
-	log.Printf("[PROXY] [%s] <- %s responded HTTP %d in %dms", reqID, safeTargetURL, resp.StatusCode, duration)
+	proxyLogf("[%s] <- %s responded HTTP %d in %dms", reqID, safeTargetURL, resp.StatusCode, duration)
 
 	isStream = parsedReq.Stream || strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
@@ -761,34 +945,34 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	respHeaders := maskHeaders(resp.Header)
 
 	baseRecord := ProxyTrafficRecord{
-		ID:             reqID,
-		Timestamp:      start,
-		DurationMs:     duration,
-		Method:         r.Method,
-		IncomingPath:   r.URL.Path,
-		TargetURL:      safeTargetURL,
-		Provider:       provider,
-		Model:          modelName,
-		AgentName:      agentName,
-		TaskID:         taskID,
-		RunID:          sessionID,
-		SessionKey:     sessionKey,
-		ProjectID:      projectID,
-		ProjectSlug:    projectSlug,
-		StatusCode:     resp.StatusCode,
-		RequestHeaders: reqHeaders,
-		// Raw on purpose: analysis in the handlers runs on rec.RequestBody/
-		// respBytes; recordTraffic() is the single sanitizing choke point.
-		RequestBody:     string(reqBody),
+		ID:           reqID,
+		Timestamp:    start,
+		DurationMs:   duration,
+		Method:       r.Method,
+		IncomingPath: r.URL.Path,
+		TargetURL:    safeTargetURL,
+		Provider:     provider,
+		Model:        modelName,
+		AgentName:    agentName,
+		TaskID:       taskID,
+		RunID:        sessionID,
+		SessionKey:   sessionKey,
+		ProjectID:    projectID,
+		ProjectSlug:  projectSlug,
+		StatusCode:   resp.StatusCode,
+		// RequestHeaders carry only masked values. RequestBody/ResponseBody
+		// are attached by the finalize pipeline from the raw bytes, keeping
+		// the multi-hundred-KB string conversions off the request path.
+		RequestHeaders:  reqHeaders,
 		ResponseHeaders: respHeaders,
 	}
 
 	baseRecord.IsStream = isStream
 
 	if isStream {
-		p.handleStreamingResponse(w, resp.Body, baseRecord, userIntent, cacheKey, cacheEnabled, policyEnabled)
+		p.relayStreamingResponse(w, resp.Body, baseRecord, reqBody, cacheKey, cacheEnabled, policyEnabled)
 	} else {
-		p.handleJSONResponse(w, resp.Body, baseRecord, userIntent, cacheKey, cacheEnabled)
+		p.relayJSONResponse(w, resp.Body, baseRecord, reqBody, cacheKey, cacheEnabled)
 	}
 }
 
@@ -813,12 +997,12 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 	copyProxyHeaders(outReq, r.Header)
 	outReq.Host = outReq.URL.Host
 
-	log.Printf("[PROXY] [%s] relaying catalog call %s %s -> %s (provider: %s, untraced)", catID, r.Method, r.URL.Path, sanitizeURLForRecord(targetURL), provider)
+	proxyLogf("[%s] relaying catalog call %s %s -> %s (provider: %s, untraced)", catID, r.Method, r.URL.Path, sanitizeURLForRecord(targetURL), provider)
 
 	resp, err := p.httpClient.Do(outReq)
 	if err != nil {
 		safeErr := scrubErrorString(err.Error())
-		log.Printf("[PROXY] [%s] upstream error for %s: %s", catID, sanitizeURLForRecord(targetURL), safeErr)
+		proxyLogf("[%s] upstream error for %s: %s", catID, sanitizeURLForRecord(targetURL), safeErr)
 		http.Error(w, "upstream error: "+safeErr, http.StatusBadGateway)
 		return
 	}
@@ -833,11 +1017,12 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// handleJSONResponse writes the upstream JSON body to the client and records
-// the exchange. cacheKey is the lookup-time response-cache key; reusing it for
-// the store (instead of recomputing from rec.RequestBody/rec.Model, which
-// analysis may have rewritten) is what makes future lookups actually hit.
-func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent, cacheKey string, cacheEnabled bool) {
+// relayJSONResponse streams the upstream JSON body to the client and flushes
+// it immediately — including bodies smaller than the server's 4KB write
+// buffer, which would otherwise sit unflushed until handler return. Recording
+// is handed to the finalize pipeline; see finalize for what moved off this
+// path.
+func (p *GatewayProxy) relayJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, reqBody []byte, cacheKey string, cacheEnabled bool) {
 	const maxResponseBytes = 32 * 1024 * 1024
 	respBytes, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
 	if err != nil {
@@ -852,106 +1037,30 @@ func (p *GatewayProxy) handleJSONResponse(w http.ResponseWriter, body io.Reader,
 	}
 	w.WriteHeader(rec.StatusCode)
 	_, _ = w.Write(respBytes)
-
-	var parsedResp struct {
-		Usage struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
-			InputTokens      int64 `json:"input_tokens"`
-			OutputTokens     int64 `json:"output_tokens"`
-		} `json:"usage"`
-	}
-	_ = json.Unmarshal(respBytes, &parsedResp)
-
-	promptTokens := parsedResp.Usage.PromptTokens
-	if promptTokens == 0 {
-		promptTokens = parsedResp.Usage.InputTokens
-	}
-	completionTokens := parsedResp.Usage.CompletionTokens
-	if completionTokens == 0 {
-		completionTokens = parsedResp.Usage.OutputTokens
-	}
-
-	rec.ResponseBody = string(respBytes)
-
-	// Perform deep wire traffic analysis (tool calls, reasoning, cached tokens, replies)
-	// on the ORIGINAL bytes; recordTraffic() sanitizes only the stored copy.
-	analysis := AnalyzeWirePayloads([]byte(rec.RequestBody), respBytes, false)
-	if analysis.PromptTokens > 0 {
-		promptTokens = analysis.PromptTokens
-	}
-	if analysis.CompletionTokens > 0 {
-		completionTokens = analysis.CompletionTokens
-	}
-	if analysis.WireModel != "" && (rec.Model == "" || rec.Model == "unknown-model") {
-		rec.Model = analysis.WireModel
-	}
-	if analysis.WireID != "" {
-		rec.ID = analysis.WireID
-	}
-
-	if analysis.CachedTokens > 0 && promptTokens < analysis.CachedTokens {
-		promptTokens += analysis.CachedTokens
-	}
-
-	rec.PromptTokens = promptTokens
-	rec.CompletionTokens = completionTokens
-	rec.TotalTokens = promptTokens + completionTokens
-	rec.CachedTokens = analysis.CachedTokens
-	rec.ReasoningTokens = analysis.ReasoningTokens
-	if promptTokens > 0 && analysis.CachedTokens > 0 {
-		rate := (float64(analysis.CachedTokens) / float64(promptTokens)) * 100
-		if rate > 100.0 {
-			rate = 100.0
-		}
-		rec.CacheHitRate = rate
-	}
-
-	costUSD, cacheSavingsUSD := models.Global.CalculateCostDetailed(rec.Provider, rec.Model, promptTokens, completionTokens, analysis.CachedTokens)
-	rec.CostUSD = costUSD
-	rec.CacheSavingsUSD = cacheSavingsUSD
-
-	rec.ToolCalls = analysis.ToolCalls
-	rec.ToolCount = analysis.ToolCount
-	rec.AssistantReply = analysis.AssistantReply
-	rec.Reasoning = analysis.Reasoning
-	rec.SystemPrompt = analysis.SystemPrompt
-	rec.MessageCount = analysis.MessageCount
-	rec.FinishReason = analysis.FinishReason
-
-	if intent == "" && analysis.AssistantReply != "" {
-		intent = runeSafePrefix(analysis.AssistantReply, 80)
-		if len(analysis.AssistantReply) > len(intent) {
-			intent += "…"
-		}
-	}
-
-	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, rec.CostUSD, intent)
-	if runID != "" {
-		rec.RunID = runID
-	}
-	p.recordTraffic(rec)
-
-	if p.Quotas != nil && rec.CostUSD > 0 {
-		quotaKey := rec.ProjectSlug
-		if quotaKey == "" {
-			quotaKey = rec.AgentName
-		}
-		p.Quotas.RecordSpend(quotaKey, rec.CostUSD)
-	}
-
-	// Save to response cache if successful
-	if cacheEnabled && rec.StatusCode == http.StatusOK && p.Cache != nil && len(respBytes) > 0 && cacheKey != "" {
-		p.Cache.Set(cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, respBytes, false, promptTokens+completionTokens, costUSD, 24*time.Hour)
+	// Enqueue BEFORE the flush: once the body (whose Content-Length the
+	// client already knows) hits the wire, the agent may immediately
+	// pipeline its next request, and any wait-for-finalize must already see
+	// the pending job.
+	rec.DurationMs = time.Since(rec.Timestamp).Milliseconds()
+	p.enqueueFinalize(finalizeJob{
+		rec:          rec,
+		reqBody:      reqBody,
+		respBytes:    respBytes,
+		cacheKey:     cacheKey,
+		cacheEnabled: cacheEnabled,
+	})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 
-func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, intent, cacheKey string, cacheEnabled, policyEnabled bool) {
+func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, reqBody []byte, cacheKey string, cacheEnabled, policyEnabled bool) {
 	w.WriteHeader(rec.StatusCode)
 	flusher, isFlusher := w.(http.Flusher)
-	buf := make([]byte, 4096)
+	// 32KB: fewer read/write syscalls on chunked non-SSE streams, while the
+	// per-read Flush below still keeps SSE token latency at wire speed.
+	buf := make([]byte, 32*1024)
 
-	var promptTokens, completionTokens int64
 	var capturedHead bytes.Buffer
 	const maxCapturedBytes = 1024 * 1024
 	const capturedHeadBytes = maxCapturedBytes * 3 / 4
@@ -998,88 +1107,15 @@ func (p *GatewayProxy) handleStreamingResponse(w http.ResponseWriter, body io.Re
 		fullSSE += string(terminalMarker)
 	}
 
-	// Perform deep wire traffic analysis on streamed response (SSE chunks + usage metadata)
-	analysis := AnalyzeWirePayloads([]byte(rec.RequestBody), []byte(fullSSE), true)
-	if analysis.PromptTokens > 0 {
-		promptTokens = analysis.PromptTokens
-	}
-	if analysis.CompletionTokens > 0 {
-		completionTokens = analysis.CompletionTokens
-	}
-	if analysis.WireModel != "" && (rec.Model == "" || rec.Model == "unknown-model") {
-		rec.Model = analysis.WireModel
-	}
-	if analysis.WireID != "" {
-		rec.ID = analysis.WireID
-	}
-
-	if promptTokens == 0 {
-		promptTokens = EstimatePromptTokens([]byte(rec.RequestBody))
-	}
-	if completionTokens == 0 {
-		if analysis.CompletionTokens > 0 {
-			completionTokens = analysis.CompletionTokens
-		} else {
-			completionTokens = 1
-		}
-	}
-
-	if analysis.CachedTokens > 0 && promptTokens < analysis.CachedTokens {
-		promptTokens += analysis.CachedTokens
-	}
-
-	rec.ResponseBody = fullSSE
 	rec.DurationMs = time.Since(rec.Timestamp).Milliseconds()
-	rec.PromptTokens = promptTokens
-	rec.CompletionTokens = completionTokens
-	rec.TotalTokens = promptTokens + completionTokens
-	rec.CachedTokens = analysis.CachedTokens
-	rec.ReasoningTokens = analysis.ReasoningTokens
-	if promptTokens > 0 && analysis.CachedTokens > 0 {
-		rate := (float64(analysis.CachedTokens) / float64(promptTokens)) * 100
-		if rate > 100.0 {
-			rate = 100.0
-		}
-		rec.CacheHitRate = rate
-	}
-
-	costUSD, cacheSavingsUSD := models.Global.CalculateCostDetailed(rec.Provider, rec.Model, promptTokens, completionTokens, analysis.CachedTokens)
-	rec.CostUSD = costUSD
-	rec.CacheSavingsUSD = cacheSavingsUSD
-
-	rec.ToolCalls = analysis.ToolCalls
-	rec.ToolCount = analysis.ToolCount
-	rec.AssistantReply = analysis.AssistantReply
-	rec.Reasoning = analysis.Reasoning
-	rec.SystemPrompt = analysis.SystemPrompt
-	rec.MessageCount = analysis.MessageCount
-	rec.FinishReason = analysis.FinishReason
-
-	if intent == "" && analysis.AssistantReply != "" {
-		intent = runeSafePrefix(analysis.AssistantReply, 80)
-		if len(analysis.AssistantReply) > len(intent) {
-			intent += "…"
-		}
-	}
-
-	runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, promptTokens, completionTokens, rec.CostUSD, intent)
-	if runID != "" {
-		rec.RunID = runID
-	}
-	p.recordTraffic(rec)
-
-	if p.Quotas != nil && rec.CostUSD > 0 {
-		quotaKey := rec.ProjectSlug
-		if quotaKey == "" {
-			quotaKey = rec.AgentName
-		}
-		p.Quotas.RecordSpend(quotaKey, rec.CostUSD)
-	}
-
-	// Save to response cache if successful
-	if cacheEnabled && rec.StatusCode == http.StatusOK && p.Cache != nil && len(fullSSE) > 0 && cacheKey != "" {
-		p.Cache.Set(cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, []byte(fullSSE), true, promptTokens+completionTokens, costUSD, 24*time.Hour)
-	}
+	p.enqueueFinalize(finalizeJob{
+		rec:          rec,
+		reqBody:      reqBody,
+		respBytes:    []byte(fullSSE),
+		cacheKey:     cacheKey,
+		cacheEnabled: cacheEnabled,
+		isStream:     true,
+	})
 }
 
 func maskHeaders(h http.Header) map[string]string {
