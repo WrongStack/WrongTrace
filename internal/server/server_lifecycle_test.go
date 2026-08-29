@@ -86,6 +86,12 @@ func TestProxyTrafficLimit(t *testing.T) {
 func (f *failingEngine) Metrics(...string) (core.MetricsSnapshot, error) {
 	return core.MetricsSnapshot{}, errForced
 }
+func (f *failingEngine) ThrashingRows(...string) ([]db.ThrashingRow, error) {
+	return nil, errForced
+}
+func (f *failingEngine) ModelRows(...string) ([]db.ModelRow, error) {
+	return nil, errForced
+}
 func (f *failingEngine) Atlas(...string) (core.AtlasSnapshot, error) {
 	return core.AtlasSnapshot{}, errForced
 }

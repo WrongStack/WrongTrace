@@ -91,24 +91,32 @@ func (h *Handlers) Overview(w http.ResponseWriter, r *http.Request) {
 }
 
 // Thrashing returns the thrashing panel standalone for tooling that wants
-// just the fragile-node list.
+// just the fragile-node list. It queries only the thrashing rows instead of
+// assembling the full metrics snapshot.
 func (h *Handlers) Thrashing(w http.ResponseWriter, r *http.Request) {
-	snap, err := h.Engine.Metrics(h.getProjectFilter(r))
+	rows, err := h.Engine.ThrashingRows(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, snap.Thrashing)
+	if rows == nil {
+		rows = []db.ThrashingRow{}
+	}
+	writeJSON(w, http.StatusOK, rows)
 }
 
-// Models returns the per-model survival and ROI comparison.
+// Models returns the per-model survival and ROI comparison. It queries only
+// the model rows instead of assembling the full metrics snapshot.
 func (h *Handlers) Models(w http.ResponseWriter, r *http.Request) {
-	snap, err := h.Engine.Metrics(h.getProjectFilter(r))
+	rows, err := h.Engine.ModelRows(h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, snap.Models)
+	if rows == nil {
+		rows = []db.ModelRow{}
+	}
+	writeJSON(w, http.StatusOK, rows)
 }
 
 // ReportTelemetry accepts run and token telemetry from AI agents.
@@ -203,6 +211,11 @@ func parseSince(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid since timestamp: %s", s)
 }
 
+// maxRecentEventsLimit bounds the client-supplied limit: the recent-events
+// cache is keyed by limit, so an unbounded value would let one request pin
+// megabytes of records in memory and serialize them on every poll.
+const maxRecentEventsLimit = 1000
+
 // RecentEvents returns the most recent AST events for the live feed, optionally filtered by file_path, repo, or since.
 func (h *Handlers) RecentEvents(w http.ResponseWriter, r *http.Request) {
 	limit := 50
@@ -212,6 +225,9 @@ func (h *Handlers) RecentEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if strings.Contains(r.URL.Path, "/metrics/") {
 		limit = 500
+	}
+	if limit > maxRecentEventsLimit {
+		limit = maxRecentEventsLimit
 	}
 
 	var since time.Time

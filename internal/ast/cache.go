@@ -27,9 +27,9 @@ import (
 //     diff_snippet degrades for files nobody has touched in a long time.
 const defaultSourceBudgetBytes = 48 << 20
 
-// sourceBudgetBytes is the compressed-source ceiling for the snapshot cache.
-// WRONGTRACE_AST_CACHE_MB overrides it; 0 disables source retention entirely
-// (node-level diffs only, minimum footprint).
+// defaultSourceBudgetBytes is the compressed-source ceiling for the snapshot
+// cache. WRONGTRACE_AST_CACHE_MB overrides it; 0 disables source retention
+// entirely (node-level diffs only, minimum footprint).
 var sourceBudgetBytes = func() int64 {
 	if v := os.Getenv("WRONGTRACE_AST_CACHE_MB"); v != "" {
 		if mb, err := strconv.ParseInt(v, 10, 64); err == nil && mb >= 0 {
@@ -38,6 +38,25 @@ var sourceBudgetBytes = func() int64 {
 	}
 	return defaultSourceBudgetBytes
 }()
+
+// defaultSnapshotLimit bounds the number of retained FileSnapshots. The
+// source byte budget never covered node metadata: each snapshot pins its
+// Nodes map (signature, 64-char hash, line ranges per declaration) — and
+// generic-parser snapshots a full Body string per node — so a 20k-file
+// workspace could pin well over a hundred megabytes with zero eviction
+// pressure. Past the limit the coldest snapshots are dropped entirely; the
+// next touch of such a file re-parses it, exactly like a file never seen
+// before. WRONGTRACE_AST_MAX_SNAPSHOTS overrides it.
+var snapshotLimit = func() int {
+	if v := os.Getenv("WRONGTRACE_AST_MAX_SNAPSHOTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultSnapshotLimit
+}()
+
+const defaultSnapshotLimit = 8000
 
 var flateWriterPool = sync.Pool{
 	New: func() any {
@@ -193,6 +212,62 @@ func (l *sourceLRU) evictTo(budget int64, snapshots map[string]*FileSnapshot) {
 	}
 	if l.bytes < 0 {
 		l.bytes = 0
+	}
+}
+
+// recencyList tracks snapshot recency (paths only) so the cache can drop the
+// coldest snapshots entirely once the count exceeds its limit. It is separate
+// from sourceLRU because source shedding removes entries there while the
+// snapshot itself — and its node map — stays resident.
+type recencyList struct {
+	order   *list.List               // front = most recently set
+	entries map[string]*list.Element // path -> element
+}
+
+func newRecencyList() *recencyList {
+	return &recencyList{order: list.New(), entries: make(map[string]*list.Element)}
+}
+
+func (r *recencyList) touch(path string) {
+	if el, ok := r.entries[path]; ok {
+		r.order.MoveToFront(el)
+		return
+	}
+	r.entries[path] = r.order.PushFront(path)
+}
+
+func (r *recencyList) remove(path string) {
+	if el, ok := r.entries[path]; ok {
+		r.order.Remove(el)
+		delete(r.entries, path)
+	}
+}
+
+func (r *recencyList) reset() {
+	r.order.Init()
+	r.entries = make(map[string]*list.Element)
+}
+
+// evictSnapshots drops the coldest snapshots while the count exceeds limit,
+// releasing the node-map metadata the source byte budget cannot see. The
+// next touch of a dropped file re-parses it, exactly like a file never seen
+// before. Refunds any retained source against the source budget.
+func (r *recencyList) evictSnapshots(limit int, snapshots map[string]*FileSnapshot, source *sourceLRU) {
+	for len(snapshots) > limit {
+		el := r.order.Back()
+		if el == nil {
+			return
+		}
+		path, _ := el.Value.(string)
+		r.remove(path)
+		snap, ok := snapshots[path]
+		if !ok {
+			continue
+		}
+		if source != nil {
+			source.remove(path, snap.retainedBytes())
+		}
+		delete(snapshots, path)
 	}
 }
 

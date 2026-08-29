@@ -336,8 +336,19 @@ func (w *Watcher) computePathIgnored(p string) bool {
 	return false
 }
 
+// debounceEntry is the per-path debounce state. The timer is reused via Reset
+// instead of Stop+allocate on every fsnotify event, which build storms (tens
+// of thousands of events) turned into constant allocation churn. deadline is
+// what makes stale callbacks distinguishable: a timer that fired before a
+// Reset extended the deadline must not consume the entry, because Reset does
+// not cancel an AfterFunc callback that is already queued.
+type debounceEntry struct {
+	timer    *time.Timer
+	deadline time.Time
+}
+
 // Run blocks until ctx is cancelled or the underlying fsnotify watcher fails.
-// It implements per-path debouncing with a timer per pending path.
+// It implements per-path debouncing with a reused timer per pending path.
 func (w *Watcher) Run(ctx context.Context) {
 	if w.cfg.Engine == nil {
 		log.Printf("watcher: no engine configured; idle")
@@ -346,13 +357,13 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 
 	var pendingMu sync.Mutex
-	pending := make(map[string]*time.Timer)
+	pending := make(map[string]*debounceEntry)
 
 	defer func() {
 		pendingMu.Lock()
-		for _, t := range pending {
-			if t != nil {
-				t.Stop()
+		for _, e := range pending {
+			if e != nil && e.timer != nil {
+				e.timer.Stop()
 			}
 		}
 		pendingMu.Unlock()
@@ -380,27 +391,32 @@ func (w *Watcher) Run(ctx context.Context) {
 
 			path := ev.Name
 			pendingMu.Lock()
-			if t, exists := pending[path]; exists && t != nil {
-				t.Stop()
-			}
-			var timer *time.Timer
-			timer = time.AfterFunc(w.debounce, func() {
-				pendingMu.Lock()
-				// Stop can lose a race with a callback that is already runnable.
-				// Only the newest timer for this path may consume the entry and
-				// trigger an expensive parse/diff/database cycle.
-				if pending[path] != timer {
+			if entry := pending[path]; entry != nil {
+				entry.deadline = time.Now().Add(w.debounce)
+				entry.timer.Reset(w.debounce)
+			} else {
+				entry := &debounceEntry{deadline: time.Now().Add(w.debounce)}
+				entry.timer = time.AfterFunc(w.debounce, func() {
+					pendingMu.Lock()
+					cur := pending[path]
+					// Only the newest schedule for this path may consume the
+					// entry: an in-flight callback from before a Reset sees a
+					// deadline in the future and leaves it for the rearmed
+					// timer. Timers never fire early, so firing at or after
+					// the deadline means this callback owns the schedule.
+					if cur == nil || cur.timer != entry.timer || time.Now().Before(cur.deadline) {
+						pendingMu.Unlock()
+						return
+					}
+					delete(pending, path)
 					pendingMu.Unlock()
-					return
-				}
-				delete(pending, path)
-				pendingMu.Unlock()
-				if ctx.Err() != nil {
-					return
-				}
-				w.cfg.Engine.HandleFileChange(ctx, path)
-			})
-			pending[path] = timer
+					if ctx.Err() != nil {
+						return
+					}
+					w.cfg.Engine.HandleFileChange(ctx, path)
+				})
+				pending[path] = entry
+			}
 			pendingMu.Unlock()
 		case err, ok := <-w.fs.Errors:
 			if !ok {

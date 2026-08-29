@@ -17,9 +17,19 @@ const (
 // large JSON-RPC request/response objects. Normal calls keep their complete
 // shape; oversized values become a small scalar summary with an explicit byte
 // count instead of pinning up to the protocol's 16 MiB frame limit.
+//
+// The size probes re-encode params and result in full, which used to run on
+// every request — including the per-edit check_guardrail calls. When the
+// caller supplies the on-wire frame sizes, values that provably fit the cap
+// skip the probe: a value is a byte range of its frame, so a frame at or
+// under the cap can never contain an oversized value.
 func compactIPCTraffic(rec ipc.IPCTrafficRecord) ipc.IPCTrafficRecord {
-	rec.Params = compactIPCParams(rec.Params)
-	rec.Result = compactIPCValue(rec.Result)
+	if rec.WireBytes <= 0 || rec.WireBytes > maxStoredIPCValueBytes {
+		rec.Params = compactIPCParams(rec.Params)
+	}
+	if rec.RespBytes <= 0 || rec.RespBytes > maxStoredIPCValueBytes {
+		rec.Result = compactIPCValue(rec.Result)
+	}
 	if rec.Error != nil && len(rec.Error.Message) > maxIPCSummaryString {
 		copyErr := *rec.Error
 		copyErr.Message = copyErr.Message[:maxIPCSummaryString] + "…[truncated]"

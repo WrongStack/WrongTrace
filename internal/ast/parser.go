@@ -69,6 +69,7 @@ type Engine struct {
 	mu        sync.RWMutex
 	snapshots map[string]*FileSnapshot // abs path -> last snapshot
 	lru       *sourceLRU               // recency + byte accounting for retained source
+	snapLRU   *recencyList             // recency of snapshots, bounds the snapshot count
 
 	parseMu sync.Mutex
 	parsers map[Language]*sitter.Parser
@@ -87,6 +88,7 @@ func NewEngine() (*Engine, error) {
 	e := &Engine{
 		snapshots: make(map[string]*FileSnapshot),
 		lru:       newSourceLRU(),
+		snapLRU:   newRecencyList(),
 		parsers:   make(map[Language]*sitter.Parser),
 	}
 	for lang, fn := range map[Language]func() *sitter.Language{
@@ -118,6 +120,7 @@ func (e *Engine) Close() {
 	e.parsers = nil
 	e.snapshots = nil
 	e.lru = nil
+	e.snapLRU = nil
 }
 
 // Reset drops all cached file snapshots. Used when switching active projects.
@@ -129,6 +132,9 @@ func (e *Engine) Reset() {
 	}
 	if e.lru != nil {
 		e.lru.reset()
+	}
+	if e.snapLRU != nil {
+		e.snapLRU.reset()
 	}
 }
 
@@ -426,6 +432,10 @@ func (e *Engine) SetSnapshot(s *FileSnapshot) {
 		e.lru.touch(s.Path, s.retainedBytes())
 		e.lru.evictTo(sourceBudgetBytes, e.snapshots)
 	}
+	if e.snapLRU != nil {
+		e.snapLRU.touch(s.Path)
+		e.snapLRU.evictSnapshots(snapshotLimit, e.snapshots, e.lru)
+	}
 }
 
 // Forget removes the cached snapshot for a deleted file.
@@ -436,6 +446,9 @@ func (e *Engine) Forget(path string) {
 		if snap, ok := e.snapshots[path]; ok {
 			e.lru.remove(path, snap.retainedBytes())
 		}
+	}
+	if e.snapLRU != nil {
+		e.snapLRU.remove(path)
 	}
 	delete(e.snapshots, path)
 }

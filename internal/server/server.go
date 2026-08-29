@@ -39,6 +39,8 @@ import (
 // interface so handlers can be exercised with a fake in tests.
 type EngineAPI interface {
 	Metrics(repoFilter ...string) (core.MetricsSnapshot, error)
+	ThrashingRows(repoFilter ...string) ([]db.ThrashingRow, error)
+	ModelRows(repoFilter ...string) ([]db.ModelRow, error)
 	Atlas(repoFilter ...string) (core.AtlasSnapshot, error)
 	FileHealth(path string) (core.IPCHealth, error)
 	CheckGuardrail(path string) (core.GuardrailResult, error)

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -52,6 +53,15 @@ func (h *Hub) Broadcast(ev WSEvent) {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	if len(h.clients) > 0 {
+		// Encode once here: every subscriber would otherwise marshal the
+		// identical payload in its own writer goroutine. Diff snippets make
+		// these frames large enough that N× encodes showed up as real GC
+		// pressure with several dashboards open.
+		if b, err := json.Marshal(ev); err == nil {
+			ev.Wire = b
+		}
+	}
 	for _, ch := range h.clients {
 		select {
 		case ch <- ev:

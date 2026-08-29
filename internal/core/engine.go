@@ -285,6 +285,9 @@ func (e *Engine) handleFileGone(_ context.Context, path string) {
 // run_id is back-filled from the most recent active run when one exists within
 // the correlation window.
 func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
+	if len(res.Events) == 0 {
+		return
+	}
 	var runID, attributionSource string
 	var attributionConfidence float64
 	if len(res.Events) > 0 {
@@ -302,16 +305,20 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 			attributionSource = "unknown"
 		}
 	}
+	// Every event in one diff result originates from the same file, so the
+	// store handle and repo attribution are resolved once instead of per event.
+	store := e.Store()
+	defaultRepo := e.repoName()
+	if p, ok := e.FindProjectForFile(res.Events[0].FilePath); ok && p.Name != "" {
+		defaultRepo = p.Name
+	}
 	for _, ev := range res.Events {
 		if runID != "" && ev.RunID == "" {
 			ev.RunID = runID
 		}
 		repo := ev.RepoName
 		if repo == "" {
-			repo = e.repoName()
-		}
-		if p, ok := e.FindProjectForFile(ev.FilePath); ok && p.Name != "" {
-			repo = p.Name
+			repo = defaultRepo
 		}
 		rec := db.EventRecord{
 			EventID:               newID(),
@@ -332,7 +339,6 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 			AttributionConfidence: attributionConfidence,
 			OccurredAt:            ev.OccurredAt,
 		}
-		store := e.Store()
 		if store != nil {
 			if err := store.InsertEvent(rec); err != nil {
 				log.Printf("engine: insert event %s: %v", rec.EventID, err)
@@ -460,6 +466,11 @@ func (e *Engine) Run(ctx context.Context) {
 			return
 		case <-runTicker.C:
 			e.pruneActiveRuns()
+			// Guardrail locks and pending file-operation hints carry their own
+			// expiry; sweeping them here keeps the per-edit hot paths read-only
+			// instead of mutating maps under full locks on every check.
+			e.sweepExpiredLocks()
+			e.prunePendingOps()
 		case <-retentionTicker.C:
 			days := e.GetSettings().AutoPruneDays
 			if days <= 0 {
@@ -717,7 +728,11 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 			return fmt.Errorf("insert read event: %w", err)
 		}
 	}
-	e.BumpCacheGen()
+	// No BumpCacheGen here: the cached payloads (metrics snapshot, atlas,
+	// recent code events) are all derived from code events and runs, which live
+	// in separate tables. Read events arrive dozens of times per agent turn,
+	// and bumping the generation on each one silently disabled every cache
+	// during exactly the sessions where the CPU matters most.
 	e.hub.Broadcast(WSEvent{Type: "file_read_event", Payload: rec, EventID: rec.ReadID})
 	return nil
 }
@@ -781,6 +796,11 @@ func (e *Engine) GetRecentEventsFiltered(limit int, repo string, filePath string
 	}
 	if cacheable {
 		e.cacheMu.Lock()
+		// The key embeds a client-controlled limit; wholesale-clear past the
+		// cap so arbitrary ?limit= values cannot grow the map without bound.
+		if len(e.recentCache) >= 64 {
+			e.recentCache = make(map[string]cachedRecent)
+		}
 		if e.recentCache == nil {
 			e.recentCache = make(map[string]cachedRecent)
 		}
@@ -928,11 +948,31 @@ func (e *Engine) recentRunID() string {
 	return ""
 }
 
+// idRand buffers CSPRNG output so event IDs do not pay a syscall per event.
+// A single refill serves 256 IDs; ids are still drawn from crypto/rand. off
+// starts past the buffer so the first call triggers a refill instead of
+// handing out zero bytes.
+var idRand = struct {
+	sync.Mutex
+	buf [4096]byte
+	off int
+}{off: 4096}
+
 // newID returns a random 16-byte hex identifier for DB primary keys.
 func newID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "00000000000000000000000000000000"
+	idRand.Mutex.Lock()
+	if idRand.off+16 > len(idRand.buf) {
+		if _, err := rand.Read(idRand.buf[:]); err != nil {
+			idRand.Mutex.Unlock()
+			return "00000000000000000000000000000000"
+		}
+		idRand.off = 0
 	}
-	return hex.EncodeToString(b[:])
+	b := idRand.buf[idRand.off : idRand.off+16]
+	idRand.off += 16
+	idRand.Mutex.Unlock()
+
+	var out [32]byte
+	hex.Encode(out[:], b)
+	return string(out[:])
 }

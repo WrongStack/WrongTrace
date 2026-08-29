@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wrongstack/wrongtrace/internal/core"
@@ -149,132 +150,7 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			},
 		}
 	case "tools/list":
-		resp.Result = map[string]interface{}{
-			"tools": []map[string]interface{}{
-				{
-					"name":        "report_telemetry",
-					"description": "Record an agent run's intent, model, token usage, and cost so WrongTrace can correlate it to subsequent AST churn.",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"model":             map[string]string{"type": "string"},
-							"model_name":        map[string]string{"type": "string"},
-							"provider":          map[string]string{"type": "string"},
-							"agent_name":        map[string]string{"type": "string"},
-							"task_id":           map[string]string{"type": "string"},
-							"intent":            map[string]string{"type": "string"},
-							"tokens_used":       map[string]string{"type": "integer"},
-							"prompt_tokens":     map[string]string{"type": "integer"},
-							"completion_tokens": map[string]string{"type": "integer"},
-							"cost":              map[string]string{"type": "number"},
-							"cost_usd":          map[string]string{"type": "number"},
-						},
-						"required": []string{"model", "provider", "task_id", "intent"},
-					},
-				},
-				{
-					"name":        "get_file_health_score",
-					"description": "Inspect a file's recent churn and lock status. Returns a 0-100 health score, fragile flag, and guardrail lock status.",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"file_path": map[string]string{"type": "string"},
-						},
-						"required": []string{"file_path"},
-					},
-				},
-				{
-					"name":        "lock_file",
-					"description": "Lock a fragile file against unwanted edits with optional ownership and duration (TTL).",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"file_path":    map[string]string{"type": "string"},
-							"reason":       map[string]string{"type": "string"},
-							"owner":        map[string]string{"type": "string"},
-							"owner_run_id": map[string]string{"type": "string"},
-							"ttl_minutes":  map[string]string{"type": "integer"},
-							"ttl_seconds":  map[string]string{"type": "integer"},
-						},
-						"required": []string{"file_path"},
-					},
-				},
-				{
-					"name":        "unlock_file",
-					"description": "Unlock a previously locked file when edits or refactoring is completed.",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"file_path": map[string]string{"type": "string"},
-						},
-						"required": []string{"file_path"},
-					},
-				},
-				{
-					"name":        "list_locks",
-					"description": "List all active guardrail file locks and their TTL expiry times.",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"filter": map[string]string{"type": "string"},
-						},
-					},
-				},
-				{
-					"name":        "check_guardrail",
-					"description": "Check if a file is safe to modify before performing automated AI refactoring.",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"file_path": map[string]string{"type": "string"},
-						},
-						"required": []string{"file_path"},
-					},
-				},
-				{
-					"name":        "report_file_read",
-					"description": "Record a file read/inspection tool event executed by an AI agent.",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"file_path":     map[string]string{"type": "string"},
-							"model":         map[string]string{"type": "string"},
-							"provider":      map[string]string{"type": "string"},
-							"tool_name":     map[string]string{"type": "string"},
-							"start_line":    map[string]string{"type": "integer"},
-							"end_line":      map[string]string{"type": "integer"},
-							"prompt_tokens": map[string]string{"type": "integer"},
-							"cost":          map[string]string{"type": "number"},
-							"intent":        map[string]string{"type": "string"},
-						},
-						"required": []string{"file_path", "model"},
-					},
-				},
-				{
-					"name":        "get_file_read_stats",
-					"description": "Get file read counts, model breakdown, and recent inspection history.",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"file_path": map[string]string{"type": "string"},
-						},
-						"required": []string{"file_path"},
-					},
-				},
-				{
-					"name":        "get_file_diff_history",
-					"description": "Inspect recent line-by-line diffs, AST mutations, and churn for a file or entire codebase.",
-					"inputSchema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"file_path": map[string]string{"type": "string"},
-							"limit":     map[string]string{"type": "integer"},
-						},
-						"required": []string{"file_path"},
-					},
-				},
-			},
-		}
+		resp.Result = mcpToolsList()
 	case "tools/call":
 		return callTool(sink, req)
 	case "notifications/initialized", "notifications/cancelled":
@@ -602,3 +478,137 @@ func toFloat(v interface{}) float64 {
 	}
 	return 0
 }
+
+// mcpToolsList builds the static capability advertisement exactly once.
+// Clients call tools/list on every session start and reconnect; the nested
+// map literal is constant, so rebuilding it per request was pure allocation
+// churn. The returned structure is shared read-only: json.Marshal never
+// mutates its argument and dispatch stores no per-request state in it.
+var mcpToolsList = sync.OnceValue(func() interface{} {
+	return map[string]interface{}{
+		"tools": []map[string]interface{}{
+			{
+				"name":        "report_telemetry",
+				"description": "Record an agent run's intent, model, token usage, and cost so WrongTrace can correlate it to subsequent AST churn.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"model":             map[string]string{"type": "string"},
+						"model_name":        map[string]string{"type": "string"},
+						"provider":          map[string]string{"type": "string"},
+						"agent_name":        map[string]string{"type": "string"},
+						"task_id":           map[string]string{"type": "string"},
+						"intent":            map[string]string{"type": "string"},
+						"tokens_used":       map[string]string{"type": "integer"},
+						"prompt_tokens":     map[string]string{"type": "integer"},
+						"completion_tokens": map[string]string{"type": "integer"},
+						"cost":              map[string]string{"type": "number"},
+						"cost_usd":          map[string]string{"type": "number"},
+					},
+					"required": []string{"model", "provider", "task_id", "intent"},
+				},
+			},
+			{
+				"name":        "get_file_health_score",
+				"description": "Inspect a file's recent churn and lock status. Returns a 0-100 health score, fragile flag, and guardrail lock status.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"file_path": map[string]string{"type": "string"},
+					},
+					"required": []string{"file_path"},
+				},
+			},
+			{
+				"name":        "lock_file",
+				"description": "Lock a fragile file against unwanted edits with optional ownership and duration (TTL).",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"file_path":    map[string]string{"type": "string"},
+						"reason":       map[string]string{"type": "string"},
+						"owner":        map[string]string{"type": "string"},
+						"owner_run_id": map[string]string{"type": "string"},
+						"ttl_minutes":  map[string]string{"type": "integer"},
+						"ttl_seconds":  map[string]string{"type": "integer"},
+					},
+					"required": []string{"file_path"},
+				},
+			},
+			{
+				"name":        "unlock_file",
+				"description": "Unlock a previously locked file when edits or refactoring is completed.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"file_path": map[string]string{"type": "string"},
+					},
+					"required": []string{"file_path"},
+				},
+			},
+			{
+				"name":        "list_locks",
+				"description": "List all active guardrail file locks and their TTL expiry times.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"filter": map[string]string{"type": "string"},
+					},
+				},
+			},
+			{
+				"name":        "check_guardrail",
+				"description": "Check if a file is safe to modify before performing automated AI refactoring.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"file_path": map[string]string{"type": "string"},
+					},
+					"required": []string{"file_path"},
+				},
+			},
+			{
+				"name":        "report_file_read",
+				"description": "Record a file read/inspection tool event executed by an AI agent.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"file_path":     map[string]string{"type": "string"},
+						"model":         map[string]string{"type": "string"},
+						"provider":      map[string]string{"type": "string"},
+						"tool_name":     map[string]string{"type": "string"},
+						"start_line":    map[string]string{"type": "integer"},
+						"end_line":      map[string]string{"type": "integer"},
+						"prompt_tokens": map[string]string{"type": "integer"},
+						"cost":          map[string]string{"type": "number"},
+						"intent":        map[string]string{"type": "string"},
+					},
+					"required": []string{"file_path", "model"},
+				},
+			},
+			{
+				"name":        "get_file_read_stats",
+				"description": "Get file read counts, model breakdown, and recent inspection history.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"file_path": map[string]string{"type": "string"},
+					},
+					"required": []string{"file_path"},
+				},
+			},
+			{
+				"name":        "get_file_diff_history",
+				"description": "Inspect recent line-by-line diffs, AST mutations, and churn for a file or entire codebase.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"file_path": map[string]string{"type": "string"},
+						"limit":     map[string]string{"type": "integer"},
+					},
+					"required": []string{"file_path"},
+				},
+			},
+		},
+	}
+})

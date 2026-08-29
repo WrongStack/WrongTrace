@@ -25,23 +25,33 @@ type cachedMetrics struct {
 	snapshot MetricsSnapshot
 }
 
+// metricsFilter resolves the repo filter shared by the metrics endpoints:
+// explicit filter first, then the active project, then the configured repo.
+func (e *Engine) metricsFilter(repoFilter ...string) string {
+	if len(repoFilter) > 0 && repoFilter[0] != "" {
+		return repoFilter[0]
+	}
+	if active := e.GetActiveProject(); active != nil && active.Name != "" {
+		return active.Name
+	}
+	return e.repoName()
+}
+
+// metricsCacheFresh returns the cached snapshot for filter when it is current.
+func (e *Engine) metricsCacheFresh(filter string) (MetricsSnapshot, bool) {
+	e.cacheMu.RLock()
+	defer e.cacheMu.RUnlock()
+	cached, ok := e.metricsCache[filter]
+	return cached.snapshot, ok && cached.gen == e.cacheGen && time.Since(cached.cachedAt) < 2*time.Second
+}
+
 // Metrics assembles a fresh snapshot from the underlying store, optionally filtered by repo_name.
 func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
-	var filter string
-	if len(repoFilter) > 0 && repoFilter[0] != "" {
-		filter = repoFilter[0]
-	} else if active := e.GetActiveProject(); active != nil && active.Name != "" {
-		filter = active.Name
-	} else {
-		filter = e.repoName()
-	}
+	filter := e.metricsFilter(repoFilter...)
 
-	e.cacheMu.RLock()
-	if cached, ok := e.metricsCache[filter]; ok && cached.gen == e.cacheGen && time.Since(cached.cachedAt) < 2*time.Second {
-		e.cacheMu.RUnlock()
-		return cached.snapshot, nil
+	if cached, ok := e.metricsCacheFresh(filter); ok {
+		return cached, nil
 	}
-	e.cacheMu.RUnlock()
 
 	store := e.Store()
 	if store == nil {
@@ -79,6 +89,11 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 	}
 
 	e.cacheMu.Lock()
+	// The filter comes from the ?repo= query string; clear wholesale past the
+	// cap so arbitrary values cannot grow the map without bound.
+	if len(e.metricsCache) >= 64 {
+		e.metricsCache = make(map[string]cachedMetrics)
+	}
 	if e.metricsCache == nil {
 		e.metricsCache = make(map[string]cachedMetrics)
 	}
@@ -92,6 +107,36 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 	return res, nil
 }
 
+// ThrashingRows returns just the fragile-node panel. Standalone tooling polls
+// this endpoint without needing the full snapshot, whose Overview and
+// ModelComparison CTEs are the most expensive scans in the store — so this
+// skips them entirely and only reuses the snapshot cache when it is warm.
+func (e *Engine) ThrashingRows(repoFilter ...string) ([]db.ThrashingRow, error) {
+	filter := e.metricsFilter(repoFilter...)
+	if cached, ok := e.metricsCacheFresh(filter); ok {
+		return cached.Thrashing, nil
+	}
+	store := e.Store()
+	if store == nil {
+		return nil, nil
+	}
+	return store.Thrashing(3, 7, filter)
+}
+
+// ModelRows returns just the per-model survival and ROI comparison, without
+// assembling the rest of the metrics snapshot.
+func (e *Engine) ModelRows(repoFilter ...string) ([]db.ModelRow, error) {
+	filter := e.metricsFilter(repoFilter...)
+	if cached, ok := e.metricsCacheFresh(filter); ok {
+		return cached.Models, nil
+	}
+	store := e.Store()
+	if store == nil {
+		return nil, nil
+	}
+	return store.ModelComparison(filter)
+}
+
 // WSEvent is the wire format pushed to all dashboard WebSocket clients. The
 // Type discriminator lets the UI switch on payload shape without reflection.
 type WSEvent struct {
@@ -99,4 +144,8 @@ type WSEvent struct {
 	Payload interface{} `json:"payload,omitempty"` // ast.Event, db.RunRecord, ...
 	EventID string      `json:"event_id,omitempty"`
 	At      time.Time   `json:"at"`
+	// Wire carries the pre-serialized JSON frame set by Hub.Broadcast so N
+	// subscribers share one encode instead of marshaling identical payloads
+	// per connection. Consumers fall back to marshaling when it is nil.
+	Wire []byte `json:"-"`
 }

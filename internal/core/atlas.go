@@ -439,6 +439,11 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	}
 
 	e.cacheMu.Lock()
+	// The filter comes from the ?repo= query string; clear wholesale past the
+	// cap so arbitrary values cannot grow the map without bound.
+	if len(e.atlasCache) >= 64 {
+		e.atlasCache = make(map[string]cachedAtlas)
+	}
 	if e.atlasCache == nil {
 		e.atlasCache = make(map[string]cachedAtlas)
 	}

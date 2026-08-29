@@ -108,9 +108,18 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		return res
 	}
 
-	// Cached snapshots hold their source compressed, so inflate each side at
-	// most once here. nodeBody slices these strings; calling Source() per node
-	// would decompress the whole file once per declaration.
+	// Cheap identity check first: comparing the retained file hashes must not
+	// pay for inflating both sources. Cached snapshots hold their source
+	// DEFLATE-compressed, so the two Source() calls below each decompress the
+	// whole file — wasted work whenever the hash shortcut fires, which is the
+	// common case for no-op touches. nodeBody slices these strings; calling
+	// Source() per node would decompress the file once per declaration.
+	if prev != nil && next != nil {
+		if prev.Hash != "" && next.Hash != "" && prev.Hash == next.Hash {
+			res.NewSnap = next
+			return res
+		}
+	}
 	prevSrc := prev.Source()
 	nextSrc := next.Source()
 
@@ -173,11 +182,6 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 			})
 		}
 
-		return res
-	}
-
-	if prev.Hash != "" && next.Hash != "" && prev.Hash == next.Hash {
-		res.NewSnap = next
 		return res
 	}
 

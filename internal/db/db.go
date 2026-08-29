@@ -178,28 +178,27 @@ func (s *Store) Overview(repoFilter ...string) (Overview, error) {
 		return o, nil
 	}
 
+	// The matched-run set and the only-other-repos probe are materialized CTEs:
+	// the previous form inlined the identical UNION subquery into each of the
+	// three output columns, re-scanning both event tables three times per call.
 	row := s.db.QueryRowContext(ctx, `
+		WITH matched AS (
+			SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+			UNION
+			SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
+		),
+		only_other AS (
+			SELECT NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL) AS no_other
+		)
 		SELECT
-			(SELECT COUNT(DISTINCT r.run_id) FROM agent_runs r
-			 WHERE r.run_id IN (
-				SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
-				UNION
-				SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
-			 ) OR NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL)),
+			(SELECT COUNT(DISTINCT r.run_id) FROM agent_runs r, only_other
+			 WHERE no_other OR r.run_id IN (SELECT run_id FROM matched)),
 			(SELECT COUNT(*) FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL)),
-			COALESCE((SELECT SUM(r.cost_usd) FROM agent_runs r
-			 WHERE r.run_id IN (
-				SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
-				UNION
-				SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
-			 ) OR NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL)), 0),
-			(SELECT COUNT(DISTINCT r.model_name) FROM agent_runs r
-			 WHERE r.run_id IN (
-				SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
-				UNION
-				SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
-			 ) OR NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL))
-	`, repo, repo, repo, repo, repo, repo, repo, repo, repo, repo)
+			COALESCE((SELECT SUM(r.cost_usd) FROM agent_runs r, only_other
+			 WHERE no_other OR r.run_id IN (SELECT run_id FROM matched)), 0),
+			(SELECT COUNT(DISTINCT r.model_name) FROM agent_runs r, only_other
+			 WHERE no_other OR r.run_id IN (SELECT run_id FROM matched))
+	`, repo, repo, repo, repo)
 	if err := row.Scan(&o.TotalRuns, &o.TotalEvents, &o.TotalCost, &o.UniqueModels); err != nil {
 		return Overview{}, fmt.Errorf("overview scan: %w", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/wrongstack/wrongtrace/internal/core"
 )
 
 // upgrader is shared across all /api/ws connections. checkOrigin admits
@@ -108,7 +109,7 @@ func (h *Handlers) WebSocket(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if err := writeJSONWithDeadline(conn, ev); err != nil {
+			if err := writeEventWithDeadline(conn, ev); err != nil {
 				return
 			}
 		case <-pingTicker.C:
@@ -129,6 +130,23 @@ func writeJSONWithDeadline(conn *websocket.Conn, v interface{}) error {
 	if err != nil {
 		return err
 	}
+	return writePayloadWithDeadline(conn, payload)
+}
+
+// writeEventWithDeadline writes a hub event, preferring the pre-serialized
+// frame Hub.Broadcast attached so N subscribers share a single JSON encode.
+func writeEventWithDeadline(conn *websocket.Conn, ev core.WSEvent) error {
+	if ev.Wire != nil {
+		return writePayloadWithDeadline(conn, ev.Wire)
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	return writePayloadWithDeadline(conn, payload)
+}
+
+func writePayloadWithDeadline(conn *websocket.Conn, payload []byte) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
 		return err
 	}

@@ -75,6 +75,44 @@ func (e *Engine) RegisterFileOperation(filePath, runID string, observedAt time.T
 
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
+	// Expiry of unrelated paths is handled by prunePendingOps on the engine's
+	// maintenance ticker; a per-entry scan here cost O(pendingOps) on every
+	// proxy tool call during bursts. The per-key cap below still bounds this
+	// path's own slice.
+	if len(e.pendingOps) >= 2048 {
+		var oldestPath string
+		var oldest time.Time
+		for path, ops := range e.pendingOps {
+			if len(ops) > 0 && (oldest.IsZero() || ops[0].ObservedAt.Before(oldest)) {
+				oldestPath, oldest = path, ops[0].ObservedAt
+			}
+		}
+		delete(e.pendingOps, oldestPath)
+	}
+	ops := e.pendingOps[key]
+	// Drop this key's own stale entries so a re-registered path cannot match
+	// hints from outside the correlation window.
+	cutoff := time.Now().UTC().Add(-fileOperationWindow)
+	fresh := ops[:0]
+	for _, op := range ops {
+		if !op.ObservedAt.Before(cutoff) {
+			fresh = append(fresh, op)
+		}
+	}
+	ops = fresh
+	if len(ops) >= 8 {
+		copy(ops, ops[len(ops)-7:])
+		ops = ops[:7]
+	}
+	e.pendingOps[key] = append(ops, pendingFileOperation{RunID: runID, ObservedAt: observedAt.UTC()})
+}
+
+// prunePendingOps drops stale path hints across the whole map. Stale entries
+// are harmless to correctness — fileOperationRunID filters by cutoff — so this
+// runs on the maintenance ticker rather than on every registration.
+func (e *Engine) prunePendingOps() {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
 	cutoff := time.Now().UTC().Add(-fileOperationWindow)
 	for path, ops := range e.pendingOps {
 		fresh := ops[:0]
@@ -89,22 +127,6 @@ func (e *Engine) RegisterFileOperation(filePath, runID string, observedAt time.T
 			e.pendingOps[path] = fresh
 		}
 	}
-	if len(e.pendingOps) >= 2048 {
-		var oldestPath string
-		var oldest time.Time
-		for path, ops := range e.pendingOps {
-			if len(ops) > 0 && (oldest.IsZero() || ops[0].ObservedAt.Before(oldest)) {
-				oldestPath, oldest = path, ops[0].ObservedAt
-			}
-		}
-		delete(e.pendingOps, oldestPath)
-	}
-	ops := e.pendingOps[key]
-	if len(ops) >= 8 {
-		copy(ops, ops[len(ops)-7:])
-		ops = ops[:7]
-	}
-	e.pendingOps[key] = append(ops, pendingFileOperation{RunID: runID, ObservedAt: observedAt.UTC()})
 }
 
 func (e *Engine) fileOperationRunID(filePath string, eventAt time.Time) string {

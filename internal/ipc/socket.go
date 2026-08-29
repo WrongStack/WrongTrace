@@ -31,6 +31,11 @@ type IPCTrafficRecord struct {
 	DurationMs float64                `json:"duration_ms"`
 	Timestamp  time.Time              `json:"timestamp"`
 	ClientAddr string                 `json:"client_addr,omitempty"`
+	// WireBytes/RespBytes are the on-wire sizes of the request line and the
+	// marshaled response. They let the retention layer prove params/result
+	// fit the stored cap without re-encoding them. Not serialized.
+	WireBytes int `json:"-"`
+	RespBytes int `json:"-"`
 }
 
 // EngineSink is the subset of the core Engine used by the IPC server. Keeping
@@ -216,16 +221,29 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 		}
 		var req Request
 		if err := json.Unmarshal(line, &req); err != nil {
-			_ = writeJSONLine(writer, Response{
+			parseErrPayload, mErr := json.Marshal(Response{
 				JSONRPC: "2.0",
 				ID:      nil,
 				Error:   &RPCError{Code: -32700, Message: "parse error: " + err.Error()},
 			})
+			if mErr != nil {
+				continue
+			}
+			_ = writeJSONLine(writer, parseErrPayload)
 			continue
 		}
 		start := time.Now()
 		resp := s.dispatch(&req)
 		durMs := float64(time.Since(start).Microseconds()) / 1000.0
+
+		// Marshal the response up front: the wire write needs the bytes, and
+		// the traffic record needs the encoded size to skip retention-side
+		// size probing for normal-sized traffic.
+		respPayload, err := json.Marshal(resp)
+		if err != nil {
+			log.Printf("ipc: marshal response: %v", err)
+			return
+		}
 
 		if s.cfg.Engine != nil {
 			clientAddr := "named_pipe"
@@ -241,10 +259,12 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 				DurationMs: durMs,
 				Timestamp:  time.Now().UTC(),
 				ClientAddr: clientAddr,
+				WireBytes:  len(line),
+				RespBytes:  len(respPayload),
 			})
 		}
 
-		if err := writeJSONLine(writer, resp); err != nil {
+		if err := writeJSONLine(writer, respPayload); err != nil {
 			if !isClientDisconnect(err) {
 				log.Printf("ipc: write error: %v", err)
 			}
@@ -612,12 +632,10 @@ func readJSONLine(r *bufio.Reader) ([]byte, error) {
 	return line, nil
 }
 
-func writeJSONLine(w *bufio.Writer, v Response) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	if _, err := w.Write(b); err != nil {
+// writeJSONLine writes a pre-marshaled response frame followed by a newline
+// and flushes, so the traffic layer and the wire share one encode.
+func writeJSONLine(w *bufio.Writer, payload []byte) error {
+	if _, err := w.Write(payload); err != nil {
 		return err
 	}
 	if err := w.WriteByte('\n'); err != nil {

@@ -68,57 +68,83 @@ func (e *Engine) UnlockFile(path string) {
 	norm := normalizeLockPath(path)
 	delete(e.lockedFiles, norm)
 	for k := range e.lockedFiles {
-		if k == norm || strings.HasSuffix(norm, "/"+k) || strings.HasSuffix(k, "/"+norm) {
+		if lockPathMatch(k, norm) {
 			delete(e.lockedFiles, k)
 		}
 	}
 }
 
-// isFileLockedUnlocked checks if a file is currently locked and unexpired (e.lockMu must be held).
-func (e *Engine) isFileLockedUnlocked(path string) (bool, LockInfo) {
+// lockPathMatch reports whether two normalized lock paths refer to the same
+// file or a directory/file nesting of each other. It is the allocation-free
+// equivalent of the earlier "a == b || suffix(a, "/"+b) || suffix(b, "/"+a)"
+// form, which built two concatenated strings per entry on the per-edit
+// guardrail path.
+func lockPathMatch(a, b string) bool {
+	if a == b {
+		return true
+	}
+	la, lb := len(a), len(b)
+	if la > lb && a[la-lb-1] == '/' && a[la-lb:] == b {
+		return true
+	}
+	if lb > la && b[lb-la-1] == '/' && b[lb-la:] == a {
+		return true
+	}
+	return false
+}
+
+// IsFileLocked checks if a file is currently locked and unexpired. It runs
+// under a read lock: expired entries are simply ignored here and left for
+// sweepExpiredLocks, so concurrent guardrail checks never serialize behind a
+// writer or mutate the map on the hot path.
+func (e *Engine) IsFileLocked(path string) (bool, LockInfo) {
+	e.lockMu.RLock()
+	defer e.lockMu.RUnlock()
 	if len(e.lockedFiles) == 0 {
 		return false, LockInfo{}
 	}
 	now := time.Now().UTC()
 	norm := normalizeLockPath(path)
 	if info, ok := e.lockedFiles[norm]; ok {
-		if now.After(info.ExpiresAt) {
-			delete(e.lockedFiles, norm)
-		} else {
+		if !now.After(info.ExpiresAt) {
 			return true, info
 		}
 	}
 	for k, info := range e.lockedFiles {
 		if now.After(info.ExpiresAt) {
-			delete(e.lockedFiles, k)
 			continue
 		}
-		if k == norm || strings.HasSuffix(norm, "/"+k) || strings.HasSuffix(k, "/"+norm) {
+		if lockPathMatch(k, norm) {
 			return true, info
 		}
 	}
 	return false, LockInfo{}
 }
 
-// IsFileLocked checks if a file is currently locked and unexpired.
-func (e *Engine) IsFileLocked(path string) (bool, LockInfo) {
+// sweepExpiredLocks drops expired entries so their memory cannot accumulate
+// between checks. Called from the engine's maintenance ticker.
+func (e *Engine) sweepExpiredLocks() {
 	e.lockMu.Lock()
 	defer e.lockMu.Unlock()
-	return e.isFileLockedUnlocked(path)
+	now := time.Now().UTC()
+	for k, info := range e.lockedFiles {
+		if now.After(info.ExpiresAt) {
+			delete(e.lockedFiles, k)
+		}
+	}
 }
 
 // ListLocks returns all active, non-expired file locks.
 func (e *Engine) ListLocks() []LockInfo {
-	e.lockMu.Lock()
-	defer e.lockMu.Unlock()
+	e.lockMu.RLock()
+	defer e.lockMu.RUnlock()
 	if len(e.lockedFiles) == 0 {
 		return []LockInfo{}
 	}
 	now := time.Now().UTC()
 	out := make([]LockInfo, 0, len(e.lockedFiles))
-	for k, info := range e.lockedFiles {
+	for _, info := range e.lockedFiles {
 		if now.After(info.ExpiresAt) {
-			delete(e.lockedFiles, k)
 			continue
 		}
 		out = append(out, info)

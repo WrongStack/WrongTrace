@@ -405,7 +405,7 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
 			WHERE e.action = 'ADDED'
 			  AND e.event_time <= datetime('now', '-14 days')
-			  AND e.node_signature NOT IN (SELECT node_signature FROM code_node_events WHERE action = 'DELETED')
+			  AND NOT EXISTS (SELECT 1 FROM code_node_events d WHERE d.node_signature = e.node_signature AND d.action = 'DELETED')
 			GROUP BY COALESCE(r.model_name, 'unknown')
 		),
 		spend AS (
@@ -464,7 +464,7 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 			WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
 			  AND e.action = 'ADDED'
 			  AND e.event_time <= datetime('now', '-14 days')
-			  AND e.node_signature NOT IN (SELECT node_signature FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND action = 'DELETED')
+			  AND NOT EXISTS (SELECT 1 FROM code_node_events d WHERE d.node_signature = e.node_signature AND d.action = 'DELETED' AND (d.repo_name = ? OR d.repo_name = '' OR d.repo_name IS NULL))
 			GROUP BY COALESCE(r.model_name, 'unknown')
 		),
 		spend AS (

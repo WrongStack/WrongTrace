@@ -207,7 +207,11 @@ func TestHandleConn_SinkErrorMapsToCode(t *testing.T) {
 func TestWriteJSONLine_NewlineFraming(t *testing.T) {
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
-	if err := writeJSONLine(w, Response{JSONRPC: "2.0", ID: 42}); err != nil {
+	payload, err := json.Marshal(Response{JSONRPC: "2.0", ID: 42})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	if err := writeJSONLine(w, payload); err != nil {
 		t.Fatalf("writeJSONLine: %v", err)
 	}
 	out := buf.Bytes()
