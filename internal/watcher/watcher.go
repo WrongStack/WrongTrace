@@ -382,7 +382,11 @@ func (w *Watcher) Run(ctx context.Context) {
 			}
 			if ev.Op&fsnotify.Create == fsnotify.Create {
 				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
-					_ = w.addRecursive(ev.Name)
+					go func() {
+						if err := w.addRecursive(ev.Name); err != nil {
+							log.Printf("watcher: addRecursive %s: %v", ev.Name, err)
+						}
+					}()
 				}
 			}
 			if !isRelevant(ev.Op) {

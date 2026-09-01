@@ -22,16 +22,44 @@ func TestRun_NewDirectoryIsWatchedRecursively(t *testing.T) {
 	root := t.TempDir()
 	_, h := startWatcher(t, root, 60*time.Millisecond, nil)
 
+	// Create brand/.  The kernel delivers the Create event; waitFor confirms the
+	// event was received.  The hardcoded 300 ms sleep was hiding a timing gap:
+	// on a loaded CI runner, filepath.Walk inside addRecursive may not finish
+	// recursing into the new tree before the next os.Mkdir call races ahead.
+	// Replacing the flat count check with per-level waits ensures each subtree
+	// is fully watched before we touch its children.
 	b1 := filepath.Join(root, "brand")
 	_ = os.Mkdir(b1, 0o755)
-	time.Sleep(300 * time.Millisecond)
+	waitFor(t, 3*time.Second, func() bool { return h.count() > 0 },
+		"watcher never delivered event for root-level directory")
+
+	// Wait until the watcher has finished walking brand's subtree.  We have no
+	// direct handle on addRecursive's completion, so we poll the fsnotify lag:
+	// wait until no new events have arrived for at least one full debounce cycle.
+	// Once the watcher's walk is done, brand/new will be registered and
+	// subsequent mkdir will trigger addRecursive on the new subdirectory.
+	debounce := 60 * time.Millisecond
+	waitFor(t, 3*time.Second, func() bool {
+		before := h.count()
+		time.Sleep(debounce * 2)
+		return h.count() == before
+	}, "addRecursive did not finish walking brand/ before next mkdir")
 
 	nested := filepath.Join(b1, "new")
 	if err := os.Mkdir(nested, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// Let the Create events reach the loop so addRecursive registers both levels
-	time.Sleep(500 * time.Millisecond)
+	waitFor(t, 3*time.Second, func() bool { return h.count() > 0 },
+		"watcher did not observe new subdirectory event")
+
+	// Same debounce lag guard before writing the leaf file.  The original 500 ms
+	// sleep was a fixed-tolerance ceiling — it flaked whenever the kernel did
+	// not deliver the nested Create event within 500 ms of the mkdir syscall.
+	waitFor(t, 3*time.Second, func() bool {
+		before := h.count()
+		time.Sleep(debounce * 2)
+		return h.count() == before
+	}, "addRecursive did not finish walking nested/ before file write")
 
 	path := filepath.Join(nested, "deep.go")
 	if err := os.WriteFile(path, []byte("package new\n"), 0o644); err != nil {
