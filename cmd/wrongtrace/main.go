@@ -111,6 +111,7 @@ func init() {
 	rootCmd.PersistentFlags().String("db", filepath.Join(defaultDataDir(), "wrongtrace.db"), "SQLite database file")
 	rootCmd.PersistentFlags().String("socket", defaultSocketPath(), "Unix Domain Socket / Named Pipe path")
 	rootCmd.PersistentFlags().String("repo", filepath.Base(mustCwd()), "repository name to record events under")
+	rootCmd.PersistentFlags().Bool("debug-fs", false, "enable the fsnotify event log (GET /debug/fsnotify SSE endpoint)")
 
 	traceCmd.Flags().String("service", "cli-command", "service name for the trace")
 	traceCmd.Flags().String("node", "", "optional AST node or function signature to correlate")
@@ -227,9 +228,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	engine.PrimeDirectory(abs)
 
 	// Filesystem watcher with debouncing + ignore rules.
+	debugFS, _ := cmd.Flags().GetBool("debug-fs")
 	w, err := watcher.New(watcher.Config{
-		Dir:    abs,
-		Engine: engine,
+		Dir:             abs,
+		Engine:          engine,
+		DebugFSEvents:   debugFS,
 	})
 	if err != nil {
 		return fmt.Errorf("init watcher: %w", err)
