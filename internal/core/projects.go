@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,6 +50,10 @@ type Project = ProjectProfile
 type WatcherAPI interface {
 	AddWatchDir(dir string) error
 	RemoveWatchDir(dir string) error
+	Handler() http.Handler
+	// UpdateSemOccupied is called by the engine after each webhook dispatch to record
+	// the dispatcher's in-flight count (0–maxConcurrentDeliveries) at capture time.
+	UpdateSemOccupied(occ int)
 }
 
 // SetWatcher links a file watcher instance to the engine.

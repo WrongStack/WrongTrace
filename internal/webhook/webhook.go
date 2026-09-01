@@ -79,6 +79,10 @@ func NewDispatcher(cfg Config) *Dispatcher {
 	}
 }
 
+// InFlight returns the number of concurrent deliveries currently in-flight (0–maxConcurrentDeliveries).
+// This is the live semaphore occupancy that drives the watcher's fsnotify event log.
+func (d *Dispatcher) InFlight() int { return len(d.inFlight) }
+
 // UpdateConfig dynamically updates target webhook URLs and the per-request
 // timeout. An http.Client fixes its deadline at construction, so assigning
 // d.cfg alone left every runtime Timeout change inert. The client is

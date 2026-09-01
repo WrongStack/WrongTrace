@@ -183,6 +183,9 @@ func NewEngine(cfg Config) *Engine {
 // Hub exposes the WebSocket broadcaster. The server package reads from it.
 func (e *Engine) Hub() *Hub { return e.hub }
 
+// Watcher exposes the filesystem watcher for debug endpoints (e.g. SSE fsnotify log).
+func (e *Engine) Watcher() WatcherAPI { return e.watcher }
+
 // Store exposes the underlying analytical database store.
 func (e *Engine) Store() *db.Store {
 	e.lockMu.RLock()

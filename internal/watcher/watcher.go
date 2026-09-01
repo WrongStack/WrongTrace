@@ -6,11 +6,15 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -34,6 +38,10 @@ type Config struct {
 	// IgnoreDirs are directory basenames whose changes never reach the
 	// engine: VCS metadata, dependency caches, build output.
 	IgnoreDirs []string
+	// DebugFSEvents enables in-memory capture of every fsnotify event with
+	// path, op, timestamp, and semaphore occupancy. Access via
+	// GET /api/debug/fsnotify. When disabled the buffer is nil (zero cost).
+	DebugFSEvents bool
 }
 
 // DefaultIgnoreDirs contains directory names that are always ignored from watching and AST diffs.
@@ -89,6 +97,141 @@ type Watcher struct {
 	// never changes while the watcher lives, so any survivor is equally valid.
 	decisionMu sync.RWMutex
 	decisions  map[string]bool
+
+	// DebugFSEvents captures every fsnotify event in a bounded circular buffer
+	// when Config.DebugFSEvents is true. Access via Watcher.FSNotifyLog().
+	evBuf   []fsEvent // nil when disabled (zero allocation cost)
+	evMu    sync.Mutex
+	evHead  int
+	evCount uint64 // monotonic sequence number for ordering
+
+	// semOcc records the webhook dispatcher's in-flight count at the moment each
+	// fsnotify event was captured, enabling correlation between disk activity and
+	// semaphore pressure. Updated by Engine via UpdateSemOccupied; read atomically.
+	semOcc atomic.Int32
+
+	// httpHandler serves GET /api/debug/fsnotify when DebugFSEvents is true.
+	httpHandler http.Handler
+	httpMu     sync.RWMutex
+}
+
+// fsEvent is one captured fsnotify event in arrival order.
+type fsEvent struct {
+	Seq         uint64        // monotonic sequence number
+	Path        string        // absolute event path
+	Op         fsnotify.Op   // fsnotify.Create/Write/Rename/Remove/...
+	Time        time.Time     // wall-clock time of arrival from fsnotify
+	SemOccupied int           // len(inFlight) at moment of capture
+}
+
+// captureEvent appends ev to the circular buffer when DebugFSEvents is enabled.
+// Safe to call from the fsnotify event-loop goroutine without a lock on the
+// hot path when evBuf is nil.
+func (w *Watcher) captureEvent(ev fsnotify.Event) {
+	if w.evBuf == nil {
+		return
+	}
+	w.evMu.Lock()
+	w.evBuf[w.evHead] = fsEvent{
+		Seq:         w.evCount,
+		Path:        ev.Name,
+		Op:          ev.Op,
+		Time:        time.Now(),
+		SemOccupied: int(w.semOcc.Load()),
+	}
+	w.evHead = (w.evHead + 1) % len(w.evBuf)
+	w.evCount++
+	w.evMu.Unlock()
+}
+
+// FSNotifyLog returns up to n most-recent captured fsnotify events, oldest
+// first. Returns nil when Config.DebugFSEvents is false.
+func (w *Watcher) FSNotifyLog(n int) []fsEvent {
+	w.evMu.Lock()
+	defer w.evMu.Unlock()
+	if w.evBuf == nil {
+		return nil
+	}
+	if n > len(w.evBuf) {
+		n = len(w.evBuf)
+	}
+	out := make([]fsEvent, n)
+	head := w.evHead
+	for i := 0; i < n; i++ {
+		out[i] = w.evBuf[(head-i+len(w.evBuf))%len(w.evBuf)]
+	}
+	// reverse so oldest comes first
+	for i, j := 0, n-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// Handler returns an HTTP handler that streams captured fsnotify events as SSE.
+// The handler drains the circular buffer and then waits for new events.
+// Returns nil when Config.DebugFSEvents is false.
+func (w *Watcher) Handler() http.Handler {
+	if w.httpHandler == nil {
+		return nil
+	}
+	return w.httpHandler
+}
+
+// UpdateSemOccupied records the webhook dispatcher's in-flight count so that
+// captureEvent can embed it in the next captured fsnotify event. Called by the
+// engine after each dispatch completes. Zero cost when evBuf is nil.
+func (w *Watcher) UpdateSemOccupied(occ int) {
+	w.semOcc.Store(int32(occ))
+}
+
+// debugFSNotifyHandler returns an SSE handler that streams fsnotify events from
+// w's circular buffer by polling every 200ms. It first sends any buffered events
+// (oldest first), then streams new events as they accumulate.
+func debugFSNotifyHandler(ww *Watcher) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !ww.cfg.DebugFSEvents {
+			http.Error(w, "debug fsnotify is not enabled", 400)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(200)
+		flusher.Flush()
+
+		// Stream buffered events first (oldest first).
+		for _, ev := range ww.FSNotifyLog(4096) {
+			fmt.Fprintf(w, "data: {\"seq\":%d,\"path\":%q,\"op\":%q,\"time\":%q,\"sem_occupied\":%d}\n\n",
+				ev.Seq, ev.Path, ev.Op, ev.Time.Format(time.RFC3339Nano), ev.SemOccupied)
+			flusher.Flush()
+		}
+
+		// Poll for new events until the client disconnects.
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		var lastSeq uint64
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				for _, ev := range ww.FSNotifyLog(4096) {
+					if ev.Seq <= lastSeq {
+						continue
+					}
+					lastSeq = ev.Seq
+					fmt.Fprintf(w, "data: {\"seq\":%d,\"path\":%q,\"op\":%q,\"time\":%q,\"sem_occupied\":%d}\n\n",
+						ev.Seq, ev.Path, ev.Op, ev.Time.Format(time.RFC3339Nano), ev.SemOccupied)
+					flusher.Flush()
+				}
+			}
+		}
+	})
 }
 
 // maxIgnoreDecisions caps the memo. Large enough to cover a real repository's
@@ -124,6 +267,13 @@ func New(cfg Config) (*Watcher, error) {
 		patternsLower[i] = strings.ToLower(patNorm)
 	}
 
+	// Allocate the circular event buffer when debug capture is enabled.
+	var evBuf []fsEvent
+	var httpHandler http.Handler
+	if cfg.DebugFSEvents {
+		evBuf = make([]fsEvent, 4096)
+	}
+
 	w := &Watcher{
 		cfg:           cfg,
 		root:          absRoot(cfg.Dir),
@@ -134,6 +284,13 @@ func New(cfg Config) (*Watcher, error) {
 		patternsLower: patternsLower,
 		ignoreSet:     ignoreSet,
 		decisions:     make(map[string]bool, 256),
+		evBuf:        evBuf,
+	}
+
+	// Wire the SSE handler after w is allocated so it can capture w.
+	if cfg.DebugFSEvents {
+		httpHandler = debugFSNotifyHandler(w)
+		w.httpHandler = httpHandler
 	}
 	if err := w.addRecursive(cfg.Dir); err != nil {
 		_ = fw.Close()
@@ -377,6 +534,9 @@ func (w *Watcher) Run(ctx context.Context) {
 			if !ok {
 				return
 			}
+			// Capture every fsnotify event to the circular buffer when enabled.
+			// This has zero overhead when evBuf is nil (DebugFSEvents=false).
+			w.captureEvent(ev)
 			if w.pathIgnored(ev.Name) {
 				continue
 			}

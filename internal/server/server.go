@@ -531,6 +531,14 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/profiler/overview", h.GetProfilerOverview)
 
 		r.Get("/ws", h.WebSocket)
+
+		// Debug: SSE stream of captured fsnotify events (path, op, timestamp, sem occupancy).
+		// Enable via watcher.Config{DebugFSEvents: true}.
+		if w := s.cfg.Engine.Watcher(); w != nil {
+			if h := w.Handler(); h != nil {
+				r.Get("/debug/fsnotify", h.ServeHTTP)
+			}
+		}
 	})
 
 	// Standard OpenTelemetry OTLP endpoint support at root /v1/traces
