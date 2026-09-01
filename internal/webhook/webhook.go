@@ -184,8 +184,12 @@ func (d *Dispatcher) sendGeneric(ctx context.Context, url string, p Payload) err
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	// Drain before close so the connection is returned to the pool cleanly.
+	// Go's HTTP client buffers the response body for keep-alive reuse; closing
+	// an undrained body signals an error to the transport and drops the
+	// connection, causing unnecessary reconnect overhead on the next request.
 	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 	return nil
 }
 

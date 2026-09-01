@@ -56,11 +56,23 @@ type WatcherAPI interface {
 	UpdateSemOccupied(occ int)
 }
 
-// SetWatcher links a file watcher instance to the engine.
+// SetWatcher links a file watcher instance to the engine and starts a background
+// goroutine that samples the webhook dispatcher's in-flight count every 200ms,
+// feeding it to the watcher so fsnotify events carry live semaphore occupancy.
 func (e *Engine) SetWatcher(w WatcherAPI) {
 	e.lockMu.Lock()
 	defer e.lockMu.Unlock()
 	e.watcher = w
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			if e.webhooks != nil {
+				w.UpdateSemOccupied(e.webhooks.InFlight())
+			}
+		}
+	}()
 }
 
 // ListProjects returns all currently registered project profiles.
