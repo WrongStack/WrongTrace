@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -459,6 +460,13 @@ func TestServerLifecycle(t *testing.T) {
 	}
 }
 
+// catalogIDSeq keeps the custom model ID in TestModelCatalogEndpoints unique
+// per invocation. models.Global is a process-wide registry and Registry.Upsert
+// is idempotent on the ID it stores under, so a fixed ID grows the catalog only
+// the first time it is posted; a later -count pass would then assert a growth
+// that is mathematically impossible rather than testing the add path.
+var catalogIDSeq atomic.Uint64
+
 func TestModelCatalogEndpoints(t *testing.T) {
 	_, _, ts := newTestServer(t)
 
@@ -482,7 +490,8 @@ func TestModelCatalogEndpoints(t *testing.T) {
 
 	// 2. POST /api/models/catalog (Add custom model)
 	countBefore := len(catalog)
-	customBody := `{"id":"custom-deepseek-coder","name":"Custom DeepSeek Coder","provider":"Internal","input_price_per_m":0.1,"output_price_per_m":0.2,"context_window":64000}`
+	customID := fmt.Sprintf("custom-deepseek-coder-%d", catalogIDSeq.Add(1))
+	customBody := fmt.Sprintf(`{"id":%q,"name":"Custom DeepSeek Coder","provider":"Internal","input_price_per_m":0.1,"output_price_per_m":0.2,"context_window":64000}`, customID)
 	postResp, err := http.Post(ts.URL+"/api/models/catalog", "application/json", strings.NewReader(customBody))
 	if err != nil {
 		t.Fatalf("POST /api/models/catalog: %v", err)
@@ -502,7 +511,7 @@ func TestModelCatalogEndpoints(t *testing.T) {
 	}
 	found := false
 	for _, m := range catalogAfter {
-		if m["id"] == "custom-deepseek-coder" {
+		if m["id"] == customID {
 			found = true
 			if m["is_custom"] != true {
 				t.Errorf("custom model not marked is_custom: %v", m)
@@ -510,11 +519,11 @@ func TestModelCatalogEndpoints(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("custom-deepseek-coder missing from catalog after upsert")
+		t.Errorf("%s missing from catalog after upsert", customID)
 	}
 
 	// 4. POST /api/models/calculate-cost
-	calcBody := `{"model":"custom-deepseek-coder","prompt_tokens":1000000,"completion_tokens":1000000}`
+	calcBody := fmt.Sprintf(`{"model":%q,"prompt_tokens":1000000,"completion_tokens":1000000}`, customID)
 	calcResp, err := http.Post(ts.URL+"/api/models/calculate-cost", "application/json", strings.NewReader(calcBody))
 	if err != nil {
 		t.Fatalf("POST /api/models/calculate-cost: %v", err)
