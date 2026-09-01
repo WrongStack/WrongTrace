@@ -606,6 +606,37 @@ func prettifyProvider(host string) string {
 	}
 }
 
+// declaredOutputCap returns the largest output bound the client itself declared,
+// or nil when it declared none. Providers spell this either max_tokens or
+// max_completion_tokens; both are already recognised as token fields by the
+// gateway's header/body masking, so neither is redacted out of the payload.
+func declaredOutputCap(maxTokens, maxCompletionTokens *float64) *float64 {
+	best := maxTokens
+	if maxCompletionTokens != nil && (best == nil || *maxCompletionTokens > *best) {
+		best = maxCompletionTokens
+	}
+	return best
+}
+
+// estimateRequestCostUSD projects the cost of an incoming request so the
+// pre-flight quota gate can decide whether it is affordable at all. Prompt tokens
+// reuse EstimatePromptTokens -- the same estimator the finalize path falls back to
+// -- so projection and eventual charge stay consistent. Completion is bounded by
+// the client's own declared cap; when none was declared the projection covers the
+// prompt only, which keeps the residual overshoot to a single response that
+// RecordSpend still accounts for afterwards. No request content is logged here.
+func estimateRequestCostUSD(provider, model string, reqBody []byte, maxOutput *float64) float64 {
+	promptTokens := EstimatePromptTokens(reqBody)
+	var completionTokens int64
+	if maxOutput != nil && *maxOutput > 0 {
+		completionTokens = int64(*maxOutput)
+	}
+	if promptTokens == 0 && completionTokens == 0 {
+		return 0
+	}
+	return models.Global.CalculateCostWithProvider(provider, model, promptTokens, completionTokens)
+}
+
 // ServeHTTP routes LLM calls to the exact resolved provider.
 func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	provider, targetBase, cleanPath := p.DetectProvider(r)
@@ -699,8 +730,10 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// payloads; wire analysis (including last-user-message intent) re-parses
 	// the body once in the background finalize pipeline instead.
 	var parsedReq struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
+		Model               string   `json:"model"`
+		Stream              bool     `json:"stream"`
+		MaxTokens           *float64 `json:"max_tokens"`
+		MaxCompletionTokens *float64 `json:"max_completion_tokens"`
 	}
 	_ = json.Unmarshal(reqBody, &parsedReq)
 
@@ -755,7 +788,19 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		quotaKey = agentName
 	}
 	if policyEnabled {
-		if allowed, _, quotaMsg := p.Quotas.CheckSpend(quotaKey, 0.0); !allowed {
+		allowed, remaining, quotaMsg := p.Quotas.CheckSpend(quotaKey, 0.0)
+		if allowed && remaining != remainingUnbounded {
+			// A budget is configured, so admission has to account for THIS
+			// request's projected cost. The real charge only lands later, in the
+			// async finalize path (RecordSpend), so a zero-cost probe lets the
+			// daily cap be overshot by exactly one request. The extra body
+			// decode is paid only by budgeted tenants -- unbounded traffic keeps
+			// its byte-preserving, allocation-light fast path.
+			allowed, _, quotaMsg = p.Quotas.CheckSpend(quotaKey,
+				estimateRequestCostUSD(provider, modelName, reqBody,
+					declaredOutputCap(parsedReq.MaxTokens, parsedReq.MaxCompletionTokens)))
+		}
+		if !allowed {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{

@@ -1,6 +1,8 @@
 package ast
 
 import (
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -182,5 +184,139 @@ func TestLineDiffOmitsDistantUnchangedContext(t *testing.T) {
 	}
 	if !strings.Contains(diff, "unchanged lines omitted") {
 		t.Fatal("diff did not mark omitted context")
+	}
+}
+
+// longLineDecls builds `count` shared lines of roughly `width` bytes each,
+// followed by a line that differs between the two revisions. It models an
+// ordinary edit made below a block of generated/base64-inflated source, which
+// is what a minified or machine-written .js file looks like in practice.
+func longLineDecls(count, width int, tail string) string {
+	var b strings.Builder
+	for i := 0; i < count; i++ {
+		b.WriteString("var s")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(` = "`)
+		b.WriteString(strings.Repeat("x", width))
+		b.WriteString(`";`)
+		b.WriteByte('\n')
+	}
+	b.WriteString(tail)
+	return b.String()
+}
+
+// Regression guard: generateLineDiff used to initialise the builder's byte cap
+// AFTER emitting the common-prefix context, so those writes were uncapped. A
+// long shared prefix pushed the builder past maxDiffSnippetBytes and the
+// capacity arithmetic below it (maxDiffSnippetBytes - b.Len()) then went
+// negative, panicking inside strings.Builder.Grow. The cap is now decided
+// before the first emit, so the snippet stays bounded and the arithmetic
+// cannot underflow.
+func TestGenerateLineDiffLongCommonPrefixStaysBounded(t *testing.T) {
+	// 3 shared lines x ~25 KiB overflows the 64 KiB cap by a wide margin.
+	oldText := longLineDecls(3, 25000, "var n = 1;\n")
+	newText := longLineDecls(3, 25000, "var n = 2;\n")
+
+	diff, _, _ := generateLineDiff(oldText, newText)
+	if len(diff) > maxDiffSnippetBytes {
+		t.Fatalf("diff snippet grew to %d bytes, cap is %d", len(diff), maxDiffSnippetBytes)
+	}
+	if !strings.Contains(diff, "diff snippet truncated") {
+		t.Error("over-budget diff did not disclose truncation")
+	}
+}
+
+// The same overflow is reachable through the exported entry point the watcher
+// drives, at both file level and per-node level.
+func TestDiffLongSharedPrefixDoesNotPanic(t *testing.T) {
+	t.Run("file level", func(t *testing.T) {
+		prev := &FileSnapshot{Path: "app.js", RawContent: longLineDecls(3, 25000, "var n = 1;\n")}
+		next := &FileSnapshot{Path: "app.js", RawContent: longLineDecls(3, 25000, "var n = 2;\n")}
+
+		res := Diff("repo", prev, next)
+		if len(res.FileDiff) > maxDiffSnippetBytes {
+			t.Fatalf("FileDiff grew to %d bytes, cap is %d", len(res.FileDiff), maxDiffSnippetBytes)
+		}
+	})
+
+	t.Run("modified node", func(t *testing.T) {
+		sig := "function:app.js::build"
+		bodyA := longLineDecls(3, 25000, "return 1;\n")
+		bodyB := longLineDecls(3, 25000, "return 2;\n")
+		prev := &FileSnapshot{Path: "app.js", RawContent: bodyA, Nodes: map[string]Node{
+			sig: {Signature: sig, Kind: NodeFunction, Body: bodyA, Hash: "hash-a"},
+		}}
+		next := &FileSnapshot{Path: "app.js", RawContent: bodyB, Nodes: map[string]Node{
+			sig: {Signature: sig, Kind: NodeFunction, Body: bodyB, Hash: "hash-b"},
+		}}
+
+		res := Diff("repo", prev, next)
+		if len(res.Events) != 1 {
+			t.Fatalf("expected 1 MODIFIED event, got %d", len(res.Events))
+		}
+		if res.Events[0].Action != ActionModified {
+			t.Errorf("action = %s, want %s", res.Events[0].Action, ActionModified)
+		}
+		if len(res.Events[0].DiffSnippet) > maxDiffSnippetBytes {
+			t.Fatalf("DiffSnippet grew to %d bytes, cap is %d",
+				len(res.Events[0].DiffSnippet), maxDiffSnippetBytes)
+		}
+	})
+}
+
+// Boundary half of the contract: a prefix that fits under the cap must still be
+// emitted. Without this case the panic could also be "fixed" by dropping all
+// context, which would silently degrade every near-cap snippet.
+func TestGenerateLineDiffKeepsContextUnderTheCap(t *testing.T) {
+	// 2 shared lines x 20 KiB ≈ 40 KiB: comfortably under the 64 KiB cap.
+	oldText := longLineDecls(2, 20000, "var n = 1;\n")
+	newText := longLineDecls(2, 20000, "var n = 2;\n")
+
+	diff, added, deleted := generateLineDiff(oldText, newText)
+	if len(diff) > maxDiffSnippetBytes {
+		t.Fatalf("diff snippet grew to %d bytes", len(diff))
+	}
+	if !strings.Contains(diff, "var s0") {
+		t.Error("legitimate near-cap context was dropped")
+	}
+	if strings.Contains(diff, "diff snippet truncated") {
+		t.Error("under-budget diff was truncated")
+	}
+	if added != 1 || deleted != 1 {
+		t.Errorf("counts = +%d -%d, want +1 -1", added, deleted)
+	}
+}
+
+// End-to-end witness through the real Tree-sitter JavaScript parser, so the
+// guard cannot drift away from what Engine.HandleFileChange actually feeds Diff.
+func TestDiffRealParserLongLineFileStaysBounded(t *testing.T) {
+	e, err := NewEngine()
+	if err != nil {
+		t.Skipf("tree-sitter engine unavailable: %v", err)
+	}
+	defer e.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gen.min.js")
+
+	before, err := e.Parse(path, []byte(longLineDecls(3, 25000, "var n = 1;\n")))
+	if err != nil || before == nil {
+		t.Skipf("javascript fixture did not parse: err=%v nil=%v", err, before == nil)
+	}
+	e.SetSnapshot(before)
+
+	after, err := e.Parse(path, []byte(longLineDecls(3, 25000, "var n = 2;\n")))
+	if err != nil || after == nil {
+		t.Fatalf("edited javascript fixture did not parse: err=%v nil=%v", err, after == nil)
+	}
+
+	prev, ok := e.Snapshot(path)
+	if !ok || prev == nil {
+		t.Fatal("no cached snapshot for the parsed file")
+	}
+
+	res := Diff("repo", prev, after)
+	if len(res.FileDiff) > maxDiffSnippetBytes {
+		t.Fatalf("FileDiff grew to %d bytes, cap is %d", len(res.FileDiff), maxDiffSnippetBytes)
 	}
 }

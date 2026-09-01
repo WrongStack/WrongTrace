@@ -388,6 +388,16 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 	added := 0
 	deleted := 0
 
+	// Decide the byte cap BEFORE the first emit. emit() only enforces the cap
+	// while b.bounded is true, so leaving this until after the common-prefix
+	// context below let those writes grow the builder past
+	// maxDiffSnippetBytes; the capacity arithmetic further down then
+	// subtracts past zero and panics inside Grow. Setting it up front also
+	// keeps the snippet inside the cap advertised to the DB and WebSocket
+	// payload. Same ordering as formatAddedDiff and formatDeletedDiff.
+	estimated := len(oldText) + len(newText) + (len(oldLines)+len(newLines))*3
+	b.bounded = estimated > maxDiffSnippetBytes
+
 	// 1. Strip the common prefix. Only nearby context belongs in a snippet;
 	// emitting an unchanged 20k-line prefix made a one-line edit allocate and
 	// persist almost the entire file.
@@ -414,8 +424,6 @@ func generateLineDiff(oldText, newText string) (string, int, int) {
 	midNew := newLines[prefixLen : len(newLines)-suffixLen]
 
 	m, n := len(midOld), len(midNew)
-	estimated := len(oldText) + len(newText) + (len(oldLines)+len(newLines))*3
-	b.bounded = estimated > maxDiffSnippetBytes
 	grow := 4 * 1024
 	if m*n > 200000 {
 		grow = min(estimated, maxDiffSnippetBytes)

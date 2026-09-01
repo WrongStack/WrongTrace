@@ -56,26 +56,48 @@ type Dispatcher struct {
 
 const maxConcurrentDeliveries = 16
 
+// defaultDispatchTimeout bounds one delivery attempt when Config.Timeout is
+// unset or non-positive.
+const defaultDispatchTimeout = 5 * time.Second
+
+// resolveTimeout normalizes the per-request deadline. It is the single source
+// of truth for construction and for runtime updates alike, so an omitted
+// Timeout can never reach the client as 0 (which means unlimited).
+func resolveTimeout(cfg Config) time.Duration {
+	if cfg.Timeout <= 0 {
+		return defaultDispatchTimeout
+	}
+	return cfg.Timeout
+}
+
 // NewDispatcher constructs a Dispatcher.
 func NewDispatcher(cfg Config) *Dispatcher {
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
 	return &Dispatcher{
-		cfg: cfg,
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
-		inFlight: make(chan struct{}, maxConcurrentDeliveries),
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: resolveTimeout(cfg)},
+		inFlight:   make(chan struct{}, maxConcurrentDeliveries),
 	}
 }
 
-// UpdateConfig dynamically updates target webhook URLs.
+// UpdateConfig dynamically updates target webhook URLs and the per-request
+// timeout. An http.Client fixes its deadline at construction, so assigning
+// d.cfg alone left every runtime Timeout change inert. The client is
+// republished here instead; it owns no transport (http.DefaultTransport is
+// shared), so swapping it is cheap and retains no per-client state.
 func (d *Dispatcher) UpdateConfig(cfg Config) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.cfg = cfg
+	d.httpClient = &http.Client{Timeout: resolveTimeout(cfg)}
+}
+
+// client snapshots the active HTTP client under the read lock. The senders call
+// Do outside the lock, so a delivery already in flight keeps the deadline it
+// started with while a concurrent update swaps in the next client.
+func (d *Dispatcher) client() *http.Client {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.httpClient
 }
 
 // Dispatch sends notifications to all configured webhook endpoints in the background.
@@ -103,19 +125,37 @@ func (d *Dispatcher) Dispatch(p Payload) {
 
 	go func() {
 		defer func() { <-d.inFlight }()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		if genericURL != "" {
-			_ = d.sendGeneric(ctx, genericURL, p)
-		}
-		if slackURL != "" {
-			_ = d.sendSlack(ctx, slackURL, p)
-		}
-		if discordURL != "" {
-			_ = d.sendDiscord(ctx, discordURL, p)
-		}
+		// Each endpoint is delivered under its OWN deadline derived from
+		// Config.Timeout. A single batch-wide context was wrong twice over: it
+		// silently truncated any Timeout above it, and because the sends run
+		// sequentially the first slow endpoint ate the budget the rest needed.
+		timeout := d.deliveryTimeout()
+		d.deliver(d.sendGeneric, genericURL, p, timeout)
+		d.deliver(d.sendSlack, slackURL, p, timeout)
+		d.deliver(d.sendDiscord, discordURL, p, timeout)
 	}()
+}
+
+// deliveryTimeout returns the per-request deadline to enforce. It mirrors the
+// active http.Client so the surrounding context can never be tighter than the
+// client's own timeout, which would silently override the caller's config.
+func (d *Dispatcher) deliveryTimeout() time.Duration {
+	if c := d.client(); c != nil && c.Timeout > 0 {
+		return c.Timeout
+	}
+	return defaultDispatchTimeout
+}
+
+// deliver performs one endpoint's send under its own deadline. Empty targets are
+// skipped, and delivery stays best-effort: a failing endpoint must never abort
+// the remaining ones.
+func (d *Dispatcher) deliver(send func(context.Context, string, Payload) error, url string, p Payload, timeout time.Duration) {
+	if url == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_ = send(ctx, url, p)
 }
 
 func (d *Dispatcher) sendGeneric(ctx context.Context, url string, p Payload) error {
@@ -136,7 +176,7 @@ func (d *Dispatcher) sendGeneric(ctx context.Context, url string, p Payload) err
 		mac.Write(b)
 		req.Header.Set("X-WrongTrace-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 	}
-	resp, err := d.httpClient.Do(req)
+	resp, err := d.client().Do(req)
 	if err != nil {
 		return err
 	}
@@ -169,7 +209,7 @@ func (d *Dispatcher) sendSlack(ctx context.Context, url string, p Payload) error
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := d.httpClient.Do(req)
+	resp, err := d.client().Do(req)
 	if err != nil {
 		return err
 	}
@@ -202,7 +242,7 @@ func (d *Dispatcher) sendDiscord(ctx context.Context, url string, p Payload) err
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := d.httpClient.Do(req)
+	resp, err := d.client().Do(req)
 	if err != nil {
 		return err
 	}

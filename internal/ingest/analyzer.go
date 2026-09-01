@@ -463,16 +463,21 @@ func extractModelFromRow(m map[string]interface{}) string {
 
 func normalizeModelName(raw string) string {
 	raw = strings.TrimSpace(raw)
+
+	// Clean trailing annotations like "(Medium)" or "(Default)" BEFORE the junk
+	// gate. IsJunkModel rejects any string containing '(', so running the gate
+	// first made this strip unreachable and silently discarded every annotated
+	// model name -- transcripts that report "Gemini 3.7 Flash (Medium)" were
+	// attributed to unknown-model and priced on the fallback estimate. The gate
+	// below still runs, now on the cleaned name, so genuine junk
+	// ("this.model (x)", a leading "(Preview)") stays rejected.
+	if idx := strings.Index(raw, "("); idx > 0 {
+		raw = strings.TrimSpace(raw[:idx])
+	}
 	if models.IsJunkModel(raw) {
 		return ""
 	}
 	lower := strings.ToLower(raw)
-
-	// Clean trailing annotations like "(Medium)" or "(Default)"
-	if idx := strings.Index(raw, "("); idx > 0 {
-		raw = strings.TrimSpace(raw[:idx])
-		lower = strings.ToLower(raw)
-	}
 
 	// Canonical mapping for common display names
 	switch {
@@ -522,56 +527,94 @@ func extractInt64(m map[string]interface{}, keys ...string) int64 {
 	return 0
 }
 
+// containsAgentToken reports whether an agent key occurs in the lowered path as a
+// whole token: the neighbouring bytes must not be letters. Digits, punctuation and
+// '_' count as boundaries, so legitimate install directories still match --
+// ".claude", "github-copilot", the versioned "abab6.5s", the dotted "z.ai" -- while
+// a key buried inside an ordinary English word does not ("roo" in "classroom",
+// "zed" in "customized", "v0" in "srv01", "cline" in "incline"). Bytes >= 0x80 are
+// treated as letters so a non-ASCII path segment cannot masquerade as a separator.
+func containsAgentToken(haystack, needle string) bool {
+	if needle == "" || len(needle) > len(haystack) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] != needle {
+			continue
+		}
+		if i > 0 && isAgentTokenLetter(haystack[i-1]) {
+			continue
+		}
+		if end := i + len(needle); end < len(haystack) && isAgentTokenLetter(haystack[end]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// isAgentTokenLetter reports whether b continues a word. Only ASCII letters and the
+// bytes of a multi-byte rune do; digits and punctuation break a word.
+func isAgentTokenLetter(b byte) bool {
+	return b >= 0x80 || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
 func detectAgentFromPath(p string) string {
+	// Agent keys are matched at word boundaries rather than as raw substrings: a
+	// transcript stored under a directory like "classroom" or "customized-theme"
+	// says nothing about which agent produced it, and the value is persisted as
+	// ToolCallEvent.AgentName / FileReadEvent.AgentName. Branch ORDER is
+	// significant -- it resolves paths that legitimately mention several products
+	// -- so only the matching predicate changed.
 	lower := strings.ToLower(p)
 	switch {
-	case strings.Contains(lower, "wrongstack"):
+	case containsAgentToken(lower, "wrongstack"):
 		return "WrongStack"
-	case strings.Contains(lower, "antigravity") || strings.Contains(lower, "gemini"):
+	case containsAgentToken(lower, "antigravity") || containsAgentToken(lower, "gemini"):
 		return "Antigravity"
-	case strings.Contains(lower, "claude"):
+	case containsAgentToken(lower, "claude"):
 		return "Claude Code"
-	case strings.Contains(lower, "cline") || strings.Contains(lower, "roo"):
+	case containsAgentToken(lower, "cline") || containsAgentToken(lower, "roo"):
 		return "Cline/Roo"
-	case strings.Contains(lower, "replit"):
+	case containsAgentToken(lower, "replit"):
 		return "Replit Agent"
-	case strings.Contains(lower, "zed"):
+	case containsAgentToken(lower, "zed"):
 		return "Zed AI"
-	case strings.Contains(lower, "zcode") || strings.Contains(lower, "z.ai"):
+	case containsAgentToken(lower, "zcode") || containsAgentToken(lower, "z.ai"):
 		return "ZCode"
-	case strings.Contains(lower, "minimax") || strings.Contains(lower, "abab"):
+	case containsAgentToken(lower, "minimax") || containsAgentToken(lower, "abab"):
 		return "MiniMax Code"
-	case strings.Contains(lower, "kimi") || strings.Contains(lower, "moonshot"):
+	case containsAgentToken(lower, "kimi") || containsAgentToken(lower, "moonshot"):
 		return "Kimi Code"
-	case strings.Contains(lower, "devin"):
+	case containsAgentToken(lower, "devin"):
 		return "Devin"
-	case strings.Contains(lower, "trae"):
+	case containsAgentToken(lower, "trae"):
 		return "Trae"
-	case strings.Contains(lower, "copilot") || strings.Contains(lower, "github-copilot"):
+	case containsAgentToken(lower, "copilot") || containsAgentToken(lower, "github-copilot"):
 		return "GitHub Copilot"
-	case strings.Contains(lower, "openhands") || strings.Contains(lower, "opendevin"):
+	case containsAgentToken(lower, "openhands") || containsAgentToken(lower, "opendevin"):
 		return "OpenHands"
-	case strings.Contains(lower, "goose"):
+	case containsAgentToken(lower, "goose"):
 		return "Goose"
-	case strings.Contains(lower, "cursor"):
+	case containsAgentToken(lower, "cursor"):
 		return "Cursor"
-	case strings.Contains(lower, "windsurf") || strings.Contains(lower, "codeium"):
+	case containsAgentToken(lower, "windsurf") || containsAgentToken(lower, "codeium"):
 		return "Windsurf"
-	case strings.Contains(lower, "aider"):
+	case containsAgentToken(lower, "aider"):
 		return "Aider"
-	case strings.Contains(lower, "continue"):
+	case containsAgentToken(lower, "continue"):
 		return "Continue.dev"
-	case strings.Contains(lower, "tabnine"):
+	case containsAgentToken(lower, "tabnine"):
 		return "Tabnine"
-	case strings.Contains(lower, "bolt"):
+	case containsAgentToken(lower, "bolt"):
 		return "Bolt.new"
-	case strings.Contains(lower, "lovable"):
+	case containsAgentToken(lower, "lovable"):
 		return "Lovable"
-	case strings.Contains(lower, "v0"):
+	case containsAgentToken(lower, "v0"):
 		return "v0.dev"
-	case strings.Contains(lower, "plandex"):
+	case containsAgentToken(lower, "plandex"):
 		return "Plandex"
-	case strings.Contains(lower, "sweep"):
+	case containsAgentToken(lower, "sweep"):
 		return "Sweep"
 	default:
 		return "Coding Agent"

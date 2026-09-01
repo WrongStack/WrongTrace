@@ -272,3 +272,334 @@ func TestIngest_DirAndFileExistsHelpers(t *testing.T) {
 		t.Errorf("expected dirExists=false for sample.txt")
 	}
 }
+
+// TestNormalizeModelName_TrailingAnnotation is the regression guard for the
+// ordering bug in normalizeModelName: models.IsJunkModel rejects any string
+// containing '(', and it used to run BEFORE the "(Medium)"/"(Default)"
+// annotation was stripped. That made the strip unreachable, so every annotated
+// model name collapsed to "" and the transcript was attributed to
+// "unknown-model" and priced on the fallback estimate.
+func TestNormalizeModelName_TrailingAnnotation(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"annotated reasoning effort", "Gemini 3.7 Flash (Medium)", "gemini-3.7-flash"},
+		{"annotated default tier", "Claude 3.5 Sonnet (Default)", "claude-3-5-sonnet"},
+		{"unannotated still works", "Gemini 3.7 Flash", "gemini-3.7-flash"},
+		// Junk must stay rejected after cleaning, not leak through the strip.
+		{"leading paren is junk", "(Preview)", ""},
+		{"code expression with annotation", "this.model (x)", ""},
+		{"placeholder", "None", ""},
+		{"empty", "", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizeModelName(tc.in); got != tc.want {
+				t.Errorf("normalizeModelName(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseJSONLTranscript_AnnotatedModelName drives the same defect through
+// the real production entry point, so the guard fails on behaviour and not on
+// a helper someone could rename.
+func TestParseJSONLTranscript_AnnotatedModelName(t *testing.T) {
+	logFile := filepath.Join(t.TempDir(), "antigravity-transcript.jsonl")
+	sample := `{"type":"PLANNER_RESPONSE","model":"Gemini 3.7 Flash (Medium)","tool_calls":[{"name":"replace_file_content","args":{"TargetFile":"internal/db/queries.go"}}],"usage":{"input_tokens":8000,"output_tokens":400}}
+`
+	if err := os.WriteFile(logFile, []byte(sample), 0644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	events, err := ParseJSONLTranscript(logFile)
+	if err != nil {
+		t.Fatalf("ParseJSONLTranscript: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].ModelName != "gemini-3.7-flash" {
+		t.Errorf("annotated model name lost: got %q, want %q", events[0].ModelName, "gemini-3.7-flash")
+	}
+	// The annotation must not change attribution of the edit itself.
+	if events[0].TargetFile != "internal/db/queries.go" {
+		t.Errorf("unexpected target file: %s", events[0].TargetFile)
+	}
+}
+
+// TestIsFileToolNameMatching_TokenBoundaries guards the fuzzy-matching defect: the
+// stems used to be tested with strings.Contains, so a 3-4 letter fragment anywhere
+// inside an unrelated word classified the tool as file I/O. That injected bogus
+// path->run attribution hints (server.go RegisterFileOperation) and phantom
+// FileReadEvent rows. It does NOT affect FileHealth, which counts code_node_events.
+func TestIsFileToolNameMatching_TokenBoundaries(t *testing.T) {
+	// Real tool names whose stem is not a separate token: covered by the explicit
+	// tables rather than by widening the stems back to raw substrings.
+	if !IsFileModifyingTool("NotebookEdit") || !IsFileModifyingTool("MultiEdit") {
+		t.Error("suffix-shaped modifying tools must stay recognised")
+	}
+	if !IsFileReadingTool("NotebookRead") {
+		t.Error("suffix-shaped reading tool must stay recognised")
+	}
+
+	cases := []struct {
+		name      string
+		predicate func(string) bool
+		want      bool
+	}{
+		// Fragments buried inside unrelated words -- must not classify.
+		{"locate_file", IsFileReadingTool, false},
+		{"duplicate_file", IsFileReadingTool, false},
+		{"catalog_search", IsFileReadingTool, false},
+		{"thread_analyzer", IsFileReadingTool, false},
+		{"misread_counter", IsFileReadingTool, false},
+		{"credit_card_scan", IsFileModifyingTool, false},
+		{"accredited_review", IsFileModifyingTool, false},
+		// Legitimate derivations -- must keep classifying.
+		{"reader_tool", IsFileReadingTool, true},
+		{"inspector_view", IsFileReadingTool, true},
+		{"cat_file", IsFileReadingTool, true},
+		{"code_edit", IsFileModifyingTool, true},
+		{"overwrite_file", IsFileModifyingTool, true},
+		{"search_and_replace", IsFileModifyingTool, true},
+		{"patch_applier", IsFileModifyingTool, true},
+		// Cross-class guard: a read tool is never a write.
+		{"read_file", IsFileModifyingTool, false},
+	}
+
+	for _, tc := range cases {
+		if got := tc.predicate(tc.name); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestParseJSONLTranscript_NonFileToolsProduceNoEvents drives the same defect
+// through the real parser: a transcript whose tool calls touch no files must
+// yield no modifying and no read events.
+func TestParseJSONLTranscript_NonFileToolsProduceNoEvents(t *testing.T) {
+	logFile := filepath.Join(t.TempDir(), "claude-transcript.jsonl")
+	sample := `{"type":"PLANNER_RESPONSE","model":"gpt-4o","tool_calls":[{"name":"locate_file","args":{"path":"internal/core/engine.go"}},{"name":"credit_card_scan","args":{"path":"internal/core/engine.go"}}],"usage":{"input_tokens":10,"output_tokens":5}}
+`
+	if err := os.WriteFile(logFile, []byte(sample), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	modEvents, readEvents, err := ParseJSONLTranscriptFull(logFile)
+	if err != nil {
+		t.Fatalf("ParseJSONLTranscriptFull: %v", err)
+	}
+	if len(modEvents) != 0 || len(readEvents) != 0 {
+		t.Fatalf("non-file tools produced %d modifying and %d read event(s), want 0/0", len(modEvents), len(readEvents))
+	}
+
+	// A genuine write tool in the same transcript must still be recorded, so the
+	// guard cannot be satisfied by simply dropping everything.
+	sample += `{"type":"PLANNER_RESPONSE","model":"gpt-4o","tool_calls":[{"name":"write_to_file","args":{"path":"internal/core/engine.go"}}],"usage":{"input_tokens":10,"output_tokens":5}}
+`
+	if err := os.WriteFile(logFile, []byte(sample), 0o644); err != nil {
+		t.Fatalf("rewrite transcript: %v", err)
+	}
+	modEvents, _, err = ParseJSONLTranscriptFull(logFile)
+	if err != nil {
+		t.Fatalf("ParseJSONLTranscriptFull: %v", err)
+	}
+	if len(modEvents) != 1 || modEvents[0].TargetFile != "internal/core/engine.go" {
+		t.Fatalf("expected the real write tool to still register, got %+v", modEvents)
+	}
+}
+
+// TestDetectAgentFromPath_WordsContainingAgentStemsAreNotAgents guards the
+// substring defect: every branch used to be a bare strings.Contains over the whole
+// lowered path, so an agent key sitting INSIDE an ordinary directory word won the
+// attribution, and the wrong agent was persisted in ToolCallEvent.AgentName /
+// FileReadEvent.AgentName. These paths name no agent at all.
+func TestDetectAgentFromPath_WordsContainingAgentStemsAreNotAgents(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"roo inside classroom", "/home/teacher/classroom/lessons/transcript.jsonl"},
+		{"zed inside customized", "/home/dev/projects/customized-theme/transcript.jsonl"},
+		{"v0 inside srv01", "/srv01/app/data/transcript.jsonl"},
+		{"devin inside devine", "/home/devine/notes/transcript.jsonl"},
+		{"bolt inside boltzmann", "/home/dev/theory/boltzmann-brain/transcript.jsonl"},
+		{"cline inside incline", "/home/dev/lessons/incline-notes/transcript.jsonl"},
+		{"goose inside gooseberry", "/home/dev/theory/gooseberry/transcript.jsonl"},
+		{"lovable inside unlovable", "/home/dev/books/unlovable/transcript.jsonl"},
+	}
+
+	for _, tc := range cases {
+		if got := detectAgentFromPath(tc.path); got != "Coding Agent" {
+			t.Errorf("%s: detectAgentFromPath(%q) = %q, want Coding Agent", tc.name, tc.path, got)
+		}
+	}
+}
+
+// TestIsFileToolName_AffixDerivation guards round 9: nameHasStem must accept a stem
+// only when the extra letters form a real derivation, not merely because a token
+// happens to start or end with a stem. Before the fix the rule was a bare length
+// gate, so dispatch_job and despatch_ticket (ending in "patch"), ready_state and
+// readiness_probe (starting with "read") and editable_note (starting with "edit")
+// all classified as file I/O despite touching no file -- emitting phantom events and
+// bogus path->run attribution hints.
+func TestIsFileToolName_AffixDerivation(t *testing.T) {
+	for _, n := range []string{
+		"dispatch_job", "despatch_ticket", // head "dis"/"des" is not a derivation
+		"editable_note", // tail "able" describes a state, not an operation
+		"preview_mode",  // "pre" is excluded on purpose
+		"credit_card_scan", "accredited_review", "misread_counter", "thread_analyzer",
+	} {
+		if IsFileModifyingTool(n) {
+			t.Errorf("%q must not classify as modifying", n)
+		}
+	}
+
+	for _, n := range []string{
+		"ready_state", "readiness_probe", // tails "y"/"iness" are not derivations
+		"preview_mode", "catalog_search", "locate_file", "duplicate_file",
+	} {
+		if IsFileReadingTool(n) {
+			t.Errorf("%q must not classify as reading", n)
+		}
+	}
+
+	// Real derivations must survive -- the recall half, and the reason the fix
+	// narrows the affix instead of deleting prefix/suffix matching outright.
+	for _, tc := range []struct {
+		name string
+		read bool
+	}{
+		{"reader_tool", true},  // read + "er"
+		{"readers_view", true}, // read + "s"
+		{"reading_mode", true}, // read + "ing"
+		{"inspector_view", true},
+		{"overwrite_file", false}, // over + write
+		{"rewrite_buffer", false}, // re + write
+		{"patcher_run", false},    // patch + "er"
+		{"code_edit", false},
+		{"custom_patch_writer", false},
+		{"search_and_replace", false},
+	} {
+		if tc.read {
+			if !IsFileReadingTool(tc.name) {
+				t.Errorf("regression: legitimate derivation %q no longer classifies as reading", tc.name)
+			}
+			continue
+		}
+		if !IsFileModifyingTool(tc.name) {
+			t.Errorf("regression: legitimate derivation %q no longer classifies as modifying", tc.name)
+		}
+	}
+}
+
+// TestParseJSONLTranscript_AffixPhantomEvents drives the same rule through the real
+// parser, so a future widening cannot silently restore the phantom telemetry.
+func TestParseJSONLTranscript_AffixPhantomEvents(t *testing.T) {
+	// tool_calls sit at the row top level (analyzer.go:200), args under "args" (:226).
+	const sample = `{"type":"ASSISTANT","tool_calls":[{"name":"dispatch_job","args":{"file_path":"internal/core/engine.go","job":"nightly"}}]}
+{"type":"ASSISTANT","tool_calls":[{"name":"ready_state","args":{"file_path":"internal/core/engine.go"}}]}
+`
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	if err := os.WriteFile(path, []byte(sample), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	modEvents, readEvents, err := ParseJSONLTranscriptFull(path)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(modEvents) != 0 {
+		names := make([]string, 0, len(modEvents))
+		for _, ev := range modEvents {
+			names = append(names, ev.ToolName)
+		}
+		t.Errorf("parser emitted %d phantom modification event(s) %v for a tool that never writes", len(modEvents), names)
+	}
+	if len(readEvents) != 0 {
+		names := make([]string, 0, len(readEvents))
+		for _, ev := range readEvents {
+			names = append(names, ev.ToolName)
+		}
+		t.Errorf("parser emitted %d phantom read event(s) %v for a tool that never reads", len(readEvents), names)
+	}
+
+	// A genuine write in an otherwise identical transcript must still record, so the
+	// zero counts above cannot come from the parser ignoring the fixture shape.
+	const realWrite = `{"type":"ASSISTANT","tool_calls":[{"name":"write_to_file","args":{"file_path":"internal/core/engine.go"}}]}
+`
+	realPath := filepath.Join(t.TempDir(), "real.jsonl")
+	if err := os.WriteFile(realPath, []byte(realWrite), 0o644); err != nil {
+		t.Fatalf("write control: %v", err)
+	}
+	realMod, err := ParseJSONLTranscript(realPath)
+	if err != nil {
+		t.Fatalf("parse control: %v", err)
+	}
+	if len(realMod) != 1 {
+		t.Fatalf("control: got %d modification event(s), want 1", len(realMod))
+	}
+	if realMod[0].TargetFile != "internal/core/engine.go" {
+		t.Errorf("control: TargetFile = %q, want internal/core/engine.go", realMod[0].TargetFile)
+	}
+}
+
+// TestDetectAgentFromPath_RealAgentDirsStillDetected is the over-tightening guard.
+// A boundary rule that only accepted whole path segments would fail the last two
+// rows: MiniMax ships versioned directories and ZCode's key is dotted, so digits
+// and punctuation must count as boundaries alongside separators.
+func TestDetectAgentFromPath_RealAgentDirsStillDetected(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"/home/dev/.claude/projects/proj/transcript.jsonl", "Claude Code"},
+		{"/home/dev/.roo/storage/task-1/transcript.jsonl", "Cline/Roo"},
+		{"/home/dev/.config/zed/sessions/transcript.jsonl", "Zed AI"},
+		{"/home/dev/.v0/logs/transcript.jsonl", "v0.dev"},
+		{"/home/dev/.local/share/github-copilot/logs/transcript.jsonl", "GitHub Copilot"},
+		{"/home/dev/.wrongstack/projects/wrongtrace/transcript.jsonl", "WrongStack"},
+		{"/home/dev/.antigravity/history/transcript.jsonl", "Antigravity"},
+		{"/home/dev/.cursor/ai-comments/transcript.jsonl", "Cursor"},
+		{"/opt/models/abab6.5s/transcript.jsonl", "MiniMax Code"},
+		{"/home/dev/.z.ai/history/transcript.jsonl", "ZCode"},
+	}
+
+	for _, tc := range cases {
+		if got := detectAgentFromPath(tc.path); got != tc.want {
+			t.Errorf("detectAgentFromPath(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestParseJSONLTranscript_DirectoryWordDoesNotAttributeAgent drives the same
+// defect through the real parser. It asserts only "not Cline/Roo" because the OS
+// temp prefix is outside the test's control; the claim under test is that a
+// "classroom" directory must not file the transcript under the Roo agent.
+func TestParseJSONLTranscript_DirectoryWordDoesNotAttributeAgent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "classroom", "lessons")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	logFile := filepath.Join(dir, "transcript.jsonl")
+	sample := `{"type":"PLANNER_RESPONSE","model":"gpt-4o","tool_calls":[{"name":"write_to_file","args":{"path":"notes.md"}}],"usage":{"input_tokens":10,"output_tokens":5}}
+`
+	if err := os.WriteFile(logFile, []byte(sample), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	events, err := ParseJSONLTranscript(logFile)
+	if err != nil {
+		t.Fatalf("ParseJSONLTranscript: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if got := events[0].AgentName; got == "Cline/Roo" {
+		t.Fatalf("transcript under a \"classroom\" directory was attributed to %q", got)
+	}
+}

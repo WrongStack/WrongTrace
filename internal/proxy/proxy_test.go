@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1523,6 +1524,236 @@ func TestQuotaLimiter_GlobalAndKeyBudgets(t *testing.T) {
 	q.RecordSpend("agent-a", 0)
 	q.RecordSpend("agent-a", -1)
 }
+
+// TestQuotaLimiter_BudgetedKeyCannotBypassGlobalCap guards the root cause: the
+// limit was resolved as "this key's budget, else global", so a key that set its
+// own (larger) budget never had the global aggregate checked -- even though every
+// recorded spend accumulates into dailySpend["global"]. The binding budget is now
+// whichever has the least headroom.
+func TestQuotaLimiter_BudgetedKeyCannotBypassGlobalCap(t *testing.T) {
+	q := NewQuotaLimiter()
+	q.SetBudget("global", 10.00)
+	q.SetBudget("rich-agent", 100.00)
+	q.RecordSpend("someone-else", 9.50) // global is at 9.50/10.00
+
+	// $2 fits inside rich-agent's own $100 budget but not the $0.50 of global left.
+	allowed, _, warn := q.CheckSpend("rich-agent", 2.00)
+	if allowed {
+		t.Fatalf("budgeted key bypassed the exhausted global cap: remaining=%v warn=%q", allowed, warn)
+	}
+	if !strings.Contains(warn, "budget of $10.00 exceeded") {
+		t.Fatalf("denial must name the binding global cap, got %q", warn)
+	}
+
+	// A denial must not consume budget (Quota Check Separation invariant).
+	if spend, _ := q.GetSpend("global"); spend != 9.50 {
+		t.Errorf("denied request moved global spend: %v, want 9.50", spend)
+	}
+	if spend, _ := q.GetSpend("rich-agent"); spend != 0 {
+		t.Errorf("denied request charged the key: %v, want 0", spend)
+	}
+
+	// While the key budget is the tighter of the two, it still governs.
+	q2 := NewQuotaLimiter()
+	q2.SetBudget("global", 10.00)
+	q2.SetBudget("poor-agent", 3.00)
+	if _, rem, _ := q2.CheckSpend("poor-agent", 1.00); rem != 3.00 {
+		t.Errorf("remaining should come from the tighter key budget: %v, want 3.00", rem)
+	}
+}
+
+// TestQuotaLimiter_UnlimitedBudgetReportsNoBalance guards the second half of the
+// defect: with no budget configured, remainingUSD reported the literal 999999.0,
+// a dollar-shaped number indistinguishable from a real balance.
+func TestQuotaLimiter_UnlimitedBudgetReportsNoBalance(t *testing.T) {
+	q := NewQuotaLimiter()
+
+	allowed, rem, warn := q.CheckSpend("anyone", 1.00)
+	if !allowed || warn != "" {
+		t.Fatalf("unbounded key must be allowed: allowed=%v warn=%q", allowed, warn)
+	}
+	if rem == 999999.0 {
+		t.Fatal("remainingUSD still reports the fabricated 999999 sentinel for an unbounded budget")
+	}
+	if rem > 0 {
+		t.Fatalf("an unbounded budget must not report a positive balance, got %v", rem)
+	}
+
+	// A zero or negative limit means unlimited per SetBudget, and must not act
+	// as a binding cap on a key that does have a real budget.
+	q.SetBudget("global", 0)
+	q.SetBudget("project-x", 5.00)
+	if allowed, rem, warn := q.CheckSpend("project-x", 1.00); !allowed || warn != "" || rem != 5.00 {
+		t.Errorf("zero global budget leaked as a cap: allowed=%v rem=%v warn=%q", allowed, rem, warn)
+	}
+}
+
+// TestQuotaLimiter_GlobalKeyIsNotDoubleCounted pins the boundary where the key
+// under evaluation IS the global aggregate.
+func TestQuotaLimiter_GlobalKeyIsNotDoubleCounted(t *testing.T) {
+	q := NewQuotaLimiter()
+	q.SetBudget("global", 10.00)
+
+	allowed, rem, _ := q.CheckAndRecordSpend("global", 4.00)
+	if !allowed {
+		t.Fatal("$4 of a $10 global budget was refused")
+	}
+	if spend, _ := q.GetSpend("global"); spend != 4.00 {
+		t.Errorf("global spend double-counted: %v, want 4.00", spend)
+	}
+	if rem != 6.00 {
+		t.Errorf("remaining after charging $4 of $10: %v, want 6.00", rem)
+	}
+}
+
+// quotaGateFixture puts a GatewayProxy in front of a mock upstream that answers
+// 200 immediately. The upstream hit counter is the decisive witness: a gate that
+// correctly refuses never contacts the provider, so nothing is spent.
+func quotaGateFixture(t *testing.T) (*GatewayProxy, string, *int64) {
+	t.Helper()
+	var hits int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-gate","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1200,"completion_tokens":150}}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	proxy := NewGatewayProxy(Config{CustomUpstreams: map[string]string{"quota": upstream.URL}})
+	t.Cleanup(proxy.Close)
+	srv := httptest.NewServer(proxy)
+	t.Cleanup(srv.Close)
+	return proxy, srv.URL, &hits
+}
+
+// quotaGatePost sends one chat completion under enforce policy and returns status.
+func quotaGatePost(t *testing.T, baseURL, slug, body string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/proxy/quota/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-WrongTrace-Policy", "enforce")
+	req.Header.Set("X-Project-Slug", slug)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST to gateway: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+// quotaGateBody declares max_tokens=4096, projecting a cost far above the $0.001
+// of headroom the refusal test leaves. Declared in a var because strings.Repeat
+// is not a constant expression.
+var quotaGateBody = `{"model":"gpt-4o","max_tokens":4096,"messages":[{"role":"user","content":"` +
+	strings.Repeat("project the incoming cost ", 200) + `"}]}`
+
+// TestQuotaGateRefusesRequestThatCannotFit is the regression guard: the pre-flight
+// used CheckSpend(quotaKey, 0.0), asking only whether ANY budget remained, while
+// the real cost was recorded afterwards in finalize. A tenant with $0.001 left was
+// admitted and the cap was breached by the request's own cost.
+func TestQuotaGateRefusesRequestThatCannotFit(t *testing.T) {
+	proxy, url, hits := quotaGateFixture(t)
+	proxy.Quotas.SetBudget("edge-tenant", 1.00)
+	proxy.Quotas.RecordSpend("edge-tenant", 0.999)
+
+	// The old zero-cost probe passes here -- that is precisely the hole.
+	if allowed, rem, _ := proxy.Quotas.CheckSpend("edge-tenant", 0.0); !allowed {
+		t.Fatalf("precondition: zero-cost probe should pass while headroom remains (rem=%v)", rem)
+	}
+
+	if status := quotaGatePost(t, url, "edge-tenant", quotaGateBody); status != http.StatusTooManyRequests {
+		t.Fatalf("request that cannot fit was admitted with %d", status)
+	}
+	if got := atomic.LoadInt64(hits); got != 0 {
+		t.Fatalf("refused request still reached upstream %d time(s), want 0", got)
+	}
+
+	proxy.waitFinalize()
+	if spend, limit := proxy.Quotas.GetSpend("edge-tenant"); spend > limit {
+		t.Fatalf("daily cap was breached: spend=%v limit=%v", spend, limit)
+	}
+}
+
+// TestQuotaGateForwardsAffordableRequest guards against the opposite failure -- an
+// estimate so pessimistic it blocks traffic that easily fits.
+func TestQuotaGateForwardsAffordableRequest(t *testing.T) {
+	proxy, url, hits := quotaGateFixture(t)
+	proxy.Quotas.SetBudget("healthy-tenant", 50.00)
+	proxy.Quotas.RecordSpend("healthy-tenant", 1.00)
+
+	if status := quotaGatePost(t, url, "healthy-tenant", quotaGateBody); status != http.StatusOK {
+		t.Fatalf("affordable request blocked with %d", status)
+	}
+	if got := atomic.LoadInt64(hits); got != 1 {
+		t.Fatalf("upstream hits = %d, want 1", got)
+	}
+}
+
+// TestQuotaGateUnboundedTenantSkipsEstimate pins the fast path: with no budget the
+// gate must not decode the body for a projection or refuse anything.
+func TestQuotaGateUnboundedTenantSkipsEstimate(t *testing.T) {
+	_, url, hits := quotaGateFixture(t)
+
+	if status := quotaGatePost(t, url, "no-budget-tenant", quotaGateBody); status != http.StatusOK {
+		t.Fatalf("unbounded tenant refused with %d", status)
+	}
+	if got := atomic.LoadInt64(hits); got != 1 {
+		t.Fatalf("upstream hits = %d, want 1", got)
+	}
+}
+
+// TestEstimateRequestCostUSD covers the projection itself. Assertions are relative
+// rather than exact dollar figures: models.Global is a shared registry that other
+// tests can re-import, so pinning literal prices would make this flaky for the
+// wrong reason.
+func TestEstimateRequestCostUSD(t *testing.T) {
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + strings.Repeat("x", 3700) + `"}]}`
+
+	noCap := estimateRequestCostUSD("OpenAI", "gpt-4o", []byte(body), nil)
+	if noCap <= 0 {
+		t.Fatalf("prompt-only estimate = %v, want > 0", noCap)
+	}
+	capped := estimateRequestCostUSD("OpenAI", "gpt-4o", []byte(body), ptrFloat(4096))
+	if capped <= noCap {
+		t.Fatalf("declaring max_tokens must raise the projection: capped=%v noCap=%v", capped, noCap)
+	}
+	if bigger := estimateRequestCostUSD("OpenAI", "gpt-4o", []byte(body), ptrFloat(8192)); bigger < capped {
+		t.Fatalf("a larger declared cap must not lower the projection: %v < %v", bigger, capped)
+	}
+	if empty := estimateRequestCostUSD("OpenAI", "gpt-4o", nil, nil); empty != 0 {
+		t.Fatalf("empty body with no cap = %v, want 0", empty)
+	}
+	// An unpriced model still yields a finite positive fallback estimate.
+	if unknown := estimateRequestCostUSD("NoSuchProvider", "no-such-model-xyz", []byte(body), ptrFloat(100)); unknown <= 0 {
+		t.Fatalf("unknown model estimate = %v, want > 0", unknown)
+	}
+}
+
+// TestDeclaredOutputCap covers the two spellings of the output cap.
+func TestDeclaredOutputCap(t *testing.T) {
+	if got := declaredOutputCap(nil, nil); got != nil {
+		t.Fatalf("no declared cap = %v, want nil", *got)
+	}
+	big, small := 9000.0, 100.0
+	if got := declaredOutputCap(&big, &small); got == nil || *got != big {
+		t.Fatalf("max_tokens path returned %v, want %v", got, big)
+	}
+	if got := declaredOutputCap(&small, &big); got == nil || *got != big {
+		t.Fatalf("max_completion_tokens path returned %v, want %v", got, big)
+	}
+	neg := -5.0
+	if got := declaredOutputCap(&neg, nil); got == nil {
+		t.Fatal("a declared (even invalid) cap must still be reported, not silently dropped")
+	}
+}
+
+func ptrFloat(v float64) *float64 { return &v }
 
 func TestResponseCache_FullLifecycle(t *testing.T) {
 	c := NewResponseCache(2, 50*time.Millisecond)
