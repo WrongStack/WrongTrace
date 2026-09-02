@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -187,5 +188,90 @@ func TestUpdateSettings_PartialPostKeepsWebhooks(t *testing.T) {
 	}
 	if after.DebounceMs != 500 {
 		t.Errorf("debounce_ms = %d, want 500", after.DebounceMs)
+	}
+}
+
+// atlasPrefixFakeEngine serves one crafted AtlasSnapshot so the handler's
+// ?prefix= filter can be pinned without priming a real workspace.
+type atlasPrefixFakeEngine struct {
+	failingEngine
+	snap core.AtlasSnapshot
+}
+
+func (e *atlasPrefixFakeEngine) Atlas(...string) (core.AtlasSnapshot, error) {
+	return e.snap, nil
+}
+
+// TestAtlasHandler_PrefixFilterIsBoundaryCorrect pins the handler-level half
+// of the sibling-prefix rule: ?prefix=api must keep the api package and
+// everything under it (api/nested), and must drop the sibling api-v2 even
+// though "api-v2" starts with the string "api". The filter used a bare
+// strings.HasPrefix, so the sibling package and its files bled into every
+// prefix query — the same leak fixed inside core.Atlas with pathIsWithin
+// (TestAtlas_SiblingPrefixProjectIsolation).
+func TestAtlasHandler_PrefixFilterIsBoundaryCorrect(t *testing.T) {
+	snap := core.AtlasSnapshot{
+		Repo: "ws",
+		Packages: []core.AtlasPackage{
+			{Path: "api", Name: "api", Files: []core.AtlasFile{{Path: "api/a.go", Name: "a.go"}}},
+			{Path: "api-v2", Name: "apiv2", Files: []core.AtlasFile{{Path: "api-v2/b.go", Name: "b.go"}}},
+			{Path: "api/nested", Name: "nested", Files: []core.AtlasFile{{Path: "api/nested/c.go", Name: "c.go"}}},
+		},
+	}
+	h := &Handlers{Engine: &atlasPrefixFakeEngine{snap: snap}}
+
+	// prefix=api: api and api/nested stay, api-v2 is dropped whole.
+	rec := httptest.NewRecorder()
+	h.Atlas(rec, httptest.NewRequest(http.MethodGet, "/api/atlas?prefix=api", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prefix=api: status %d", rec.Code)
+	}
+	var got core.AtlasSnapshot
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.TotalPackages != 2 {
+		t.Fatalf("prefix=api: TotalPackages=%d, want 2 — the api-v2 sibling leaked", got.TotalPackages)
+	}
+	seen := map[string]int{}
+	for _, p := range got.Packages {
+		seen[p.Path]++
+		if p.Path == "api-v2" {
+			t.Errorf("prefix=api: leaked sibling package api-v2")
+		}
+		for _, f := range p.Files {
+			if filepath.Base(f.Path) == "b.go" {
+				t.Errorf("prefix=api: leaked sibling file %q", f.Path)
+			}
+		}
+	}
+	if seen["api"] != 1 || seen["api/nested"] != 1 {
+		t.Errorf("prefix=api: kept packages %v, want api and api/nested", seen)
+	}
+
+	// prefix=api-v2: only the v2 sibling, nothing from api.
+	rec = httptest.NewRecorder()
+	h.Atlas(rec, httptest.NewRequest(http.MethodGet, "/api/atlas?prefix=api-v2", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prefix=api-v2: status %d", rec.Code)
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode v2: %v", err)
+	}
+	if got.TotalPackages != 1 || len(got.Packages) != 1 || got.Packages[0].Path != "api-v2" {
+		t.Errorf("prefix=api-v2: got %v, want only api-v2", got.Packages)
+	}
+
+	// No prefix: nothing is filtered.
+	rec = httptest.NewRecorder()
+	h.Atlas(rec, httptest.NewRequest(http.MethodGet, "/api/atlas", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no prefix: status %d", rec.Code)
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode no-prefix: %v", err)
+	}
+	if got.TotalPackages != 3 {
+		t.Errorf("no prefix: TotalPackages=%d, want 3 (unfiltered)", got.TotalPackages)
 	}
 }

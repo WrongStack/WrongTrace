@@ -369,13 +369,14 @@ func (h *Handlers) Atlas(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if prefixFilter != "" {
-			normPrefix := strings.ToLower(filepath.ToSlash(prefixFilter))
+			// Trim a trailing slash so the boundary check below cannot become
+			// "prefix//" and silently match nothing.
+			normPrefix := strings.TrimSuffix(strings.ToLower(filepath.ToSlash(prefixFilter)), "/")
 			normPkg := strings.ToLower(filepath.ToSlash(pkg.Path))
-			if !strings.HasPrefix(normPkg, normPrefix) {
+			if !atlasPathWithin(normPkg, normPrefix) {
 				var matchingFiles []core.AtlasFile
 				for _, f := range pkg.Files {
-					normFile := strings.ToLower(filepath.ToSlash(f.Path))
-					if strings.HasPrefix(normFile, normPrefix) {
+					if atlasPathWithin(strings.ToLower(filepath.ToSlash(f.Path)), normPrefix) {
 						matchingFiles = append(matchingFiles, f)
 					}
 				}
@@ -422,6 +423,18 @@ func (h *Handlers) Atlas(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, atlas)
+}
+
+// atlasPathWithin reports whether candidate is prefix itself or lives under
+// it at a path-separator boundary: "api" and "api/nested/c.go" are within
+// "api", but the sibling "api-v2" is not. The filter previously used a bare
+// strings.HasPrefix, so a sibling directory sharing a string prefix satisfied
+// a ?prefix= query and bled into the filtered atlas — the same leak fixed
+// inside core.Atlas with pathIsWithin (TestAtlas_SiblingPrefixProjectIsolation):
+// a path prefix is a containment test only when the next character is a
+// separator.
+func atlasPathWithin(candidate, prefix string) bool {
+	return candidate == prefix || strings.HasPrefix(candidate, prefix+"/")
 }
 
 // AtlasStatus returns the percentage and live progress of codebase indexing.
