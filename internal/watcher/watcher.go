@@ -213,8 +213,15 @@ func debugFSNotifyHandler(ww *Watcher) http.Handler {
 		w.WriteHeader(200)
 		flusher.Flush()
 
-		// Stream buffered events first (oldest first).
+		// Stream buffered events first (oldest first), remembering the newest
+		// delivered sequence so the poll loop below never re-emits what the
+		// drain already sent. seenAny keeps an empty drain from pre-marking
+		// Seq 0 as delivered for a client that connected before any event.
+		var lastSeq uint64
+		seenAny := false
 		for _, ev := range ww.FSNotifyLog(4096) {
+			lastSeq = ev.Seq
+			seenAny = true
 			fmt.Fprintf(w, "data: {\"seq\":%d,\"path\":%q,\"op\":%q,\"time\":%q,\"sem_occupied\":%d}\n\n",
 				ev.Seq, ev.Path, ev.Op, ev.Time.Format(time.RFC3339Nano), ev.SemOccupied)
 			flusher.Flush()
@@ -223,17 +230,17 @@ func debugFSNotifyHandler(ww *Watcher) http.Handler {
 		// Poll for new events until the client disconnects.
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
-		var lastSeq uint64
 		for {
 			select {
 			case <-r.Context().Done():
 				return
 			case <-ticker.C:
 				for _, ev := range ww.FSNotifyLog(4096) {
-					if ev.Seq <= lastSeq {
+					if seenAny && ev.Seq <= lastSeq {
 						continue
 					}
 					lastSeq = ev.Seq
+					seenAny = true
 					fmt.Fprintf(w, "data: {\"seq\":%d,\"path\":%q,\"op\":%q,\"time\":%q,\"sem_occupied\":%d}\n\n",
 						ev.Seq, ev.Path, ev.Op, ev.Time.Format(time.RFC3339Nano), ev.SemOccupied)
 					flusher.Flush()
