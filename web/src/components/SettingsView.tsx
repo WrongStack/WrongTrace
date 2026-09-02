@@ -30,6 +30,7 @@ export function SettingsView() {
   const [newProjPath, setNewProjPath] = useState('');
   const [isAddingProj, setIsAddingProj] = useState(false);
   const [projActionMsg, setProjActionMsg] = useState<string | null>(null);
+  const [projError, setProjError] = useState<string | null>(null);
 
   // WrongStack Import state
   const [isImporting, setIsImporting] = useState(false);
@@ -142,18 +143,26 @@ export function SettingsView() {
     e.preventDefault();
     setIsAddingProj(true);
     try {
-      await fetch('/api/projects', {
+      const res = await fetch('/api/projects', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newProjName, path: newProjPath }),
       });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        // The API returns {"error": "..."} on 400 for nonexistent paths and
+        // for guardrail refusals (volume roots, WrongTrace's own state home).
+        setProjError(data?.error || `Failed to register project (${res.status})`);
+        return;
+      }
+      setProjError(null);
       setNewProjName('');
       setNewProjPath('');
       setProjActionMsg('Project registered and watching started!');
       refetchProjects();
       setTimeout(() => setProjActionMsg(null), 3000);
     } catch (err) {
-      console.error(err);
+      setProjError(err instanceof Error ? err.message : 'Failed to register project');
     } finally {
       setIsAddingProj(false);
     }
@@ -422,6 +431,13 @@ export function SettingsView() {
                 </button>
               </div>
             </form>
+
+            {projError && (
+              <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-start gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                <span className="break-all">{projError}</span>
+              </div>
+            )}
           </div>
 
           {/* Import from WrongStack Card */}
