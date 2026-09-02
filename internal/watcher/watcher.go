@@ -145,24 +145,33 @@ func (w *Watcher) captureEvent(ev fsnotify.Event) {
 }
 
 // FSNotifyLog returns up to n most-recent captured fsnotify events, oldest
-// first. Returns nil when Config.DebugFSEvents is false.
+// first. Only slots captureEvent has actually written are returned: before
+// the buffer fills, no unwritten (zero-value) entries leak out. Returns nil
+// when Config.DebugFSEvents is false or nothing has been captured.
 func (w *Watcher) FSNotifyLog(n int) []fsEvent {
 	w.evMu.Lock()
 	defer w.evMu.Unlock()
 	if w.evBuf == nil {
 		return nil
 	}
-	if n > len(w.evBuf) {
-		n = len(w.evBuf)
+	bufLen := len(w.evBuf)
+	filled := bufLen
+	if w.evCount < uint64(bufLen) {
+		filled = int(w.evCount)
 	}
+	if n > filled {
+		n = filled
+	}
+	if n <= 0 {
+		return nil
+	}
+	// evHead is the slot captureEvent will write NEXT, so the oldest event
+	// of the most-recent-n window sits n slots behind it. Walking forward
+	// from there yields strictly increasing Seqs across the wrap boundary.
+	start := (w.evHead - n + bufLen) % bufLen
 	out := make([]fsEvent, n)
-	head := w.evHead
 	for i := 0; i < n; i++ {
-		out[i] = w.evBuf[(head-i+len(w.evBuf))%len(w.evBuf)]
-	}
-	// reverse so oldest comes first
-	for i, j := 0, n-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
+		out[i] = w.evBuf[(start+i)%bufLen]
 	}
 	return out
 }
