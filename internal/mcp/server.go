@@ -100,24 +100,28 @@ func ServeStdio(sink EngineSink) error {
 const maxMCPLineBytes = 16 * 1024 * 1024 // 16 MB max line length to protect against unbounded RAM allocation
 
 func readMessage(r *bufio.Reader) ([]byte, error) {
-	var line []byte
 	for {
-		chunk, isPrefix, err := r.ReadLine()
-		if err != nil {
-			return nil, err
+		var line []byte
+		for {
+			chunk, isPrefix, err := r.ReadLine()
+			if err != nil {
+				return nil, err
+			}
+			if len(line)+len(chunk) > maxMCPLineBytes {
+				return nil, fmt.Errorf("mcp: message line exceeded maximum limit of %d bytes", maxMCPLineBytes)
+			}
+			line = append(line, chunk...)
+			if !isPrefix {
+				break
+			}
 		}
-		if len(line)+len(chunk) > maxMCPLineBytes {
-			return nil, fmt.Errorf("mcp: message line exceeded maximum limit of %d bytes", maxMCPLineBytes)
+		if len(line) > 0 {
+			return line, nil
 		}
-		line = append(line, chunk...)
-		if !isPrefix {
-			break
-		}
+		// A blank line is not end-of-stream: real EOF surfaces as an error
+		// from ReadLine above. Treating a blank separator line as EOF exited
+		// the whole MCP session mid-flight; skip it and keep serving.
 	}
-	if len(line) == 0 {
-		return nil, io.EOF
-	}
-	return line, nil
 }
 
 func writeMessage(w *bufio.Writer, v interface{}) error {
@@ -312,21 +316,44 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		reason, _ := args["reason"].(string)
 		owner, _ := args["owner"].(string)
 		ownerRunID, _ := args["owner_run_id"].(string)
+		// TTL sanity: time.Duration is int64 nanoseconds, so
+		// time.Duration(mins) * time.Minute silently wraps negative once
+		// mins exceeds ~153.7M (secs beyond ~9.2e9); the engine would then
+		// degrade the lock to its 15-minute default or an arbitrary expiry
+		// while this tool reports success. Client-supplied TTLs are capped
+		// at 24h; anything beyond is an invalid parameter.
+		const (
+			maxLockTTLMinutes = 24 * 60
+			maxLockTTLSeconds = 24 * 60 * 60
+		)
+		mins := toInt64(args["ttl_minutes"])
+		secs := toInt64(args["ttl_seconds"])
+		if mins > maxLockTTLMinutes || secs > maxLockTTLSeconds {
+			resp.Error = &rpcError{Code: -32602, Message: "ttl_minutes and ttl_seconds must be <= 1440 and 86400 respectively (24h maximum lock)"}
+			return resp
+		}
 		var ttl time.Duration = 15 * time.Minute
-		if mins := int(toInt64(args["ttl_minutes"])); mins > 0 {
+		if mins > 0 {
 			ttl = time.Duration(mins) * time.Minute
-		} else if secs := int(toInt64(args["ttl_seconds"])); secs > 0 {
+		} else if secs > 0 {
 			ttl = time.Duration(secs) * time.Second
 		}
 		if path == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
 			return resp
 		}
+		// Capability assertions must match the sink's real signatures:
+		// core.Engine's Lock methods RETURN core.LockInfo, and Go interface
+		// satisfaction requires exact result types. The previous result-less
+		// assertions matched no production sink, so lock_file silently took
+		// no lock while reporting success.
 		if locker, ok := sink.(interface {
-			LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration)
+			LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) core.LockInfo
 		}); ok {
 			locker.LockFileWithOptions(path, reason, owner, ownerRunID, ttl)
-		} else if locker, ok := sink.(interface{ LockFile(path, reason string) }); ok {
+		} else if locker, ok := sink.(interface {
+			LockFile(path, reason string) core.LockInfo
+		}); ok {
 			locker.LockFile(path, reason)
 		}
 		resp.Result = map[string]interface{}{

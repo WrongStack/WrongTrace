@@ -714,3 +714,28 @@ func TestMCP_ToolsAndErrorHandling(t *testing.T) {
 		t.Errorf("expected error -32601 for unknown method, got %+v", resp.Error)
 	}
 }
+
+// TestServeStdio_BlankLineDoesNotEndSession pins readMessage's blank-line
+// handling: a bare "\n" separator is not end-of-stream — the session must
+// keep serving subsequent requests and only exit at real EOF.
+func TestServeStdio_BlankLineDoesNotEndSession(t *testing.T) {
+	out := runStdioSession(t, &fakeSink{}, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`,
+		``,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+	})
+	if len(out) != 2 {
+		t.Fatalf("blank line ended the session: want 2 responses, got %d: %q", len(out), out)
+	}
+	for i, want := range []float64{1, 2} {
+		var resp struct {
+			ID interface{} `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(out[i]), &resp); err != nil {
+			t.Fatalf("parse response %d: %v", i, err)
+		}
+		if id, _ := resp.ID.(float64); id != want {
+			t.Fatalf("response %d id = %v, want %v", i, resp.ID, want)
+		}
+	}
+}
