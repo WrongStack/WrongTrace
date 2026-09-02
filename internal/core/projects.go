@@ -376,7 +376,29 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	}
 
 	id := "proj-" + newID()[:8]
-	slug := sanitizeSlug(name)
+	base := sanitizeSlug(name)
+
+	// Storage isolation: sanitizeSlug collapses case and spacing variants
+	// ("api" vs "API") and same-named checkouts to one slug, so plain
+	// derivation would point two distinct workspaces at the same
+	// wrongtrace.db and silently merge their telemetry. Disambiguate against
+	// a registry snapshot; two concurrent same-name adds can still race the
+	// same way ImportFromWrongStack's snapshot-once duplicate guard does
+	// (accepted and documented there).
+	e.lockMu.RLock()
+	taken := make(map[string]struct{}, len(e.projects))
+	for _, p := range e.projects {
+		taken[normalizeRoot(filepath.Dir(p.DBPath))] = struct{}{}
+	}
+	e.lockMu.RUnlock()
+
+	slug := base
+	for n := 2; ; n++ {
+		if _, clash := taken[normalizeRoot(GetProjectStorageDir(slug))]; !clash {
+			break
+		}
+		slug = fmt.Sprintf("%s-%d", base, n)
+	}
 
 	// Isolated storage in userhome ~/.wrongtrace/projects/<slug>/
 	storageDir := GetProjectStorageDir(slug)
