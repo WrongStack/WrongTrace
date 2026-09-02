@@ -603,3 +603,63 @@ func TestParseJSONLTranscript_DirectoryWordDoesNotAttributeAgent(t *testing.T) {
 		t.Fatalf("transcript under a \"classroom\" directory was attributed to %q", got)
 	}
 }
+
+// TestParseAiderHistory_SessionIDFollowsPath pins the round-18 fix: every
+// parser must derive SessionID from the transcript path. ParseAiderHistory
+// used to hardcode "aider-session", collapsing every workspace's aider
+// history onto one session id; cmd/wrongtrace's ingest sink maps
+// SessionID -> ReportRun RunID and db.UpsertRun's ON CONFLICT(run_id)
+// DO UPDATE clause then let the last-ingested workspace erase every other
+// workspace's agent_runs row (model, tokens, cost and intent included).
+func TestParseAiderHistory_SessionIDFollowsPath(t *testing.T) {
+	writeHistory := func(ws, model string) string {
+		dir := filepath.Join(t.TempDir(), ws)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		path := filepath.Join(dir, ".aider.chat.history.md")
+		body := "# Aider chat history\nModel: " + model + "\n\nApplied edit to src/main.go\n"
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write history: %v", err)
+		}
+		return path
+	}
+
+	alphaPath := writeHistory("ws-alpha", "claude-3-7-sonnet")
+	alpha, err := ParseAiderHistory(alphaPath)
+	if err != nil || len(alpha) != 1 {
+		t.Fatalf("parse ws-alpha: err=%v events=%d", err, len(alpha))
+	}
+	beta, err := ParseAiderHistory(writeHistory("ws-beta", "deepseek-v3"))
+	if err != nil || len(beta) != 1 {
+		t.Fatalf("parse ws-beta: err=%v events=%d", err, len(beta))
+	}
+
+	// Distinct workspaces must never share a run identity: the ingest sink
+	// upserts agent_runs keyed by this id, so a collision is silent data loss.
+	if alpha[0].SessionID == "" {
+		t.Fatal("session id must not be empty")
+	}
+	if alpha[0].SessionID == beta[0].SessionID {
+		t.Fatalf("distinct workspaces collapsed onto one session id %q", alpha[0].SessionID)
+	}
+
+	// Same convention as JSONL transcripts (sessionIDForPath): parent
+	// directory + "-" + base name without extension.
+	if alpha[0].SessionID != "ws-alpha-.aider.chat.history" {
+		t.Errorf("ws-alpha session id = %q, want ws-alpha-.aider.chat.history", alpha[0].SessionID)
+	}
+	if beta[0].SessionID != "ws-beta-.aider.chat.history" {
+		t.Errorf("ws-beta session id = %q, want ws-beta-.aider.chat.history", beta[0].SessionID)
+	}
+
+	// Stable across re-reads of the same file: the id keys dedup and the
+	// agent_runs row, so it must not drift between polls.
+	again, err := ParseAiderHistory(alphaPath)
+	if err != nil {
+		t.Fatalf("re-parse: %v", err)
+	}
+	if again[0].SessionID != alpha[0].SessionID {
+		t.Errorf("session id drifted between parses of the same file: %q vs %q", alpha[0].SessionID, again[0].SessionID)
+	}
+}

@@ -376,7 +376,12 @@ func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 	for _, fm := range fileMatches {
 		if len(fm) > 1 {
 			events = append(events, ToolCallEvent{
-				SessionID:  "aider-session",
+				// Derived from the path like every other parser: a constant
+				// here collapsed every workspace's aider history into one
+				// session id, which ReportRun upserts onto a single
+				// agent_runs row — the last ingested workspace erased all
+				// the others (see sessionIDForPath).
+				SessionID:  sessionIDForPath(filePath),
 				AgentName:  "Aider",
 				ModelName:  model,
 				ToolName:   "apply_diff",
