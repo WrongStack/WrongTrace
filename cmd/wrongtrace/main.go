@@ -868,11 +868,17 @@ This repository is monitored by **WrongTrace AI Observability**.
 	// 5. Install Git Hooks if repository exists
 	if err := runHook(cmd, []string{"install"}); err == nil {
 		fmt.Println("  ✓ Configured Git post-commit telemetry hook")
+	} else {
+		fmt.Printf("  - Git hook not configured: %v\n", err)
 	}
 
 	fmt.Println("\n✨ Setup complete! WrongTrace is now ready to observe and guide all coding agents.")
 	return nil
 }
+
+// wrongTraceHookMarker identifies hooks this tool owns: install refuses to
+// replace a foreign hook and uninstall refuses to remove one.
+const wrongTraceHookMarker = "WrongTrace"
 
 func runHook(cmd *cobra.Command, args []string) error {
 	action := strings.ToLower(args[0])
@@ -911,11 +917,20 @@ if command -v wrongtrace >/dev/null 2>&1; then
   wrongtrace status >/dev/null 2>&1 &
 fi
 `
+		// A user's post-commit hook (husky, custom scripts) is configuration
+		// we must never destroy: refuse unless the hook is already ours.
+		if existing, rErr := os.ReadFile(hookFile); rErr == nil && !strings.Contains(string(existing), wrongTraceHookMarker) {
+			return fmt.Errorf("refusing to overwrite %s (existing hook is not a WrongTrace hook); merge the telemetry ping manually or remove the hook first", hookFile)
+		}
 		if err := os.WriteFile(hookFile, []byte(hookScript), 0755); err != nil {
 			return fmt.Errorf("write git hook: %w", err)
 		}
 		fmt.Printf("✓ Installed WrongTrace post-commit hook at %s\n", hookFile)
 	case "uninstall":
+		// Same ownership rule in reverse: only remove a hook we installed.
+		if existing, rErr := os.ReadFile(hookFile); rErr == nil && !strings.Contains(string(existing), wrongTraceHookMarker) {
+			return fmt.Errorf("refusing to remove %s (existing hook is not a WrongTrace hook)", hookFile)
+		}
 		if err := os.Remove(hookFile); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove git hook: %w", err)
 		}
