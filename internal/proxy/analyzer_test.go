@@ -190,3 +190,40 @@ func TestAnalyzeWirePayloads_FallbackPromptTokenEstimation(t *testing.T) {
 		t.Errorf("assistant reply = %q", analysis.AssistantReply)
 	}
 }
+
+// TestExtractFileFromMap_DeterministicFallback pins the round-19 fix: the
+// fallback matches ANY key mentioning file/path, and Go randomizes map
+// iteration order, so picking the first hit made the identical payload
+// yield a different TargetFile on every parse (the round-19 proof measured
+// 2 distinct values across 400 parses). TargetFile feeds traffic records
+// and project attribution, so the pick must be deterministic: the
+// lexicographically smallest qualifying key wins, and the explicit
+// extractFileKeys list keeps priority over the fallback.
+func TestExtractFileFromMap_DeterministicFallback(t *testing.T) {
+	args := `{"source_file":"src/old/main.py","output_path":"src/new/main.py"}`
+	seen := map[string]int{}
+	for i := 0; i < 200; i++ {
+		got := extractFileFromArgsString(args)
+		if got == "" {
+			t.Fatalf("iteration %d: empty TargetFile", i)
+		}
+		seen[got]++
+	}
+	if len(seen) != 1 {
+		t.Fatalf("non-deterministic TargetFile across 200 parses: %v", seen)
+	}
+	if _, ok := seen["src/new/main.py"]; !ok {
+		t.Fatalf("TargetFile = %v, want only src/new/main.py (smallest qualifying key)", seen)
+	}
+
+	// The explicit extractFileKeys list keeps priority over the fallback: a
+	// listed key wins even when smaller unlisted file-ish keys also exist.
+	listed := extractFileFromMap(map[string]interface{}{
+		"output_path": "src/new/main.py",
+		"source_file": "src/old/main.py",
+		"target_file": "cmd/wrongtrace/main.go",
+	})
+	if listed != "cmd/wrongtrace/main.go" {
+		t.Errorf("explicit extractFileKeys lost priority: got %q", listed)
+	}
+}

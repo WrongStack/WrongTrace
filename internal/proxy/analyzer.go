@@ -613,15 +613,28 @@ func extractFileFromMap(m map[string]interface{}) string {
 			}
 		}
 	}
+	// The fallback matches ANY key that merely mentions file/path, so several
+	// keys can qualify at once. Go randomizes map iteration order per map
+	// instance, so returning the first hit made the identical payload yield a
+	// different TargetFile on every parse — and TargetFile drives downstream
+	// project attribution. Keep the lexicographically smallest qualifying key
+	// instead, so the result cannot depend on iteration order; the explicit
+	// extractFileKeys list above still takes priority.
+	var bestKey, bestVal string
 	for k, val := range m {
+		s, isStr := val.(string)
+		if !isStr || s == "" {
+			continue
+		}
 		lowerK := strings.ToLower(k)
-		if strings.Contains(lowerK, "file") || strings.Contains(lowerK, "path") {
-			if s, isStr := val.(string); isStr && s != "" {
-				return s
-			}
+		if !strings.Contains(lowerK, "file") && !strings.Contains(lowerK, "path") {
+			continue
+		}
+		if bestKey == "" || k < bestKey {
+			bestKey, bestVal = k, s
 		}
 	}
-	return ""
+	return bestVal
 }
 
 func runeSafeTruncate(s string, maxRunes int) string {
