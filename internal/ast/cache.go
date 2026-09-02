@@ -118,6 +118,11 @@ func (f *FileSnapshot) Source() string {
 	if f == nil {
 		return ""
 	}
+	// Source runs on diff goroutines that hold no engine lock, while evictTo
+	// may be shedding this snapshot's source under it — take the snapshot's
+	// own lock so packed/RawContent cannot be read mid-shed.
+	f.srcMu.RLock()
+	defer f.srcMu.RUnlock()
 	if f.RawContent != "" {
 		return f.RawContent
 	}
@@ -207,8 +212,12 @@ func (l *sourceLRU) evictTo(budget int64, snapshots map[string]*FileSnapshot) {
 			continue
 		}
 		l.bytes -= snap.retainedBytes()
+		// Source() reads packed/RawContent on diff goroutines that hold no
+		// engine lock, so shedding must take the snapshot's own lock.
+		snap.srcMu.Lock()
 		snap.packed = nil
 		snap.RawContent = ""
+		snap.srcMu.Unlock()
 	}
 	if l.bytes < 0 {
 		l.bytes = 0

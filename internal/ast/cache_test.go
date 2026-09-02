@@ -1,7 +1,9 @@
 package ast
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -138,5 +140,71 @@ func TestForgetReleasesBudget(t *testing.T) {
 	e.Forget("gone.go")
 	if got := e.CachedSourceBytes(); got != 0 {
 		t.Fatalf("Forget left %d bytes charged to the budget", got)
+	}
+}
+
+// TestSourceConcurrentWithEviction pins the round-20 fix: Source() reads
+// packed/RawContent on diff goroutines that hold no engine lock, while
+// evictTo sheds the coldest source under the engine write lock from a
+// concurrent SetSnapshot. Before the fix that write/read pair raced
+// unsynchronized on the string and slice headers (visible only under
+// -race); the shed now takes the snapshot's own srcMu.
+func TestSourceConcurrentWithEviction(t *testing.T) {
+	body := strings.Repeat("y := parse(alpha, beta)\n", 400)
+	paths := make([]string, 0, 24)
+	for i := 0; i < 24; i++ {
+		paths = append(paths, fmt.Sprintf("churn_%02d.go", i))
+	}
+
+	// Calibrate the budget to roughly two retained entries so the churn
+	// provably sheds the victim's source while readers are inside Source().
+	probe := snapshotWithSource(paths[0], paths[0]+"\n"+body)
+	probe.pack()
+	restore := sourceBudgetBytes
+	sourceBudgetBytes = probe.retainedBytes()*2 + 8
+	defer func() { sourceBudgetBytes = restore }()
+
+	e, err := NewEngine()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	victim := snapshotWithSource(paths[0], paths[0]+"\n"+body)
+	e.SetSnapshot(victim)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				s, ok := e.Snapshot(paths[0])
+				if ok && s != nil {
+					_ = s.Source()
+				}
+			}
+		}()
+	}
+	for _, p := range paths[1:] {
+		e.SetSnapshot(snapshotWithSource(p, p+"\n"+body))
+	}
+	close(stop)
+	wg.Wait()
+
+	// The churn must actually have shed the victim's source, or this test
+	// exercised no eviction at all.
+	shed, ok := e.Snapshot(paths[0])
+	if !ok {
+		t.Fatal("source eviction must not drop the snapshot itself")
+	}
+	if got := shed.Source(); got != "" {
+		t.Fatalf("churn did not shed the victim's source (%d bytes kept); the race window was not exercised", len(got))
 	}
 }

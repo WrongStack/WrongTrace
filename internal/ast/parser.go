@@ -58,6 +58,11 @@ type FileSnapshot struct {
 	packed     []byte   // DEFLATE-compressed RawContent once cached
 	rawLen     int      // uncompressed length, for decode buffer sizing
 	sortedSigs []string // cached pre-sorted signatures
+
+	// srcMu guards packed/RawContent: Source() reads them on diff goroutines
+	// that hold no engine lock, while the LRU sheds them under the engine
+	// write lock. Always acquired after the engine lock, never before.
+	srcMu sync.RWMutex
 }
 
 // Engine owns the Tree-sitter parser pool and the snapshot cache. All
