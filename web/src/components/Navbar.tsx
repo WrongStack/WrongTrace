@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Activity, Cpu, Plug, Radio, LayoutDashboard, Boxes, Code2, Bot, Network, Settings, FolderGit2 } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useProjects } from '../hooks/useMetrics';
@@ -26,10 +27,19 @@ export function Navbar({
 }: NavbarProps) {
   const queryClient = useQueryClient();
   const { data: projects = [], refetch: refetchProjects } = useProjects();
+  const [switchError, setSwitchError] = useState<string | null>(null);
 
   const handleSwitchProject = async (projectId: string) => {
     try {
-      await fetch(`/api/projects/${projectId}/activate`, { method: 'POST' });
+      const res = await fetch(`/api/projects/${projectId}/activate`, { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        // A failed activation must not update the local selection — the
+        // server kept the previous project active.
+        setSwitchError(data?.error || `Failed to switch project (${res.status})`);
+        return;
+      }
+      setSwitchError(null);
       await refetchProjects();
       await queryClient.invalidateQueries();
       const switched = projects.find((p: Project) => p.id === projectId) || null;
@@ -37,7 +47,7 @@ export function Navbar({
         onProjectChange(switched);
       }
     } catch (err) {
-      console.error('Failed to switch project:', err);
+      setSwitchError(err instanceof Error ? err.message : 'Failed to switch project');
     }
   };
 
@@ -77,6 +87,14 @@ export function Navbar({
               <Cpu className="h-3 w-3 text-cyan-400" />
               <span>{repo}</span>
             </div>
+          )}
+          {switchError && (
+            <span
+              className="text-[10px] text-rose-400 bg-rose-500/10 border border-rose-500/20 rounded px-1.5 py-0.5 max-w-[220px] truncate"
+              title={switchError}
+            >
+              {switchError}
+            </span>
           )}
         </div>
 

@@ -31,6 +31,7 @@ export function SettingsView() {
   const [isAddingProj, setIsAddingProj] = useState(false);
   const [projActionMsg, setProjActionMsg] = useState<string | null>(null);
   const [projError, setProjError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
 
   // WrongStack Import state
   const [isImporting, setIsImporting] = useState(false);
@@ -56,10 +57,15 @@ export function SettingsView() {
   const handleRescanProject = async (id: string) => {
     setRescanningId(id);
     try {
-      await fetch(`/api/projects/${id}/rescan`, { method: 'POST' });
+      const res = await fetch(`/api/projects/${id}/rescan`, { method: 'POST' });
+      if (!res.ok) {
+        setProjError(`Rescan failed (${res.status})`);
+        return;
+      }
+      setProjError(null);
       refetchProjects();
     } catch (err) {
-      console.error('Failed to rescan project', err);
+      setProjError(err instanceof Error ? err.message : 'Rescan failed');
     } finally {
       setRescanningId(null);
     }
@@ -68,10 +74,15 @@ export function SettingsView() {
   const handleRescanAllProjects = async () => {
     setIsRescanningAll(true);
     try {
-      await fetch('/api/projects/rescan', { method: 'POST' });
+      const res = await fetch('/api/projects/rescan', { method: 'POST' });
+      if (!res.ok) {
+        setProjError(`Rescan failed (${res.status})`);
+        return;
+      }
+      setProjError(null);
       refetchProjects();
     } catch (err) {
-      console.error('Failed to rescan all projects', err);
+      setProjError(err instanceof Error ? err.message : 'Rescan failed');
     } finally {
       setIsRescanningAll(false);
     }
@@ -123,17 +134,22 @@ export function SettingsView() {
         ignore_patterns: ignorePatterns,
       };
 
-      await fetch('/api/settings', {
+      const res = await fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        setSettingsError(data?.error || `Failed to save settings (${res.status})`);
+        return;
+      }
+      setSettingsError(null);
       setSavedSuccess(true);
       refetchSettings();
       setTimeout(() => setSavedSuccess(false), 3000);
     } catch (err) {
-      console.error(err);
+      setSettingsError(err instanceof Error ? err.message : 'Failed to save settings');
     } finally {
       setIsSaving(false);
     }
@@ -170,11 +186,17 @@ export function SettingsView() {
 
   const handleActivateProject = async (id: string) => {
     try {
-      await fetch(`/api/projects/${id}/activate`, { method: 'POST' });
+      const res = await fetch(`/api/projects/${id}/activate`, { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        // A failed activation must not reload the page as if it succeeded.
+        setProjError(data?.error || `Failed to activate project (${res.status})`);
+        return;
+      }
       refetchProjects();
       window.location.reload();
     } catch (err) {
-      console.error(err);
+      setProjError(err instanceof Error ? err.message : 'Failed to activate project');
     }
   };
 
@@ -244,17 +266,23 @@ export function SettingsView() {
 
   const handleRemoveProject = async (id: string) => {
     try {
-      await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+      const res = await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        setProjError(data?.error || `Failed to remove project (${res.status})`);
+        return;
+      }
+      setProjError(null);
       refetchProjects();
     } catch (err) {
-      console.error(err);
+      setProjError(err instanceof Error ? err.message : 'Failed to remove project');
     }
   };
 
   const handleUpdateProjectFields = async (p: Project) => {
     const edit = editingProject[p.id] || {};
     try {
-      await fetch(`/api/projects/${p.id}`, {
+      const res = await fetch(`/api/projects/${p.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -267,22 +295,32 @@ export function SettingsView() {
           custom_logs_path: edit.custom_logs_path ?? p.custom_logs_path,
         }),
       });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        // UpdateProject returns 404 for unknown ids and 409 on id mismatch.
+        setProjError(data?.error || `Failed to save ${p.name} (${res.status})`);
+        return;
+      }
+      setProjError(null);
       setProjActionMsg(`Saved & rescanned ${p.name}!`);
       refetchProjects();
       setTimeout(() => setProjActionMsg(null), 3000);
     } catch (err) {
-      console.error(err);
+      setProjError(err instanceof Error ? err.message : 'Failed to save project');
     }
   };
 
   const handleVacuum = async () => {
     setIsVacuuming(true);
     try {
-      await fetch('/api/settings/vacuum', { method: 'POST' });
+      const res = await fetch('/api/settings/vacuum', { method: 'POST' });
+      if (!res.ok) {
+        throw new Error(`Vacuum failed with status: ${res.status}`);
+      }
       setVacuumMsg('Database optimized and pages reclaimed!');
       setTimeout(() => setVacuumMsg(null), 4000);
     } catch (err) {
-      setVacuumMsg('Vacuum failed');
+      setVacuumMsg(err instanceof Error ? err.message : 'Vacuum failed');
     } finally {
       setIsVacuuming(false);
     }
@@ -375,6 +413,13 @@ export function SettingsView() {
           </button>
         </div>
       </div>
+
+      {settingsError && (
+        <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center gap-2 animate-in fade-in">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          <span className="break-all">{settingsError}</span>
+        </div>
+      )}
 
       {projActionMsg && (
         <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs flex items-center gap-2 animate-in fade-in">

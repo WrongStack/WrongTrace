@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { FolderTree, Database, Code2, Bot, Save, RefreshCw, X, Check, ShieldCheck, Sparkles } from 'lucide-react';
+import { FolderTree, Database, Code2, Bot, Save, RefreshCw, X, Check, ShieldCheck, Sparkles, AlertTriangle } from 'lucide-react';
 import type { Project } from '../types';
 
 interface ProjectIdentityModalProps {
@@ -25,8 +25,10 @@ export function ProjectIdentityModal({
 
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
+    setSaveError(null);
     setName(project.name);
     setDescription(project.description || '');
     setClaudePath(project.claude_logs_path || '');
@@ -41,8 +43,9 @@ export function ProjectIdentityModal({
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSaving(true);
+    setSaveError(null);
     try {
-      await fetch(`/api/projects/${project.id}`, {
+      const res = await fetch(`/api/projects/${project.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -55,11 +58,18 @@ export function ProjectIdentityModal({
           custom_logs_path: customPath,
         }),
       });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        // UpdateProject returns 404 for unknown ids and 409 on id mismatch;
+        // without this branch the modal flashed "Saved!" on a failed save.
+        setSaveError(data?.error || `Failed to save project (${res.status})`);
+        return;
+      }
       setSaveSuccess(true);
       onUpdated();
       setTimeout(() => setSaveSuccess(false), 2500);
     } catch (err) {
-      console.error(err);
+      setSaveError(err instanceof Error ? err.message : 'Failed to save project');
     } finally {
       setIsSaving(false);
     }
@@ -246,7 +256,12 @@ export function ProjectIdentityModal({
           </div>
 
           <div className="flex items-center justify-between pt-3 border-t border-white/10">
-            {saveSuccess ? (
+            {saveError ? (
+              <span className="text-rose-400 text-xs flex items-center gap-1 min-w-0" title={saveError}>
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate max-w-[300px]">{saveError}</span>
+              </span>
+            ) : saveSuccess ? (
               <span className="text-emerald-400 text-xs flex items-center gap-1">
                 <Check className="h-3.5 w-3.5" /> Saved project settings!
               </span>

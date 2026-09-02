@@ -105,6 +105,7 @@ export function AgentSessionsView({
   const [customCtx, setCustomCtx] = useState('128000');
   const [isSavingModel, setIsSavingModel] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const filteredRuns = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -321,18 +322,23 @@ export function AgentSessionsView({
           description: 'Custom registered AI model',
         }),
       });
-      if (res.ok) {
-        setSaveSuccess(true);
-        catalogQuery.refetch();
-        setTimeout(() => {
-          setSaveSuccess(false);
-          setShowAddModal(false);
-          setCustomId('');
-          setCustomName('');
-        }, 1200);
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        // The API answers {"error": "..."} for duplicate ids and invalid
+        // bodies; without this branch the modal silently stayed open.
+        setSaveError(data?.error || `Failed to save model (${res.status})`);
+        return;
       }
+      setSaveSuccess(true);
+      catalogQuery.refetch();
+      setTimeout(() => {
+        setSaveSuccess(false);
+        setShowAddModal(false);
+        setCustomId('');
+        setCustomName('');
+      }, 1200);
     } catch (err) {
-      console.error('Failed to save custom model', err);
+      setSaveError(err instanceof Error ? err.message : 'Failed to save model');
     } finally {
       setIsSavingModel(false);
     }
@@ -1212,6 +1218,13 @@ export function AgentSessionsView({
                   />
                 </div>
               </div>
+
+              {saveError && (
+                <div className="p-2 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-start gap-2">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                  <span className="break-all">{saveError}</span>
+                </div>
+              )}
 
               <div className="flex items-center justify-end gap-2 pt-2 border-t border-white/10">
                 <button
