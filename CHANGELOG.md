@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed & Hardened
+- **`/debug/fsnotify` Capture Buffer Integrity (`--debug-fs`)**:
+  - `Watcher.FSNotifyLog` clamped its read window to the 4096-slot buffer capacity instead of the captured-event count and walked backward from the next-write ring head: before the buffer filled it returned unwritten zero-value entries (`seq=0`, empty path, zero timestamp), and once the buffer wrapped the oldest event was delivered last. The window now starts `n` slots behind the head and is clamped to the fill count, so the SSE drain streams exactly the captured events, oldest first, across the wrap boundary.
+  - The SSE handler never seeded its dedup high-water mark from the initial drain, so the first 200 ms poll replayed the entire buffer a client had just received; and because the mark defaulted to 0, a client connecting on an empty buffer never received the first captured event (`seq 0`) at all. The handler now seeds `lastSeq` and a `seenAny` flag from the drain itself, keeping an empty drain from pre-marking `seq 0` as delivered.
+  - Both defects are covered by deterministic regression tests: ring-window contract tests inject captured events directly (no kernel delivery), and an httptest-driven SSE test asserts every event is delivered exactly once across drain and poll.
+
+---
+
 ## [0.3.10] - 2026-08-29
 
 ### Added
