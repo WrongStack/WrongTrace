@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"sort"
+	"unicode/utf8"
 
 	"github.com/wrongstack/wrongtrace/internal/ipc"
 )
@@ -32,7 +33,7 @@ func compactIPCTraffic(rec ipc.IPCTrafficRecord) ipc.IPCTrafficRecord {
 	}
 	if rec.Error != nil && len(rec.Error.Message) > maxIPCSummaryString {
 		copyErr := *rec.Error
-		copyErr.Message = copyErr.Message[:maxIPCSummaryString] + "…[truncated]"
+		copyErr.Message = truncateUTF8(copyErr.Message, maxIPCSummaryString) + "…[truncated]"
 		rec.Error = &copyErr
 	}
 	return rec
@@ -92,12 +93,31 @@ func compactIPCScalar(value interface{}) (interface{}, bool) {
 		return v, true
 	case string:
 		if len(v) > maxIPCSummaryString {
-			return v[:maxIPCSummaryString] + "…[truncated]", true
+			return truncateUTF8(v, maxIPCSummaryString) + "…[truncated]", true
 		}
 		return v, true
 	default:
 		return nil, false
 	}
+}
+
+// truncateUTF8 cuts s to at most max bytes without splitting a multi-byte
+// rune: if the cut would land inside a rune, it backs up to that rune's
+// leading byte so the retained prefix stays valid UTF-8. max <= 0 yields "".
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 0 {
+		return ""
+	}
+	cut := s[:max]
+	// If the byte just past the cut continues a rune, the cut split one;
+	// drop the partial sequence down to its leading byte.
+	for len(cut) > 0 && !utf8.RuneStart(s[len(cut)]) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }
 
 func ipcTrafficSummary(rec ipc.IPCTrafficRecord) ipc.IPCTrafficRecord {
