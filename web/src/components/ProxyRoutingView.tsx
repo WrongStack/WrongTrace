@@ -439,14 +439,19 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
 
   // Helper to generate replayable curl command
   const generateCurlCommand = (t: ProxyTrafficRecord) => {
+    // POSIX single-quote every captured value (the convention the body path
+    // already used): inside single quotes the shell treats every byte
+    // literally, so a `"` or $(...) in captured headers can neither corrupt
+    // the command nor execute when the copied line is pasted. Double quotes
+    // allowed both.
+    const sh = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3444';
-    const url = `${origin}${t.incoming_path || '/proxy/custom'}`;
+    const url = sh(`${origin}${t.incoming_path || '/proxy/custom'}`);
     const headerLines = Object.entries(t.request_headers || {})
       .filter(([k]) => !['host', 'content-length', 'connection'].includes(k.toLowerCase()))
-      .map(([k, v]) => `-H "${k}: ${v}"`)
+      .map(([k, v]) => `-H ${sh(`${k}: ${v}`)}`)
       .join(' \\\n  ');
-    const escapedBody = (t.request_body || '').replace(/'/g, `'\\''`);
-    return `curl -X ${t.method || 'POST'} "${url}" \\\n  ${headerLines ? headerLines + ' \\\n  ' : ''}-d '${escapedBody}'`;
+    return `curl -X ${sh(t.method || 'POST')} ${url} \\\n  ${headerLines ? headerLines + ' \\\n  ' : ''}-d ${sh(t.request_body || '')}`;
   };
 
   // Export full wire traffic log as JSON
