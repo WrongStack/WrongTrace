@@ -9,6 +9,7 @@ import {
   Cpu,
   Zap,
   ArrowRight,
+  AlertTriangle,
   ShieldCheck,
   Activity,
   Terminal,
@@ -84,6 +85,8 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
   const [formProtocol, setFormProtocol] = useState<'openai' | 'openai-compatible' | 'anthropic' | 'gemini' | 'custom'>('openai-compatible');
   const [formModel, setFormModel] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const discoveredProviders = useMemo(() => {
     const provs = new Map<string, { name: string; api?: string; npm?: string; models: string[] }>();
@@ -351,29 +354,46 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
   };
 
   const handleClearTraffic = async () => {
+    setActionError(null);
     try {
-      await fetch('/api/proxy/traffic', { method: 'DELETE' });
+      const res = await fetch('/api/proxy/traffic', { method: 'DELETE' });
+      if (!res.ok) {
+        // A rejected clear must leave the selection alone and say so: running
+        // the success path on failure made the button look broken with zero
+        // feedback (e.g. 401 after a daemon restart invalidates the
+        // per-process session cookie).
+        const data = await res.json().catch(() => null);
+        setActionError(data?.error || `Failed to clear traffic log (${res.status})`);
+        return;
+      }
       setSelectedTraffic(null);
       refetchTraffic();
     } catch (err) {
-      console.error(err);
+      setActionError(err instanceof Error ? err.message : 'Failed to clear traffic log');
     }
   };
 
   const handleDelete = async (id: string) => {
+    setActionError(null);
     try {
-      await fetch(`/api/proxy/routes/${id}`, { method: 'DELETE' });
+      const res = await fetch(`/api/proxy/routes/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        setActionError(data?.error || `Failed to delete route (${res.status})`);
+        return;
+      }
       refetchRoutes();
-    } catch (e) {
-      console.error(e);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to delete route');
     }
   };
 
   const handleSaveRoute = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
+    setRouteError(null);
     try {
-      await fetch('/api/proxy/routes', {
+      const res = await fetch('/api/proxy/routes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -385,6 +405,15 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
           enabled: true,
         }),
       });
+      if (!res.ok) {
+        // A rejected save must keep the modal open with the server's error:
+        // closing it here made a failed route creation look successful while
+        // the route silently never appeared — e.g. 401 after a daemon restart
+        // invalidates the per-process session cookie.
+        const data = await res.json().catch(() => null);
+        setRouteError(data?.error || `Failed to save route (${res.status})`);
+        return;
+      }
       setIsModalOpen(false);
       setFormName('');
       setFormPath('');
@@ -392,7 +421,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
       setFormModel('');
       refetchRoutes();
     } catch (err) {
-      console.error(err);
+      setRouteError(err instanceof Error ? err.message : 'Failed to save route');
     } finally {
       setIsSubmitting(false);
     }
@@ -549,6 +578,15 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
           )}
         </div>
       </div>
+
+      {actionError && (
+        <div className="panel text-xs text-rose-400 flex items-center gap-2 border-rose-500/30 bg-rose-950/20 px-3 py-2">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate" title={actionError}>
+            {actionError}
+          </span>
+        </div>
+      )}
 
       {activeSubTab === 'routes' && (
         <>
@@ -2085,6 +2123,13 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
                   ))}
                 </datalist>
               </div>
+
+              {routeError && (
+                <div className="text-rose-400 text-xs flex items-center gap-1.5 min-w-0" title={routeError}>
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate">{routeError}</span>
+                </div>
+              )}
 
               <div className="flex justify-end gap-2 pt-3 border-t border-white/10">
                 <button
