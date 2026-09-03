@@ -99,6 +99,14 @@ func ServeStdio(sink EngineSink) error {
 
 const maxMCPLineBytes = 16 * 1024 * 1024 // 16 MB max line length to protect against unbounded RAM allocation
 
+// maxMCPHistoryLimit caps the client-supplied limit on get_file_diff_history,
+// mirroring the HTTP surface's maxRecentEventsLimit (internal/server/handlers.go):
+// the store only defaults limit <= 0 to 50, so an unbounded positive value
+// would reach `LIMIT ?` verbatim and materialize the entire code_node_events
+// table into one stdio response. The cap lives here (not in db) because this
+// is the only entrypoint left without a bound.
+const maxMCPHistoryLimit = 1000
+
 func readMessage(r *bufio.Reader) ([]byte, error) {
 	for {
 		var line []byte
@@ -451,6 +459,9 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		limit := 20
 		if l := int(toInt64(args["limit"])); l > 0 {
 			limit = l
+		}
+		if limit > maxMCPHistoryLimit {
+			limit = maxMCPHistoryLimit
 		}
 		var events []db.EventRecord
 		var err error
