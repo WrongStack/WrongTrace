@@ -110,7 +110,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
       if (projectScope === 'current' && currentProject) {
         const matchesProj =
           (t.project_id && t.project_id === currentProject.id) ||
-          (t.project_slug && (t.project_slug.toLowerCase() === currentProject.name.toLowerCase() || currentProject.name.toLowerCase().includes(t.project_slug.toLowerCase()))) ||
+          (t.project_slug && t.project_slug.toLowerCase() === currentProject.name.toLowerCase()) ||
           (!t.project_id && !t.project_slug);
         if (!matchesProj) return false;
       }
