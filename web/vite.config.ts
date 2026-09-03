@@ -3,11 +3,11 @@ import react from '@vitejs/plugin-react';
 
 // Daemon port the dev server proxies to; dev.sh / dev.ps1 export this so a
 // custom -Port keeps the dev proxy coherent.
-const daemonPort = process.env.WRONGTRACE_DAEMON_PORT ?? process.env.WRONGTRACE_PORT ?? '3445';
+const daemonPort = process.env.WRONGTRACE_DAEMON_PORT ?? process.env.WRONGTRACE_PORT ?? '3444';
 const vitePort = process.env.VITE_PORT ? parseInt(process.env.VITE_PORT, 10) : 3444;
 
 // WrongTrace's Go daemon embeds web/dist at build time, so the dev server
-// proxies API + WS calls to the local daemon (default :3445 in dev, :3444 in standalone).
+// proxies API + WS calls to the local daemon (no env: the daemon's own default, :3444).
 export default defineConfig({
   plugins: [react()],
   server: {
