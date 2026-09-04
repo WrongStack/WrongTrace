@@ -58,6 +58,12 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
 // endpoint agents should connect to (empty when IPC is disabled).
 func (h *Handlers) Health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
+		// "service" identifies the daemon unambiguously. Single-instance
+		// startup probes the configured port and used to treat ANY 200 as
+		// "WrongTrace is already running" -- {"ok":true,"status":"ok"} is a
+		// generic health shape, so an unrelated dev server on the same port
+		// blocked startup with a wrong diagnosis. Do not rename this value.
+		"service":     "wrongtrace",
 		"ok":          true,
 		"status":      "ok",
 		"repo":        h.Engine.Repo(),
@@ -330,6 +336,9 @@ func (h *Handlers) ModelFriction(w http.ResponseWriter, r *http.Request) {
 		if val, err := strconv.Atoi(l); err == nil && val > 0 {
 			limit = val
 		}
+	}
+	if limit > maxRecentEventsLimit {
+		limit = maxRecentEventsLimit
 	}
 	report, err := h.Engine.GetModelFrictionReport(limit)
 	if err != nil {
@@ -1085,6 +1094,9 @@ func (h *Handlers) GetProfilerTraces(w http.ResponseWriter, r *http.Request) {
 			limit = val
 		}
 	}
+	if limit > maxRecentEventsLimit {
+		limit = maxRecentEventsLimit
+	}
 	traces, err := h.Profiler.Recent(limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1104,6 +1116,9 @@ func (h *Handlers) GetProfilerHotspots(w http.ResponseWriter, r *http.Request) {
 		if val, err := strconv.Atoi(l); err == nil && val > 0 {
 			limit = val
 		}
+	}
+	if limit > maxRecentEventsLimit {
+		limit = maxRecentEventsLimit
 	}
 	hotspots, err := h.Profiler.Hotspots(limit)
 	if err != nil {

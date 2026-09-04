@@ -1,8 +1,10 @@
 package lock
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +15,11 @@ import (
 
 // ErrAlreadyRunning indicates that an active WrongTrace daemon instance already exists.
 var ErrAlreadyRunning = errors.New("wrongtrace daemon is already running")
+
+// healthServiceMarker is the "service" value GET /api/health reports. It is
+// what distinguishes our daemon from any other process that happens to answer
+// 200 on the same port; keep it in sync with the server's Health handler.
+const healthServiceMarker = "wrongtrace"
 
 // InstanceLock represents an exclusively held single-instance lock.
 type InstanceLock struct {
@@ -109,16 +116,43 @@ func isDaemonAlive(pid int, port int) bool {
 	return isProcessAlive(pid)
 }
 
-// isPortActive checks if the WrongTrace health API is already answering.
+// isPortActive reports whether a WrongTrace daemon -- specifically, not merely
+// something -- is already answering on the port.
+//
+// A bare 200 is not enough evidence. {"ok":true,"status":"ok"} is the most
+// generic health shape there is, and an SPA dev server answering every path
+// with index.html returns 200 too. Trusting the status code alone made an
+// unrelated process holding the port abort startup with the wrong diagnosis
+// ("wrongtrace daemon is already running"), which sends the operator hunting
+// for a daemon that does not exist instead of for the port conflict that does.
+// So the body must carry our own service marker.
+//
+// A false negative here is safe: it only loses the friendly message. The
+// authoritative single-instance gate is the OS lock on daemon.lock, which a
+// real second daemon cannot pass regardless of what this probe concludes.
 func isPortActive(port int) bool {
 	if port <= 0 {
 		return false
 	}
 	client := http.Client{Timeout: 300 * time.Millisecond}
 	resp, err := client.Get(fmt.Sprintf("http://localhost:%d/api/health", port))
-	if err == nil && resp != nil {
-		defer resp.Body.Close()
-		return resp.StatusCode == http.StatusOK
+	if err != nil || resp == nil {
+		return false
 	}
-	return false
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	// Bounded read: a foreign server on this port may stream indefinitely.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	if err != nil {
+		return false
+	}
+	var payload struct {
+		Service string `json:"service"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return payload.Service == healthServiceMarker
 }

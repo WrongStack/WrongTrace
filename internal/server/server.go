@@ -353,7 +353,11 @@ func (s *Server) currentHS() *http.Server {
 func (s *Server) buildRouter() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	// middleware.RealIP is deliberately NOT used. It rewrites r.RemoteAddr from
+	// client-supplied X-Forwarded-For / X-Real-IP / True-Client-IP headers
+	// (GHSA-3fxj-6jh8-hvhx), and nothing terminates in front of this daemon to
+	// sanitize them. Keeping it would let any caller forge the client IP that
+	// requestLogger logs and that the gateway proxy records into telemetry.
 	r.Use(requestLogger)
 	r.Use(middleware.Recoverer)
 	// Loopback CORS only. The dashboard is served same-origin and the vite

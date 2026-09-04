@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -56,33 +57,66 @@ func TestStalePIDReclaimed(t *testing.T) {
 	}
 }
 
-func TestPortActiveCollision(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Start a mock server serving /api/health with 200 OK
+// healthStub serves GET /api/health with the given body and returns its port.
+func healthStub(t *testing.T, body string) int {
+	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/health" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		if r.URL.Path != "/api/health" {
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
 	}))
-	defer ts.Close()
+	t.Cleanup(ts.Close)
 
-	// Extract port from ts.URL
-	var port int
-	for i := len(ts.URL) - 1; i >= 0; i-- {
-		if ts.URL[i] == ':' {
-			p, _ := strconv.Atoi(ts.URL[i+1:])
-			port = p
-			break
-		}
+	idx := strings.LastIndex(ts.URL, ":")
+	if idx < 0 {
+		t.Fatalf("no port in stub URL %q", ts.URL)
 	}
+	port, err := strconv.Atoi(ts.URL[idx+1:])
+	if err != nil || port <= 0 {
+		t.Fatalf("parse port from %q: %v", ts.URL, err)
+	}
+	return port
+}
 
-	if port > 0 {
-		_, err := Acquire(tempDir, port)
-		if !errors.Is(err, ErrAlreadyRunning) {
-			t.Errorf("expected ErrAlreadyRunning, got %v", err)
+// TestPortActiveCollision: a live daemon on the port must abort startup with
+// the friendly ErrAlreadyRunning rather than a raw bind failure.
+func TestPortActiveCollision(t *testing.T) {
+	port := healthStub(t, `{"service":"wrongtrace","ok":true,"status":"ok"}`)
+
+	_, err := Acquire(t.TempDir(), port)
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Errorf("expected ErrAlreadyRunning, got %v", err)
+	}
+}
+
+// TestPortActive_IgnoresForeignHealthEndpoint guards the misdiagnosis: the
+// probe used to accept ANY 200 on /api/health as proof of a running daemon.
+// {"status":"ok"} is the most generic health shape there is (and an SPA dev
+// server answers 200 on every path), so an unrelated process holding the port
+// aborted startup with "wrongtrace daemon is already running" and sent the
+// operator hunting for a daemon that did not exist. Without our own service
+// marker in the body, the probe must not claim the port is ours.
+func TestPortActive_IgnoresForeignHealthEndpoint(t *testing.T) {
+	for _, body := range []string{
+		`{"status":"ok"}`,              // generic health JSON
+		`{"service":"grafana"}`,        // someone else's marker
+		`<!doctype html><html></html>`, // SPA dev server catch-all
+		``,                             // empty 200
+	} {
+		port := healthStub(t, body)
+		if isPortActive(port) {
+			t.Errorf("isPortActive claimed a foreign endpoint serving %q is a WrongTrace daemon", body)
 		}
+		l, err := Acquire(t.TempDir(), port)
+		if errors.Is(err, ErrAlreadyRunning) {
+			t.Errorf("Acquire refused to start over a foreign endpoint serving %q", body)
+		}
+		// Release before the temp dir is torn down: Windows cannot unlink a
+		// file whose handle is still open.
+		l.Release()
 	}
 }
 

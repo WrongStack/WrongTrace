@@ -155,6 +155,12 @@ func TestSingleInstance_PreventDuplicate(t *testing.T) {
 	// holding a recycled PID must never block startup), so runStart would
 	// acquire the lock, boot the whole daemon and block on its signal channel
 	// until the test binary hit its 10-minute timeout.
+	//
+	// The stub must identify itself with the same "service" marker the real
+	// Health handler emits. A bare 200 is deliberately no longer accepted as
+	// proof of a running daemon -- that let any unrelated process holding the
+	// port abort startup with a wrong diagnosis -- so a stub without the
+	// marker would sail past Acquire and hang exactly as described above.
 	ln, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -162,7 +168,9 @@ func TestSingleInstance_PreventDuplicate(t *testing.T) {
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/api/health" {
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"service":"wrongtrace","ok":true,"status":"ok"}`))
 				return
 			}
 			http.NotFound(w, r)
