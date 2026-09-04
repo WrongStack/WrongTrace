@@ -368,6 +368,8 @@ func TestServer_StartListenAndServeAndShutdown(t *testing.T) {
 	// Shutdown-readiness instead: give it a moment, then shut down cleanly —
 	// the contract under test is that Shutdown unblocks Start with nil.
 	time.Sleep(150 * time.Millisecond)
+	//lint:ignore SA1012 the nil ctx is the contract under test: Shutdown
+	// documents that it substitutes context.Background().
 	if err := s.Shutdown(nil); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
@@ -380,5 +382,6 @@ func TestServer_StartListenAndServeAndShutdown(t *testing.T) {
 		t.Fatal("Start did not return after Shutdown")
 	}
 	// Double shutdown must be safe (hs already nil-ed or closed).
+	//lint:ignore SA1012 see above: nil ctx is deliberate.
 	_ = s.Shutdown(nil)
 }

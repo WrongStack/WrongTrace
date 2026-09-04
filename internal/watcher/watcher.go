@@ -111,8 +111,9 @@ type Watcher struct {
 	semOcc atomic.Int32
 
 	// httpHandler serves GET /api/debug/fsnotify when DebugFSEvents is true.
+	// Written once in New before the Watcher escapes to any other goroutine,
+	// read-only afterwards, so it needs no lock.
 	httpHandler http.Handler
-	httpMu     sync.RWMutex
 }
 
 // fsEvent is one captured fsnotify event in arrival order.
@@ -285,7 +286,6 @@ func New(cfg Config) (*Watcher, error) {
 
 	// Allocate the circular event buffer when debug capture is enabled.
 	var evBuf []fsEvent
-	var httpHandler http.Handler
 	if cfg.DebugFSEvents {
 		evBuf = make([]fsEvent, 4096)
 	}
@@ -305,8 +305,7 @@ func New(cfg Config) (*Watcher, error) {
 
 	// Wire the SSE handler after w is allocated so it can capture w.
 	if cfg.DebugFSEvents {
-		httpHandler = debugFSNotifyHandler(w)
-		w.httpHandler = httpHandler
+		w.httpHandler = debugFSNotifyHandler(w)
 	}
 	if err := w.addRecursive(cfg.Dir); err != nil {
 		_ = fw.Close()

@@ -7,14 +7,6 @@ import (
 	"github.com/wrongstack/wrongtrace/internal/db"
 )
 
-type dummyBroadcaster struct {
-	events []any
-}
-
-func (d *dummyBroadcaster) Broadcast(v any) {
-	d.events = append(d.events, v)
-}
-
 func TestProfilerCollector(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "test-profiler.db")
 	store, err := db.Open(tmp)

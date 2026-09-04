@@ -455,6 +455,8 @@ func TestServerLifecycle(t *testing.T) {
 	engine := core.NewEngine(core.Config{RepoName: "lifecycle-test", Store: store})
 	srv := New(Config{Port: 0, Engine: engine})
 
+	//lint:ignore SA1012 nil ctx is deliberate: Shutdown documents that it
+	// substitutes context.Background().
 	if err := srv.Shutdown(nil); err != nil {
 		t.Errorf("Shutdown on unstarted server returned error: %v", err)
 	}
