@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,9 @@ var proxyLogEnabled = func() bool {
 	v := os.Getenv("WRONGTRACE_PROXY_LOG")
 	return v != "0" && !strings.EqualFold(v, "false")
 }()
+
+// defaultProviderKey is the reserved alias naming the catch-all upstream.
+const defaultProviderKey = "default"
 
 func proxyLogf(format string, args ...interface{}) {
 	if proxyLogEnabled {
@@ -105,14 +109,22 @@ type GatewayProxy struct {
 	cfg        Config
 	httpClient *http.Client
 	providers  map[string]string
-	Routes     *RouteManager
-	Cache      *ResponseCache
-	Quotas     *QuotaLimiter
-	trafficMu  sync.RWMutex
-	trafficLog []ProxyTrafficRecord
-	maxTraffic int
-	sessionMu  sync.Mutex
-	sessions   map[string]*proxySessionTracker
+	// providerKeys is providers' key set ordered most-specific-first (longest
+	// key wins, ties broken alphabetically) with the "default" sentinel removed.
+	// resolveProvider's substring scan MUST NOT range over the map directly:
+	// Go randomizes map iteration order, so a path matching two registered
+	// aliases ("openai" and "openai-compat") routed to a different upstream on
+	// every request. Computed once at construction; providers is never mutated
+	// afterwards.
+	providerKeys []string
+	Routes       *RouteManager
+	Cache        *ResponseCache
+	Quotas       *QuotaLimiter
+	trafficMu    sync.RWMutex
+	trafficLog   []ProxyTrafficRecord
+	maxTraffic   int
+	sessionMu    sync.Mutex
+	sessions     map[string]*proxySessionTracker
 
 	// Finalize pipeline: wire analysis, run correlation, traffic persistence,
 	// quota accounting, and cache fill all run OFF the request path, after the
@@ -163,14 +175,15 @@ func NewGatewayProxy(cfg Config) *GatewayProxy {
 			Transport: transport,
 			Timeout:   0, // 0 = no arbitrary timeout killing active SSE streams
 		},
-		providers:  providers,
-		Routes:     NewRouteManager(),
-		Cache:      NewResponseCache(128, 24*time.Hour),
-		Quotas:     NewQuotaLimiter(),
-		trafficLog: make([]ProxyTrafficRecord, 0, 100),
-		maxTraffic: 100,
-		sessions:   make(map[string]*proxySessionTracker),
-		finalizeCh: make(chan finalizeJob, finalizeQueueCap),
+		providers:    providers,
+		providerKeys: sortedProviderKeys(providers),
+		Routes:       NewRouteManager(),
+		Cache:        NewResponseCache(128, 24*time.Hour),
+		Quotas:       NewQuotaLimiter(),
+		trafficLog:   make([]ProxyTrafficRecord, 0, 100),
+		maxTraffic:   100,
+		sessions:     make(map[string]*proxySessionTracker),
+		finalizeCh:   make(chan finalizeJob, finalizeQueueCap),
 	}
 	go p.finalizeWorker()
 	return p
@@ -543,20 +556,44 @@ func (p *GatewayProxy) DetectProvider(r *http.Request) (provider string, targetB
 		}
 	}
 
-	// 3. Registered providers from CustomUpstreams (map keys are lowercase)
+	// 3. Registered providers from CustomUpstreams (map keys are lowercase).
+	// Scanned most-specific-first over the precomputed key order so that a path
+	// matching several aliases always resolves to the same upstream.
 	lowerPath := strings.ToLower(path)
-	for k, v := range p.providers {
+	for _, k := range p.providerKeys {
 		if strings.Contains(lowerPath, k) {
-			return strings.Title(k), v, path
+			return prettifyProvider(k), p.providers[k], path
 		}
 	}
 
 	// 4. Fallback to default route if configured
-	if def, ok := p.providers["default"]; ok && def != "" {
+	if def, ok := p.providers[defaultProviderKey]; ok && def != "" {
 		return "Default", def, path
 	}
 
 	return "", "", path
+}
+
+// sortedProviderKeys orders the registered provider aliases most-specific-first
+// for resolveProvider's substring scan: longest key first so "openai-compat"
+// is tested before "openai", ties broken alphabetically so the order is total.
+// The "default" sentinel is excluded -- it is not an alias to match inside a
+// path, it is the explicit fallback applied only after every alias misses.
+func sortedProviderKeys(providers map[string]string) []string {
+	keys := make([]string, 0, len(providers))
+	for k := range providers {
+		if k == defaultProviderKey {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
 }
 
 func prettifyProvider(host string) string {
