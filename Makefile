@@ -1,4 +1,4 @@
-.PHONY: all build build-ui build-go run run-mcp status clean test fmt vet tidy
+.PHONY: all build build-ui build-go run run-mcp status clean test test-race lint fmt vet tidy
 
 # --- Configuration ---------------------------------------------------------
 BIN_DIR       ?= bin
@@ -47,6 +47,15 @@ status: build
 # --- Housekeeping -----------------------------------------------------------
 test:
 	go test ./...
+
+# What CI actually gates on. Run this before pushing.
+test-race:
+	go test -race -count=1 ./...
+
+# staticcheck finds what `go vet` misses: deprecated APIs, unreachable code,
+# and dropped assignments. Installed on demand so a fresh clone needs no setup.
+lint: vet
+	go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 
 fmt:
 	go fmt ./...

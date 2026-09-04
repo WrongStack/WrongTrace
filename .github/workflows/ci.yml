@@ -32,6 +32,15 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # staticcheck catches what vet does not: deprecated APIs (it is how the
+      # spoofable chi middleware.RealIP was found), unreachable code, and
+      # dropped assignments -- including test assertions computed and then
+      # never checked, which vet happily ignores.
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+
       # Guards the fresh-clone invariant: the committed web/dist placeholder
       # must satisfy //go:embed all:web/dist with no frontend tooling present.
       - name: go build (embed check)
