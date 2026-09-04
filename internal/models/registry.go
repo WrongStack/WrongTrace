@@ -3,6 +3,7 @@ package models
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -317,9 +318,38 @@ func (r *Registry) GetWithProvider(provider, modelID string) (ModelInfo, bool) {
 }
 
 // Upsert adds or updates a model in the catalog.
+// sanitizePrice normalizes a per-million-token rate to something arithmetic
+// can safely use.
+//
+// Prices reach the registry from the models.dev sync and from POST
+// /api/models, neither of which validated them. Two shapes did real damage:
+//
+//	NaN or infinity -> the computed cost inherits it, and encoding/json
+//	REFUSES to marshal a non-finite float. One poisoned rate therefore broke
+//	every dashboard endpoint that carried a record priced with it, not just
+//	the number shown.
+//
+//	negative -> the cost goes negative, and spend is accumulated into the
+//	budget totals the quota guardrail checks. A negative rate REFUNDS quota,
+//	which turns the spend cap into something a caller can lift at will.
+//
+// None of these are legitimate prices, so they are treated as unpriced (0)
+// rather than rejected: an unknown price already means the caller falls back
+// to the default estimate.
+func sanitizePrice(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	return v
+}
+
 func (r *Registry) Upsert(m ModelInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	m.InputPricePerM = sanitizePrice(m.InputPricePerM)
+	m.OutputPricePerM = sanitizePrice(m.OutputPricePerM)
+	m.CacheReadPricePerM = sanitizePrice(m.CacheReadPricePerM)
 
 	normModel := normalizeModelID(m.ID)
 	if m.ModelID == "" {
@@ -379,7 +409,7 @@ func (r *Registry) CalculateCostDetailed(provider, modelID string, promptTokens,
 		inCost := (float64(nonCached) * 2.0 / 1e6) + (float64(cachedTokens) * 0.5 / 1e6)
 		outCost := (float64(completionTokens) * 8.0 / 1e6)
 		savings := (float64(cachedTokens) * 1.5 / 1e6)
-		return inCost + outCost, savings
+		return finiteCost(inCost + outCost), finiteCost(savings)
 	}
 
 	nonCached := promptTokens - cachedTokens
@@ -394,7 +424,19 @@ func (r *Registry) CalculateCostDetailed(provider, modelID string, promptTokens,
 	if savings < 0 {
 		savings = 0
 	}
-	return inCost + outCost, savings
+	// Last line of defense. Upsert sanitizes the rates it stores, but a
+	// ModelInfo built any other way must still not be able to emit a value
+	// that encoding/json cannot marshal or that refunds a spend budget.
+	return finiteCost(inCost + outCost), finiteCost(savings)
+}
+
+// finiteCost clamps a computed dollar figure to a value that is safe to
+// persist, accumulate into a budget, and JSON-encode.
+func finiteCost(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	return v
 }
 
 func normalizeModelID(id string) string {
