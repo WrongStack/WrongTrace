@@ -1513,6 +1513,11 @@ func TestQuotaLimiter_GlobalAndKeyBudgets(t *testing.T) {
 	if !allowed {
 		t.Errorf("expected $6 on agent-b allowed")
 	}
+	// CheckAndRecordSpend reports headroom left AFTER charging, so the global
+	// cap ($10) minus the running total (2.50 + 6.00) must be exactly 1.50.
+	if rem != 1.50 {
+		t.Errorf("expected 1.50 remaining on the global cap after recording, got %f", rem)
+	}
 
 	// Now total global is 2.50 + 6.00 = 8.50. Another $2 should exceed global $10 limit
 	allowed, _, warn = q.CheckSpend("agent-c", 2.00)

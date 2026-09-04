@@ -30,16 +30,6 @@ var secretFoldTargets = []struct {
 	{lower: []byte("auth_token"), firstLower: 'a', firstUpper: 'A'},
 }
 
-func bytesContainsFold(b []byte, sub string) bool {
-	if len(sub) == 0 {
-		return true
-	}
-	subLower := strings.ToLower(sub)
-	firstLower := subLower[0]
-	firstUpper := strings.ToUpper(sub[:1])[0]
-	return bytesContainsFoldStatic(b, []byte(subLower), firstLower, firstUpper)
-}
-
 func bytesContainsFoldStatic(b, subLower []byte, firstLower, firstUpper byte) bool {
 	subLen := len(subLower)
 	if len(b) < subLen {
@@ -91,6 +81,9 @@ var (
 	bMongo      = []byte("mongodb")
 	bRedis      = []byte("redis")
 )
+
+// genericSecretPlaceholder replaces a matched secret value in place.
+const genericSecretPlaceholder = "[REDACTED_SECRET]"
 
 // ScanAndRedactSecrets inspects request payloads for confidential secrets and masks them before sending to LLMs.
 // Uses fast-path substring checks so multi-megabyte payloads bypass expensive regex scans when no matching tokens exist.
@@ -153,15 +146,46 @@ func ScanAndRedactSecrets(body []byte) ([]byte, int) {
 		redactionCount++
 	}
 
-	// 6. Redact Generic Secrets
-	if hasGeneric && genericSecretRe.MatchString(text) {
-		text = genericSecretRe.ReplaceAllStringFunc(text, func(m string) string {
-			redactionCount++
-			if idx := strings.IndexAny(m, ":="); idx != -1 {
-				return m[:idx+1] + " [REDACTED_SECRET]"
+	// 6. Redact Generic Secrets.
+	//
+	// Only capture group 1 -- the secret value itself -- is rewritten. The
+	// pattern deliberately consumes the surrounding delimiters (\s*[:=]\s* and
+	// an optional quote on each side) in order to FIND the value, but replacing
+	// the whole match threw those delimiters away. For a secret pasted into a
+	// prompt that meant the JSON string's own closing quote was eaten:
+	//
+	//   {"content":"PASSWORD=hunter2secret"}
+	//     -> {"content":"PASSWORD= [REDACTED_SECRET]}
+	//
+	// The gateway forwards that to the provider, which rejects it as malformed.
+	// Redaction must not be able to break the request it is protecting.
+	if hasGeneric {
+		if locs := genericSecretRe.FindAllStringSubmatchIndex(text, -1); len(locs) > 0 {
+			var b strings.Builder
+			b.Grow(len(text))
+			prev, changed := 0, false
+			for _, loc := range locs {
+				start, end := loc[2], loc[3] // capture group 1: the secret value
+				if start < 0 {
+					continue
+				}
+				// Already-redacted text still matches the pattern (the placeholder
+				// is bracketed and the class admits brackets), so skip it rather
+				// than rewrite and re-count it on a second pass.
+				if text[start:end] == genericSecretPlaceholder {
+					continue
+				}
+				b.WriteString(text[prev:start])
+				b.WriteString(genericSecretPlaceholder)
+				prev = end
+				changed = true
+				redactionCount++
 			}
-			return "[REDACTED_SECRET]"
-		})
+			if changed {
+				b.WriteString(text[prev:])
+				text = b.String()
+			}
+		}
 	}
 
 	if redactionCount > 0 {
