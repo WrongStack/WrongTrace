@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -223,9 +224,31 @@ func (p *GatewayProxy) enqueueFinalize(job finalizeJob) {
 
 func (p *GatewayProxy) finalizeWorker() {
 	for job := range p.finalizeCh {
-		p.finalize(job)
-		p.finalizeWG.Done()
+		p.runFinalize(job)
 	}
+}
+
+// runFinalize processes one job with two guarantees the bare loop did not
+// make.
+//
+// First, the panic never escapes. finalize walks response bytes that came
+// from an upstream provider -- arbitrary, untrusted input -- and this is the
+// daemon's only goroutine that did so without a recover. Every long-lived
+// goroutine in cmd/wrongtrace is supervised precisely so one component's
+// crash cannot end the process; an unrecovered panic here bypassed all of
+// that and killed a daemon whose whole job is to keep observing.
+//
+// Second, Done is deferred rather than called after finalize returns, so a
+// panic can no longer leave the WaitGroup counter stuck -- which would hang
+// Close, and with it daemon shutdown, forever.
+func (p *GatewayProxy) runFinalize(job finalizeJob) {
+	defer p.finalizeWG.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			proxyLogf("PANIC finalizing %s %s: %v\n%s", job.rec.Method, job.rec.IncomingPath, r, debug.Stack())
+		}
+	}()
+	p.finalize(job)
 }
 
 // waitFinalize blocks until every enqueued finalize job has been processed.
@@ -577,7 +600,7 @@ func (p *GatewayProxy) DetectProvider(r *http.Request) (provider string, targetB
 // sortedProviderKeys orders the registered provider aliases most-specific-first
 // for resolveProvider's substring scan: longest key first so "openai-compat"
 // is tested before "openai", ties broken alphabetically so the order is total.
-// The "default" sentinel is excluded -- it is not an alias to match inside a
+// The "default" sentinel is excluded — it is not an alias to match inside a
 // path, it is the explicit fallback applied only after every alias misses.
 func sortedProviderKeys(providers map[string]string) []string {
 	keys := make([]string, 0, len(providers))
