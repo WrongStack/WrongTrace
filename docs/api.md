@@ -41,6 +41,21 @@ WrongTrace exposes bidirectional interfaces for AI agent telemetry collection, A
 
 ## 2. Endpoint Specifications
 
+### 2.0. Conventions
+
+**Row limits are clamped.** Every `limit` query parameter is bounded at
+**1000** rows, enforced in the storage layer rather than per endpoint, so
+the ceiling applies identically over HTTP, MCP, and IPC. A larger value is
+silently reduced to 1000 rather than rejected — page through results if you
+need more. A missing, zero, or negative `limit` falls back to the
+per-endpoint default documented below.
+
+The clamp exists because several result sets are materialized in full
+before serialization; an unbounded limit is an out-of-memory risk, not
+merely a slow query.
+
+---
+
 ### 2.1. `POST /api/telemetry`
 Records agent execution metadata at task completion.
 
@@ -306,6 +321,39 @@ Returns per-model read vs write activity summary sorted chronologically by most 
 
 ---
 
+### 2.9. `GET /api/health`
+Cheap readiness probe: no database access, no filesystem check. Answers
+"did the HTTP listener come up?" plus live diagnostics.
+
+Exempt from token authentication (see `WRONGTRACE_TOKEN`) so liveness
+probes keep working on an authenticated daemon.
+
+* **Response (200 OK):**
+```json
+{
+  "service": "wrongtrace",
+  "ok": true,
+  "status": "ok",
+  "repo": "my-project",
+  "timestamp": "2026-09-04T08:21:11Z",
+  "ws_clients": 2,
+  "socket_path": "\\\\.\\pipe\\wrongtrace"
+}
+```
+
+* `service` is a **stable identifier**, not decoration. WrongTrace's
+  single-instance startup check probes this endpoint on the configured port
+  and treats the port as occupied by a daemon only when this field reads
+  `wrongtrace`. A bare `200` is not sufficient evidence — `{"ok":true,
+  "status":"ok"}` is a generic health shape, and an SPA dev server answers
+  `200` on every path. Tooling that detects a running daemon should match on
+  this field for the same reason.
+* `socket_path` is the IPC endpoint agents should connect to (named pipe on
+  Windows, Unix socket elsewhere). Empty when IPC is disabled.
+* `ws_clients` is the current number of connected dashboard WebSocket
+  clients.
+
+---
 ## 3. Error Handling Format
 
 All HTTP error responses return a standardized JSON structure with both `error` and `message` keys:

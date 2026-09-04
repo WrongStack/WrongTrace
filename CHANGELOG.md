@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **`GET /api/health` now has a real specification** (`docs/api.md` §2.9). It
+  previously appeared only as a one-line table row, and 0.3.11 added a
+  `"service": "wrongtrace"` field that single-instance detection depends on —
+  external tooling that probes for a running daemon should match on it rather
+  than on a bare `200`, so it needed to be written down.
+- **The row-limit ceiling is documented** (`docs/api.md` §2.0). Every `limit`
+  query parameter is clamped at 1000 in the storage layer as of 0.3.11, so a
+  caller asking for more silently receives less — undocumented, that reads as
+  data loss rather than a contract.
+- **README: two shipped MCP tools were missing** from both the capability
+  summary and the tool list — `list_locks` and `get_file_diff_history`.
+- **README: six implemented environment variables were undocumented.**
+  `WRONGTRACE_HOME`, `WRONGTRACE_PORT`, and `WRONGTRACE_SOCKET` now have a
+  configuration table next to the daemon startup section (flag →
+  environment → platform default precedence); `WRONGTRACE_AST_MAX_SNAPSHOTS`
+  and `WRONGTRACE_LOG_ALL_HTTP` (with its `WRONGTRACE_VERBOSE` alias) join the
+  tuning table.
+
 ---
 
 ## [0.3.11] - 2026-09-04

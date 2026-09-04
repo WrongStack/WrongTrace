@@ -27,7 +27,7 @@ Watches your code with Tree-sitter, correlates AST-level edits with path-scoped 
 5. **🧠 Model Intelligence & True Token ROI Matrix** — Grades AI models into Quality Tiers (S/A/B/C) based on 14-day code survival rate %, dollar expenditure per surviving node ($/node), context read-to-write ratio, and longevity.
 6. **🔍 Semantic AST Churn & Accurate Multi-Line Diffing** — Tracks code transformations via Tree-sitter AST diffing across 11+ languages with exact `+AddedLines / -DeletedLines` granularity, filtering out cosmetic formatting churn.
 7. **🤖 Universal Auto-Discovery for 20+ Coding Agents** — Zero-config transcript ingestion for WrongStack, Antigravity, Claude Code, Cursor, Windsurf, Cline/Roo, MiniMax Code, Kimi Code (Moonshot), ZCode, Devin, Trae, Goose, OpenHands, GitHub Copilot, Aider, Continue, and more.
-8. **🛡️ Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, `unlock_file`, `report_file_read`, and `get_file_read_stats`.
+8. **🛡️ Model Context Protocol (MCP) Server** — Native stdio MCP server exposing `check_guardrail`, `get_file_health_score`, `report_telemetry`, `lock_file`, `unlock_file`, `list_locks`, `report_file_read`, `get_file_read_stats`, and `get_file_diff_history`.
 9. **🌐 AI Gateway & Wire Telemetry** — Relays and analyzes LLM traffic (OpenAI, Anthropic, Gemini, DeepSeek, Groq, MiniMax, Moonshot), tracking prompt/completion/reasoning tokens, budget quotas, and optional scoped response-cache savings.
 10. **⚡ Universal Profiler & Runtime Traces** — Ingests OpenTelemetry (OTLP) traces, pprof profiles, and test execution latencies, correlating runtime hotspots directly with AI code changes.
 
@@ -55,6 +55,16 @@ wrongtrace start --watch /path/to/project --port 3444
 
 Open **<http://localhost:3444>** in your browser.
 
+Paths and ports resolve from flags first, then these environment
+variables, then platform defaults:
+
+| Variable | Default | Effect |
+|:---|:---|:---|
+| `WRONGTRACE_HOME` | `~/.wrongtrace` | Root directory for the database, socket, project registry, and gateway routes. |
+| `WRONGTRACE_PORT` | `3444` | Port for the dashboard, JSON API, gateway proxy, and OTLP receiver. `PORT` is honoured as a fallback. |
+| `WRONGTRACE_SOCKET` | `\\.\pipe\wrongtrace` (Windows), `$WRONGTRACE_HOME/wrongtrace.sock` (Unix) | IPC endpoint agents connect to. Reported back on `GET /api/health` so clients need not guess. |
+
+---
 ### 3. Diagnostics & Health Check
 
 ```bash
@@ -159,8 +169,10 @@ Add WrongTrace to your favorite MCP client (`~/.claude.json`, `.cursor/mcp.json`
 - **`report_telemetry`**: Record run intent, model name, token usage, and cost.
 - **`lock_file`**: Lock fragile files against concurrent AI rewrites.
 - **`unlock_file`**: Release locked files upon completion.
+- **`list_locks`**: List active, unexpired guardrail locks with TTL and owner metadata.
 - **`report_file_read`**: Record file reading activity with line range and token consumption.
 - **`get_file_read_stats`**: Query aggregate read counts, unique models, and cost per file.
+- **`get_file_diff_history`**: Retrieve recent AST mutation history for a file, or repo-wide when `file_path` is omitted (`limit` capped at 1000).
 
 ---
 
@@ -229,6 +241,8 @@ read at startup.
 | `WRONGTRACE_PPROF` | *unset* | Set to `1` to expose loopback pprof endpoints on `127.0.0.1:6060` (override with `WRONGTRACE_PPROF_ADDR`). |
 | `WRONGTRACE_MAX_SCAN_DEPTH` | `8` | How many directory levels below each watched root transcript discovery descends (2–16). The default covers WrongStack's nested subagent layout at six levels; lower it to shave the walk on shallow setups. |
 | `WRONGTRACE_PROXY_LOG` | `on` | Set to `0`/`false` to silence `[PROXY]` lifecycle console logging. Windows console writes are synchronous and can add milliseconds per line to the proxy request path; telemetry is unaffected. |
+| `WRONGTRACE_AST_MAX_SNAPSHOTS` | `8000` | How many parsed file snapshots the AST engine retains. Past the limit the coldest are dropped and re-parsed on next touch, so this bounds footprint on very large workspaces rather than changing results. |
+| `WRONGTRACE_LOG_ALL_HTTP` | *unset* | Set to `1` to log every HTTP request instead of only errors and slow requests (`WRONGTRACE_VERBOSE=true` does the same). Noisy; intended for debugging. |
 
 Raise `WRONGTRACE_INDEX_CPU` and `WRONGTRACE_AST_CACHE_MB` on a dedicated
 machine to index large monorepos faster; lower `WRONGTRACE_MEMORY_LIMIT_MB` and
