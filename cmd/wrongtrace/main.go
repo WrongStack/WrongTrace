@@ -333,77 +333,28 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	// Optional pprof listener; no-op unless WRONGTRACE_PPROF=1.
 	server.StartDebugServer(ctx)
 
-	// Resilient HTTP Server Loop: never drops daemon on temporary listener issues
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("PANIC in httpServer: %v\n%s (recovering in 2s)", r, debug.Stack())
-						time.Sleep(2 * time.Second)
-					}
-				}()
-				if err := httpServer.Start(); err != nil {
-					if errors.Is(err, http.ErrServerClosed) || ctx.Err() != nil {
-						return
-					}
-					log.Printf("http server warning: %v (restarting in 2s)", err)
-					time.Sleep(2 * time.Second)
-				}
-			}()
-			if ctx.Err() != nil {
-				return
-			}
-			time.Sleep(500 * time.Millisecond)
+	// Each long-lived component runs under superviseLoop: panics and errors
+	// restart the component with backoff instead of taking the daemon down,
+	// and every wait is cancellable so shutdown stays prompt.
+	go superviseLoop(ctx, "http server", func() error {
+		// Start returns nil on graceful close; a real bind failure comes back
+		// as an error and drives the backoff.
+		err := httpServer.Start()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
 		}
-	}()
+		return err
+	})
 
-	// Resilient Watcher Loop
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("PANIC in watcher.Run: %v\n%s (recovering in 2s)", r, debug.Stack())
-						time.Sleep(2 * time.Second)
-					}
-				}()
-				w.Run(ctx)
-			}()
-			time.Sleep(1 * time.Second)
-		}
-	}()
+	go superviseLoop(ctx, "watcher", func() error {
+		w.Run(ctx)
+		return nil
+	})
 
-	// Resilient Core Engine Loop
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("PANIC in engine.Run: %v\n%s (recovering in 2s)", r, debug.Stack())
-						time.Sleep(2 * time.Second)
-					}
-				}()
-				engine.Run(ctx)
-			}()
-			time.Sleep(1 * time.Second)
-		}
-	}()
+	go superviseLoop(ctx, "engine", func() error {
+		engine.Run(ctx)
+		return nil
+	})
 
 	// Model catalog background sync
 	go func() {
