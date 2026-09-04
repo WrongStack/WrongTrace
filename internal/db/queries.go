@@ -179,6 +179,29 @@ func (s *Store) InsertEvent(e EventRecord) error {
 	return nil
 }
 
+// maxQueryLimit is the hard ceiling on any client-influenced row limit.
+//
+// Every limited query used to enforce only the LOWER bound (limit <= 0 -> a
+// default) while the callers were expected to enforce the upper one. That is
+// the wrong place for it: a single caller that forgets -- and several did --
+// turns a query into an out-of-memory abort, because RecentEventsFiltered and
+// RecentTraces preallocate their result slice at cap=limit BEFORE reading a
+// single row. A caller passing a bogus limit gets clamped output; it can no
+// longer take the daemon down.
+const maxQueryLimit = 1000
+
+// clampLimit applies the shared row-limit contract: substitute def when the
+// caller supplied nothing usable, and never exceed maxQueryLimit.
+func clampLimit(limit, def int) int {
+	if limit <= 0 {
+		limit = def
+	}
+	if limit > maxQueryLimit {
+		return maxQueryLimit
+	}
+	return limit
+}
+
 // RecentEvents returns the N most recent events for the live feed, optionally filtered by repo_name.
 func (s *Store) RecentEvents(limit int, repoFilter ...string) ([]EventRecord, error) {
 	var repo string
@@ -195,9 +218,7 @@ func (s *Store) RecentFileEvents(filePath string, limit int) ([]EventRecord, err
 
 // RecentEventsFiltered queries recent AST and code mutation events with flexible filtering.
 func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, since time.Time) ([]EventRecord, error) {
-	if limit <= 0 {
-		limit = 50
-	}
+	limit = clampLimit(limit, 50)
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
@@ -830,9 +851,7 @@ func (s *Store) InsertTrace(t RuntimeTraceRecord) error {
 
 // RecentTraces returns the N most recent runtime trace events.
 func (s *Store) RecentTraces(limit int) ([]RuntimeTraceRecord, error) {
-	if limit <= 0 {
-		limit = 50
-	}
+	limit = clampLimit(limit, 50)
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
@@ -869,9 +888,9 @@ func (s *Store) RecentTraces(limit int) ([]RuntimeTraceRecord, error) {
 
 // ProfilerHotspots returns hotspot functions ranked by average execution duration and errors.
 func (s *Store) ProfilerHotspots(limit int) ([]ProfilerHotspotRow, error) {
-	if limit <= 0 {
-		limit = 25
-	}
+	// A client-supplied limit is clamped, not trusted: this aggregates over the
+	// whole runtime_traces table and materializes every row into a JSON array.
+	limit = clampLimit(limit, 25)
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
@@ -1003,9 +1022,7 @@ func (s *Store) InsertReadEvent(r FileReadRecord) error {
 
 // GetRecentFileReads returns the most recent file read events, optionally filtered by repo_name.
 func (s *Store) GetRecentFileReads(limit int, repoFilter ...string) ([]FileReadRecord, error) {
-	if limit <= 0 {
-		limit = 50
-	}
+	limit = clampLimit(limit, 50)
 	var repo string
 	if len(repoFilter) > 0 {
 		repo = repoFilter[0]
@@ -1297,9 +1314,7 @@ type SymbolHistoryRecord struct {
 
 // SymbolHistory returns the chronological revision history of a specific AST symbol / node or all symbols in a file.
 func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHistoryRecord, error) {
-	if limit <= 0 {
-		limit = 100
-	}
+	limit = clampLimit(limit, 100)
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
@@ -1648,9 +1663,7 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
-	if limit <= 0 || limit > 1000 {
-		limit = 200
-	}
+	limit = clampLimit(limit, 200)
 
 	const q = `
 		WITH OrderedEvents AS (
