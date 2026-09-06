@@ -87,6 +87,11 @@ type Watcher struct {
 	patterns      []string
 	patternsNorm  []string
 	patternsLower []string
+	// anchoredNorm/anchoredLower hold the root-anchored "/dir" lines with
+	// the leading slash stripped; anchoring is what keeps them from leaking
+	// onto nested trees of the same name.
+	anchoredNorm  []string
+	anchoredLower []string
 	ignoreSet     map[string]struct{}
 
 	// decisions memoizes pathIgnored. An editor save-burst, a build, or a
@@ -275,13 +280,20 @@ func New(cfg Config) (*Watcher, error) {
 		ignoreSet[strings.ToLower(filepath.Clean(ig))] = struct{}{}
 	}
 
-	patterns := loadGitIgnorePatterns(cfg.Dir)
+	patterns, anchored := loadGitIgnorePatterns(cfg.Dir)
 	patternsNorm := make([]string, len(patterns))
 	patternsLower := make([]string, len(patterns))
 	for i, pat := range patterns {
 		patNorm := filepath.ToSlash(pat)
 		patternsNorm[i] = patNorm
 		patternsLower[i] = strings.ToLower(patNorm)
+	}
+	anchoredNorm := make([]string, len(anchored))
+	anchoredLower := make([]string, len(anchored))
+	for i, pat := range anchored {
+		patNorm := filepath.ToSlash(pat)
+		anchoredNorm[i] = patNorm
+		anchoredLower[i] = strings.ToLower(patNorm)
 	}
 
 	// Allocate the circular event buffer when debug capture is enabled.
@@ -298,6 +310,8 @@ func New(cfg Config) (*Watcher, error) {
 		patterns:      patterns,
 		patternsNorm:  patternsNorm,
 		patternsLower: patternsLower,
+		anchoredNorm:  anchoredNorm,
+		anchoredLower: anchoredLower,
 		ignoreSet:     ignoreSet,
 		decisions:     make(map[string]bool, 256),
 		evBuf:        evBuf,
@@ -328,12 +342,18 @@ func absRoot(dir string) string {
 	return filepath.Clean(abs)
 }
 
-func loadGitIgnorePatterns(root string) []string {
-	var patterns []string
+// loadGitIgnorePatterns reads the workspace .gitignore and splits it into
+// unanchored patterns and root-anchored ones (lines beginning with "/").
+// A leading slash in .gitignore means "only directly under the watched
+// root": "/generated" must ignore the root's generated tree while leaving
+// pkg/generated alone. computePathIgnored compares against root-relative
+// scoped paths, which carry no leading slash — so the anchor marker is kept
+// as list membership and the slash itself is stripped before matching.
+func loadGitIgnorePatterns(root string) (patterns, anchored []string) {
 	giPath := filepath.Join(root, ".gitignore")
 	data, err := os.ReadFile(giPath)
 	if err != nil {
-		return patterns
+		return nil, nil
 	}
 	lines := strings.Split(string(data), "\n")
 	for _, l := range lines {
@@ -341,10 +361,18 @@ func loadGitIgnorePatterns(root string) []string {
 		if l == "" || strings.HasPrefix(l, "#") {
 			continue
 		}
-		l = strings.TrimSuffix(l, "/")
-		patterns = append(patterns, l)
+		rooted := strings.HasPrefix(l, "/")
+		l = strings.Trim(l, "/")
+		if l == "" {
+			continue
+		}
+		if rooted {
+			anchored = append(anchored, l)
+		} else {
+			patterns = append(patterns, l)
+		}
 	}
-	return patterns
+	return patterns, anchored
 }
 
 // Close releases the underlying fsnotify resources.
@@ -501,6 +529,22 @@ func (w *Watcher) computePathIgnored(p string) bool {
 			strings.HasPrefix(normLower, patLower+"/") ||
 			strings.HasSuffix(normLower, "/"+patLower) ||
 			strings.Contains(normLower, "/"+patLower+"/") {
+			return true
+		}
+	}
+
+	// 3. Root-anchored patterns ("/dir", "/*.log") match the path only as
+	// located from the watched root — never a nested tree of the same name.
+	// The full scoped path is matched (not just the base) so anchored globs
+	// stay root-level: "/*.secret" ignores app.secret but not sub/app.secret.
+	// Comparing these against the unanchored forms above would be wrong twice:
+	// the suffix/contains forms would leak the anchor onto nested trees.
+	for i, patNorm := range w.anchoredNorm {
+		if matched, _ := filepath.Match(patNorm, scoped); matched {
+			return true
+		}
+		patLower := w.anchoredLower[i]
+		if patLower == normLower || strings.HasPrefix(normLower, patLower+"/") {
 			return true
 		}
 	}

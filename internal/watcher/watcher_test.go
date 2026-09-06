@@ -367,6 +367,45 @@ func TestPathIgnored_AncestorsOutsideRootAreNotMatched(t *testing.T) {
 	}
 }
 
+// TestPathIgnored_GitignoreRootAnchoredDirectory pins root-anchored
+// .gitignore semantics: a leading slash means "only directly under the
+// watched root". Before anchors were tracked as a separate pattern list,
+// loadGitIgnorePatterns kept the leading slash while computePathIgnored
+// compares against root-relative scoped paths that carry none — so every
+// root-anchored rule ("/generated/", "/*.secret", and the whole
+// create-next-app style of .gitignore) silently matched nothing and the
+// churn under those trees reached the engine.
+func TestPathIgnored_GitignoreRootAnchoredDirectory(t *testing.T) {
+	root := t.TempDir()
+	gitignore := "/generated/\n/*.secret\nlogs/\n"
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(gitignore), 0o644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+	w, err := New(Config{Dir: root})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	cases := []struct {
+		rel  string
+		want bool
+		why  string
+	}{
+		{"generated/app.go", true, "root-anchored /generated/ ignores the watched-root generated tree"},
+		{"pkg/generated/app.go", false, "root-anchored /generated/ must not leak onto nested pkg/generated"},
+		{"app.secret", true, "root-anchored glob /*.secret ignores root-level files"},
+		{"sub/app.secret", false, "root-anchored glob /*.secret must not ignore nested files"},
+		{"logs/a.log", true, "unanchored logs/ still ignores the root logs tree"},
+		{"pkg/logs/a.log", true, "unanchored logs/ still ignores nested logs trees"},
+	}
+	for _, c := range cases {
+		if got := w.pathIgnored(filepath.Join(root, filepath.FromSlash(c.rel))); got != c.want {
+			t.Errorf("pathIgnored(%q) = %v, want %v: %s", c.rel, got, c.want, c.why)
+		}
+	}
+}
+
 // TestRun_RootBelowIgnoredAncestorStillDelivers is the integration half:
 // a watcher rooted inside a directory named like an ignore entry must still
 // deliver events for its own files.
