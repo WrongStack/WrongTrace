@@ -119,7 +119,8 @@ func (e *Engine) UpdateSettings(s AppSettings) AppSettings {
 	if s.DebounceMs > 0 {
 		globalSettings.DebounceMs = s.DebounceMs
 	}
-	if len(s.IgnorePatterns) > 0 {
+	// Use nil-check, not len>0, so an explicitly empty slice clears the field.
+	if s.IgnorePatterns != nil {
 		globalSettings.IgnorePatterns = s.IgnorePatterns
 	}
 	if s.ThrashingThreshold > 0 {
@@ -151,6 +152,12 @@ func (e *Engine) UpdateSettings(s AppSettings) AppSettings {
 		globalSettings.CustomWebhookURL = ""
 	} else if s.CustomWebhookURL != "" {
 		globalSettings.CustomWebhookURL = s.CustomWebhookURL
+	}
+	if s.DBPath != "" {
+		globalSettings.DBPath = s.DBPath
+	}
+	if s.SocketPath != "" {
+		globalSettings.SocketPath = s.SocketPath
 	}
 
 	saveSettingsToDisk(globalSettings)

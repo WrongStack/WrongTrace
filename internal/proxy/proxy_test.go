@@ -127,6 +127,7 @@ func TestGatewayProxy_UpstreamErrorDoesNotLeakQueryKey(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	p.ServeHTTP(rec, req)
+	p.waitFinalize() // drain async finalize pipeline before inspecting traffic log
 
 	if body := rec.Body.String(); strings.Contains(body, leakySecret) {
 		t.Errorf("client error response leaks query key: %s", body)
