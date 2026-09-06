@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -193,5 +195,90 @@ func Sub(a, b int) int {
 	}
 	if engine.shouldSkip("valid.go") {
 		t.Error("shouldSkip should be false for valid.go")
+	}
+}
+
+// TestAtlas_SiblingPrefixProjectIsolation pins boundary-correct project
+// filtering in Engine.Atlas: a sibling directory that merely shares the
+// project path's prefix ("<ws>/api-v2" under project root "<ws>/api") must
+// never bleed into Atlas("api"). Both the hasActivePathMatch probe and the
+// per-snapshot filter used a bare prefix test, so the sibling's file
+// appeared with an ABSOLUTE path (its filepath.Rel fallback yields "..")
+// and inflated TotalFiles/TotalLOC for the wrong project.
+func TestAtlas_SiblingPrefixProjectIsolation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("WRONGTRACE_HOME", home)
+	ws := t.TempDir()
+
+	apiDir := filepath.Join(ws, "api")
+	sibDir := filepath.Join(ws, "api-v2")
+	if err := os.MkdirAll(apiDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sibDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apiDir, "a.go"), []byte("package api\n\nfunc A() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibDir, "b.go"), []byte("package apiv2\n\nfunc B() int { return 2 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pj, err := json.Marshal(map[string]any{"projects": []map[string]any{
+		{"id": "p1", "name": "api", "path": apiDir},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "projects.json"), pj, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := db.Open(filepath.Join(home, "atlas.db"))
+	if err != nil {
+		t.Fatalf("db open: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	astEng, err := ast.NewEngine()
+	if err != nil {
+		t.Fatalf("ast.NewEngine: %v", err)
+	}
+	defer astEng.Close()
+
+	engine := NewEngine(Config{RepoName: "atlas-repo", Store: store, AST: astEng})
+
+	// Real parser walk over the whole workspace: both siblings load into the
+	// AST cache, exactly like a cold start before any project filtering.
+	engine.PrimeDirectory(ws)
+
+	snap, err := engine.Atlas("api")
+	if err != nil {
+		t.Fatalf("Atlas(api): %v", err)
+	}
+	if snap.Repo != "api" {
+		t.Fatalf("snap.Repo = %q, want \"api\"", snap.Repo)
+	}
+
+	var paths []string
+	for _, pkg := range snap.Packages {
+		for _, f := range pkg.Files {
+			paths = append(paths, filepath.ToSlash(f.Path))
+		}
+	}
+	if snap.TotalFiles != 1 || len(paths) != 1 {
+		t.Errorf("Atlas(\"api\") exposed %d file(s) (TotalFiles=%d), want exactly 1: %v", len(paths), snap.TotalFiles, paths)
+	}
+	for _, p := range paths {
+		if strings.Contains(strings.ToLower(p), "api-v2") {
+			t.Errorf("sibling file %q leaked into Atlas(\"api\") — relPath is not project-relative", p)
+		}
+	}
+	if len(paths) == 1 && !strings.HasSuffix(paths[0], "a.go") {
+		t.Errorf("expected the project's own a.go, got %v", paths)
 	}
 }

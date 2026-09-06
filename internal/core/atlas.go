@@ -288,9 +288,11 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	// Check if activePath matches loaded snapshots
 	var hasActivePathMatch bool
 	if activePath != "" && e.cfg.AST != nil {
-		activeLower := strings.ToLower(activePath)
 		e.cfg.AST.ForEachSnapshot(func(p string, _ *ast.FileSnapshot) bool {
-			if strings.HasPrefix(strings.ToLower(filepath.Clean(p)), activeLower) {
+			// Boundary-correct containment: a sibling directory that merely
+			// shares the prefix ("<ws>/api-v2" under project root "<ws>/api")
+			// must not count as a match. pathIsWithin cleans and lowercases.
+			if pathIsWithin(p, activePath) {
 				hasActivePathMatch = true
 				return false
 			}
@@ -302,10 +304,13 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	pkgMap := make(map[string]*AtlasPackage)
 
 	if e.cfg.AST != nil {
-		activeLower := strings.ToLower(activePath)
 		e.cfg.AST.ForEachSnapshot(func(path string, fileSnap *ast.FileSnapshot) bool {
 			cleanPath := filepath.Clean(path)
-			if hasActivePathMatch && !strings.HasPrefix(strings.ToLower(cleanPath), activeLower) {
+			// Same boundary as the probe above: exclude sibling directories
+			// sharing the project path's prefix, not just foreign trees.
+			// Without it the sibling's relPath (filepath.Rel yields "..")
+			// fell back to the absolute path and grouped into junk packages.
+			if hasActivePathMatch && !pathIsWithin(cleanPath, activePath) {
 				return true
 			}
 
