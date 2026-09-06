@@ -2,6 +2,7 @@ package profiler
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/wrongstack/wrongtrace/internal/db"
@@ -129,5 +130,67 @@ func TestProfilerCollector(t *testing.T) {
 	})
 	if collectorWithFn.store() != store {
 		t.Errorf("expected store from GetStore callback")
+	}
+}
+
+// TestIngestOTLP_PreservesNonStringAttributeMetadata pins the metadata type
+// contract of Collector.IngestOTLP: OTLP attributes are oneof-typed, and
+// TraceEvent.Metadata — the OnTrace broadcast payload and the metadata_json
+// column — must carry each attribute's actual Go type (bool, int64, float64,
+// string). Storing OTLPVal.StringValue alone turned every numeric/boolean
+// attribute (http.status_code, cpu.usage_pct, feature.enabled) into an empty
+// string even though the same record's typed fields were populated from the
+// very same attributes.
+func TestIngestOTLP_PreservesNonStringAttributeMetadata(t *testing.T) {
+	var captured []TraceEvent
+	collector := NewCollector(Config{
+		OnTrace: func(ev TraceEvent) { captured = append(captured, ev) },
+	})
+
+	payload := `{
+		"resourceSpans": [{
+			"resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "checkout"}}]},
+			"scopeSpans": [{"spans": [{
+				"traceId": "trace-1",
+				"spanId": "span-1",
+				"name": "controller.handle",
+				"attributes": [
+					{"key": "feature.enabled", "value": {"boolValue": true}},
+					{"key": "cpu.usage_pct", "value": {"doubleValue": 77.5}},
+					{"key": "http.status_code", "value": {"intValue": "404"}},
+					{"key": "client.id", "value": {"intValue": "42"}},
+					{"key": "span.kind", "value": {"stringValue": "web"}}
+				]
+			}]}]
+		}]
+	}`
+
+	count, err := collector.IngestOTLP([]byte(payload))
+	if err != nil {
+		t.Fatalf("IngestOTLP: %v", err)
+	}
+	if count != 1 || len(captured) != 1 {
+		t.Fatalf("expected 1 span captured, got count=%d captured=%d", count, len(captured))
+	}
+
+	meta := captured[0].Metadata
+	for _, c := range []struct {
+		key  string
+		want any
+	}{
+		{"feature.enabled", true},
+		{"cpu.usage_pct", 77.5},
+		{"http.status_code", int64(404)},
+		{"client.id", int64(42)},
+		{"span.kind", "web"},
+	} {
+		got, ok := meta[c.key]
+		if !ok {
+			t.Errorf("metadata[%q] missing (have %v)", c.key, meta)
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("metadata[%q] = %#v (%T), want %#v (%T)", c.key, got, got, c.want, c.want)
+		}
 	}
 }

@@ -135,7 +135,7 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 
 				meta := make(map[string]interface{})
 				for _, attr := range span.Attributes {
-					meta[attr.Key] = attr.Value.StringValue
+					meta[attr.Key] = otlpAttributeValue(attr.Value)
 					switch attr.Key {
 					case "code.filepath", "code.file":
 						filePath = attr.Value.StringValue
@@ -233,6 +233,28 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 	}
 
 	return count, nil
+}
+
+// otlpAttributeValue unwraps an OTLP oneof attribute value into its Go type:
+// string, int64, float64, or bool. IngestOTLP stores every attribute into
+// TraceEvent.Metadata (broadcast via OnTrace and persisted as metadata_json);
+// taking StringValue alone turned numeric and boolean attributes
+// (http.status_code, cpu.usage_pct, feature.enabled) into empty strings
+// there — even though the typed sibling fields of the same record were
+// populated from the very same attributes.
+func otlpAttributeValue(v OTLPVal) any {
+	switch {
+	case v.StringValue != "":
+		return v.StringValue
+	case v.IntValue != 0:
+		return v.IntValue
+	case v.DoubleValue != 0:
+		return v.DoubleValue
+	case v.BoolValue:
+		return v.BoolValue
+	default:
+		return ""
+	}
 }
 
 // Hotspots returns functions with high latency or errors.
