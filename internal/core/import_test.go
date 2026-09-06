@@ -436,6 +436,38 @@ func TestDetectPrimaryLanguage_HonorsCustomIgnorePatterns(t *testing.T) {
 	}
 }
 
+// TestDetectPrimaryLanguage_MtsCtsAreTypeScript pins the alignment invariant
+// with ast.DetectLanguage (internal/ast/supported.go): .mts (ES-module
+// TypeScript) and .cts (CommonJS TypeScript) must count toward TypeScript
+// exactly like .ts/.tsx. Before the alignment, a workspace dominated by those
+// spellings classified as "Generic" — or let a minority language win — so
+// AddProject stamped the wrong language label at registration. Case-variant
+// extensions must count too (the switch lowercases the extension first).
+func TestDetectPrimaryLanguage_MtsCtsAreTypeScript(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"a1.mts":      "export const a = 1;\n",
+		"a2.mts":      "export const b = 2;\n",
+		"a3.mts":      "export const c = 3;\n",
+		"a4.mts":      "export const d = 4;\n",
+		"entry.cts":   "export const e = 5;\n",
+		"WORKER.MTS":  "export const f = 6;\n",
+		"cli.py":      "x = 1\n",
+	}
+	writeFiles(t, root, files)
+
+	if got := DetectPrimaryLanguage(root); got != "TypeScript" {
+		t.Errorf("DetectPrimaryLanguage = %q, want TypeScript for .mts/.cts-dominated workspace", got)
+	}
+
+	// No over-reach: a Python-only workspace still classifies as Python.
+	pyRoot := t.TempDir()
+	writeFiles(t, pyRoot, map[string]string{"main.py": "x = 1\n", "util.py": "y = 2\n"})
+	if got := DetectPrimaryLanguage(pyRoot); got != "Python" {
+		t.Errorf("DetectPrimaryLanguage = %q, want Python for python-only workspace", got)
+	}
+}
+
 // TestImportFromWrongStack_FullRegistryWithFatIgnoredTrees covers the batch
 // path that used to take >60s on a real registry: a full-registry import
 // (roots=nil) where every workspace embeds a deep, fat node_modules tree.

@@ -1331,7 +1331,9 @@ func DetectPrimaryLanguage(root string) string {
 		switch ext {
 		case ".go":
 			extCounts["Go"]++
-		case ".ts", ".tsx":
+		// .mts/.cts are TypeScript's ESM/CJS spellings — align with ast.DetectLanguage,
+	// which parses them with the TypeScript grammar.
+		case ".ts", ".tsx", ".mts", ".cts":
 			extCounts["TypeScript"]++
 		case ".js", ".jsx":
 			extCounts["JavaScript"]++
