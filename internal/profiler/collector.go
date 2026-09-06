@@ -186,6 +186,21 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 				if traceID == "" {
 					traceID = randomID("otlp")
 				}
+				// Row identity: every span of a trace shares one traceId, but
+				// runtime_traces.trace_id is the PRIMARY KEY and InsertTrace
+				// is a plain INSERT, so keying rows by the group ID made spans
+				// 2..N of any multi-span trace fail the UNIQUE constraint and
+				// get silently dropped (the error is only logged) while count
+				// still reported them. Key the persisted row per span; the
+				// broadcast event keeps the raw traceId.
+				rowID := traceID
+				if span.SpanID != "" {
+					if span.TraceID != "" {
+						rowID = span.TraceID + "-" + span.SpanID
+					} else {
+						rowID = "span-" + span.SpanID
+					}
+				}
 
 				ev := TraceEvent{
 					TraceID:       traceID,
@@ -205,7 +220,7 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 				if s := c.store(); s != nil {
 					metaBytes, _ := json.Marshal(meta)
 					rec := db.RuntimeTraceRecord{
-						TraceID:       ev.TraceID,
+						TraceID:       rowID,
 						ServiceName:   ev.ServiceName,
 						NodeSignature: ev.NodeSignature,
 						FilePath:      ev.FilePath,

@@ -194,3 +194,97 @@ func TestIngestOTLP_PreservesNonStringAttributeMetadata(t *testing.T) {
 		}
 	}
 }
+
+// TestIngestOTLP_SharedTraceIDKeepsAllSpans pins the persistence contract
+// for multi-span OTLP traces: every span of a trace shares one traceId, but
+// runtime_traces.trace_id is the PRIMARY KEY and InsertTrace is a plain
+// INSERT, so persisted rows must be keyed per span (traceId-spanId;
+// span-spanId when only the spanId exists; randomID when neither). Keying
+// by the group ID made spans 2..N fail the UNIQUE constraint and vanish —
+// the error was only logged while IngestOTLP still returned the full
+// count, so ProfilerOverview/RecentTraces/Hotspots undercounted silently.
+// The broadcast event keeps the raw traceId; only the row key changes.
+func TestIngestOTLP_SharedTraceIDKeepsAllSpans(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "traces.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	var captured []TraceEvent
+	collector := NewCollector(Config{
+		Store:   store,
+		OnTrace: func(ev TraceEvent) { captured = append(captured, ev) },
+	})
+
+	payload := `{
+		"resourceSpans": [{
+			"resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "checkout"}}]},
+			"scopeSpans": [{"spans": [
+				{
+					"traceId": "trace-shared", "spanId": "span-1",
+					"name": "controller.handle",
+					"attributes": [
+						{"key": "code.filepath", "value": {"stringValue": "src/controller.go"}},
+						{"key": "code.function", "value": {"stringValue": "controller.handle"}}
+					]
+				},
+				{
+					"traceId": "trace-shared", "spanId": "span-2",
+					"name": "db.query",
+					"attributes": [
+						{"key": "code.filepath", "value": {"stringValue": "src/db.go"}},
+						{"key": "code.function", "value": {"stringValue": "db.query"}}
+					]
+				},
+				{
+					"traceId": "trace-solo", "spanId": "span-3",
+					"name": "solo.run", "attributes": []
+				}
+			]}]
+		}]
+	}`
+
+	count, err := collector.IngestOTLP([]byte(payload))
+	if err != nil {
+		t.Fatalf("IngestOTLP: %v", err)
+	}
+	if count != 3 || len(captured) != 3 {
+		t.Fatalf("expected 3 spans ingested and captured, got count=%d captured=%d", count, len(captured))
+	}
+
+	// The broadcast keeps the raw traceId — row keying must not leak into
+	// the event stream.
+	for _, ev := range captured[:2] {
+		if ev.TraceID != "trace-shared" {
+			t.Errorf("broadcast TraceID = %q, want the raw \"trace-shared\"", ev.TraceID)
+		}
+	}
+
+	// Every span must persist: overview counts all three...
+	overview, err := store.ProfilerOverview()
+	if err != nil {
+		t.Fatalf("overview: %v", err)
+	}
+	if overview.TotalTraces != 3 {
+		t.Errorf("TotalTraces = %d, want 3 (spans 2..N of a shared traceId must not be dropped)", overview.TotalTraces)
+	}
+
+	// ...and the rows are keyed per span under the documented scheme.
+	rows, err := store.RecentTraces(10)
+	if err != nil {
+		t.Fatalf("recent traces: %v", err)
+	}
+	rowIDs := map[string]bool{}
+	for _, r := range rows {
+		rowIDs[r.TraceID] = true
+	}
+	for _, want := range []string{"trace-shared-span-1", "trace-shared-span-2", "trace-solo-span-3"} {
+		if !rowIDs[want] {
+			t.Errorf("persisted row %q missing (have %v)", want, rowIDs)
+		}
+	}
+}
