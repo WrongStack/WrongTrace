@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -1615,6 +1616,21 @@ func (s *Store) AllFileModelActivity(limit int) ([]ModelActivitySummary, error) 
 	out := make([]ModelActivitySummary, 0, len(activityMap))
 	for _, entry := range activityMap {
 		out = append(out, *entry)
+	}
+
+	// Sort deterministically: descending by total activity (reads + writes), then by
+	// model name for stable output order. This is required so that the limit cap
+	// produces consistent, reproducible results.
+	sort.Slice(out, func(i, j int) bool {
+		a := out[i].ReadCount + out[i].WriteEvents
+		b := out[j].ReadCount + out[j].WriteEvents
+		if a != b {
+			return a > b
+		}
+		return out[i].ModelName < out[j].ModelName
+	})
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

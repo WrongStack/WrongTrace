@@ -118,19 +118,24 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 		}
 
 		// 2. Flexible /proxy/<prefix> match if route was configured as /<name> or <name>
-		slug := strings.TrimPrefix(lowerPfx, "/proxy")
-		slug = "/" + strings.Trim(slug, "/")
-		if slug != "/" {
-			proxySlug := "/proxy" + slug
-			if lowerPath == proxySlug {
-				return &r, "/"
-			}
-			if strings.HasPrefix(lowerPath, proxySlug+"/") {
-				remaining := normPath[len(proxySlug):]
-				if remaining == "" || !strings.HasPrefix(remaining, "/") {
-					remaining = "/" + strings.TrimPrefix(remaining, "/")
+		// Guard: only strip "/proxy" at a path-segment boundary — not a raw substring.
+		// Without this, a route with PathPrefix="/proxyzai" derives proxySlug="/proxy/zai"
+		// and hijacks /proxy/zai traffic, forwarding Authorization headers to the wrong host.
+		if lowerPfx == "/proxy" || strings.HasPrefix(lowerPfx, "/proxy/") {
+			slug := strings.TrimPrefix(lowerPfx, "/proxy")
+			slug = "/" + strings.Trim(slug, "/")
+			if slug != "/" {
+				proxySlug := "/proxy" + slug
+				if lowerPath == proxySlug {
+					return &r, "/"
 				}
-				return &r, remaining
+				if strings.HasPrefix(lowerPath, proxySlug+"/") {
+					remaining := normPath[len(proxySlug):]
+					if remaining == "" || !strings.HasPrefix(remaining, "/") {
+						remaining = "/" + strings.TrimPrefix(remaining, "/")
+					}
+					return &r, remaining
+				}
 			}
 		}
 

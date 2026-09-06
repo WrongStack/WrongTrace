@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -65,6 +66,42 @@ func rowFor(t *testing.T, rows []ModelRow, model string) ModelRow {
 
 func approx(got, want float64) bool {
 	return got > want-1e-9 && got < want+1e-9
+}
+
+// TestAllFileModelActivity_HonorsLimit seeds 6 distinct models and asserts that
+// AllFileModelActivity returns at most the requested number of results.
+//
+// Bug (fixed): limit was accepted and defaulted to 50, but was never read — both
+// SQL aggregate queries ran unbounded and the merged map was returned whole. The
+// fix sorts deterministically (reads+writes desc, name asc) before capping.
+func TestAllFileModelActivity_HonorsLimit(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+
+	// Seed 6 distinct models, each with one event so they appear in the aggregates.
+	for i := 1; i <= 6; i++ {
+		model := fmt.Sprintf("model-%d", i)
+		seedRun(t, s, RunRecord{
+			RunID:     fmt.Sprintf("run-%d", i),
+			TaskID:    "task-1",
+			AgentName: "test-agent",
+			ModelName: model,
+			Provider:  "test",
+			CreatedAt: now.Add(-time.Duration(i) * time.Minute),
+		})
+		// All events target the same file so the model-level aggregates are independent.
+		seedEvent(t, s, fmt.Sprintf("evt-%d", i), fmt.Sprintf("run-%d", i),
+			"main.Test", "ADDED", now.Add(-time.Duration(i)*time.Minute))
+	}
+
+	// Request top 2 only — the function MUST cap at 2.
+	got, err := s.AllFileModelActivity(2)
+	if err != nil {
+		t.Fatalf("AllFileModelActivity(2) error: %v", err)
+	}
+	if len(got) > 2 {
+		t.Fatalf("AllFileModelActivity(2) returned %d models, want ≤ 2: %v", len(got), got)
+	}
 }
 
 // TestModelComparison_SurvivalAndROI seeds backdated rows (15+ days) and
