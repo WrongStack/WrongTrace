@@ -61,7 +61,11 @@ func DetectLanguage(path string) Language {
 	switch ext {
 	case ".go":
 		return LangGo
-	case ".ts", ".tsx":
+	case ".ts", ".tsx", ".mts", ".cts":
+		// .mts/.cts are TypeScript's ESM/CJS module spellings (tsc, node
+		// type-stripping, tsx). They are plain TypeScript for grammar
+		// purposes; leaving them unknown made Engine.Parse return nil, so
+		// those files got no AST snapshot, diff events, or guardrail health.
 		return LangTypeScript
 	case ".js", ".jsx", ".mjs", ".cjs":
 		return LangJavaScript

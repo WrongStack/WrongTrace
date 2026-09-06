@@ -283,6 +283,20 @@ func TestParse_MultiLanguage(t *testing.T) {
 	if _, ok := ts.Nodes["arrow_function:mod.ts::h"]; !ok {
 		t.Errorf("named ts arrow function missing; got %+v", ts.SortedSignatures())
 	}
+
+	// .mts/.cts are TypeScript's ESM/CJS module spellings (tsc, node
+	// type-stripping, tsx) and must reach the same grammar as .ts. Before
+	// DetectLanguage mapped them, Engine.Parse returned nil for them — no
+	// snapshot, no diff events, no guardrail health, no atlas coverage.
+	tsSrc := "export function bar(input: string): number { return input.length }\n\nclass Qux {\n  m(): number { return 2 }\n}\nconst h = (value: number): number => value + 3\n"
+	for _, tsPath := range []string{"entry.mts", "config.cts", "WORKER.MTS"} {
+		mts := parseOrFatal(t, eng, tsPath, tsSrc)
+		for _, sig := range []string{"function:" + tsPath + "::bar", "class:" + tsPath + "::Qux", "method:" + tsPath + "::Qux.m", "arrow_function:" + tsPath + "::h"} {
+			if _, ok := mts.Nodes[sig]; !ok {
+				t.Errorf("%s node %q missing; got %+v", tsPath, sig, mts.SortedSignatures())
+			}
+		}
+	}
 }
 
 // TestParse_Concurrent drives Parse + snapshot accessors from many
