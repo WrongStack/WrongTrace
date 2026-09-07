@@ -25,7 +25,7 @@ func GenerateMarkdownReport(data ReportData) string {
 	var b strings.Builder
 
 	b.WriteString("# 🎯 WrongTrace — AI Observability & Telemetry Report\n\n")
-	b.WriteString(fmt.Sprintf("> **Repository:** `%s` · **Generated:** `%s`\n\n", snap.Repo, snap.GeneratedAt.Format(time.RFC822)))
+	b.WriteString(fmt.Sprintf("> **Repository:** `%s` · **Generated:** `%s`\n\n", mdCell(snap.Repo), snap.GeneratedAt.Format(time.RFC822)))
 
 	// 1. Executive Summary
 	b.WriteString("## 📊 Executive Summary\n\n")
@@ -58,7 +58,7 @@ func GenerateMarkdownReport(data ReportData) string {
 				costStr = "—"
 			}
 			b.WriteString(fmt.Sprintf("| **`%s`** | `%.1f%%` | `%d` | `$%.4f` | `%s` |\n",
-				m.Model, m.SurvivalRatePct, m.TotalSurvivedNodes, m.TotalCostUSD, costStr))
+				mdCell(m.Model), m.SurvivalRatePct, m.TotalSurvivedNodes, m.TotalCostUSD, costStr))
 		}
 		b.WriteString("\n")
 	}
@@ -70,7 +70,7 @@ func GenerateMarkdownReport(data ReportData) string {
 		b.WriteString("| :--- | :--- | :---: | :---: | :---: |\n")
 		for _, h := range data.Hotspots {
 			b.WriteString(fmt.Sprintf("| `%s` | `%s` | `%.2f ms` | `%d` | `%d` |\n",
-				h.NodeSignature, h.FilePath, h.AvgDurationMs, h.TraceCount, h.TotalErrors))
+				mdCell(h.NodeSignature), mdCell(h.FilePath), h.AvgDurationMs, h.TraceCount, h.TotalErrors))
 		}
 		b.WriteString("\n")
 	}
@@ -82,7 +82,7 @@ func GenerateMarkdownReport(data ReportData) string {
 		b.WriteString("| :--- | :--- | :---: | :---: |\n")
 		for _, t := range snap.Thrashing {
 			b.WriteString(fmt.Sprintf("| `%s` | `%s` | `%d` | `%.1fh` |\n",
-				t.FilePath, t.Signature, t.EditCount, t.WindowHours))
+				mdCell(t.FilePath), mdCell(t.Signature), t.EditCount, t.WindowHours))
 		}
 		b.WriteString("\n")
 	}
@@ -101,7 +101,7 @@ func GenerateMarkdownReport(data ReportData) string {
 				runStr = "—"
 			}
 			b.WriteString(fmt.Sprintf("| `%s` | `%s` | `%s` | `%s` | `%s` |\n",
-				r.FilePath, r.Signature, r.Action, runStr, r.OccurredAt.Format("15:04:05")))
+				mdCell(r.FilePath), mdCell(r.Signature), mdCell(r.Action), mdCell(runStr), r.OccurredAt.Format("15:04:05")))
 		}
 		b.WriteString("\n")
 	}
@@ -110,6 +110,27 @@ func GenerateMarkdownReport(data ReportData) string {
 	b.WriteString("_Generated automatically by [WrongTrace](https://github.com/wrongstack/wrongtrace)._\n")
 
 	return b.String()
+}
+
+// mdCell renders a telemetry-derived string as a safe Markdown table cell.
+//
+// Every telemetry cell in this report is wrapped in backticks, so a raw
+// payload could split the cell (|), split the row (CR/LF), terminate the code
+// span early (`), or defeat the pipe escape (a payload backslash directly
+// before the escaped pipe re-opens a cell delimiter). Backslash is replaced
+// first so the payload can never turn "\|" back into a boundary sequence.
+func mdCell(s string) string {
+	if !strings.ContainsAny(s, "\\|`\r\n") {
+		return s
+	}
+	return strings.NewReplacer(
+		`\`, `\\`,
+		"|", `\|`,
+		"`", "'",
+		"\r\n", " ",
+		"\r", " ",
+		"\n", " ",
+	).Replace(s)
 }
 
 // GenerateHTMLReport renders a standalone dark-themed HTML report.
