@@ -543,7 +543,7 @@ var mcpToolsList = sync.OnceValue(func() interface{} {
 						"cost":              map[string]string{"type": "number"},
 						"cost_usd":          map[string]string{"type": "number"},
 					},
-					"required": []string{"model", "provider", "task_id", "intent"},
+					"required": []string{"model", "provider", "task_id"},
 				},
 			},
 			{
@@ -644,7 +644,6 @@ var mcpToolsList = sync.OnceValue(func() interface{} {
 						"file_path": map[string]string{"type": "string"},
 						"limit":     map[string]string{"type": "integer"},
 					},
-					"required": []string{"file_path"},
 				},
 			},
 		},

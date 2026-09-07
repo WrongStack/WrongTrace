@@ -237,7 +237,11 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 		}
 		props, _ := schema["properties"].(map[string]interface{})
 		reqd, _ := schema["required"].([]interface{})
-		if name != "list_locks" && (len(props) == 0 || len(reqd) == 0) {
+		// list_locks and get_file_diff_history enforce no required arguments
+		// (the latter's file_path is optional: omitting it yields the
+		// documented codebase-wide history), so their advertised required may
+		// be empty. Every other tool must advertise at least one.
+		if name != "list_locks" && name != "get_file_diff_history" && (len(props) == 0 || len(reqd) == 0) {
 			t.Errorf("tool %s: properties/required empty", name)
 		}
 		for _, r := range reqd {
@@ -253,10 +257,16 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 	for _, r := range rt["required"].([]interface{}) {
 		reqSet[r.(string)] = true
 	}
-	for _, want := range []string{"model", "provider", "task_id", "intent"} {
+	for _, want := range []string{"model", "provider", "task_id"} {
 		if !reqSet[want] {
 			t.Errorf("report_telemetry required missing %q: %v", want, reqSet)
 		}
+	}
+	// Round-39: intent is OPTIONAL (the handler accepts telemetry without it),
+	// so the advertisement must not require it — a schema-validating client
+	// would otherwise silently refuse valid telemetry.
+	if reqSet["intent"] {
+		t.Errorf("report_telemetry required includes %q, but the handler treats intent as optional", "intent")
 	}
 	props := rt["properties"].(map[string]interface{})
 	for _, want := range []string{"model", "provider", "task_id", "intent", "tokens_used", "cost"} {
@@ -264,8 +274,8 @@ func TestDispatch_ToolsList_SchemaShape(t *testing.T) {
 			t.Errorf("report_telemetry properties missing %q", want)
 		}
 	}
-	if len(reqSet) != 4 {
-		t.Errorf("report_telemetry required should have exactly 4 entries, got %d", len(reqSet))
+	if len(reqSet) != 3 {
+		t.Errorf("report_telemetry required should have exactly 3 entries, got %d", len(reqSet))
 	}
 
 	fh := byName["get_file_health_score"]["inputSchema"].(map[string]interface{})
