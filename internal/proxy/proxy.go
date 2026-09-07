@@ -747,14 +747,33 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cleanPath = "chat/completions"
 	}
 
-	targetURL := strings.TrimSuffix(targetBase, "/") + "/" + cleanPath
+	// Parse the base to extract any embedded query string (e.g. ?key=... from
+	// X-Target-Upstream or a dynamic route with query-string auth).  Using string
+	// concatenation here (was: targetBase + "/" + cleanPath) would put the path
+	// AFTER the query separator, absorbing it into the query string and sending
+	// the upstream a request with an empty path.
+	base, _ := url.Parse(targetBase)
+	if base == nil {
+		http.Error(w, "wrongtrace proxy: could not parse upstream URL "+targetBase, http.StatusInternalServerError)
+		return
+	}
+	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + cleanPath
+	// url.JoinPath normalises the path, preventing double-slashes.
 	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
+		q := base.Query()
+		for _, kv := range strings.Split(r.URL.RawQuery, "&") {
+			if idx := strings.IndexByte(kv, '='); idx >= 0 {
+				q.Set(kv[:idx], kv[idx+1:])
+			} else {
+				q.Set(kv, "")
+			}
+		}
+		base.RawQuery = q.Encode()
 	}
 	// safeTargetURL is the credential-scrubbed form used ONLY for logs and
 	// traffic records; the forwarded request keeps the real URL so
 	// query-authenticated providers (e.g. Gemini ?key=...) keep working.
-	safeTargetURL := sanitizeURLForRecord(targetURL)
+	safeTargetURL := sanitizeURLForRecord(base.String())
 
 	reqID := randomID("px")
 
@@ -981,7 +1000,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build outgoing proxy request
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(reqBody))
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, base.String(), bytes.NewReader(reqBody))
 	if err != nil {
 		http.Error(w, "create proxy request failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1089,10 +1108,24 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // record, no cache or quota interaction.
 func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Request, provider, targetBase, cleanPath string) {
 	catID := randomID("px-cat")
-	targetURL := strings.TrimSuffix(targetBase, "/") + "/" + strings.TrimPrefix(cleanPath, "/")
-	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
+	base, _ := url.Parse(targetBase)
+	if base == nil {
+		http.Error(w, "wrongtrace proxy: could not parse upstream URL "+targetBase, http.StatusInternalServerError)
+		return
 	}
+	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + strings.TrimPrefix(cleanPath, "/")
+	if r.URL.RawQuery != "" {
+		q := base.Query()
+		for _, kv := range strings.Split(r.URL.RawQuery, "&") {
+			if idx := strings.IndexByte(kv, '='); idx >= 0 {
+				q.Set(kv[:idx], kv[idx+1:])
+			} else {
+				q.Set(kv, "")
+			}
+		}
+		base.RawQuery = q.Encode()
+	}
+	targetURL := base.String()
 
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	if err != nil {
