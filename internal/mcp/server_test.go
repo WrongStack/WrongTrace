@@ -35,18 +35,23 @@ type fakeSink struct {
 	lockReason                                  string
 }
 
-func (f *fakeSink) IsFileLocked(path string) (bool, string) {
-	return f.isLocked, f.lockReason
+func (f *fakeSink) IsFileLocked(path string) (bool, ipc.LockInfo) {
+	if f.isLocked {
+		return true, ipc.LockInfo{Path: path, Reason: f.lockReason}
+	}
+	return false, ipc.LockInfo{}
 }
 
-func (f *fakeSink) LockFile(path, reason string) {
+func (f *fakeSink) LockFile(path, reason string) ipc.LockInfo {
 	f.isLocked = true
 	f.lockReason = reason
+	return ipc.LockInfo{Path: path, Reason: reason}
 }
 
-func (f *fakeSink) UnlockFile(path string) {
+func (f *fakeSink) UnlockFile(path string) ipc.LockInfo {
 	f.isLocked = false
 	f.lockReason = ""
+	return ipc.LockInfo{}
 }
 
 func (f *fakeSink) ReportRunMCP(model, provider, taskID, intent string, promptTokens, completionTokens int64, cost float64) (string, error) {

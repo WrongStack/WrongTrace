@@ -1057,7 +1057,14 @@ func (h *Handlers) ClearStale(w http.ResponseWriter, r *http.Request) {
 			Days *int `json:"days"`
 		}
 		if r.Body != nil {
-			if err := decodeJSON(w, r, &body); err == nil && body.Days != nil {
+			if err := decodeJSON(w, r, &body); err != nil {
+				// io.EOF means the body is empty — valid for this optional-body endpoint.
+				// Any other error means malformed JSON; reject it with 400.
+				if err != io.EOF {
+					writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+					return
+				}
+			} else if body.Days != nil {
 				days = *body.Days
 			}
 		}
@@ -1194,6 +1201,9 @@ func (h *Handlers) GetRecentReads(w http.ResponseWriter, r *http.Request) {
 		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
 			limit = parsed
 		}
+	}
+	if limit > maxRecentEventsLimit {
+		limit = maxRecentEventsLimit
 	}
 	reads, err := h.Engine.GetRecentFileReads(limit, h.getProjectFilter(r))
 	if err != nil {

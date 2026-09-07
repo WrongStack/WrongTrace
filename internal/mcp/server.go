@@ -250,11 +250,11 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			return resp
 		}
 		if locker, ok := sink.(interface {
-			IsFileLocked(path string) (bool, string)
+			IsFileLocked(path string) (bool, core.LockInfo)
 		}); ok {
-			if locked, lockReason := locker.IsFileLocked(path); locked {
+			if locked, lockInfo := locker.IsFileLocked(path); locked {
 				rec := fmt.Sprintf("GUARDRAIL BLOCKED: File %s is locked.", path)
-				text := fmt.Sprintf("allowed=false health_score=0 fragile=%v recent_thrashing_count=%d is_locked=true lock_reason=%q recommendation=%q", true, 0, lockReason, rec)
+				text := fmt.Sprintf("allowed=false health_score=0 fragile=%v recent_thrashing_count=%d is_locked=true lock_reason=%q recommendation=%q", true, 0, lockInfo.Reason, rec)
 				resp.Result = map[string]interface{}{
 					"content": []map[string]interface{}{
 						{"type": "text", "text": text},
@@ -265,8 +265,10 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 						"is_fragile":             true,
 						"is_locked":              true,
 						"recent_thrashing_count": 0,
-						"lock_reason":            lockReason,
-						"recommendation":         rec,
+						"lock_reason":            lockInfo.Reason,
+						"lock_owner":             lockInfo.Owner,
+						"lock_expires_at":        lockInfo.ExpiresAt,
+						"recommendation":          rec,
 					},
 				}
 				return resp

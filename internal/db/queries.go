@@ -1727,9 +1727,9 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 				e.event_time,
 				COALESCE(r.model_name, 'unknown') AS overwriter_model,
 				COALESCE(r.run_id, '') AS overwriter_run_id,
-				LAG(COALESCE(r.model_name, 'unknown')) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time) AS author_model,
-				LAG(COALESCE(r.run_id, '')) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time) AS author_run_id,
-				LAG(e.event_time) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time) AS author_time
+				LAG(COALESCE(r.model_name, 'unknown')) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_model,
+				LAG(COALESCE(r.run_id, '')) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_run_id,
+				LAG(e.event_time) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_time
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
 			WHERE e.run_id IS NOT NULL
@@ -1825,6 +1825,17 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 	for _, e := range edgeMap {
 		edges = append(edges, *e)
 	}
+
+	// Sort edges deterministically: highest conflict count first, then alphabetically
+	// by author model to ensure stable results when counts are equal.
+	// Without this sort, Go's random map iteration makes TopFrictionPair
+	// arbitrary on tied cross-agent edges.
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].ConflictCount != edges[j].ConflictCount {
+			return edges[i].ConflictCount > edges[j].ConflictCount
+		}
+		return edges[i].OverwriterModel < edges[j].OverwriterModel
+	})
 
 	ratio := 0.0
 	if totalCollisions > 0 {
