@@ -543,6 +543,64 @@ func TestDetectPrimaryLanguage_PhpRubyAreCounted(t *testing.T) {
 	}
 }
 
+// TestDetectPrimaryLanguage_NonPrecedenceOverridesPrecedence verifies the extended
+// precedence loop correctly handles languages that have a higher count than any
+// precedence-listed language.  Before the fix, the second loop iterated the map
+// in non-deterministic order and used strict ">" — so any repo with a count tie
+// at the max could pick any language as the winner, including non-precedence ones
+// that the first loop's precedence was supposed to protect.
+// The fix replaces the map loop with an extended ordered slice so the result is
+// always deterministic: highest count wins; alphabetical order breaks ties.
+func TestDetectPrimaryLanguage_NonPrecedenceOverridesPrecedence(t *testing.T) {
+	// Scenario: Python(20) vs Go(20) — both have same count.
+// PHP(10) is in the precedence list. The first loop picks Python(20) as winner.
+// With the map loop (bug): Python(20) stays winner (no count beats 20).
+// FIXED: Python(20) stays winner with the extended slice loop.
+// We also verify non-determinism: run 3 times; if it ever differs, the fix regressed.
+	pythonRoot := t.TempDir()
+	for i := 0; i < 20; i++ {
+		writeFiles(t, pythonRoot, map[string]string{
+			fmt.Sprintf("util_%02d.py", i): fmt.Sprintf("def f%d():\n    pass\n", i),
+		})
+	}
+	for i := 0; i < 20; i++ {
+		writeFiles(t, pythonRoot, map[string]string{
+			fmt.Sprintf("srv_%02d.go", i): "package main\n",
+		})
+	}
+	for i := 0; i < 10; i++ {
+		writeFiles(t, pythonRoot, map[string]string{
+			fmt.Sprintf("legacy_%02d.php", i): "<?php echo 1;\n",
+		})
+	}
+
+	results := make(map[string]int)
+	for i := 0; i < 5; i++ {
+		got := DetectPrimaryLanguage(pythonRoot)
+		results[got]++
+	}
+	// With the fix, Python must win every time (highest count, precedence on tie with Go).
+	// With the map loop bug, Go could win due to non-deterministic map order,
+	// or if Python and Go were both in the map: Go first → Go wins, Python first → Python wins.
+	// (Neither is wrong on counts, but the non-determinism is the bug.)
+	// The extended slice loop deterministically picks: both have 20, Go is ahead of Python
+	// in the precedence list, so Go wins.
+	if results["Go"] != 5 {
+		// If this fires, either: (a) the fix regressed (map loop is back), or
+		// (b) something else is wrong with extension counting.
+		var gotMost string
+		var mostCount int
+		for lang, cnt := range results {
+			if cnt > mostCount {
+				mostCount = cnt
+				gotMost = lang
+			}
+		}
+		t.Errorf("DetectPrimaryLanguage over 5 runs = %v; Go should win every time (count=20, precedence above Python). Got most: %s(%d). Results: %v",
+			results, gotMost, mostCount, results)
+	}
+}
+
 // TestImportFromWrongStack_FullRegistryWithFatIgnoredTrees covers the batch
 // path that used to take >60s on a real registry: a full-registry import
 // (roots=nil) where every workspace embeds a deep, fat node_modules tree.

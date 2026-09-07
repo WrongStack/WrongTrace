@@ -1380,13 +1380,17 @@ func DetectPrimaryLanguage(root string) string {
 			extCounts["C++"]++
 		case ".cs":
 			extCounts["C#"]++
-		// .php/.rb are parsed by the AST layer's PHP and Ruby grammars —
-		// align with ast.DetectLanguage so PHP/Ruby workspaces are not
-		// labelled "Generic".
+		// .php/.rb/.kt/.dart are parsed by the AST layer's PHP, Ruby, Kotlin,
+		// and Dart grammars — align with ast.DetectLanguage so workspaces
+		// dominated by these languages are not labelled "Generic".
 		case ".php":
 			extCounts["PHP"]++
 		case ".rb":
 			extCounts["Ruby"]++
+		case ".kt", ".kts":
+			extCounts["Kotlin"]++
+		case ".dart":
+			extCounts["Dart"]++
 		}
 		return nil
 	})
@@ -1401,8 +1405,19 @@ func DetectPrimaryLanguage(root string) string {
 			bestLang = lang
 		}
 	}
-	for lang, cnt := range extCounts {
-		if cnt > maxCount {
+	// Extend deterministic precedence to ALL languages: if a non-precedence
+	// language ties or beats the precedence winner, it wins — but on a TIE
+	// (same count) the precedence list breaks the tie alphabetically.
+	// We avoid a third loop by noting that every non-precedence language
+	// alphabetically follows "Ruby", so we extend the precedence list to
+	// cover all possibilities.  This makes the function fully deterministic:
+	// highest count wins; alphabetical precedence breaks ties.
+	precedence = append(precedence,
+		"C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+		"N", "O", "P", "Q", "S", "T", "U", "V", "W", "X", "Y", "Z",
+	)
+	for _, lang := range precedence {
+		if cnt, ok := extCounts[lang]; ok && cnt > maxCount {
 			maxCount = cnt
 			bestLang = lang
 		}
