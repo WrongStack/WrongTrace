@@ -112,10 +112,16 @@ export function AgentSessionsView({
     return activeRuns.filter((r) => {
       if (isJunkModel(r.model_name)) return false;
       if (currentProject) {
-        if (r.project_id && r.project_id !== currentProject.id) return false;
-        if (r.project_slug && !r.project_slug.toLowerCase().includes(currentProject.name.toLowerCase()) && !currentProject.name.toLowerCase().includes(r.project_slug.toLowerCase())) {
-          return false;
-        }
+        // Round-35 contract (mirrors the round-32 ProxyRoutingView fix): an
+        // exact project_id match suffices on its own; a slug-only run needs
+        // EXACT case-insensitive slug==name equality — never containment,
+        // which matches a DIFFERENT workspace ("api" vs "api-v2"); fully
+        // unattributed runs pass through.
+        const matchesProj =
+          (r.project_id && r.project_id === currentProject.id) ||
+          (r.project_slug && r.project_slug.toLowerCase() === currentProject.name.toLowerCase()) ||
+          (!r.project_id && !r.project_slug);
+        if (!matchesProj) return false;
       }
       if (q && !r.agent_name.toLowerCase().includes(q) && !r.model_name.toLowerCase().includes(q) && !r.run_id.toLowerCase().includes(q)) {
         return false;
@@ -240,11 +246,15 @@ export function AgentSessionsView({
         });
       }
 
-      if (m.input_price_per_m > 0 && (g.lowestInputPrice === 0 || m.input_price_per_m < g.lowestInputPrice)) {
+      // Plain min-scan: 0 is a REAL price (free / self-hosted models), not an
+      // unset sentinel — lowestInputPrice/lowestOutputPrice were initialized
+      // from the first entry, so strict less-than keeps the true minimum and
+      // lets a free provider own bestProvider.
+      if (m.input_price_per_m < g.lowestInputPrice) {
         g.lowestInputPrice = m.input_price_per_m;
         g.bestProvider = m.provider;
       }
-      if (m.output_price_per_m > 0 && (g.lowestOutputPrice === 0 || m.output_price_per_m < g.lowestOutputPrice)) {
+      if (m.output_price_per_m < g.lowestOutputPrice) {
         g.lowestOutputPrice = m.output_price_per_m;
       }
     });
@@ -542,8 +552,15 @@ export function AgentSessionsView({
 
                   {/* Session Code Mutations & Diffs */}
                   {(() => {
+                    // Exact run match, plus unattributed watcher events for the
+                    // daemon session only (engine attribution can leave run_id
+                    // empty when several runs are active). A bare agent-name
+                    // bypass here claimed OTHER sessions' diffs as
+                    // "produced in this session".
                     const sessionDiffs = recentEvents.filter(
-                      (e) => (e.run_id === selectedRun.run_id || selectedRun.agent_name === 'WrongStack') && !!e.diff_snippet
+                      (e) =>
+                        (e.run_id === selectedRun.run_id || (!e.run_id && selectedRun.agent_name === 'WrongStack')) &&
+                        !!e.diff_snippet
                     );
                     if (sessionDiffs.length === 0) return null;
                     return (
@@ -968,7 +985,8 @@ export function AgentSessionsView({
 
                     <div className="space-y-1 max-h-48 overflow-y-auto pr-0.5">
                       {g.providers.map((p) => {
-                        const isCheapest = p.inputPrice > 0 && p.inputPrice === g.lowestInputPrice;
+                        // 0 is a valid cheapest price (free / self-hosted).
+                        const isCheapest = p.inputPrice === g.lowestInputPrice;
                         return (
                           <div
                             key={p.fullId}

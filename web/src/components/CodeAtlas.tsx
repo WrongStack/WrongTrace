@@ -739,7 +739,14 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
 
       const MAX_CANVAS_SYMBOLS = 14;
       const sortedSymbols = [...file.symbols].sort((a, b) => {
-        if (a.status !== b.status) return a.status === 'MODIFIED' ? -1 : 1;
+        // Rank-based weak ordering: MODIFIED first, then edit_count desc, then
+        // lines_of_code desc. The previous ternary returned 1 for BOTH
+        // directions of any non-MODIFIED status pair, breaking antisymmetry —
+        // the tiebreaks never applied and the canvas top-14 depended on
+        // backend insertion order.
+        const aMod = a.status === 'MODIFIED' ? 1 : 0;
+        const bMod = b.status === 'MODIFIED' ? 1 : 0;
+        if (aMod !== bMod) return bMod - aMod;
         if (a.edit_count !== b.edit_count) return b.edit_count - a.edit_count;
         return b.lines_of_code - a.lines_of_code;
       });
