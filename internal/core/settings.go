@@ -60,7 +60,10 @@ func loadSettingsFromDisk() {
 		if loaded.DebounceMs > 0 {
 			globalSettings.DebounceMs = loaded.DebounceMs
 		}
-		if len(loaded.IgnorePatterns) > 0 {
+		// Nil-check, not len>0, mirroring UpdateSettings: settings.json
+		// omits the field to preserve the current list and writes [] to
+		// clear it, so a persisted clear must survive the reload.
+		if loaded.IgnorePatterns != nil {
 			globalSettings.IgnorePatterns = loaded.IgnorePatterns
 		}
 		if loaded.ThrashingThreshold > 0 {
@@ -81,6 +84,15 @@ func loadSettingsFromDisk() {
 		globalSettings.SlackWebhookURL = loaded.SlackWebhookURL
 		globalSettings.DiscordWebhookURL = loaded.DiscordWebhookURL
 		globalSettings.CustomWebhookURL = loaded.CustomWebhookURL
+		// saveSettingsToDisk persists the runtime paths the settings API
+		// accepts, so they must survive the reload too — dropping them here
+		// silently fell back to the active project / defaults on restart.
+		if loaded.DBPath != "" {
+			globalSettings.DBPath = loaded.DBPath
+		}
+		if loaded.SocketPath != "" {
+			globalSettings.SocketPath = loaded.SocketPath
+		}
 		settingsMu.Unlock()
 	}
 }

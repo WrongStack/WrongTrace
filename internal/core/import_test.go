@@ -500,6 +500,49 @@ func TestDetectPrimaryLanguage_MjsCjsAreJavaScript(t *testing.T) {
 	}
 }
 
+// TestDetectPrimaryLanguage_PhpRubyAreCounted completes the extension
+// alignment invariant with ast.DetectLanguage: .php and .rb are parsed by the
+// AST layer's PHP and Ruby grammars and must count toward PHP / Ruby. Before
+// the alignment, a PHP- or Ruby-dominated workspace classified as "Generic" —
+// or let a minority language win — so AddProject stamped the wrong language
+// label at registration. Precedence on a tie is deterministic: the existing
+// list order wins, so a Go/PHP split still classifies as Go.
+func TestDetectPrimaryLanguage_PhpRubyAreCounted(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"a1.php":    "<?php echo 1;\n",
+		"a2.php":    "<?php echo 2;\n",
+		"index.php": "<?php echo 3;\n",
+		"app.rb":    "puts 1\n",
+	}
+	writeFiles(t, root, files)
+
+	if got := DetectPrimaryLanguage(root); got != "PHP" {
+		t.Errorf("DetectPrimaryLanguage = %q, want PHP for .php-dominated workspace", got)
+	}
+
+	rubyRoot := t.TempDir()
+	writeFiles(t, rubyRoot, map[string]string{"a.rb": "puts 1\n", "b.rb": "puts 2\n"})
+	if got := DetectPrimaryLanguage(rubyRoot); got != "Ruby" {
+		t.Errorf("DetectPrimaryLanguage = %q, want Ruby for .rb-dominated workspace", got)
+	}
+
+	// Tie precedence: one Go + one PHP file — the existing list order keeps
+	// Go ahead of the newly counted PHP, so established projects never flip.
+	mixed := t.TempDir()
+	writeFiles(t, mixed, map[string]string{"x.go": "package main\n", "y.php": "<?php echo 1;\n"})
+	if got := DetectPrimaryLanguage(mixed); got != "Go" {
+		t.Errorf("DetectPrimaryLanguage = %q, want Go for a Go/PHP tie", got)
+	}
+
+	// No over-reach: a Python-only workspace still classifies as Python.
+	pyRoot := t.TempDir()
+	writeFiles(t, pyRoot, map[string]string{"main.py": "x = 1\n", "util.py": "y = 2\n"})
+	if got := DetectPrimaryLanguage(pyRoot); got != "Python" {
+		t.Errorf("DetectPrimaryLanguage = %q, want Python for python-only workspace", got)
+	}
+}
+
 // TestImportFromWrongStack_FullRegistryWithFatIgnoredTrees covers the batch
 // path that used to take >60s on a real registry: a full-registry import
 // (roots=nil) where every workspace embeds a deep, fat node_modules tree.

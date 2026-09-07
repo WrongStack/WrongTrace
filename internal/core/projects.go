@@ -173,49 +173,55 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 		e.lockMu.Unlock()
 		return nil, fmt.Errorf("project not found: %s", id)
 	}
+	watcher := e.watcher
+	e.lockMu.Unlock()
 
-	for k, p := range e.projects {
+	// Hot-swap the database BEFORE any identity change. A store that cannot
+	// be opened or migrated aborts the WHOLE switch with an error, leaving
+	// IsActive across the registry, cfg.RepoName, the persisted index, and
+	// the previous database untouched. Flipping identity first split the
+	// daemon's brain: the dashboard was told the switch succeeded while every
+	// event kept landing in the previous project's database.
+	var newStore *db.Store
+	if target.DBPath != "" {
+		opened, err := db.Open(target.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("open project store %s: %w", target.DBPath, err)
+		}
+		if mErr := opened.Migrate(); mErr != nil {
+			_ = opened.Close()
+			return nil, fmt.Errorf("migrate project store %s: %w", target.DBPath, mErr)
+		}
+		newStore = opened
+	}
+
+	// Identity, registry, persisted index, and the active store now commit
+	// together — the switch cannot half-apply.
+	e.lockMu.Lock()
+	for k := range e.projects {
+		p := e.projects[k]
 		p.IsActive = (k == id)
 		e.projects[k] = p
 	}
-
 	target.IsActive = true
 	e.projects[id] = target
 	e.cfg.RepoName = target.Name
 	SaveProjectsIndex(e.projects)
-	watcher := e.watcher
+	oldStore := e.cfg.Store
+	if newStore != nil {
+		e.cfg.Store = newStore
+	}
 	e.lockMu.Unlock()
 
-	// Hot-swap database to target project's dedicated SQLite store. A store
-	// that cannot be opened or migrated is not swapped in: the engine keeps
-	// serving the previous database instead of a half-applied schema.
-	if target.DBPath != "" {
-		newStore, err := db.Open(target.DBPath)
-		switch {
-		case err != nil:
-			log.Printf("projects: open %s: %v (active database not switched)", target.DBPath, err)
-		default:
-			mErr := newStore.Migrate()
-			if mErr != nil {
-				_ = newStore.Close()
-				log.Printf("projects: migrate %s: %v (active database not switched)", target.DBPath, mErr)
-			} else {
-				e.lockMu.Lock()
-				oldStore := e.cfg.Store
-				e.cfg.Store = newStore
-				e.lockMu.Unlock()
-				if oldStore != nil && oldStore != newStore {
-					// Close now, not on a timer: a lingering handle keeps the
-					// old SQLite file locked on Windows (breaks backup/delete of
-					// the project dir right after a switch). sql.DB.Close does
-					// not cancel queries already running, so only a caller that
-					// fetched Store() microseconds ago and has not started its
-					// query yet can observe "database is closed" — accepted as
-					// the cheaper side of the trade-off.
-					_ = oldStore.Close()
-				}
-			}
-		}
+	if newStore != nil && oldStore != nil && oldStore != newStore {
+		// Close now, not on a timer: a lingering handle keeps the
+		// old SQLite file locked on Windows (breaks backup/delete of
+		// the project dir right after a switch). sql.DB.Close does
+		// not cancel queries already running, so only a caller that
+		// fetched Store() microseconds ago and has not started its
+		// query yet can observe "database is closed" — accepted as
+		// the cheaper side of the trade-off.
+		_ = oldStore.Close()
 	}
 
 	// Reset in-memory AST snapshot cache so old repository symbols do not leak
@@ -293,8 +299,23 @@ func SaveProjectsIndex(projects map[string]ProjectProfile) {
 	}
 
 	data, err := json.MarshalIndent(map[string]interface{}{"projects": list}, "", "  ")
-	if err == nil {
-		_ = os.WriteFile(indexPath, data, 0o644)
+	if err != nil {
+		log.Printf("projects: marshal project index: %v — registry NOT persisted", err)
+		return
+	}
+	// Publish atomically and audibly. The direct WriteFile truncated the live
+	// index in place, so a crash mid-write destroyed the persisted registry —
+	// the corruption LoadProjectsIndex now quarantines. Writing a sibling and
+	// renaming it over the live path makes the publish all-or-nothing, and
+	// every failure is logged instead of silently dropped: every caller treats
+	// this save as fire-and-forget, so silence read as success.
+	tmp := indexPath + ".tmp"
+	if wErr := os.WriteFile(tmp, data, 0o644); wErr != nil {
+		log.Printf("projects: write project index %s: %v — registry NOT persisted", tmp, wErr)
+		return
+	}
+	if rErr := os.Rename(tmp, indexPath); rErr != nil {
+		log.Printf("projects: publish project index %s: %v — registry NOT persisted", indexPath, rErr)
 	}
 }
 
@@ -310,6 +331,18 @@ func LoadProjectsIndex() map[string]ProjectProfile {
 		Projects []ProjectProfile `json:"projects"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
+		// A corrupt index silently returning an empty registry is a data-loss
+		// event in disguise: startup works, but the operator's project list is
+		// erased without any signal, and the next SaveProjectsIndex overwrites
+		// the bytes permanently. Quarantine the file out of the live path so
+		// the loss is diagnosable and recoverable; a first run (no file at
+		// all) stays a quiet fresh start via the ReadFile branch above.
+		quarantine := indexPath + ".corrupt"
+		if qErr := os.Rename(indexPath, quarantine); qErr != nil {
+			log.Printf("projects: index %s is corrupt (%v); quarantine to %s failed: %v — starting with an empty registry", indexPath, err, quarantine, qErr)
+		} else {
+			log.Printf("projects: index %s is corrupt (%v); quarantined at %s — starting with an empty registry", indexPath, err, quarantine)
+		}
 		return make(map[string]ProjectProfile)
 	}
 
@@ -1347,6 +1380,13 @@ func DetectPrimaryLanguage(root string) string {
 			extCounts["C++"]++
 		case ".cs":
 			extCounts["C#"]++
+		// .php/.rb are parsed by the AST layer's PHP and Ruby grammars —
+		// align with ast.DetectLanguage so PHP/Ruby workspaces are not
+		// labelled "Generic".
+		case ".php":
+			extCounts["PHP"]++
+		case ".rb":
+			extCounts["Ruby"]++
 		}
 		return nil
 	})
@@ -1354,7 +1394,7 @@ func DetectPrimaryLanguage(root string) string {
 	var bestLang = "Generic"
 	var maxCount = 0
 	// Deterministic precedence on tie
-	precedence := []string{"Go", "Rust", "TypeScript", "JavaScript", "Python", "Java", "C++", "C#"}
+	precedence := []string{"Go", "Rust", "TypeScript", "JavaScript", "Python", "Java", "C++", "C#", "PHP", "Ruby"}
 	for _, lang := range precedence {
 		if cnt, ok := extCounts[lang]; ok && cnt > maxCount {
 			maxCount = cnt
