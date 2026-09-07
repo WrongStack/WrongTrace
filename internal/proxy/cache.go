@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"io"
 	"sync"
@@ -23,6 +24,12 @@ type CachedResponse struct {
 	CreatedAt    time.Time         `json:"created_at"`
 	ExpiresAt    time.Time         `json:"expires_at"`
 	HitCount     int64             `json:"hit_count"`
+
+	// lastAccessUnix tracks the most recent Get() hit (unix nanos) so the
+	// capacity eviction in Set can shed the coldest entries first — the LRU
+	// behavior the type documents. Unexported: cache plumbing, not wire data.
+	// All access is atomic; Get holds no write lock.
+	lastAccessUnix int64
 }
 
 // ResponseCache manages an in-memory LRU cache for LLM completions.
@@ -34,6 +41,12 @@ type ResponseCache struct {
 	totalHits   int64
 	totalMisses int64
 	totalSaved  float64
+
+	// clock hands out strictly increasing logical recency stamps. Wall-clock
+	// nanos cannot be used: whole request sequences land inside one clock
+	// tick on Windows (~0.5ms granularity), which would leave entries with
+	// identical stamps and silently degrade eviction back to FIFO.
+	clock atomic.Int64
 }
 
 // NewResponseCache creates a new in-memory response cache.
@@ -61,12 +74,22 @@ func ComputeKey(provider, model string, body []byte) string {
 // no authorization material is retained in cache keys or traffic records.
 func ComputeScopedKey(provider, model, scope string, body []byte) string {
 	hasher := sha256.New()
-	_, _ = io.WriteString(hasher, provider)
-	_, _ = io.WriteString(hasher, ":")
-	_, _ = io.WriteString(hasher, model)
-	_, _ = io.WriteString(hasher, ":")
-	_, _ = io.WriteString(hasher, scope)
-	_, _ = io.WriteString(hasher, ":")
+	// Length-prefix every field: the previous colon-joined form was
+	// delimiter-ambiguous — a model of "m:"+scope collided with the honest
+	// (model, scope) pair, so a crafted request could hit another scope's
+	// cached response, defeating the tenant isolation this key exists to
+	// provide. Explicit 8-byte big-endian length prefixes make the field
+	// boundaries part of the hash input itself. Keys change format, which at
+	// worst costs one 24h-TTL repopulation pass.
+	writeField := func(s string) {
+		var l [8]byte
+		binary.BigEndian.PutUint64(l[:], uint64(len(s)))
+		hasher.Write(l[:])
+		_, _ = io.WriteString(hasher, s)
+	}
+	writeField(provider)
+	writeField(model)
+	writeField(scope)
 	hasher.Write(body)
 	return hex.EncodeToString(hasher.Sum(nil))
 }
@@ -92,6 +115,14 @@ func (c *ResponseCache) Get(key string) (*CachedResponse, bool) {
 		return nil, false
 	}
 	c.mu.RUnlock()
+
+	// Refresh recency so Set()'s capacity eviction sheds cold entries first
+	// (the LRU contract this type documents). The stamp comes from the
+	// strictly increasing logical clock — wall-clock nanos would leave whole
+	// request sequences with identical stamps on Windows. Atomic because Get
+	// runs on many goroutines without the write lock; the eviction scan reads
+	// it under c.mu with atomic loads.
+	atomic.StoreInt64(&item.lastAccessUnix, c.clock.Add(1))
 
 	atomic.AddInt64(&item.HitCount, 1)
 	atomic.AddInt64(&c.totalHits, 1)
@@ -125,33 +156,40 @@ func (c *ResponseCache) Set(key, provider, model string, statusCode int, headers
 				delete(c.items, k)
 			}
 		}
-		// Second pass: if still at capacity, evict oldest
+		// Second pass: if still at capacity, evict the LEAST RECENTLY USED
+		// entry. Get() refreshes lastAccessUnix on every hit, so hot
+		// responses survive while cold ones are shed; CreatedAt breaks ties
+		// between entries that have never been read (last-access zero).
 		if len(c.items) >= c.maxEntries {
-			var oldestKey string
-			var oldestTime time.Time
+			var victim string
+			var victimAccess int64
+			var victimCreated time.Time
 			for k, v := range c.items {
-				if oldestTime.IsZero() || v.CreatedAt.Before(oldestTime) {
-					oldestTime = v.CreatedAt
-					oldestKey = k
+				la := atomic.LoadInt64(&v.lastAccessUnix)
+				if victim == "" || la < victimAccess || (la == victimAccess && v.CreatedAt.Before(victimCreated)) {
+					victim = k
+					victimAccess = la
+					victimCreated = v.CreatedAt
 				}
 			}
-			if oldestKey != "" {
-				delete(c.items, oldestKey)
+			if victim != "" {
+				delete(c.items, victim)
 			}
 		}
 	}
 	c.items[key] = &CachedResponse{
-		Key:          key,
-		StatusCode:   statusCode,
-		Headers:      headers,
-		Body:         body,
-		IsStream:     isStream,
-		Model:        model,
-		Provider:     provider,
-		TokensSaved:  tokensSaved,
-		CostSavedUSD: costSavedUSD,
-		CreatedAt:    now,
-		ExpiresAt:    now.Add(ttl),
+		Key:            key,
+		StatusCode:     statusCode,
+		Headers:        headers,
+		Body:           body,
+		IsStream:       isStream,
+		Model:          model,
+		Provider:       provider,
+		TokensSaved:    tokensSaved,
+		CostSavedUSD:   costSavedUSD,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(ttl),
+		lastAccessUnix: c.clock.Add(1),
 	}
 }
 
