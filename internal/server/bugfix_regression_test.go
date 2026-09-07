@@ -275,3 +275,56 @@ func TestAtlasHandler_PrefixFilterIsBoundaryCorrect(t *testing.T) {
 		t.Errorf("no prefix: TotalPackages=%d, want 3 (unfiltered)", got.TotalPackages)
 	}
 }
+
+// TestLockFileRejectsOverflowingTTL pins the round-51 contract: the HTTP
+// lock endpoint (POST /api/guardrail/lock, handlers.go LockFile) must
+// validate the 24h TTL cap BEFORE multiplying client integers into
+// time.Duration nanoseconds. Pre-fix, ttl_seconds=18446744074 overflowed
+// int64 ns into a ~0.29s lock and ttl_minutes=153722868 wrapped negative
+// into the engine's silent 15-minute default — both answered 200 "locked".
+// Mirrors the IPC transport cap (internal/ipc/socket.go lock_file dispatch)
+// and the MCP lock_file tool. Boundary: exactly 24h is accepted.
+func TestLockFileRejectsOverflowingTTL(t *testing.T) {
+	eng := core.NewEngine(core.Config{RepoName: "ttl-proof"})
+	h := Handlers{Engine: eng}
+	now := time.Now()
+
+	cases := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantTTL    time.Duration // 0 for rejections
+	}{
+		{"ttl_seconds overflow wraps to instant lock", `{"path":"x.go","reason":"p","ttl_seconds":18446744074}`, http.StatusBadRequest, 0},
+		{"ttl_minutes overflow wraps negative", `{"path":"x.go","reason":"p","ttl_minutes":153722868}`, http.StatusBadRequest, 0},
+		{"ttl string beyond 24h", `{"path":"x.go","reason":"p","ttl":"25h"}`, http.StatusBadRequest, 0},
+		{"boundary exactly 24h accepted", `{"path":"x.go","reason":"p","ttl_seconds":86400}`, http.StatusOK, 24 * time.Hour},
+		{"honest 60s lock accepted", `{"path":"x.go","reason":"p","ttl_seconds":60}`, http.StatusOK, time.Minute},
+		{"invalid ttl string abc", `{"path":"x.go","reason":"p","ttl":"abc"}`, http.StatusBadRequest, 0},
+		{"negative ttl string -1h", `{"path":"x.go","reason":"p","ttl":"-1h"}`, http.StatusBadRequest, 0},
+		{"zero ttl string 0s", `{"path":"x.go","reason":"p","ttl":"0s"}`, http.StatusBadRequest, 0},
+		{"honest ttl string 1h", `{"path":"x.go","reason":"p","ttl":"1h"}`, http.StatusOK, time.Hour},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/guardrail/lock", bytes.NewReader([]byte(tc.body)))
+			rec := httptest.NewRecorder()
+			h.LockFile(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("HTTP %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantTTL > 0 {
+				var resp struct {
+					ExpiresAt time.Time `json:"expires_at"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("decode response: %v", err)
+				}
+				got := resp.ExpiresAt.Sub(now)
+				if got < tc.wantTTL-time.Minute || got > tc.wantTTL+time.Minute {
+					t.Fatalf("expires_at drift: got %s, want ≈%s", got, tc.wantTTL)
+				}
+			}
+		})
+	}
+}

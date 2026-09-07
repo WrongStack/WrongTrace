@@ -47,10 +47,29 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	})
 }
 
-// decodeJSON reads and decodes JSON from r.Body bounded by a 10MB memory limit to protect against RAM exhaustion.
+// decodeJSON reads and decodes JSON from r.Body bounded by a 10MB memory
+// limit to protect against RAM exhaustion.
+//
+// A single Decode stops at the end of the FIRST JSON value and leaves the
+// tail unread, so a body like {"days":30} oops applied the valid prefix and
+// silently discarded the malformed remainder. The body is well-formed only
+// when nothing but whitespace follows the first value, which a second
+// Decode reports as io.EOF. First-Decode errors — including io.EOF for an
+// empty body — are returned unchanged so optional-body callers keep
+// filtering them.
 func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
-	return json.NewDecoder(r.Body).Decode(v)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected second JSON value after request body")
+		}
+		return err
+	}
+	return nil
 }
 
 // Health is a cheap readiness probe: no DB hit, no fsnotify check. It answers
@@ -630,15 +649,41 @@ func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A client TTL is an integer that can be pushed past int64 nanoseconds:
+	// ttl_seconds=18446744074 overflows into a ~0.29s lock and
+	// ttl_minutes=153722868 wraps negative into the engine's 15-minute
+	// default — both reported as success. Validate the 24h cap BEFORE the
+	// multiplication, mirroring the IPC lock_file dispatch (socket.go) and
+	// the MCP lock_file tool.
+	const maxLockTTL = 24 * time.Hour
 	ttl := 15 * time.Minute
 	if req.TTLSeconds > 0 {
+		if int64(req.TTLSeconds) > int64(maxLockTTL/time.Second) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("ttl_seconds %d exceeds the 24h maximum lock TTL", req.TTLSeconds))
+			return
+		}
 		ttl = time.Duration(req.TTLSeconds) * time.Second
 	} else if req.TTLMinutes > 0 {
+		if int64(req.TTLMinutes) > int64(maxLockTTL/time.Minute) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("ttl_minutes %d exceeds the 24h maximum lock TTL", req.TTLMinutes))
+			return
+		}
 		ttl = time.Duration(req.TTLMinutes) * time.Minute
 	} else if req.TTL != "" {
-		if d, err := time.ParseDuration(req.TTL); err == nil && d > 0 {
-			ttl = d
+		d, err := time.ParseDuration(req.TTL)
+		if err != nil || d <= 0 {
+			// A parse failure or non-positive result used to silently fall through
+			// to the 15-minute default — the same silent-rewrite class ClearStale
+			// rejects with 400 ("a caller asking to prune abc days needs to know,
+			// not get 30"). Match the house policy: surface the bad input.
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid ttl %q: must be a positive duration", req.TTL))
+			return
 		}
+		if d > maxLockTTL {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("ttl %s exceeds the 24h maximum lock TTL", req.TTL))
+			return
+		}
+		ttl = d
 	}
 
 	info := h.Engine.LockFileWithOptions(targetPath, req.Reason, owner, ownerRunID, ttl)

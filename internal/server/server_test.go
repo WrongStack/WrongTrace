@@ -1011,3 +1011,73 @@ func TestServer_Enhancements_WrongStackReport(t *testing.T) {
 
 	_ = engine
 }
+
+// TestDecodeJSON_RejectsTrailingGarbage pins the shared body-decoding
+// contract: decodeJSON must reject a body whose first JSON value is
+// followed by anything other than whitespace. A single Decode stopped at
+// the end of the first value and left the tail unread, so a body like
+// {"path":"x","reason":"y"} oops applied the valid prefix — the lock was
+// taken and the request answered 200 — while the malformed remainder was
+// silently discarded. The optional-body boundary is pinned too: an EMPTY
+// body still reaches handler logic, because the first Decode's io.EOF is
+// returned unchanged and filtered by callers that treat absence as "use
+// the default".
+func TestDecodeJSON_RejectsTrailingGarbage(t *testing.T) {
+	withIsolatedProjectsHome(t)
+	_, _, ts := newTestServer(t)
+
+	// Clean control locks successfully.
+	resp, err := http.Post(ts.URL+"/api/guardrail/lock", "application/json",
+		strings.NewReader(`{"path":"ctrl/a.go","reason":"clean"}`))
+	if err != nil {
+		t.Fatalf("POST lock: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clean body: status %d, want 200", resp.StatusCode)
+	}
+
+	// Trailing garbage after the first value must reject the whole body...
+	resp, err = http.Post(ts.URL+"/api/guardrail/lock", "application/json",
+		strings.NewReader(`{"path":"dirty/b.go","reason":"x"} this-is-not-json`))
+	if err != nil {
+		t.Fatalf("POST lock: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("trailing-garbage body: status %d, want 400", resp.StatusCode)
+	}
+
+	// ...as must a second JSON value.
+	resp, err = http.Post(ts.URL+"/api/guardrail/lock", "application/json",
+		strings.NewReader(`{"path":"two/b.go"} {"path":"two/c.go"}`))
+	if err != nil {
+		t.Fatalf("POST lock: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("two-values body: status %d, want 400", resp.StatusCode)
+	}
+
+	// Only the clean control's lock exists.
+	var locks []struct {
+		Path string `json:"path"`
+	}
+	getJSON(t, ts.URL+"/api/guardrail/locks", &locks)
+	for _, l := range locks {
+		if l.Path != "ctrl/a.go" {
+			t.Errorf("lock %q created from a malformed body; only the clean control may exist", l.Path)
+		}
+	}
+
+	// Optional-body boundary: an EMPTY body still reaches the handler and
+	// applies the default instead of erroring.
+	resp, err = http.Post(ts.URL+"/api/settings/clear-stale", "application/json", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("POST clear-stale: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusBadRequest {
+		t.Errorf("empty body rejected for an optional-body endpoint; first-Decode io.EOF must stay filterable")
+	}
+}
