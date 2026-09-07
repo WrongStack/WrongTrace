@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -184,5 +185,49 @@ func TestClassifyLogFile(t *testing.T) {
 		if got := classifyLogFile(tc.name, tc.parent); got != tc.want {
 			t.Errorf("classifyLogFile(%q, %q) = %v, want %v", tc.name, tc.parent, got, tc.want)
 		}
+	}
+}
+
+// TestPollOnce_RestoredCursorReingestsTruncatedTranscript pins the
+// change-detection contract for checkpoint-restored cursors: a transcript
+// truncated or rewritten SHORTER than its persisted offset while the daemon
+// was down must be re-ingested from byte 0, never skipped. The restore path
+// stamps the file's current mtime into the file state, so only an exact size
+// match may be treated as "nothing new" — a `<=` arm wedges the file below
+// its stale persisted offset on every poll (silent telemetry loss).
+func TestPollOnce_RestoredCursorReingestsTruncatedTranscript(t *testing.T) {
+	root := t.TempDir()
+	transcript := filepath.Join(root, "session.jsonl")
+	writeLine(t, transcript, "sess-1", "write_to_file", "one.go")
+
+	// Persist a cursor left behind by a LONGER predecessor of this file:
+	// 50 bytes past the current content, as after a truncation/rewrite.
+	st, err := os.Stat(transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := filepath.Join(root, "offsets.json")
+	stale := fmt.Sprintf(`{"version":1,"offsets":{%q:%d}}`, transcript, st.Size()+50)
+	if err := os.WriteFile(checkpoint, []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var got collector
+	sw := NewSessionWatcher(got.add)
+	sw.AddWatchDir(root)
+	if err := sw.EnablePersistentOffsets(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+
+	sw.PollOnce()
+	first := got.len()
+	if first == 0 {
+		t.Fatal("truncated transcript was skipped under its restored cursor — want re-ingestion from byte 0")
+	}
+
+	// The exact-match arm must still treat an unchanged file as done.
+	sw.PollOnce()
+	if got.len() != first {
+		t.Fatalf("unchanged poll re-ingested: want %d events, got %d", first, got.len())
 	}
 }

@@ -236,7 +236,12 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 		}
 	}
 
-	if seen && currentSize <= st.offset && !modTime.After(st.modTime) {
+	// Exact equality only: a file that SHRANK below its persisted offset was
+	// truncated or rewritten and must fall through to the truncation rule
+	// (re-ingest from byte 0), never be skipped. The mtime arm cannot save it
+	// on the checkpoint-restore path — there st.modTime is the file's current
+	// mtime, so the arm is always true.
+	if seen && currentSize == st.offset && !modTime.After(st.modTime) {
 		sw.mu.Unlock()
 		return
 	}

@@ -313,7 +313,9 @@ func (sw *SessionWatcher) pruneDirCache(gen uint64) {
 func (sw *SessionWatcher) visit(pathBuf []byte, kind fileKind, size int64, modTime time.Time) {
 	sw.mu.Lock()
 	st, seen := sw.seenFiles[string(pathBuf)]
-	unchanged := seen && size <= st.offset && !modTime.After(st.modTime)
+	// Exact equality only (see processFile): a file that shrank below its
+	// stored offset was truncated/rewritten and must be re-processed.
+	unchanged := seen && size == st.offset && !modTime.After(st.modTime)
 	sw.mu.Unlock()
 	if unchanged {
 		return
