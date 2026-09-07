@@ -45,10 +45,7 @@ func Open(path string) (*Store, error) {
 	// usually a few megabytes; 4 MiB across four connections covers the same
 	// working set at a quarter of the footprint. mmap_size caps the memory-
 	// mapped window, which the OS reclaims under pressure.
-	dsn := fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-4096)&_pragma=mmap_size(33554432)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)",
-		path,
-	)
+	dsn := fmt.Sprintf("file:%s?%s", escapeSQLiteURIPath(path), dsnPragmas)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sql.Open: %w", err)
@@ -76,6 +73,30 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	return &Store{db: conn}, nil
+}
+
+// dsnPragmas is the connection-level pragma set applied to every connection.
+// Kept byte-identical to the historical inline query; only the path component
+// of the DSN is escaped.
+const dsnPragmas = "_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-4096)&_pragma=mmap_size(33554432)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+
+// escapeSQLiteURIPath percent-encodes the three characters SQLite's URI parser
+// treats as structure so a database path containing any of them still resolves
+// to the literal file. modernc.org/sqlite pre-splits the DSN at the first raw
+// '?' for its own query handling and hands `file:`-prefixed DSNs to SQLite
+// with SQLITE_OPEN_URI, whose URI layer then percent-DECODES %HH sequences in
+// the path. A raw '%XX' in the path (legal in NTFS and POSIX filenames) was
+// therefore decoded before the file was opened: a valid sequence resolved to a
+// different, usually nonexistent, path ("pct%41est" -> "pctAtest", failing
+// open with SQLITE_CANTOPEN 14), and a literal '?' or '#' (legal on POSIX)
+// truncated the filename. '%' must be encoded first so the escapes emitted
+// here are not themselves re-encoded. Invalid sequences like "%zz" pass
+// through the URI layer literally and need no handling.
+func escapeSQLiteURIPath(p string) string {
+	p = strings.ReplaceAll(p, "%", "%25")
+	p = strings.ReplaceAll(p, "?", "%3F")
+	p = strings.ReplaceAll(p, "#", "%23")
+	return p
 }
 
 // Close releases the underlying connection pool.

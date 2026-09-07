@@ -22,7 +22,12 @@ var dbTimeLayouts = []string{
 }
 
 // parseDBTime parses a SQLite datetime string into a UTC time.Time. It returns
-// the zero time when nothing matches; callers treat that as "unknown".
+// the zero time when nothing matches; callers treat that as "unknown". The
+// fast paths below must agree exactly with the layouts fallback: an impossible
+// date ("2026-02-31", "2023-02-29", second=60) falls through to time.Parse,
+// which rejects it — so a corrupt or hand-inserted row reads as unknown
+// instead of being silently normalized by time.Date into a shifted plausible
+// date that poisons lookback windows.
 func parseDBTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
@@ -35,7 +40,7 @@ func parseDBTime(s string) time.Time {
 		h := int(s[11]-'0')*10 + int(s[12]-'0')
 		min := int(s[14]-'0')*10 + int(s[15]-'0')
 		sec := int(s[17]-'0')*10 + int(s[18]-'0')
-		if y >= 1970 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31 && h >= 0 && h <= 23 && min >= 0 && min <= 59 && sec >= 0 && sec <= 60 {
+		if y >= 1970 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= daysInMonth(y, m) && h >= 0 && h <= 23 && min >= 0 && min <= 59 && sec >= 0 && sec <= 59 {
 			return time.Date(y, m, d, h, min, sec, 0, time.UTC)
 		}
 	}
@@ -47,7 +52,7 @@ func parseDBTime(s string) time.Time {
 		h := int(s[11]-'0')*10 + int(s[12]-'0')
 		min := int(s[14]-'0')*10 + int(s[15]-'0')
 		sec := int(s[17]-'0')*10 + int(s[18]-'0')
-		if y >= 1970 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31 && h >= 0 && h <= 23 && min >= 0 && min <= 59 && sec >= 0 && sec <= 60 {
+		if y >= 1970 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= daysInMonth(y, m) && h >= 0 && h <= 23 && min >= 0 && min <= 59 && sec >= 0 && sec <= 59 {
 			return time.Date(y, m, d, h, min, sec, 0, time.UTC)
 		}
 	}
@@ -57,6 +62,25 @@ func parseDBTime(s string) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// daysInMonth returns the number of days in month m of year y under Gregorian
+// leap-year rules. The parseDBTime fast paths use it so an impossible date
+// ("2026-02-31", "2023-02-29", "2026-04-31") falls through to the layouts
+// loop, whose time.Parse rejects it — keeping the fast path exactly as strict
+// as the documented fallback instead of letting time.Date normalize the row
+// into a shifted plausible date.
+func daysInMonth(y int, m time.Month) int {
+	switch m {
+	case time.January, time.March, time.May, time.July, time.August, time.October, time.December:
+		return 31
+	case time.April, time.June, time.September, time.November:
+		return 30
+	}
+	if y%4 == 0 && (y%100 != 0 || y%400 == 0) {
+		return 29
+	}
+	return 28
 }
 
 // fmtDBTime normalizes a time for storage. Zero times return nil so the
@@ -250,7 +274,7 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 
 	query := fmt.Sprintf(`
 		SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
-		       e.action, COALESCE(e.ast_content_hash, ''), e.lines_of_code,
+		       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
 		       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
 		       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
 		       COALESCE(e.attribution_source, 'unknown'), COALESCE(e.attribution_confidence, 0.0),
@@ -575,15 +599,23 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 
 	var edits, sigs int
 	normSlash := strings.ReplaceAll(filePath, "\\", "/")
+	// Guardrail queries arrive with agent-supplied casing (MCP/IPC/HTTP) while
+	// stored event paths carry FS-native casing, so the normalized comparison
+	// must be case-insensitive — mirroring RecentEventsFiltered's LOWER arms.
+	lowerNorm := strings.ToLower(normSlash)
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
 	row := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*), COUNT(DISTINCT node_signature)
 		FROM code_node_events
-		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%/' || ?)
+		WHERE (file_path = ?
+			OR REPLACE(file_path, '\', '/') = ?
+			OR LOWER(REPLACE(file_path, '\', '/')) = ?
+			OR REPLACE(file_path, '\', '/') LIKE '%/' || ?
+			OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%/' || LOWER(?))
 		  AND event_time >= datetime('now', '-1 day')
-	`, filePath, normSlash, normSlash)
+	`, filePath, normSlash, lowerNorm, normSlash, lowerNorm)
 	if err := row.Scan(&edits, &sigs); err != nil {
 		return out, fmt.Errorf("file health scan: %w", err)
 	}
@@ -858,9 +890,10 @@ func (s *Store) RecentTraces(limit int) ([]RuntimeTraceRecord, error) {
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT trace_id, COALESCE(run_id, ''), service_name, COALESCE(node_signature, ''),
-		       COALESCE(file_path, ''), duration_ms, cpu_usage_pct, memory_bytes,
-		       status_code, COALESCE(error_msg, ''), profiler_type, COALESCE(metadata_json, '{}'),
-		       timestamp
+		       COALESCE(file_path, ''), COALESCE(duration_ms, 0.0), COALESCE(cpu_usage_pct, 0.0),
+		       COALESCE(memory_bytes, 0), COALESCE(status_code, 200), COALESCE(error_msg, ''),
+		       profiler_type, COALESCE(metadata_json, '{}'),
+		       COALESCE(timestamp, '')
 		FROM runtime_traces
 		ORDER BY timestamp DESC
 		LIMIT ?
@@ -896,10 +929,10 @@ func (s *Store) ProfilerHotspots(limit int) ([]ProfilerHotspotRow, error) {
 	defer cancel()
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT node_signature, file_path, COUNT(*) AS trace_count,
-		       AVG(duration_ms) AS avg_duration, MAX(duration_ms) AS max_duration,
+		SELECT node_signature, COALESCE(file_path, ''), COUNT(*) AS trace_count,
+		       COALESCE(AVG(duration_ms), 0.0) AS avg_duration, COALESCE(MAX(duration_ms), 0.0) AS max_duration,
 		       SUM(CASE WHEN status_code >= 400 OR error_msg != '' THEN 1 ELSE 0 END) AS total_errors,
-		       MAX(timestamp) AS last_seen
+		       COALESCE(MAX(timestamp), '') AS last_seen
 		FROM runtime_traces
 		WHERE node_signature != ''
 		GROUP BY node_signature, file_path
