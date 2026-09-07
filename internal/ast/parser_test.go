@@ -485,6 +485,66 @@ end
 	}
 }
 
+// Regression (round 27): the body scanner must carry string/comment state
+// across lines. A '}' inside a multi-line block comment used to be counted as
+// the end of the body, truncating EndLine/LOC — and freezing the body hash,
+// so Diff never emitted MODIFIED for later edits below the truncation point.
+func TestParse_Generic_MultilineCommentBraceKeepsBody(t *testing.T) {
+	eng := newTestEngine(t)
+
+	src := "fn process(input: &str) {\n" +
+		"    /* examples:\n" +
+		"       }\n" +
+		"     */\n" +
+		"    helper(input);\n" +
+		"}\n"
+	snap := parseOrFatal(t, eng, "src/lib.rs", src)
+
+	n, ok := snap.Nodes["function:lib.rs::process"]
+	if !ok {
+		t.Fatalf("expected function:lib.rs::process, have %d nodes", len(snap.Nodes))
+	}
+	if n.EndLine != 6 || n.LOC != 6 {
+		t.Errorf("body truncated by '}' inside block comment: EndLine=%d LOC=%d, want 6/6", n.EndLine, n.LOC)
+	}
+
+	// An edit strictly below the comment must change the hash, or the diff
+	// engine can never see the change.
+	edited := "fn process(input: &str) {\n" +
+		"    /* examples:\n" +
+		"       }\n" +
+		"     */\n" +
+		"    helper(input, extra);\n" +
+		"}\n"
+	after := parseOrFatal(t, eng, "src/lib.rs", edited)
+	m, ok := after.Nodes["function:lib.rs::process"]
+	if !ok {
+		t.Fatalf("edited version lost its function node")
+	}
+	if m.Hash == n.Hash {
+		t.Errorf("hash identical across an edit below the multi-line comment (%s): MODIFIED events silently missed", n.Hash)
+	}
+}
+
+func TestParse_Generic_MultilineStringBraceKeepsBody(t *testing.T) {
+	eng := newTestEngine(t)
+
+	src := "fn render() {\n" +
+		"    let s = \"start\n" +
+		"}\";\n" +
+		"    draw(s);\n" +
+		"}\n"
+	snap := parseOrFatal(t, eng, "src/lib.rs", src)
+
+	n, ok := snap.Nodes["function:lib.rs::render"]
+	if !ok {
+		t.Fatalf("expected function:lib.rs::render, have %d nodes", len(snap.Nodes))
+	}
+	if n.EndLine != 5 || n.LOC != 5 {
+		t.Errorf("body truncated by '}' inside string literal: EndLine=%d LOC=%d, want 5/5", n.EndLine, n.LOC)
+	}
+}
+
 func TestSortedSignatures_Caching(t *testing.T) {
 	eng := newTestEngine(t)
 	src := `package main

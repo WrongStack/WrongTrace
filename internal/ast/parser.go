@@ -279,12 +279,16 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 			bodyLines = append(bodyLines, line)
 
 			if strings.Contains(line, "{") {
-				braceCount := countCodeBraces(line)
+				// The scanner carries string/comment state across lines, so a
+				// '}' inside a multi-line block comment or multi-line string
+				// is no longer mistaken for the end of the body.
+				var scanner braceScanner
+				braceCount := scanner.lineDelta(line)
 				j := i + 1
 				for ; j < len(lines) && braceCount > 0; j++ {
 					l := lines[j]
 					bodyLines = append(bodyLines, l)
-					braceCount += countCodeBraces(l)
+					braceCount += scanner.lineDelta(l)
 				}
 				endLine = j
 			}
@@ -308,36 +312,47 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 	return snap
 }
 
-// countCodeBraces returns the net delta of '{' minus '}', safely ignoring braces inside strings and comments.
-func countCodeBraces(s string) int {
-	net := 0
-	inString := byte(0)
-	inLineComment := false
-	inBlockComment := false
+// braceScanner tracks the string/comment lexer state of one declaration body
+// across successive lines. Scanning each line in isolation (as the previous
+// per-line countCodeBraces calls did) loses that state at the newline, so a
+// '}' inside a multi-line block comment or a multi-line string literal — both
+// legal in every language the generic parser handles — was counted as a
+// structural closing brace. That truncated the measured body, corrupting
+// EndLine/LOC and freezing the body hash, so Diff silently missed later edits
+// below the truncation point.
+type braceScanner struct {
+	inString       byte
+	inLineComment  bool
+	inBlockComment bool
+}
 
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if inLineComment {
-			if c == '\n' {
-				inLineComment = false
-			}
+// lineDelta returns the net '{' minus '}' delta of one line and advances the
+// scanner state. Feed lines in body order: inString and inBlockComment carry
+// across lines; inLineComment cannot, because the newline separating lines is
+// exactly what terminates it.
+func (sc *braceScanner) lineDelta(line string) int {
+	sc.inLineComment = false
+	net := 0
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if sc.inLineComment {
 			continue
 		}
-		if inBlockComment {
-			if c == '*' && i+1 < len(s) && s[i+1] == '/' {
-				inBlockComment = false
+		if sc.inBlockComment {
+			if c == '*' && i+1 < len(line) && line[i+1] == '/' {
+				sc.inBlockComment = false
 				i++
 			}
 			continue
 		}
-		if inString != 0 {
-			if c == inString {
+		if sc.inString != 0 {
+			if c == sc.inString {
 				backslashes := 0
-				for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+				for j := i - 1; j >= 0 && line[j] == '\\'; j-- {
 					backslashes++
 				}
 				if backslashes%2 == 0 {
-					inString = 0
+					sc.inString = 0
 				}
 			}
 			continue
@@ -345,21 +360,21 @@ func countCodeBraces(s string) int {
 
 		switch c {
 		case '/':
-			if i+1 < len(s) && s[i+1] == '/' {
-				inLineComment = true
+			if i+1 < len(line) && line[i+1] == '/' {
+				sc.inLineComment = true
 				i++
 				continue
 			}
-			if i+1 < len(s) && s[i+1] == '*' {
-				inBlockComment = true
+			if i+1 < len(line) && line[i+1] == '*' {
+				sc.inBlockComment = true
 				i++
 				continue
 			}
 		case '#':
-			inLineComment = true
+			sc.inLineComment = true
 			continue
 		case '"', '\'', '`':
-			inString = c
+			sc.inString = c
 			continue
 		case '{':
 			net++
@@ -368,6 +383,15 @@ func countCodeBraces(s string) int {
 		}
 	}
 	return net
+}
+
+// countCodeBraces returns the net delta of '{' minus '}', safely ignoring
+// braces inside strings and comments on a single line. Multi-line bodies must
+// scan through braceScanner so string and block-comment state survives line
+// breaks.
+func countCodeBraces(s string) int {
+	var sc braceScanner
+	return sc.lineDelta(s)
 }
 
 // Snapshot returns the cached snapshot for a file, if any.
