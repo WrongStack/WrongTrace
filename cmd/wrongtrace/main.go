@@ -230,9 +230,9 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	// Filesystem watcher with debouncing + ignore rules.
 	debugFS, _ := cmd.Flags().GetBool("debug-fs")
 	w, err := watcher.New(watcher.Config{
-		Dir:             abs,
-		Engine:          engine,
-		DebugFSEvents:   debugFS,
+		Dir:           abs,
+		Engine:        engine,
+		DebugFSEvents: debugFS,
 	})
 	if err != nil {
 		return fmt.Errorf("init watcher: %w", err)
@@ -451,10 +451,15 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		if err := store.Migrate(); err != nil {
 			fmt.Printf("FAIL MIGRATION (%v)\n", err)
 		} else {
-			overview, _ := store.Overview()
-			profOverview, _ := store.ProfilerOverview()
-			fmt.Printf("OK (Runs: %d, Events: %d, Traces: %d)\n",
-				overview.TotalRuns, overview.TotalEvents, profOverview.TotalTraces)
+			overview, overviewErr := store.Overview()
+			if overviewErr != nil {
+				fmt.Printf("FAIL (overview: %v)\n", overviewErr)
+			} else if profOverview, profErr := store.ProfilerOverview(); profErr != nil {
+				fmt.Printf("FAIL (profiler overview: %v)\n", profErr)
+			} else {
+				fmt.Printf("OK (Runs: %d, Events: %d, Traces: %d)\n",
+					overview.TotalRuns, overview.TotalEvents, profOverview.TotalTraces)
+			}
 		}
 	}
 
@@ -648,9 +653,18 @@ func runExport(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("overview: %w", err)
 	}
 
-	events, _ := store.RecentEvents(1000)
-	traces, _ := store.RecentTraces(1000)
-	models, _ := store.ModelComparison()
+	events, err := store.RecentEvents(1000)
+	if err != nil {
+		return fmt.Errorf("recent events: %w", err)
+	}
+	traces, err := store.RecentTraces(1000)
+	if err != nil {
+		return fmt.Errorf("recent traces: %w", err)
+	}
+	models, err := store.ModelComparison()
+	if err != nil {
+		return fmt.Errorf("model comparison: %w", err)
+	}
 
 	exportData := map[string]interface{}{
 		"generated_at":   time.Now().UTC().Format(time.RFC3339),
@@ -697,11 +711,26 @@ func runReport(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("overview: %w", err)
 	}
 
-	events, _ := store.RecentEvents(20)
-	thrashing, _ := store.Thrashing(3, 7)
-	models, _ := store.ModelComparison()
-	profOverview, _ := store.ProfilerOverview()
-	hotspots, _ := store.ProfilerHotspots(10)
+	events, err := store.RecentEvents(20)
+	if err != nil {
+		return fmt.Errorf("recent events: %w", err)
+	}
+	thrashing, err := store.Thrashing(3, 7)
+	if err != nil {
+		return fmt.Errorf("thrashing: %w", err)
+	}
+	models, err := store.ModelComparison()
+	if err != nil {
+		return fmt.Errorf("model comparison: %w", err)
+	}
+	profOverview, err := store.ProfilerOverview()
+	if err != nil {
+		return fmt.Errorf("profiler overview: %w", err)
+	}
+	hotspots, err := store.ProfilerHotspots(10)
+	if err != nil {
+		return fmt.Errorf("profiler hotspots: %w", err)
+	}
 
 	data := report.ReportData{
 		Snapshot: core.MetricsSnapshot{
@@ -761,8 +790,11 @@ func runInit(cmd *cobra.Command, _ []string) error {
 `
 	mcpPath := filepath.Join(dir, ".mcp.json")
 	if !fileExists(mcpPath) {
-		_ = os.WriteFile(mcpPath, []byte(mcpJSON), 0644)
-		fmt.Printf("  ✓ Created %s (MCP server registration for Claude Code, Cursor, Windsurf)\n", filepath.Base(mcpPath))
+		if wErr := os.WriteFile(mcpPath, []byte(mcpJSON), 0644); wErr != nil {
+			fmt.Printf("  ✗ Could not create %s: %v\n", filepath.Base(mcpPath), wErr)
+		} else {
+			fmt.Printf("  ✓ Created %s (MCP server registration for Claude Code, Cursor, Windsurf)\n", filepath.Base(mcpPath))
+		}
 	} else {
 		fmt.Printf("  - %s already exists\n", filepath.Base(mcpPath))
 	}
@@ -777,8 +809,11 @@ When working in this repository:
 `
 	claudePath := filepath.Join(dir, "CLAUDE.md")
 	if !fileExists(claudePath) {
-		_ = os.WriteFile(claudePath, []byte(claudeMD), 0644)
-		fmt.Printf("  ✓ Created %s (Claude Code agent instructions)\n", filepath.Base(claudePath))
+		if wErr := os.WriteFile(claudePath, []byte(claudeMD), 0644); wErr != nil {
+			fmt.Printf("  ✗ Could not create %s: %v\n", filepath.Base(claudePath), wErr)
+		} else {
+			fmt.Printf("  ✓ Created %s (Claude Code agent instructions)\n", filepath.Base(claudePath))
+		}
 	} else {
 		fmt.Printf("  - %s already exists\n", filepath.Base(claudePath))
 	}
@@ -796,8 +831,11 @@ This repository is monitored by **WrongTrace AI Observability**.
 `
 	agentsPath := filepath.Join(dir, "AGENTS.md")
 	if !fileExists(agentsPath) {
-		_ = os.WriteFile(agentsPath, []byte(agentsMD), 0644)
-		fmt.Printf("  ✓ Created %s (Universal instructions for all coding agents)\n", filepath.Base(agentsPath))
+		if wErr := os.WriteFile(agentsPath, []byte(agentsMD), 0644); wErr != nil {
+			fmt.Printf("  ✗ Could not create %s: %v\n", filepath.Base(agentsPath), wErr)
+		} else {
+			fmt.Printf("  ✓ Created %s (Universal instructions for all coding agents)\n", filepath.Base(agentsPath))
+		}
 	} else {
 		fmt.Printf("  - %s already exists\n", filepath.Base(agentsPath))
 	}
@@ -810,8 +848,11 @@ This repository is monitored by **WrongTrace AI Observability**.
 `
 	cursorRulesPath := filepath.Join(dir, ".cursorrules")
 	if !fileExists(cursorRulesPath) {
-		_ = os.WriteFile(cursorRulesPath, []byte(cursorRules), 0644)
-		fmt.Printf("  ✓ Created %s (Cursor IDE rules)\n", filepath.Base(cursorRulesPath))
+		if wErr := os.WriteFile(cursorRulesPath, []byte(cursorRules), 0644); wErr != nil {
+			fmt.Printf("  ✗ Could not create %s: %v\n", filepath.Base(cursorRulesPath), wErr)
+		} else {
+			fmt.Printf("  ✓ Created %s (Cursor IDE rules)\n", filepath.Base(cursorRulesPath))
+		}
 	} else {
 		fmt.Printf("  - %s already exists\n", filepath.Base(cursorRulesPath))
 	}
