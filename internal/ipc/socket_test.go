@@ -22,6 +22,11 @@ type fakeSink struct {
 	reportCalls int
 	healthCalls int
 	pingCalls   int
+	// Round-40 capture: what dispatch actually forwarded for the capped calls.
+	gotLockTTL      time.Duration
+	lockCalls       int
+	gotHistoryLimit int
+	historyCalls    int
 }
 
 func (f *fakeSink) ReportRun(r TelemetryReport) error {
@@ -45,6 +50,8 @@ func (f *fakeSink) CheckGuardrail(p string) (GuardrailResult, error) {
 }
 
 func (f *fakeSink) LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) LockInfo {
+	f.lockCalls++
+	f.gotLockTTL = ttl
 	return LockInfo{Path: path, Reason: reason, Owner: owner, OwnerRunID: ownerRunID, LockedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(ttl)}
 }
 
@@ -59,6 +66,8 @@ func (f *fakeSink) GetFileReadStats(filePath string) (db.FileReadStats, error) {
 }
 
 func (f *fakeSink) GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error) {
+	f.historyCalls++
+	f.gotHistoryLimit = limit
 	return []db.EventRecord{}, nil
 }
 
@@ -471,5 +480,57 @@ func TestRPCDiscoverReportsConfiguredVersion(t *testing.T) {
 	result, ok := resp.Result.(map[string]interface{})
 	if !ok || result["version"] != "v0.3.7" {
 		t.Fatalf("rpc.discover version = %#v", resp.Result)
+	}
+}
+
+// TestDispatchLockFileRejectsOverflowingTTL pins the round-25 contract
+// (re-landed round 40): a client TTL must be rejected with RPC -32602 BEFORE
+// the time.Duration multiplication — a raw integer scaled into int64
+// nanoseconds overflows (ttl_seconds=18446744074 wraps to ~0.29s), silently
+// issuing a near-instant guardrail lock for an effectively unbounded request.
+func TestDispatchLockFileRejectsOverflowingTTL(t *testing.T) {
+	sink := &fakeSink{}
+	s := newTestServer(sink)
+
+	cases := []struct {
+		name, params string
+	}{
+		{"ttl_seconds overflow", `{"file_path":"x.go","ttl_seconds":18446744074}`},
+		{"ttl_minutes overflow", `{"file_path":"x.go","ttl_minutes":153722868}`},
+		{"ttl overflow", `{"file_path":"x.go","ttl":18446744074}`},
+	}
+	for _, tc := range cases {
+		resp := s.dispatch(&Request{JSONRPC: "2.0", ID: 1, Method: "lock_file", Params: params(t, tc.params)})
+		if resp.Error == nil || resp.Error.Code != -32602 {
+			t.Fatalf("%s: want -32602, got %+v", tc.name, resp.Error)
+		}
+	}
+	if sink.lockCalls != 0 {
+		t.Errorf("sink called despite validation failure (%d calls)", sink.lockCalls)
+	}
+}
+
+// TestDispatchDiffHistoryCapsClientLimit pins the round-24 contract
+// (re-landed round 40): a positive client limit is capped at
+// maxIPCHistoryLimit (1000), matching the HTTP/MCP surfaces; the documented
+// default of 20 for non-positive limits is unchanged.
+func TestDispatchDiffHistoryCapsClientLimit(t *testing.T) {
+	sink := &fakeSink{}
+	s := newTestServer(sink)
+
+	resp := s.dispatch(&Request{JSONRPC: "2.0", ID: 2, Method: "get_file_diff_history",
+		Params: params(t, `{"file_path":"x.go","limit":999999}`)})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %+v", resp.Error)
+	}
+	if sink.gotHistoryLimit != maxIPCHistoryLimit {
+		t.Fatalf("engine limit = %d, want capped %d", sink.gotHistoryLimit, maxIPCHistoryLimit)
+	}
+
+	// Non-positive limits keep the documented default of 20.
+	s.dispatch(&Request{JSONRPC: "2.0", ID: 3, Method: "get_file_diff_history",
+		Params: params(t, `{"file_path":"x.go"}`)})
+	if sink.gotHistoryLimit != 20 {
+		t.Fatalf("default engine limit = %d, want 20", sink.gotHistoryLimit)
 	}
 }

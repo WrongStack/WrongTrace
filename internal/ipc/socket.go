@@ -417,6 +417,22 @@ func (s *Server) dispatch(req *Request) Response {
 			resp.Error = &RPCError{Code: -32602, Message: "file_path or path is required"}
 			return resp
 		}
+		// Round-25 contract (re-landed round 40): cap the TTL BEFORE scaling to
+		// time.Duration — a raw client integer multiplied into int64
+		// nanoseconds overflows (ttl_seconds=18446744074 wraps to ~0.29s),
+		// silently issuing a near-instant guardrail lock.
+		const maxLockTTL = 24 * time.Hour
+		switch {
+		case int64(p.TTLSeconds) > int64(maxLockTTL/time.Second):
+			resp.Error = &RPCError{Code: -32602, Message: "ttl_seconds exceeds the 24h maximum lock TTL"}
+			return resp
+		case int64(p.TTLMinutes) > int64(maxLockTTL/time.Minute):
+			resp.Error = &RPCError{Code: -32602, Message: "ttl_minutes exceeds the 24h maximum lock TTL"}
+			return resp
+		case int64(p.TTL) > int64(maxLockTTL/time.Second):
+			resp.Error = &RPCError{Code: -32602, Message: "ttl exceeds the 24h maximum lock TTL"}
+			return resp
+		}
 		var ttl time.Duration
 		if p.TTLSeconds > 0 {
 			ttl = time.Duration(p.TTLSeconds) * time.Second
@@ -489,6 +505,9 @@ func (s *Server) dispatch(req *Request) Response {
 		limit := p.Limit
 		if limit <= 0 {
 			limit = 20
+		}
+		if limit > maxIPCHistoryLimit {
+			limit = maxIPCHistoryLimit
 		}
 		events, err := s.cfg.Engine.GetRecentFileEvents(filePath, limit)
 		if err != nil {
@@ -611,6 +630,11 @@ func bindSocket(path string) (net.Listener, error) {
 
 	return ln, nil
 }
+
+// maxIPCHistoryLimit caps positive client-supplied history limits, matching
+// the HTTP surface's maxRecentEventsLimit, so a single oversized request
+// cannot make the engine scan unbounded event history.
+const maxIPCHistoryLimit = 1000
 
 const maxJSONLineBytes = 16 * 1024 * 1024 // 16 MB max line length to protect against unbounded RAM allocation
 
