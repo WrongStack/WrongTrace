@@ -227,11 +227,11 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 	}
 	var candidates []candidate
 	for k, model := range r.models {
-		if strings.HasPrefix(norm, model.ModelID) || (model.ModelID != "" && strings.Contains(norm, model.ModelID)) {
+		if model.ModelID != "" && (strings.HasPrefix(norm, model.ModelID) || strings.Contains(norm, model.ModelID)) {
 			candidates = append(candidates, candidate{k, model})
 			continue
 		}
-		if strings.HasPrefix(norm, k) || strings.Contains(norm, k) {
+		if k != "" && (strings.HasPrefix(norm, k) || strings.Contains(norm, k)) {
 			candidates = append(candidates, candidate{k, model})
 		}
 	}
@@ -370,6 +370,48 @@ func (r *Registry) Upsert(m ModelInfo) {
 
 	r.models[key] = m
 	r.canonicals[normModel] = key
+
+	// Keep the provider index in sync with the stored model: AllProviders/
+	// GetProvider back the dashboard's provider catalog, and a stored model
+	// whose provider was absent from the index was invisible there. A model
+	// that moved providers leaves no stale entry behind.
+	for pid, p := range r.providers {
+		if pid == m.ProviderID {
+			continue
+		}
+		for i, pm := range p.Models {
+			if pm.ID != key {
+				continue
+			}
+			p.Models = append(p.Models[:i], p.Models[i+1:]...)
+			p.ModelCount = len(p.Models)
+			if len(p.Models) == 0 {
+				delete(r.providers, pid)
+			} else {
+				r.providers[pid] = p
+			}
+			break
+		}
+	}
+	p := r.providers[m.ProviderID]
+	if p.ID == "" {
+		p.ID = m.ProviderID
+		p.Name = m.Provider
+	}
+	replaced := false
+	for i := range p.Models {
+		if p.Models[i].ID == key {
+			p.Models[i] = m
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		p.Models = append(p.Models, m)
+	}
+	p.ModelCount = len(p.Models)
+	r.providers[m.ProviderID] = p
+
 	r.aliasCache = make(map[string]ModelInfo)
 }
 
@@ -636,13 +678,34 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Preserve custom models
+	// Preserve custom models — and the provider index entries they need, so
+	// a custom-only provider does not vanish from AllProviders/GetProvider
+	// when the remote catalog replaces the maps.
 	for k, v := range r.models {
 		if v.IsCustom {
 			nextModels[k] = v
 			if v.ModelID != "" {
 				nextCanonicals[v.ModelID] = k
 			}
+			if v.ProviderID == "" {
+				continue
+			}
+			cp := nextProviders[v.ProviderID]
+			if cp.ID == "" {
+				cp = ProviderInfo{ID: v.ProviderID, Name: v.Provider}
+			}
+			listed := false
+			for _, pm := range cp.Models {
+				if pm.ID == k {
+					listed = true
+					break
+				}
+			}
+			if !listed {
+				cp.Models = append(cp.Models, v)
+			}
+			cp.ModelCount = len(cp.Models)
+			nextProviders[v.ProviderID] = cp
 		}
 	}
 

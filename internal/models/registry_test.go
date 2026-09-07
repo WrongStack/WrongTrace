@@ -289,3 +289,113 @@ func TestRegistry_AliasCacheIsBounded(t *testing.T) {
 		t.Fatalf("alias cache grew to %d entries, cap is %d", got, maxAliasCacheEntries)
 	}
 }
+
+// TestGet_EmptyIdentityIsNotAWildcard pins the empty-identity fix: an entry
+// whose ModelID or registry key normalized to "" (e.g. the shape
+// POST /api/models/catalog accepts as {"id": "/"}) must never act as a
+// universal prefix in Get's fuzzy fallback — it used to resolve for every
+// unknown-model lookup and price them at its zero rates instead of the
+// documented fallback.
+func TestGet_EmptyIdentityIsNotAWildcard(t *testing.T) {
+	r := NewDefaultRegistry()
+	r.Upsert(ModelInfo{ID: "/", Name: "Ghost"})
+
+	if m, ok := r.Get("totally-unknown-model"); ok {
+		t.Fatalf("empty-identity entry %q (ModelID=%q) resolved for an unknown model", m.ID, m.ModelID)
+	}
+
+	// Documented fallback: 100k in * $2/1M + 50k out * $8/1M = $0.60.
+	cost := r.CalculateCost("totally-unknown-model", 100_000, 50_000)
+	if cost < 0.59 || cost > 0.61 {
+		t.Errorf("unknown model must price at the documented $0.60 fallback, got %f", cost)
+	}
+
+	// The guards narrow fuzzy matching only: the literal key stays directly
+	// addressable.
+	if m, ok := r.Get("/"); !ok || m.ID != "/" {
+		t.Fatalf("exact retrieval of the \"/\" key must keep working: ok=%v m=%+v", ok, m)
+	}
+
+	// Legitimate versioned snapshots must still fuzzy-match their canonical.
+	if m, ok := r.Get("claude-3-7-sonnet-20250219"); !ok || m.ID != "anthropic/claude-3-7-sonnet" {
+		got := "(none)"
+		if ok {
+			got = m.ID
+		}
+		t.Errorf("versioned snapshot recall broken, got %s", got)
+	}
+}
+
+// TestRegistry_ProviderIndexStaysInSync pins the provider-index contract:
+// Upsert registers the model's provider (name, count, listing), a model that
+// moves providers leaves no stale index entry behind, and ImportModelsDevJSON
+// preserves custom-only providers when the remote catalog replaces the maps.
+// Space-only separators keep the slug intuitive: "Local Self Hosted" slugs to
+// "local-self-hosted" (a "/" becomes one dash per separator, so "Local /
+// Self-Hosted" would slug to "local---self-hosted").
+func TestRegistry_ProviderIndexStaysInSync(t *testing.T) {
+	r := NewRegistry()
+	r.Upsert(ModelInfo{
+		ID:            "custom-ollama-qwen",
+		Name:          "Custom Ollama Qwen",
+		Provider:      "Local Self Hosted",
+		ContextWindow: 32000,
+		IsCustom:      true,
+	})
+
+	p, ok := r.GetProvider("local-self-hosted")
+	if !ok || p.Name != "Local Self Hosted" {
+		t.Fatalf("Upsert must register the model's provider: ok=%v p=%+v", ok, p)
+	}
+	if p.ModelCount != 1 || len(p.Models) != 1 || p.Models[0].ID != "custom-ollama-qwen" {
+		t.Fatalf("provider listing wrong: ModelCount=%d Models=%+v", p.ModelCount, p.Models)
+	}
+
+	// Catalog swap: 4 fixture models + 1 preserved custom = 5, and the
+	// custom-only provider must survive the index rebuild.
+	n, err := r.ImportModelsDevJSON([]byte(fixture))
+	if err != nil || n != 5 {
+		t.Fatalf("import: n=%d err=%v, want 5 (4 fixture models + 1 preserved custom)", n, err)
+	}
+	if p, ok := r.GetProvider("local-self-hosted"); !ok {
+		t.Fatal("custom-only provider vanished from the index after ImportModelsDevJSON")
+	} else if p.ModelCount != 1 || len(p.Models) != 1 || p.Models[0].ID != "custom-ollama-qwen" {
+		t.Fatalf("custom provider listing wrong after import: ModelCount=%d Models=%+v", p.ModelCount, p.Models)
+	}
+	if _, ok := r.GetProvider("anthropic"); !ok {
+		t.Error("remote provider missing after import")
+	}
+
+	// Move: re-upserting the model under a different provider must delete the
+	// emptied entry and register the new one — not duplicate the listing.
+	r.Upsert(ModelInfo{
+		ID:       "custom-ollama-qwen",
+		Name:     "Custom Ollama Qwen",
+		Provider: "Other Host",
+		IsCustom: true,
+	})
+	if _, ok := r.GetProvider("local-self-hosted"); ok {
+		t.Fatal("stale provider entry survived after its only model moved away")
+	}
+	if p, ok := r.GetProvider("other-host"); !ok {
+		t.Fatal("new provider not registered after the move")
+	} else if p.ModelCount != 1 || len(p.Models) != 1 || p.Models[0].ID != "custom-ollama-qwen" {
+		t.Fatalf("moved-model listing wrong: ModelCount=%d Models=%+v", p.ModelCount, p.Models)
+	}
+
+	// Update-in-place: re-upserting the same model under the same provider
+	// must replace, not append.
+	r.Upsert(ModelInfo{
+		ID:              "custom-ollama-qwen",
+		Name:            "Custom Ollama Qwen v2",
+		Provider:        "Other Host",
+		InputPricePerM:  0.5,
+		OutputPricePerM: 1.5,
+		IsCustom:        true,
+	})
+	if p, ok := r.GetProvider("other-host"); !ok {
+		t.Fatal("provider lost after in-place update")
+	} else if p.ModelCount != 1 || len(p.Models) != 1 || p.Models[0].Name != "Custom Ollama Qwen v2" {
+		t.Fatalf("in-place update must replace the listing: ModelCount=%d Models=%+v", p.ModelCount, p.Models)
+	}
+}
