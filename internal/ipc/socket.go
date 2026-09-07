@@ -335,6 +335,12 @@ func (s *Server) dispatch(req *Request) Response {
 			resp.Error = &RPCError{Code: -32602, Message: "file_path is required"}
 			return resp
 		}
+		// repo_name is NOT NULL in the file_read_events schema — validate upfront
+		// so the DB constraint violation is surfaced as a clean -32602 response.
+		if p.RepoName == "" {
+			resp.Error = &RPCError{Code: -32602, Message: "repo_name is required"}
+			return resp
+		}
 		modelName := p.ModelName
 		if modelName == "" {
 			modelName = p.Model

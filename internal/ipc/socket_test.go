@@ -379,7 +379,7 @@ func TestExtendedIPCMethods(t *testing.T) {
 	// 1. telemetry/report_file_read
 	resp := srv.dispatch(&Request{
 		Method: "telemetry/report_file_read",
-		Params: params(t, `{"file_path":"package.json","line_count":1,"model_name":"probe-model","tokens_consumed":1}`),
+		Params: params(t, `{"file_path":"package.json","line_count":1,"model_name":"probe-model","tokens_consumed":1,"repo_name":"test-repo"}`),
 		ID:     1,
 	})
 	if resp.Error != nil {
@@ -532,5 +532,35 @@ func TestDispatchDiffHistoryCapsClientLimit(t *testing.T) {
 		Params: params(t, `{"file_path":"x.go"}`)})
 	if sink.gotHistoryLimit != 20 {
 		t.Fatalf("default engine limit = %d, want 20", sink.gotHistoryLimit)
+	}
+}
+
+// TestDispatchReportFileReadRepoNameRequired pins the bug where the IPC dispatch
+// handler for "report_file_read" validated file_path but not repo_name, despite
+// file_read_events.repo_name being declared NOT NULL in the schema. An agent that
+// sent a file-read event without repo_name would cause RecordReadEvent to return a
+// DB constraint violation (SQLITE_CONSTRAINT NOT NULL) rather than a clean
+// JSON-RPC -32602 error. Fix: validate repo_name before calling the DB.
+func TestDispatchReportFileReadRepoNameRequired(t *testing.T) {
+	sink := &fakeSink{}
+	s := newTestServer(sink)
+
+	// Agent sends file-read event WITHOUT repo_name.
+	resp := s.dispatch(&Request{
+		JSONRPC: "2.0",
+		ID:      42,
+		Method:  "report_file_read",
+		Params:  params(t, `{"file_path":"src/main.go","agent_name":"Claude","model_name":"claude-3-7-sonnet"}`),
+	})
+
+	// The handler must return -32602 immediately, without calling RecordReadEvent.
+	if resp.Error == nil {
+		t.Fatal("expected -32602 error for missing repo_name, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Fatalf("error code = %d, want -32602", resp.Error.Code)
+	}
+	if !strings.Contains(resp.Error.Message, "repo_name") {
+		t.Fatalf("error message = %q, want message mentioning 'repo_name'", resp.Error.Message)
 	}
 }
