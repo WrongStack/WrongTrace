@@ -758,17 +758,21 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + cleanPath
-	// url.JoinPath normalises the path, preventing double-slashes.
+	// Merge the caller's query with any query embedded in the configured base by
+	// JOINING THE RAW STRINGS, never by round-tripping them through
+	// url.Values.Parse/Encode. url.Values stores decoded values and Encode()
+	// escapes them again, so feeding it still-encoded wire components corrupts
+	// them: "%2F" becomes "%252F", a "+" (which means space on the wire) becomes
+	// a literal "%2B", Set() collapses repeated parameters, and Encode() reorders
+	// keys alphabetically -- which invalidates pre-signed upstream URLs. Raw
+	// concatenation preserves the client's bytes exactly while still keeping the
+	// base's own credentials (e.g. Gemini "?key=") in front of the path.
 	if r.URL.RawQuery != "" {
-		q := base.Query()
-		for _, kv := range strings.Split(r.URL.RawQuery, "&") {
-			if idx := strings.IndexByte(kv, '='); idx >= 0 {
-				q.Set(kv[:idx], kv[idx+1:])
-			} else {
-				q.Set(kv, "")
-			}
+		if base.RawQuery == "" {
+			base.RawQuery = r.URL.RawQuery
+		} else {
+			base.RawQuery = base.RawQuery + "&" + r.URL.RawQuery
 		}
-		base.RawQuery = q.Encode()
 	}
 	// safeTargetURL is the credential-scrubbed form used ONLY for logs and
 	// traffic records; the forwarded request keeps the real URL so
@@ -1114,16 +1118,16 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + strings.TrimPrefix(cleanPath, "/")
+	// Same raw-join rule as ServeHTTP: a catalog relay must be transparent, so
+	// the client's query bytes are forwarded unchanged instead of being decoded
+	// and re-escaped through url.Values (which double-encodes "%2F" -> "%252F",
+	// turns wire "+" into a literal "%2B", and drops repeated parameters).
 	if r.URL.RawQuery != "" {
-		q := base.Query()
-		for _, kv := range strings.Split(r.URL.RawQuery, "&") {
-			if idx := strings.IndexByte(kv, '='); idx >= 0 {
-				q.Set(kv[:idx], kv[idx+1:])
-			} else {
-				q.Set(kv, "")
-			}
+		if base.RawQuery == "" {
+			base.RawQuery = r.URL.RawQuery
+		} else {
+			base.RawQuery = base.RawQuery + "&" + r.URL.RawQuery
 		}
-		base.RawQuery = q.Encode()
 	}
 	targetURL := base.String()
 
@@ -1597,6 +1601,26 @@ func runeSafeSuffix(s string, max int) string {
 // sanitizeURLForRecord scrubs credential-looking query parameters (key, apikey,
 // api_key, token, access_token, signature…) from a URL string for logging and
 // traffic records. Parsing failures return the raw path without query.
+//
+// CONTRACT: this is a RECORD/LOG-ONLY surface. Its output must NEVER be used to
+// build a forwarded request URL or a cache key. Two independent reasons:
+//
+//   - Redaction is lossy by design and collides. Every distinct credential is
+//     replaced by the same literal, so two routes that differ ONLY by their
+//     upstream key sanitize to an identical string. As a cache key that would
+//     serve one tenant's response to another; as a forwarded URL it would drop
+//     the credential and break query-auth providers. Pinned by
+//     TestSanitizeURLForRecord_RedactionCollidesDistinctCredentials.
+//   - It is NOT byte-faithful. When it does redact it re-emits the query through
+//     url.Values.Encode(), which sorts parameters alphabetically and silently
+//     drops any parameter whose value holds an invalid % escape. The forwarded
+//     request therefore deliberately uses base.String() with the raw joined
+//     query instead (see ServeHTTP / relayCatalogRequest), pinned by
+//     TestGatewayProxy_ForwardsClientQueryByteForwards.
+//
+// When nothing looks like a credential the input is returned verbatim, so the
+// normalizations above only ever affect the already-redacted record form.
+// Pinned by TestSanitizeURLForRecord_PinsRecordSurfaceSemantics.
 func sanitizeURLForRecord(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
