@@ -64,10 +64,12 @@ export function ProfilerTracesView() {
     };
   }, [traces]);
 
-  // Latency timeline bucketed data
+  // Latency timeline bucketed data — follows the type filter like the table
+  // and badge: a chart plotting traces the active filter excluded contradicted
+  // the "No matching runtime traces found." empty state rendered beside it.
   const timelineChartData = useMemo(() => {
-    if (traces.length === 0) return [];
-    const sorted = [...traces].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    if (filteredTraces.length === 0) return [];
+    const sorted = [...filteredTraces].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
     return sorted.map((t, idx) => {
       const d = new Date(t.timestamp);
       return {
@@ -79,12 +81,12 @@ export function ProfilerTracesView() {
         signature: t.node_signature || 'trace',
       };
     });
-  }, [traces]);
+  }, [filteredTraces]);
 
-  // Service Breakdown data
+  // Service Breakdown data — filtered scope, same contract as the timeline.
   const serviceChartData = useMemo(() => {
     const map = new Map<string, { service: string; count: number; totalDuration: number; errors: number }>();
-    traces.forEach((t) => {
+    filteredTraces.forEach((t) => {
       const name = t.service_name || 'default';
       if (!map.has(name)) {
         map.set(name, { service: name, count: 0, totalDuration: 0, errors: 0 });
@@ -100,7 +102,7 @@ export function ProfilerTracesView() {
       count: s.count,
       errors: s.errors,
     }));
-  }, [traces]);
+  }, [filteredTraces]);
 
   return (
     <div className="space-y-6">
@@ -194,7 +196,7 @@ export function ProfilerTracesView() {
       </div>
 
       {/* Latency & Runtime Charts */}
-      {traces.length > 0 && (
+      {filteredTraces.length > 0 && (
         <div className="panel space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/5 pb-3">
             <div className="flex items-center gap-2">
