@@ -148,6 +148,7 @@ function render() {
     'lucide-react': lucideStub,
     './RichDiffViewer': { RichDiffViewer: () => null },
     '../hooks/useMetrics': hooksMods,
+    '../lib/clipboard': { copyToClipboard: async () => true },
     '../types': { isJunkModel: () => false, formatCleanModel: (s) => s },
   };
   const fn = new Function('__mods', '__exports', bodySansImports);

@@ -1,4 +1,5 @@
 import { useEffect, useState, useMemo } from 'react';
+import { copyToClipboard } from '../lib/clipboard';
 import {
   Network,
   Plus,
@@ -347,10 +348,11 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
   const selectedTrafficDetail = useProxyTrafficDetail(selectedTrafficSummary?.id);
   const activeSelectedTraffic = selectedTrafficDetail.data ?? selectedTrafficSummary;
 
-  const handleCopy = (id: string, text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
+  const handleCopy = async (id: string, text: string) => {
+    if (await copyToClipboard(text)) {
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(null), 2000);
+    }
   };
 
   const handleClearTraffic = async () => {

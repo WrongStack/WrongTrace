@@ -151,6 +151,7 @@ function render(scope) {
     'react/jsx-runtime': { jsx: realElement, jsxs: realElement, Fragment: RealReact.Fragment },
     'lucide-react': lucideStub,
     recharts: chartsStub,
+    '../lib/clipboard': { copyToClipboard: async () => true },
     '../hooks/useMetrics': hooksMods,
   };
   const fn = new Function('__mods', '__exports', bodySansImports);

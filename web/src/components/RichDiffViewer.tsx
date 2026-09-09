@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react';
 import { Copy, Check, Download, Columns, AlignLeft, FileCode, WrapText } from 'lucide-react';
+import { copyToClipboard } from '../lib/clipboard';
 
 interface RichDiffViewerProps {
   diff?: string | null;
@@ -105,11 +106,12 @@ export function RichDiffViewer({
     return { addedCount: added, deletedCount: deleted, unifiedLines: uLines, splitRows: sRows };
   }, [diff]);
 
-  const handleCopy = () => {
+  const handleCopy = async () => {
     if (!diff) return;
-    navigator.clipboard.writeText(diff);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    if (await copyToClipboard(diff)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
   };
 
   const handleDownloadPatch = () => {

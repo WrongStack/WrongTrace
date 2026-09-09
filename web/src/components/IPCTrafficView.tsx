@@ -11,6 +11,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { useIPCTraffic, useIPCTrafficDetail } from '../hooks/useMetrics';
+import { copyToClipboard } from '../lib/clipboard';
 import type { IPCTrafficRecord } from '../types';
 
 interface IPCTrafficViewProps {
@@ -47,11 +48,12 @@ export function IPCTrafficView({ limit = 100 }: IPCTrafficViewProps) {
     });
   }, [traffic, limit, methodFilter, search]);
 
-  const handleCopy = (id: string, text: string, evt: React.MouseEvent) => {
+  const handleCopy = async (id: string, text: string, evt: React.MouseEvent) => {
     evt.stopPropagation();
-    navigator.clipboard.writeText(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
+    if (await copyToClipboard(text)) {
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(null), 2000);
+    }
   };
 
   const getMethodBadge = (method: string) => {

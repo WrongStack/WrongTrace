@@ -148,6 +148,7 @@ function render(withProject) {
     'react/jsx-runtime': { jsx: realElement, jsxs: realElement, Fragment: RealReact.Fragment },
     'lucide-react': lucideStub,
     './RichDiffViewer': { RichDiffViewer: () => null },
+    '../lib/clipboard': { copyToClipboard: async () => true },
     '../hooks/useMetrics': hooksMods,
     '../types': { isJunkModel: () => false, formatCleanModel: (s) => s },
   };

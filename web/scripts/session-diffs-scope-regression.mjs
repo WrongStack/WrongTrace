@@ -126,6 +126,7 @@ function render(selectedRunId) {
     'lucide-react': lucideStub,
     '../hooks/useMetrics': hooksMods,
     './RichDiffViewer': { RichDiffViewer: () => null },
+    '../lib/clipboard': { copyToClipboard: async () => true },
     '../types': {
       isJunkModel: () => false,
       formatCleanModel: (m, a) => m || a || '',

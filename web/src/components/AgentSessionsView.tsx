@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react';
+import { copyToClipboard } from '../lib/clipboard';
 import {
   Bot,
   Cpu,
@@ -67,10 +68,11 @@ export function AgentSessionsView({
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
 
-  const handleCopyModel = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedModelId(text);
-    setTimeout(() => setCopiedModelId(null), 2000);
+  const handleCopyModel = async (text: string) => {
+    if (await copyToClipboard(text)) {
+      setCopiedModelId(text);
+      setTimeout(() => setCopiedModelId(null), 2000);
+    }
   };
 
   const handleSyncModels = async () => {

@@ -159,6 +159,7 @@ const mods = {
   'react/jsx-runtime': { jsx: realElement, jsxs: realElement, Fragment: RealReact.Fragment },
   'lucide-react': lucideStub,
   recharts: chartsStub,
+  '../lib/clipboard': { copyToClipboard: async (text) => { capturedCommand = String(text); return true; } },
   '../hooks/useMetrics': {
     useProxyRoutes: () => ({ data: [], refetch: () => {} }),
     useModelCatalog: () => ({ data: [] }),

@@ -148,6 +148,7 @@ async function scenario(fetchBehavior, seed) {
       'react/jsx-runtime': { jsx: realElement, jsxs: realElement, Fragment: RealReact.Fragment },
       'lucide-react': lucideStub,
       recharts: chartsStub,
+      '../lib/clipboard': { copyToClipboard: async () => true },
       '../hooks/useMetrics': {
         useProxyRoutes: () => ({ data: routesFixture, refetch: () => { calls.refetchRoutes++; } }),
         useModelCatalog: () => ({ data: [] }),

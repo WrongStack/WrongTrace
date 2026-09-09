@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react';
+import { copyToClipboard } from '../lib/clipboard';
 import {
   Plus,
   Pencil,
@@ -77,11 +78,12 @@ export function LiveEventFeed({ events, loading }: LiveEventFeedProps) {
       .slice(0, 100);
   }, [events, search, filterAction]);
 
-  const handleCopy = (id: string, text: string, evt: React.MouseEvent) => {
+  const handleCopy = async (id: string, text: string, evt: React.MouseEvent) => {
     evt.stopPropagation();
-    navigator.clipboard.writeText(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
+    if (await copyToClipboard(text)) {
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(null), 2000);
+    }
   };
 
   return (
