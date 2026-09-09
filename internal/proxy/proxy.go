@@ -1679,8 +1679,19 @@ func isCredentialParam(name string) bool {
 	}
 	// Qualified vendor shapes: apikey, xapikey, xgoogapikey, accesstoken,
 	// authtoken, bearertoken, sessiontoken, securitytoken, clientsecret,
-	// proxyauthorization, subscriptionkey.
-	for _, part := range []string{"apikey", "token", "secret", "password", "authorization", "signature", "credential"} {
+	// proxyauthorization, subscriptionkey, privatekey, accesskey.
+	//
+	// Match the bare credential NOUN rather than the enumerated spelling
+	// "apikey". That one literal admitted only the variants someone had already
+	// thought of, which is precisely the list-drift this predicate exists to
+	// prevent: a configured upstream carrying "?subscription-key=" or
+	// "?private_key=" recorded the credential whole, even though the shape list
+	// above already advertises subscriptionkey as covered and the sibling
+	// isCredentialKey already treats "private_key" as a credential on the
+	// body/header path. "key" subsumes every *key shape (apikey, xapikey,
+	// xgoogapikey, subscriptionkey, accesskey, privatekey) and cannot go stale
+	// when the next vendor spelling appears.
+	for _, part := range []string{"key", "token", "secret", "password", "authorization", "signature", "credential"} {
 		if strings.Contains(canonical, part) {
 			return true
 		}
