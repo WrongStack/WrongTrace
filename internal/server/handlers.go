@@ -1117,9 +1117,24 @@ func (h *Handlers) IngestOTLPTraces(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "profiler collector not available")
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, 16*1024*1024))
+	// Read ONE byte past the cap so overflow is DETECTED instead of silently
+	// truncating: the previous LimitReader(16MB) with no detection turned a
+	// well-formed 18 MB export into "parse otlp traces: unmarshal otlp:
+	// unexpected end of JSON input" -- the server's own limit reported as the
+	// sender's malformed JSON, with no trace of why (observed in test). This
+	// mirrors the convention used everywhere else for untrusted bodies:
+	// proxy.go's maxBodyBytes+1 ("over-sized payloads are rejected outright"),
+	// engine.go's readBoundedResponse (limit+1, asserted by engine_test.go),
+	// and decodeJSON's http.MaxBytesReader above. The status stays 400 so no
+	// sender that succeeds today changes behavior; only the diagnostic does.
+	const maxOTLPBodyBytes = 16 * 1024 * 1024
+	data, err := io.ReadAll(io.LimitReader(r.Body, maxOTLPBodyBytes+1))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	if len(data) > maxOTLPBodyBytes {
+		writeError(w, http.StatusBadRequest, "request body too large: OTLP payload exceeds the 16 MiB limit")
 		return
 	}
 	count, err := h.Profiler.IngestOTLP(data)
