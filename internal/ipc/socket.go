@@ -335,12 +335,13 @@ func (s *Server) dispatch(req *Request) Response {
 			resp.Error = &RPCError{Code: -32602, Message: "file_path is required"}
 			return resp
 		}
-		// repo_name is NOT NULL in the file_read_events schema — validate upfront
-		// so the DB constraint violation is surfaced as a clean -32602 response.
-		if p.RepoName == "" {
-			resp.Error = &RPCError{Code: -32602, Message: "repo_name is required"}
-			return resp
-		}
+		// repo_name is intentionally NOT validated here. An empty value cannot
+		// violate the schema: NOT NULL rejects NULL, while the store binds plain
+		// Go strings, so "" is stored as '' (provider and tool_name are already
+		// '' on every call from this handler). Engine.RecordReadEvent resolves an
+		// empty RepoName from the active project, or from the project that owns
+		// FilePath (engine.go), which is more accurate than rejecting the event --
+		// and the MCP report_file_read tool sends this same payload shape.
 		modelName := p.ModelName
 		if modelName == "" {
 			modelName = p.Model

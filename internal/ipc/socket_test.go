@@ -535,32 +535,99 @@ func TestDispatchDiffHistoryCapsClientLimit(t *testing.T) {
 	}
 }
 
-// TestDispatchReportFileReadRepoNameRequired pins the bug where the IPC dispatch
-// handler for "report_file_read" validated file_path but not repo_name, despite
-// file_read_events.repo_name being declared NOT NULL in the schema. An agent that
-// sent a file-read event without repo_name would cause RecordReadEvent to return a
-// DB constraint violation (SQLITE_CONSTRAINT NOT NULL) rather than a clean
-// JSON-RPC -32602 error. Fix: validate repo_name before calling the DB.
-func TestDispatchReportFileReadRepoNameRequired(t *testing.T) {
-	sink := &fakeSink{}
-	s := newTestServer(sink)
+// readSpySink records the record the dispatcher forwards to the engine, so a
+// test can tell "accepted" from "silently dropped". It embeds fakeSink purely
+// to inherit the rest of EngineSink.
+type readSpySink struct {
+	*fakeSink
+	rec       db.FileReadRecord
+	sinkCalls int
+}
 
-	// Agent sends file-read event WITHOUT repo_name.
-	resp := s.dispatch(&Request{
-		JSONRPC: "2.0",
-		ID:      42,
-		Method:  "report_file_read",
-		Params:  params(t, `{"file_path":"src/main.go","agent_name":"Claude","model_name":"claude-3-7-sonnet"}`),
+func (r *readSpySink) RecordReadEvent(rec db.FileReadRecord) error {
+	r.sinkCalls++
+	r.rec = rec
+	return nil
+}
+
+// TestDispatchReportFileReadWithoutRepoNameIsAttributed replaces the assertion
+// added by f64535b, which required -32602 when repo_name was absent on the
+// stated grounds that file_read_events.repo_name is NOT NULL and would otherwise
+// raise SQLITE_CONSTRAINT. That premise is false, and was verified false against
+// the real store: NOT NULL rejects NULL, while InsertReadEvent (queries.go) binds
+// plain Go strings, so an omitted repo_name is stored as the empty string and
+// the INSERT succeeds. Two further facts confirm it: this same handler leaves
+// the equally NOT NULL provider and tool_name columns empty on every call, and the MCP
+// report_file_read tool sends the identical payload without repo_name.
+//
+// Meanwhile the rejection was actively harmful: it ran before
+// Engine.RecordReadEvent, which resolves an empty RepoName from the active
+// project -- or, better, from the project that owns FilePath -- so agents that
+// omit repo_name lost their read telemetry entirely instead of getting it
+// attributed. file_path validation must stay, because that one column the engine
+// genuinely cannot infer (it short-circuits on an empty path).
+func TestDispatchReportFileReadWithoutRepoNameIsAttributed(t *testing.T) {
+	t.Run("omitted repo_name reaches the engine unattributed", func(t *testing.T) {
+		spy := &readSpySink{fakeSink: &fakeSink{}}
+		s := NewServer(Config{Engine: spy})
+
+		resp := s.dispatch(&Request{
+			JSONRPC: "2.0",
+			ID:      42,
+			Method:  "report_file_read",
+			Params:  params(t, `{"file_path":"src/main.go","agent_name":"Claude","model_name":"claude-3-7-sonnet"}`),
+		})
+		if resp.Error != nil {
+			t.Fatalf("payload without repo_name was rejected: %d %q", resp.Error.Code, resp.Error.Message)
+		}
+		if spy.sinkCalls != 1 {
+			t.Fatalf("event never reached the sink for attribution: calls=%d, want 1", spy.sinkCalls)
+		}
+		// Empty, not defaulted here: attribution is the engine's job.
+		if spy.rec.RepoName != "" {
+			t.Errorf("RepoName = %q, want empty so the engine infers the owning project", spy.rec.RepoName)
+		}
+		if spy.rec.FilePath != "src/main.go" || spy.rec.ModelName != "claude-3-7-sonnet" {
+			t.Errorf("payload fields lost: %+v", spy.rec)
+		}
 	})
 
-	// The handler must return -32602 immediately, without calling RecordReadEvent.
-	if resp.Error == nil {
-		t.Fatal("expected -32602 error for missing repo_name, got nil")
-	}
-	if resp.Error.Code != -32602 {
-		t.Fatalf("error code = %d, want -32602", resp.Error.Code)
-	}
-	if !strings.Contains(resp.Error.Message, "repo_name") {
-		t.Fatalf("error message = %q, want message mentioning 'repo_name'", resp.Error.Message)
-	}
+	t.Run("explicit repo_name is forwarded verbatim", func(t *testing.T) {
+		spy := &readSpySink{fakeSink: &fakeSink{}}
+		s := NewServer(Config{Engine: spy})
+
+		resp := s.dispatch(&Request{
+			JSONRPC: "2.0",
+			ID:      43,
+			Method:  "report_file_read",
+			Params:  params(t, `{"file_path":"src/main.go","agent_name":"Claude","model":"gpt-5","repo_name":"WrongTrace"}`),
+		})
+		if resp.Error != nil {
+			t.Fatalf("unexpected error: %+v", resp.Error)
+		}
+		if spy.rec.RepoName != "WrongTrace" {
+			t.Errorf("RepoName = %q, want WrongTrace (caller-supplied wins)", spy.rec.RepoName)
+		}
+	})
+
+	t.Run("missing file_path is still a clean -32602", func(t *testing.T) {
+		spy := &readSpySink{fakeSink: &fakeSink{}}
+		s := NewServer(Config{Engine: spy})
+
+		resp := s.dispatch(&Request{
+			JSONRPC: "2.0",
+			ID:      44,
+			Method:  "report_file_read",
+			Params:  params(t, `{"agent_name":"Claude","model":"gpt-5","repo_name":"WrongTrace"}`),
+		})
+		if resp.Error == nil {
+			t.Fatal("missing file_path was accepted")
+		}
+		if resp.Error.Code != -32602 || !strings.Contains(resp.Error.Message, "file_path") {
+			t.Errorf("error = %d %q, want -32602 mentioning file_path", resp.Error.Code, resp.Error.Message)
+		}
+		if spy.sinkCalls != 0 {
+			t.Errorf("sink called %d times despite missing file_path", spy.sinkCalls)
+		}
+	})
 }
