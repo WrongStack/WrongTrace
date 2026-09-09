@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/wrongstack/wrongtrace/internal/ast"
 )
 
 // withFakeHome redirects the user home directory (HOME on Unix, USERPROFILE
@@ -599,6 +601,185 @@ func TestDetectPrimaryLanguage_NonPrecedenceOverridesPrecedence(t *testing.T) {
 		t.Errorf("DetectPrimaryLanguage over 5 runs = %v; Go should win every time (count=20, precedence above Python). Got most: %s(%d). Results: %v",
 			results, gotMost, mostCount, results)
 	}
+}
+
+// TestDetectPrimaryLanguage_UnlistedLanguagesAreSelectable pins the selection
+// contract commit 7af4131 intended but did not deliver. The counting switch can
+// emit twelve language names while `precedence` names only ten; the second loop
+// existed to catch the remainder but appended single letters ("C", "D", ... "Z")
+// to it, and extCounts is keyed by full names ("Kotlin", "Dart"), so no appended
+// entry could ever match. The loop was dead code, which left the two languages
+// that same commit had just started counting unselectable: a Kotlin- or
+// Dart-dominated workspace was labelled "Generic", and 20 .kt files lost to one
+// stray .go file. Selection now sweeps the counted keys the precedence list
+// omits in sorted order, so the rule is structural for any language added later.
+func TestDetectPrimaryLanguage_UnlistedLanguagesAreSelectable(t *testing.T) {
+	t.Run("dominant unlisted language wins", func(t *testing.T) {
+		kt := t.TempDir()
+		files := map[string]string{}
+		for i := 0; i < 20; i++ {
+			files[fmt.Sprintf("F%02d.kt", i)] = "fun main() {}\n"
+		}
+		writeFiles(t, kt, files)
+		if got := DetectPrimaryLanguage(kt); got != "Kotlin" {
+			t.Errorf("DetectPrimaryLanguage = %q, want Kotlin for a .kt-dominated workspace", got)
+		}
+
+		dart := t.TempDir()
+		writeFiles(t, dart, map[string]string{"a.dart": "void main() {}\n", "b.dart": "void x() {}\n", "c.dart": "void y() {}\n"})
+		if got := DetectPrimaryLanguage(dart); got != "Dart" {
+			t.Errorf("DetectPrimaryLanguage = %q, want Dart for a .dart-dominated workspace", got)
+		}
+	})
+
+	t.Run("dominant unlisted language beats a minority listed one", func(t *testing.T) {
+		root := t.TempDir()
+		files := map[string]string{"main.go": "package main\n"}
+		for i := 0; i < 20; i++ {
+			files[fmt.Sprintf("f%02d.kt", i)] = "fun main() {}\n"
+		}
+		writeFiles(t, root, files)
+		if got := DetectPrimaryLanguage(root); got != "Kotlin" {
+			t.Errorf("DetectPrimaryLanguage = %q, want Kotlin; 20 .kt files must not lose to a single .go", got)
+		}
+	})
+
+	t.Run("counted extensions match the case-insensitive switch", func(t *testing.T) {
+		root := t.TempDir()
+		writeFiles(t, root, map[string]string{"A.KT": "fun a() {}\n", "B.KTS": "fun b() {}\n"})
+		if got := DetectPrimaryLanguage(root); got != "Kotlin" {
+			t.Errorf("DetectPrimaryLanguage = %q, want Kotlin for upper-case .KT/.KTS", got)
+		}
+	})
+
+	t.Run("tie between two unlisted languages is deterministic", func(t *testing.T) {
+		root := t.TempDir()
+		files := map[string]string{}
+		for i := 0; i < 6; i++ {
+			files[fmt.Sprintf("k%02d.kt", i)] = "fun main() {}\n"
+			files[fmt.Sprintf("d%02d.dart", i)] = "void main() {}\n"
+		}
+		writeFiles(t, root, files)
+		// Sorted sweep: "Dart" precedes "Kotlin", and strict ">" keeps the first.
+		for i := 0; i < 5; i++ {
+			if got := DetectPrimaryLanguage(root); got != "Dart" {
+				t.Fatalf("run %d: DetectPrimaryLanguage = %q, want Dart (alphabetical tie-break)", i, got)
+			}
+		}
+	})
+
+	t.Run("precedence list still wins a count tie", func(t *testing.T) {
+		root := t.TempDir()
+		files := map[string]string{}
+		for i := 0; i < 5; i++ {
+			files[fmt.Sprintf("f%02d.go", i)] = "package main\n"
+			files[fmt.Sprintf("k%02d.kt", i)] = "fun main() {}\n"
+		}
+		writeFiles(t, root, files)
+		if got := DetectPrimaryLanguage(root); got != "Go" {
+			t.Errorf("DetectPrimaryLanguage = %q, want Go; the unlisted sweep must not steal an even count", got)
+		}
+	})
+
+	t.Run("empty workspace has no language", func(t *testing.T) {
+		if got := DetectPrimaryLanguage(t.TempDir()); got != "Generic" {
+			t.Errorf("DetectPrimaryLanguage = %q, want Generic for an empty workspace", got)
+		}
+	})
+}
+
+// TestDetectPrimaryLanguage_AlignsWithAstForEveryClaimedExtension pins the
+// cross-layer invariant structurally rather than by re-listing extensions.
+// DetectPrimaryLanguage's counting switch and ast.DetectLanguage maintain two
+// hand-written extension sets that must agree; ".c" was claimed by the AST layer
+// (supported.go maps the whole C family to LangCpp) but missing from the counting
+// switch, so a pure-C workspace was labelled "Generic" -- and a 20-file C tree
+// lost to one stray .go file -- even though those same files were parsed, diffed
+// and health-scored. The expectation below is DERIVED from ast.DetectLanguage, so
+// adding a grammar on either side without the other fails here instead of
+// silently misclassifying, which is the shape this bug has now recurred in four
+// times (.mts/.cts, .mjs/.cjs, .kt/.dart, .c).
+func TestDetectPrimaryLanguage_AlignsWithAstForEveryClaimedExtension(t *testing.T) {
+	astToCore := map[ast.Language]string{
+		ast.LangGo:         "Go",
+		ast.LangRust:       "Rust",
+		ast.LangTypeScript: "TypeScript",
+		ast.LangJavaScript: "JavaScript",
+		ast.LangPython:     "Python",
+		ast.LangJava:       "Java",
+		ast.LangCpp:        "C++",
+		ast.LangCSharp:     "C#",
+		ast.LangPHP:        "PHP",
+		ast.LangRuby:       "Ruby",
+	}
+	// Deliberately wider than either set, including extensions only one layer
+	// knows (".kt" has no grammar; ".txt" has none at all).
+	candidates := []string{
+		".go", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
+		".py", ".rs", ".java", ".cs", ".php", ".rb",
+		".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
+		".kt", ".kts", ".dart", ".txt", ".md", ".json",
+	}
+
+	exercised := map[ast.Language]bool{}
+	for _, ext := range candidates {
+		lang := ast.DetectLanguage("sample" + ext)
+		want, claimed := astToCore[lang]
+		if !claimed {
+			continue
+		}
+		exercised[lang] = true
+
+		root := t.TempDir()
+		files := map[string]string{}
+		for i := 0; i < 12; i++ {
+			files[fmt.Sprintf("f%02d%s", i, ext)] = "x\n"
+		}
+		writeFiles(t, root, files)
+		if got := DetectPrimaryLanguage(root); got != want {
+			t.Errorf("ast.DetectLanguage(%q) = %v but DetectPrimaryLanguage = %q, want %q",
+				ext, lang, got, want)
+		}
+	}
+	// A language absent from the candidate list would leave its extension
+	// unguarded, which is exactly how ".c" slipped through.
+	for lang, name := range astToCore {
+		if !exercised[lang] {
+			t.Errorf("no candidate extension resolved to %v (%s); extend the list", lang, name)
+		}
+	}
+
+	// Boundaries around the ".c" repair.
+	t.Run("dominant c beats a minority precedence language", func(t *testing.T) {
+		root := t.TempDir()
+		files := map[string]string{"main.go": "package main\n"}
+		for i := 0; i < 20; i++ {
+			files[fmt.Sprintf("f%02d.c", i)] = "int main(void){return 0;}\n"
+		}
+		writeFiles(t, root, files)
+		if got := DetectPrimaryLanguage(root); got != "C++" {
+			t.Errorf("DetectPrimaryLanguage = %q, want C++ for 20 .c vs 1 .go", got)
+		}
+	})
+	t.Run("even count still yields to the precedence list", func(t *testing.T) {
+		root := t.TempDir()
+		files := map[string]string{}
+		for i := 0; i < 6; i++ {
+			files[fmt.Sprintf("f%02d.c", i)] = "int main(void){return 0;}\n"
+			files[fmt.Sprintf("g%02d.go", i)] = "package main\n"
+		}
+		writeFiles(t, root, files)
+		if got := DetectPrimaryLanguage(root); got != "Go" {
+			t.Errorf("DetectPrimaryLanguage = %q, want Go for an even .c/.go split", got)
+		}
+	})
+	t.Run("upper-case extension counts", func(t *testing.T) {
+		root := t.TempDir()
+		writeFiles(t, root, map[string]string{"MAIN.C": "int x;\n", "IMPL.C": "int y;\n"})
+		if got := DetectPrimaryLanguage(root); got != "C++" {
+			t.Errorf("DetectPrimaryLanguage = %q, want C++ for upper-case .C files", got)
+		}
+	})
 }
 
 // TestImportFromWrongStack_FullRegistryWithFatIgnoredTrees covers the batch

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1376,7 +1377,10 @@ func DetectPrimaryLanguage(root string) string {
 			extCounts["Rust"]++
 		case ".java":
 			extCounts["Java"]++
-		case ".cpp", ".cc", ".cxx", ".h", ".hpp":
+		// The C-family set must match ast.DetectLanguage's LangCpp group
+		// (internal/ast/supported.go); ".c" was missing, so pure-C workspaces
+		// were classified "Generic" even though their files were parsed.
+		case ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp":
 			extCounts["C++"]++
 		case ".cs":
 			extCounts["C#"]++
@@ -1405,19 +1409,30 @@ func DetectPrimaryLanguage(root string) string {
 			bestLang = lang
 		}
 	}
-	// Extend deterministic precedence to ALL languages: if a non-precedence
-	// language ties or beats the precedence winner, it wins — but on a TIE
-	// (same count) the precedence list breaks the tie alphabetically.
-	// We avoid a third loop by noting that every non-precedence language
-	// alphabetically follows "Ruby", so we extend the precedence list to
-	// cover all possibilities.  This makes the function fully deterministic:
-	// highest count wins; alphabetical precedence breaks ties.
-	precedence = append(precedence,
-		"C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-		"N", "O", "P", "Q", "S", "T", "U", "V", "W", "X", "Y", "Z",
-	)
+	// Languages the switch above counts but the precedence list does not name --
+	// Kotlin and Dart today, anything added tomorrow -- must still be selectable,
+	// and must win deterministically when they do. The previous form of this loop
+	// appended a fabricated A-Z slice to `precedence`, but extCounts is keyed by
+	// full language names ("Kotlin", "C++"), so no single letter could ever match:
+	// the loop only re-scanned names the first loop had already exhausted, every
+	// unlisted language stayed unreachable, and a Kotlin- or Dart-dominated
+	// workspace was labelled "Generic" or lost to a single stray .go file. Walk
+	// the unlisted keys of the map itself instead, sorted so a tie between two
+	// unlisted languages breaks alphabetically. Strict ">" is kept, so a listed
+	// language still wins a count tie exactly as before.
+	listed := make(map[string]bool, len(precedence))
 	for _, lang := range precedence {
-		if cnt, ok := extCounts[lang]; ok && cnt > maxCount {
+		listed[lang] = true
+	}
+	unlisted := make([]string, 0, len(extCounts))
+	for lang := range extCounts {
+		if !listed[lang] {
+			unlisted = append(unlisted, lang)
+		}
+	}
+	sort.Strings(unlisted)
+	for _, lang := range unlisted {
+		if cnt := extCounts[lang]; cnt > maxCount {
 			maxCount = cnt
 			bestLang = lang
 		}
