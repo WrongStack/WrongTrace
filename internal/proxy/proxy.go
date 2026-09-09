@@ -1600,6 +1600,39 @@ func truncateRecordString(s string) string {
 	return head + "…[+" + strconv.Itoa(len(s)-len(head)-len(tail)) + " chars]…" + tail
 }
 
+// credentialNameSegments splits a header/query/JSON-field name into lowercased
+// name segments on separators and camelCase boundaries, so a credential noun can
+// be matched as a whole segment instead of by an enumerated spelling. "C." and
+// digits-boundaries are not split: names arrive here after a dot-free normalise
+// in practice, and a segment test only has to be conservative in the direction of
+// not masking ordinary metadata.
+func credentialNameSegments(s string) []string {
+	var out []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			out = append(out, strings.ToLower(cur.String()))
+			cur.Reset()
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '-' || c == '_' || c == ' ':
+			flush()
+		case c >= 'A' && c <= 'Z':
+			// camelCase boundary; keep the accumulated lowercase run as its own
+			// segment ("subscriptionKey" -> subscription, Key).
+			flush()
+			cur.WriteByte(c)
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	flush()
+	return out
+}
+
 func isCredentialKey(k string) bool {
 	lk := strings.ToLower(strings.TrimSpace(k))
 	// Usage/token-count fields look tokenish but are plain metadata — never
@@ -1615,6 +1648,29 @@ func isCredentialKey(k string) bool {
 		"client_secret", "token", "access_token", "refresh_token", "id_token",
 		"session", "key", "credentials", "private_key", "x-api-key":
 		return true
+	}
+	// The credential NOUNS of this name family, matched as whole name segments --
+	// split on separators and camelCase boundaries -- rather than by enumerated
+	// spelling. Enumerating is what let this list drift: `private_key` was listed
+	// while `subscription_key` (Azure's real form), `access_key` (AWS-style) and
+	// `user_key` fell through, so their values were persisted into traffic records
+	// and body previews whole, even though bare `key` was already in the switch
+	// above.
+	//
+	// Ordered strictly AFTER the token-count exemption switch, and segment-based
+	// rather than Contains/HasSuffix on purpose. Over-redacting usage metadata was
+	// a separate shipped regression here (E2E caught prompt_tokens being masked):
+	// `max_tokens`/`total_tokens` split to [...,"tokens"], which is not the noun
+	// "token", so plural counts stay readable by construction -- the singular/
+	// plural boundary the fallback below had to hand-code as "_token". A substring
+	// match would additionally swallow ordinary fields like `keys` or `keyboard`,
+	// and a bare suffix match on the folded name masked `monkey` and `turkey`
+	// (caught by this file's own preservation test).
+	for _, seg := range credentialNameSegments(strings.TrimSpace(k)) {
+		switch seg {
+		case "key", "token", "secret", "password", "credential", "credentials", "authorization":
+			return true
+		}
 	}
 	// Suffix "_token" (singular) matches credential keys (access_token,
 	// session_token) without catching plural usage counts (*_tokens).
