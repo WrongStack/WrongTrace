@@ -58,10 +58,17 @@ func TestModelFrictionMatrix_TopPairDeterministic(t *testing.T) {
 		}
 	}
 
-	// Only claude-sonnet-4-20250514 was seeded as the cross-agent overwriter;
-	// claude-opus was never in the test data.  Verify stable selection.
+	// Both overwriters ARE seeded above, each ending with 1 cross-agent
+	// collision, so this fixture is a genuine tie and the winner must be decided
+	// by the documented alphabetical tie-break -- claude-opus sorts before
+	// claude-sonnet. This assertion previously pinned claude-sonnet, which is
+	// neither alphabetical nor stable: it was whichever pair the old in-loop
+	// running max happened to reach first under "ORDER BY event_time DESC". That
+	// contradicted this test's own comment above and passed only because the
+	// fixture's insertion order favoured it; the loop below checks stability,
+	// which a fixed-but-winner-wrong value also satisfies.
 	// Note: TopFrictionPair includes "(N collisions)" in its formatted value.
-	want := "MiniMax-M2.7-highspeed ➔ claude-sonnet-4-20250514 (1 collisions)"
+	want := "MiniMax-M2.7-highspeed ➔ claude-opus-4-20250514 (1 collisions)"
 	if firstResult != want {
 		t.Fatalf("TopFrictionPair = %q; want %q (stable cross-agent winner)",
 			firstResult, want)

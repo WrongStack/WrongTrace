@@ -860,12 +860,21 @@ func (s *Store) InsertTrace(t RuntimeTraceRecord) error {
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
+	// ON CONFLICT DO NOTHING, mirroring InsertReadEvent below: runtime_traces.trace_id
+	// is the PRIMARY KEY and OTLP/LangChain SDKs legitimately re-send a batch they
+	// believe was lost, so a replay must be a no-op success rather than a store
+	// failure. Without this clause a re-POST raises SQLITE_CONSTRAINT, which
+	// IngestOTLP counts as "did not persist" and the endpoint answers an error for
+	// data that is already in the database. Losing spans to a BAD key is still
+	// caught, one layer up: TestIngestOTLP_SharedTraceIDKeepsAllSpans counts the
+	// rows actually stored instead of trusting the conflict error.
 	const q = `
 		INSERT INTO runtime_traces
 			(trace_id, run_id, service_name, node_signature, file_path,
 			 duration_ms, cpu_usage_pct, memory_bytes, status_code, error_msg,
 			 profiler_type, metadata_json, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+		ON CONFLICT(trace_id) DO NOTHING
 	`
 	var runID any
 	if t.RunID != "" {
@@ -1707,6 +1716,22 @@ type InterAgentFrictionReport struct {
 	TopFrictionPair  string              `json:"top_friction_pair"`
 }
 
+// frictionPair reports whether an author/overwriter pair names real inter-model
+// friction. Two kinds do not: self-thrash (a model rewriting its own work), and
+// any pair touching the "unknown" sentinel, which the friction query's
+// COALESCE(r.model_name, 'unknown') substitutes whenever the event's run has no
+// agent_runs row. That sentinel is MISSING ATTRIBUTION, not a model, so a pair
+// built on it cannot be blamed on anyone.
+//
+// Both IsCrossAgent (which gates CrossAgentRatio) and the TopFrictionPair
+// summary must consult this one rule. They previously disagreed because the
+// summary re-implemented only the self-thrash half, which let an unattributed
+// chain outrank every genuine pair and take the dashboard's "Highest friction
+// pair" slot while the same report counted those collisions as non-friction.
+func frictionPair(author, overwriter string) bool {
+	return author != overwriter && author != "unknown" && overwriter != "unknown"
+}
+
 // ModelFrictionMatrix computes inter-agent code overwrites, deletions, and self-thrash loops.
 func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error) {
 	ctx, cancel := s.withTimeout(context.Background())
@@ -1757,7 +1782,6 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 		edgeMap         = make(map[string]*ModelFrictionEdge)
 		totalCollisions int
 		crossCount      int
-		maxPairCount    int
 		topPair         string
 	)
 
@@ -1793,7 +1817,7 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 		if !ev.AuthorTime.IsZero() && !ev.OverwriterTime.IsZero() {
 			ev.TimeDeltaSeconds = int64(ev.OverwriterTime.Sub(ev.AuthorTime).Seconds())
 		}
-		ev.IsCrossAgent = (ev.AuthorModel != ev.OverwriterModel) && ev.AuthorModel != "unknown" && ev.OverwriterModel != "unknown"
+		ev.IsCrossAgent = frictionPair(ev.AuthorModel, ev.OverwriterModel)
 
 		events = append(events, ev)
 		totalCollisions++
@@ -1814,11 +1838,6 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 		edge.ConflictCount++
 		edge.LinesModified += added
 		edge.LinesDeleted += deleted
-
-		if edge.ConflictCount > maxPairCount && ev.AuthorModel != ev.OverwriterModel {
-			maxPairCount = edge.ConflictCount
-			topPair = fmt.Sprintf("%s ➔ %s (%d collisions)", ev.AuthorModel, ev.OverwriterModel, maxPairCount)
-		}
 	}
 
 	edges := make([]ModelFrictionEdge, 0, len(edgeMap))
@@ -1826,16 +1845,37 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 		edges = append(edges, *e)
 	}
 
-	// Sort edges deterministically: highest conflict count first, then alphabetically
-	// by author model to ensure stable results when counts are equal.
-	// Without this sort, Go's random map iteration makes TopFrictionPair
-	// arbitrary on tied cross-agent edges.
+	// Order the edges completely: highest conflict count first, then
+	// OverwriterModel and AuthorModel, so no two distinct edges compare equal.
+	// sort.Slice is not stable and edgeMap arrives in random Go map order, so a
+	// partial order would leave tied edges in an arbitrary sequence -- precisely
+	// what makes the summary below non-deterministic.
 	sort.Slice(edges, func(i, j int) bool {
 		if edges[i].ConflictCount != edges[j].ConflictCount {
 			return edges[i].ConflictCount > edges[j].ConflictCount
 		}
-		return edges[i].OverwriterModel < edges[j].OverwriterModel
+		if edges[i].OverwriterModel != edges[j].OverwriterModel {
+			return edges[i].OverwriterModel < edges[j].OverwriterModel
+		}
+		return edges[i].AuthorModel < edges[j].AuthorModel
 	})
+
+	// TopFrictionPair summarizes Edges, so it is read from the ordered slice. It
+	// used to be assigned inside the scan loop as a strict running max over rows
+	// ordered by event_time DESC -- a value finalised BEFORE this sort, which is
+	// why the sort could never stabilize it. On a tie the loop winner was simply
+	// whichever pair reached the max first in time order, so one report published
+	// two contradictory answers to "what is the top pair": TopFrictionPair (row
+	// order) against Edges[0] (documented order). The pair must satisfy the same
+	// friction rule the ratio uses, so self-thrash AND unattributed ("unknown")
+	// edges are both skipped; the matrix still records them.
+	for _, e := range edges {
+		if !frictionPair(e.AuthorModel, e.OverwriterModel) {
+			continue
+		}
+		topPair = fmt.Sprintf("%s ➔ %s (%d collisions)", e.AuthorModel, e.OverwriterModel, e.ConflictCount)
+		break
+	}
 
 	ratio := 0.0
 	if totalCollisions > 0 {
