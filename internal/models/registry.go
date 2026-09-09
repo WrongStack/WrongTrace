@@ -125,6 +125,29 @@ func (r *Registry) seedDefaults() {
 	}
 }
 
+// snapshotProvider returns a ProviderInfo whose Models slice is owned by the
+// caller. Registry stores providers by value, so copying the struct copies only
+// the slice HEADER: the copy shared the registry's live backing array. Upsert
+// mutates that array in place (append(p.Models[:i], p.Models[i+1:]...) when a
+// model moves provider, p.Models[i] = m when one is updated, and append on
+// growth), so a value already handed to a caller could change under it, a shift
+// could make a stale snapshot list the same model twice, and reading a returned
+// catalog concurrently with any Upsert is an unsynchronised access. All three
+// were reproduced under -race at registry.go:404 and :410.
+//
+// Cloning happens while the RLock is held, so the returned array can never be
+// aliased back into registry storage. ModelInfo is entirely scalar fields, so an
+// element-wise copy is a true copy; if it ever gains a slice or map field this
+// must become a deep copy. A nil Models stays nil to preserve the old shape.
+func snapshotProvider(p ProviderInfo) ProviderInfo {
+	if p.Models != nil {
+		models := make([]ModelInfo, len(p.Models))
+		copy(models, p.Models)
+		p.Models = models
+	}
+	return p
+}
+
 // AllProviders returns all providers sorted by model count descending then name.
 func (r *Registry) AllProviders() []ProviderInfo {
 	r.mu.RLock()
@@ -132,7 +155,7 @@ func (r *Registry) AllProviders() []ProviderInfo {
 
 	out := make([]ProviderInfo, 0, len(r.providers))
 	for _, p := range r.providers {
-		out = append(out, p)
+		out = append(out, snapshotProvider(p))
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -151,11 +174,11 @@ func (r *Registry) GetProvider(id string) (ProviderInfo, bool) {
 
 	slug := sanitizeSlug(id)
 	if p, ok := r.providers[slug]; ok {
-		return p, true
+		return snapshotProvider(p), true
 	}
 	for _, p := range r.providers {
 		if strings.EqualFold(p.Name, id) {
-			return p, true
+			return snapshotProvider(p), true
 		}
 	}
 	return ProviderInfo{}, false

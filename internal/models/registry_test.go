@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fixture mirrors the real models.dev/api.json shape: top-level provider
@@ -397,5 +398,191 @@ func TestRegistry_ProviderIndexStaysInSync(t *testing.T) {
 		t.Fatal("provider lost after in-place update")
 	} else if p.ModelCount != 1 || len(p.Models) != 1 || p.Models[0].Name != "Custom Ollama Qwen v2" {
 		t.Fatalf("in-place update must replace the listing: ModelCount=%d Models=%+v", p.ModelCount, p.Models)
+	}
+}
+
+// The three tests below pin the snapshot-ownership contract that
+// TestRegistry_ProviderIndexStaysInSync could not see: it asserts the LIVE index,
+// while the defect was in the value already handed to a caller. Registry stores
+// providers by value (map[string]ProviderInfo), so copying the struct copies only
+// the Models slice HEADER -- the returned ProviderInfo aliased registry storage,
+// and Upsert writes into that array in place (registry.go:386 shift, :404
+// overwrite, :410 append growth).
+//
+// Symptom 1: a value the caller already holds changes underneath it.
+// Symptom 2: an in-place shift duplicates an entry in a stale snapshot.
+// Symptom 3: reading a catalog concurrently with any Upsert is unsynchronised --
+// reproduced as a DATA RACE at registry.go:404 and :410 under -race.
+//
+// All three fail without snapshotProvider's clone. Fresh Registry instances are
+// used throughout, never models.Global: Upsert stores under the raw ID, so
+// asserting growth against shared singleton state is rerun-unsafe.
+
+func TestRegistry_ProviderSnapshotIsCallerOwned(t *testing.T) {
+	r := NewRegistry()
+	r.Upsert(ModelInfo{ID: "alpha/one", Provider: "Alpha", ProviderID: "alpha", InputPricePerM: 1, OutputPricePerM: 1})
+	r.Upsert(ModelInfo{ID: "alpha/two", Provider: "Alpha", ProviderID: "alpha", InputPricePerM: 2, OutputPricePerM: 2})
+
+	snap, ok := r.GetProvider("alpha")
+	if !ok || len(snap.Models) != 2 {
+		t.Fatalf("setup: GetProvider(alpha) ok=%v models=%+v", ok, snap.Models)
+	}
+	beforePrice := snap.Models[0].InputPricePerM
+
+	// Update-in-place branch (registry.go:404).
+	r.Upsert(ModelInfo{ID: "alpha/one", Provider: "Alpha", ProviderID: "alpha", InputPricePerM: 99, OutputPricePerM: 99})
+
+	if got := snap.Models[0].InputPricePerM; got != beforePrice {
+		t.Errorf("snapshot mutated under its caller: price %v -> %v; GetProvider returned live registry storage", beforePrice, got)
+	}
+	// Guard against "fixing" this by freezing the catalog: a FRESH read must see
+	// the update, and the clone must not be served from a stale cache.
+	live, ok := r.GetProvider("alpha")
+	if !ok {
+		t.Fatal("provider missing after update")
+	}
+	if live.ModelCount != 2 || len(live.Models) != 2 {
+		t.Fatalf("live index wrong: ModelCount=%d len=%d", live.ModelCount, len(live.Models))
+	}
+	if live.Models[0].InputPricePerM != 99 {
+		t.Errorf("fresh read did not observe the update: %v, want 99", live.Models[0].InputPricePerM)
+	}
+}
+
+func TestRegistry_SnapshotSurvivesProviderMoveWithoutDuplicates(t *testing.T) {
+	r := NewRegistry()
+	r.Upsert(ModelInfo{ID: "alpha/one", Provider: "Alpha", ProviderID: "alpha"})
+	r.Upsert(ModelInfo{ID: "alpha/two", Provider: "Alpha", ProviderID: "alpha"})
+
+	snap, ok := r.GetProvider("alpha")
+	if !ok || len(snap.Models) != 2 {
+		t.Fatalf("setup: snapshot=%+v", snap.Models)
+	}
+
+	// Move index 0 away: the removal loop runs append(p.Models[:0], p.Models[1:]...)
+	// on the SHARED array, copying "two" over slot 0.
+	r.Upsert(ModelInfo{ID: "alpha/one", Provider: "Beta", ProviderID: "beta"})
+
+	seen := map[string]int{}
+	for _, m := range snap.Models {
+		seen[m.ID]++
+	}
+	for id, n := range seen {
+		if n > 1 {
+			t.Errorf("stale snapshot lists %q %d times (ModelCount=%d agrees with the duplicate)", id, n, snap.ModelCount)
+		}
+	}
+	if snap.ModelCount != len(snap.Models) {
+		t.Errorf("snapshot self-inconsistent: ModelCount=%d len(Models)=%d", snap.ModelCount, len(snap.Models))
+	}
+
+	// And the live index must be right: alpha kept one, beta gained one.
+	if a, ok := r.GetProvider("alpha"); !ok || a.ModelCount != 1 || a.Models[0].ID != "alpha/two" {
+		t.Errorf("live alpha wrong after move: ok=%v %+v", ok, a.Models)
+	}
+	if b, ok := r.GetProvider("beta"); !ok || b.ModelCount != 1 || b.Models[0].ID != "alpha/one" {
+		t.Errorf("live beta wrong after move: ok=%v %+v", ok, b.Models)
+	}
+}
+
+func TestRegistry_AllProvidersSnapshotIsCallerOwned(t *testing.T) {
+	// The production path: engine.go ProviderCatalog hands AllProviders() straight
+	// to json.Marshal, which walks Models after the RLock is released.
+	r := NewRegistry()
+	r.Upsert(ModelInfo{ID: "alpha/one", Provider: "Alpha", ProviderID: "alpha", InputPricePerM: 1, OutputPricePerM: 1})
+	r.Upsert(ModelInfo{ID: "alpha/two", Provider: "Alpha", ProviderID: "alpha", InputPricePerM: 2, OutputPricePerM: 2})
+
+	out := r.AllProviders()
+	var snap *ProviderInfo
+	for i := range out {
+		if out[i].ID == "alpha" {
+			snap = &out[i]
+		}
+	}
+	if snap == nil || len(snap.Models) != 2 {
+		t.Fatalf("setup: no alpha provider in %+v", out)
+	}
+	beforePrice := snap.Models[0].InputPricePerM
+
+	r.Upsert(ModelInfo{ID: "alpha/one", Provider: "Alpha", ProviderID: "alpha", InputPricePerM: 99, OutputPricePerM: 99})
+
+	if got := snap.Models[0].InputPricePerM; got != beforePrice {
+		t.Errorf("AllProviders snapshot mutated under its caller: %v -> %v", beforePrice, got)
+	}
+	for _, p := range r.AllProviders() {
+		if p.ModelCount != len(p.Models) {
+			t.Errorf("provider %q: ModelCount=%d but len(Models)=%d", p.ID, p.ModelCount, len(p.Models))
+		}
+	}
+}
+
+func TestRegistry_CatalogReadsDoNotRaceUpsert(t *testing.T) {
+	// Permanent net for the DATA RACE that CI's -race gate never saw because no
+	// test read the catalog concurrently with a write. Meaningless without -race,
+	// harmless with it.
+	r := NewRegistry()
+	for i := 0; i < 40; i++ {
+		r.Upsert(ModelInfo{ID: fmt.Sprintf("alpha/m%d", i), Provider: "Alpha", ProviderID: "alpha", InputPricePerM: float64(i)})
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{}, 2)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			r.Upsert(ModelInfo{ID: "alpha/zzz", Provider: "Alpha", ProviderID: "alpha", InputPricePerM: float64(i)})
+			r.Upsert(ModelInfo{ID: "alpha/zzz", Provider: "Beta", ProviderID: "beta"}) // forces a shift
+		}
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, p := range r.AllProviders() {
+				for _, m := range p.Models {
+					_ = m.ID
+					_ = m.Provider
+				}
+			}
+		}
+	}()
+
+	// Bounded so the test cannot hang on a fast/slow machine mismatch.
+	deadline := make(chan struct{})
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		close(deadline)
+	}()
+	<-deadline
+	close(stop)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("goroutines did not exit after stop")
+		}
+	}
+}
+
+func TestSnapshotProviderKeepsNilModels(t *testing.T) {
+	// The clone must not turn an absent listing into an empty one: callers
+	// (and the JSON encoder) distinguish nil from [].
+	if got := snapshotProvider(ProviderInfo{ID: "x"}); got.Models != nil {
+		t.Errorf("nil Models became %#v", got.Models)
+	}
+	src := ProviderInfo{ID: "x", Models: []ModelInfo{{ID: "a"}}, ModelCount: 1}
+	cp := snapshotProvider(src)
+	cp.Models[0].ID = "mutated"
+	if src.Models[0].ID != "a" {
+		t.Error("snapshotProvider returned an aliased slice")
 	}
 }
