@@ -80,6 +80,7 @@ func (c *Collector) IngestReport(p ProfilerReportPayload) (TraceEvent, error) {
 		Timestamp:     time.Now().UTC(),
 	}
 
+	var storeErr error
 	if s := c.store(); s != nil {
 		rec := db.RuntimeTraceRecord{
 			TraceID:       ev.TraceID,
@@ -98,6 +99,7 @@ func (c *Collector) IngestReport(p ProfilerReportPayload) (TraceEvent, error) {
 		}
 		if err := s.InsertTrace(rec); err != nil {
 			log.Printf("profiler: insert trace %s: %v", ev.TraceID, err)
+			storeErr = fmt.Errorf("store profiler trace %s: %w", ev.TraceID, err)
 		}
 	}
 
@@ -107,7 +109,12 @@ func (c *Collector) IngestReport(p ProfilerReportPayload) (TraceEvent, error) {
 		c.cfg.OnTrace(ev)
 	}
 
-	return ev, nil
+	// The error is returned AFTER the ring record and broadcast, so the live
+	// dashboard still sees the event; what changes is that the caller can no
+	// longer mistake a failed write for a stored one. handlers.go maps this to
+	// HTTP 500, which is correct here: a single record either lands or does not,
+	// and nothing was persisted, so a retry cannot duplicate anything.
+	return ev, storeErr
 }
 
 // IngestOTLP parses OpenTelemetry traces JSON payload and persists each span.
@@ -117,7 +124,11 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 		return 0, fmt.Errorf("unmarshal otlp: %w", err)
 	}
 
-	count := 0
+	// count is spans that actually PERSISTED; failed is spans whose write was
+	// rejected. They were previously conflated: `count++` ran even when
+	// InsertTrace errored, so callers reported a batch as accepted that the
+	// database never received.
+	count, failed := 0, 0
 	for _, rs := range root.ResourceSpans {
 		serviceName := "unknown-service"
 		for _, attr := range rs.Resource.Attributes {
@@ -150,9 +161,9 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 							}
 						}
 					case "cpu.usage_pct":
-						cpuPct = attr.Value.DoubleValue
+						cpuPct = attr.Value.DoubleValue.columnValue()
 					case "memory.bytes":
-						memBytes = attr.Value.IntValue
+						memBytes = int64(attr.Value.IntValue)
 					}
 				}
 
@@ -200,7 +211,18 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 					} else {
 						rowID = "span-" + span.SpanID
 					}
+				} else if span.TraceID != "" {
+					// Only the group identity exists: without a per-span half
+					// every span of the trace collapses onto rowID=traceID, and
+					// InsertTrace's ON CONFLICT(trace_id) DO NOTHING silently
+					// keeps only the first while the returned count still
+					// reports them all. Mint the missing half — the same remedy
+					// the traceID fallback above applies to an identity-less
+					// trace — so every counted span lands in its own row.
+					rowID = traceID + "-" + randomID("span")
 				}
+				// span.TraceID == "" && span.SpanID == "": traceID is already a
+				// minted per-span random ID, unique as-is.
 
 				ev := TraceEvent{
 					TraceID:       traceID,
@@ -217,6 +239,7 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 					Timestamp:     time.Now().UTC(),
 				}
 
+				stored := true
 				if s := c.store(); s != nil {
 					metaBytes, _ := json.Marshal(meta)
 					rec := db.RuntimeTraceRecord{
@@ -235,6 +258,7 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 					}
 					if err := s.InsertTrace(rec); err != nil {
 						log.Printf("profiler: insert trace %s: %v", ev.TraceID, err)
+						stored = false
 					}
 				}
 
@@ -242,11 +266,26 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 				if c.cfg.OnTrace != nil {
 					c.cfg.OnTrace(ev)
 				}
-				count++
+				// Only a write that reached the database counts as accepted.
+				if stored {
+					count++
+				} else {
+					failed++
+				}
 			}
 		}
 	}
 
+	// Only a TOTAL failure is signalled as an error. A partial failure must not
+	// return one: handlers.go would answer HTTP 500, an OTel SDK then retries the
+	// WHOLE batch, and InsertTrace is a plain INSERT -- the spans that already
+	// persisted collide with the runtime_traces.trace_id primary key (the exact
+	// failure round 20 documented) and fail again, so the client can never drain
+	// the batch. Partial loss is reported by the honest count plus the per-span
+	// log line above; total failure is safe because nothing landed.
+	if count == 0 && failed > 0 {
+		return 0, fmt.Errorf("otlp: all %d spans failed to store", failed)
+	}
 	return count, nil
 }
 
@@ -257,17 +296,50 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 // (http.status_code, cpu.usage_pct, feature.enabled) into empty strings
 // there — even though the typed sibling fields of the same record were
 // populated from the very same attributes.
+//
+// The member is selected by which key the SENDER named (OTLPVal.present), never
+// by testing fields for non-zero-ness: a value explicitly set to its default is
+// distinguishable on the wire and must not collapse to "". See OTLPVal.
 func otlpAttributeValue(v OTLPVal) any {
-	switch {
-	case v.StringValue != "":
+	switch v.present {
+	case "stringValue":
 		return v.StringValue
-	case v.IntValue != 0:
-		return v.IntValue
-	case v.DoubleValue != 0:
-		return v.DoubleValue
-	case v.BoolValue:
+	case "boolValue":
 		return v.BoolValue
+	case "intValue":
+		// Widened back to int64 so the metadata value type is unchanged by the
+		// named field type: both this surface and metadata_json stay int64.
+		return int64(v.IntValue)
+	case "doubleValue":
+		return v.DoubleValue.metadataValue()
+	case "arrayValue":
+		// A named-but-null or valueless array is still an EMPTY array: the proto
+		// says array_value "may be empty (contain 0 elements)", so empty must not
+		// collapse into the unspecified branch's "".
+		items := []any{}
+		if v.ArrayValue != nil {
+			items = make([]any, 0, len(v.ArrayValue.Values))
+			for _, e := range v.ArrayValue.Values {
+				items = append(items, otlpAttributeValue(e)) // recursive: keeps nested presence
+			}
+		}
+		return items
+	case "kvlistValue":
+		pairs := map[string]any{}
+		if v.KvlistValue != nil {
+			pairs = make(map[string]any, len(v.KvlistValue.Values))
+			for _, kv := range v.KvlistValue.Values {
+				pairs[kv.Key] = otlpAttributeValue(kv.Value)
+			}
+		}
+		return pairs
+	case "bytesValue":
+		return v.BytesValue
 	default:
+		// Only the genuinely unspecified value reaches here now -- legal per
+		// AnyValue ("considered to be empty"). string_value_strindex (proto field
+		// 8) also lands here on purpose: the proto directs non-Profiling
+		// receivers to treat it as if absent, so ignoring it IS the compliance.
 		return ""
 	}
 }
