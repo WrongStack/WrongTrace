@@ -314,7 +314,7 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 
 // braceScanner tracks the string/comment lexer state of one declaration body
 // across successive lines. Scanning each line in isolation (as the previous
-// per-line countCodeBraces calls did) loses that state at the newline, so a
+// per-line brace counting did) loses that state at the newline, so a
 // '}' inside a multi-line block comment or a multi-line string literal — both
 // legal in every language the generic parser handles — was counted as a
 // structural closing brace. That truncated the measured body, corrupting
@@ -383,15 +383,6 @@ func (sc *braceScanner) lineDelta(line string) int {
 		}
 	}
 	return net
-}
-
-// countCodeBraces returns the net delta of '{' minus '}', safely ignoring
-// braces inside strings and comments on a single line. Multi-line bodies must
-// scan through braceScanner so string and block-comment state survives line
-// breaks.
-func countCodeBraces(s string) int {
-	var sc braceScanner
-	return sc.lineDelta(s)
 }
 
 // Snapshot returns the cached snapshot for a file, if any.
