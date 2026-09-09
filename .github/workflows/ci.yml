@@ -1,8 +1,9 @@
 name: CI
 
 # Validate every commit: backend static analysis + race-detector test suite,
-# and the dashboard production build. Backend and frontend are independent
-# jobs so a Node failure never masks a Go failure (and vice versa).
+# and the dashboard's production build plus its regression guards. Backend
+# and frontend are independent jobs so a Node failure never masks a Go
+# failure (and vice versa).
 on:
   push:
   pull_request:
@@ -50,7 +51,7 @@ jobs:
         run: go test -race -count=1 ./...
 
   frontend:
-    name: Dashboard build
+    name: Dashboard build + regression guards
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -71,3 +72,11 @@ jobs:
       - name: npm run build (tsc + vite)
         working-directory: web
         run: npm run build
+
+      # The eleven standalone regression guards are SSR harnesses over the real
+      # components; a successful vite build proves nothing about filter scoping
+      # or honest clipboard failure — both defects passed `npm run build`.
+      # run-all.mjs streams each guard's output and fails on any non-zero exit.
+      - name: npm run regressions (11 web guards)
+        working-directory: web
+        run: npm run regressions

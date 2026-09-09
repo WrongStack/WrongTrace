@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "regressions": "node scripts/run-all.mjs",
     "preview": "vite preview",
     "restore:placeholder": "node -e \"const fs=require('fs'); fs.copyFileSync('placeholder.html', 'dist/index.html');\""
   },
