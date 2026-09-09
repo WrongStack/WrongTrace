@@ -95,7 +95,18 @@ func TestSanitizeURLForRecord(t *testing.T) {
 		{"gemini key", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=" + gemSecret, "[redacted]", gemSecret},
 		{"access token", "https://api.example.com/v1/x?access_token=" + tokSecret, "[redacted]", tokSecret},
 		{"api key snake", "https://api.example.com/v1/x?api_key=" + apiSecret, "[redacted]", apiSecret},
+		// The hyphenated spellings. maskSecretValue (headers) and credQueryParamRe
+		// (errors) both already covered "api-key"; the query loop knew only
+		// apikey/api_key, so "?api-key=" -- Azure OpenAI's real query form -- was
+		// returned verbatim and the upstream key was stored in traffic records.
+		{"api key hyphen", "https://api.example.com/v1/x?api-key=" + apiSecret, "[redacted]", apiSecret},
+		{"qualified x-api-key", "https://api.example.com/v1/x?x-api-key=" + apiSecret, "[redacted]", apiSecret},
+		{"qualified x-goog-api-key", "https://api.example.com/v1/x?x-goog-api-key=" + apiSecret, "[redacted]", apiSecret},
 		{"clean url untouched", "https://api.openai.com/v1/chat/completions?foo=bar", "foo=bar", ""},
+		// Token-COUNT metadata is not a credential: isCredentialKey learned that in
+		// E2E when prompt_tokens got masked, and the query predicate matches any
+		// name containing "token", so the exemption has to hold here as well.
+		{"token count metadata stays readable", "https://api.example.com/v1/x?max_tokens=64&prompt_tokens=7", "max_tokens=64", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

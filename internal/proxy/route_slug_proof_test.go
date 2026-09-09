@@ -93,4 +93,13 @@ func TestMatchRoute_SlugDerivationIsBoundaryCorrect(t *testing.T) {
 	if r != nil {
 		t.Fatalf("FAIL: /proxyzaii unexpectedly matched prefix=%q, want nil", r.PathPrefix)
 	}
+	// A rejected path must also come back UNCHANGED. MatchRoute's no-match
+	// fallback is `return nil, path`, i.e. the caller's original string; the
+	// /proxyzai, /proxyzai/chat and /proxy/zai cases above all assert their
+	// remaining path, and this one silently dropped its value (staticcheck
+	// SA4006) even though it is the case that proves the boundary guard neither
+	// matches nor hands back a stripped remainder.
+	if rem != "/proxyzaii" {
+		t.Fatalf("FAIL: /proxyzaii remaining=%q, want %q echoed back verbatim", rem, "/proxyzaii")
+	}
 }

@@ -71,8 +71,11 @@ func FuzzSanitizeURLForRecord(f *testing.F) {
 			return
 		}
 		for k, vs := range u.Query() {
-			if !strings.EqualFold(k, "key") && !strings.EqualFold(k, "api_key") &&
-				!strings.EqualFold(k, "token") && !strings.EqualFold(k, "access_token") {
+			// Deliberately its own list, NOT a call to isCredentialParam: an oracle
+			// that asks the production predicate whether a name is a credential can
+			// never disagree with it, and that blind spot is how "api-key" survived
+			// here while maskSecretValue already redacted the same header name.
+			if !oracleCredentialParam(k) {
 				continue
 			}
 			for _, v := range vs {
@@ -90,3 +93,22 @@ func FuzzSanitizeURLForRecord(f *testing.F) {
 // parseForFuzz mirrors sanitizeURLForRecord's own parse step so the fuzz
 // property only asserts on URLs the function actually understood.
 func parseForFuzz(raw string) (*url.URL, error) { return url.Parse(raw) }
+
+// oracleCredentialParam is the fuzz oracle's OWN hand-spelled notion of a
+// credential-bearing query parameter. It intentionally does NOT call
+// isCredentialParam and does not reuse its separator-folding algorithm: an oracle
+// that asks the code under test what counts as a secret can never catch that code
+// being wrong, and that blind spot is exactly how the hyphenated "api-key" form
+// was redacted in headers while leaking through the query recorder. Every
+// credential name that has ever appeared in this package's own lists is spelled
+// out, including all three api-key variants; count-shaped metadata is not listed
+// at all, so the oracle cannot flag a field production deliberately keeps.
+func oracleCredentialParam(name string) bool {
+	switch strings.ToLower(name) {
+	case "key", "apikey", "api_key", "api-key", "x-api-key", "x-goog-api-key",
+		"token", "access_token", "access-token", "refresh_token", "refresh-token",
+		"secret", "client_secret", "signature", "password":
+		return true
+	}
+	return false
+}

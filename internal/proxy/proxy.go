@@ -479,7 +479,8 @@ func isModelCatalogPath(cleanPath string) bool {
 	}
 	// Detail form: .../models/<id>. Gemini routes inference THROUGH the path as
 	// models/<model>:generateContent — the ":" method suffix distinguishes
-	// those, so they stay on the traced model-request path.
+	// those, so they stay on the traced model-request path. Colon escapes are
+	// already normalized at the source by normalizePathColons, so this sees ":".
 	if len(segs) >= 2 && strings.ToLower(segs[len(segs)-2]) == "models" && !strings.Contains(last, ":") {
 		return true
 	}
@@ -490,9 +491,56 @@ func isModelCatalogPath(cleanPath string) bool {
 	return false
 }
 
+// normalizePathColons rewrites the one percent-escape that denotes a plain
+// CHARACTER rather than path structure, so it stays visible to the literal tests
+// downstream. ":" is an ordinary pchar inside a segment (RFC 3986), and this
+// function always sees a leading "/", so it carries no parsing ambiguity -- but
+// DetectProvider matches the embedded-URL passthrough on "https:/" and a
+// "host:port" label, and isModelCatalogPath excludes Gemini's
+// "models/<id>:generateContent" verb suffix, all by looking for a literal colon
+// that "%3A"/"%3a" would hide.
+//
+// Every other escape is deliberately preserved, because they are structural:
+// "%2F" is a segment separator in disguise, "%3F" and "%23" open the query and
+// fragment, and "%2E" takes part in dot-segment normalization. Decoding those is
+// what made a single client segment reach the provider as two.
+func normalizePathColons(p string) string {
+	p = strings.ReplaceAll(p, "%3A", ":")
+	return strings.ReplaceAll(p, "%3a", ":")
+}
+
+// setForwardedPath composes the upstream request target from the configured
+// base and the caller's path WITHOUT re-encoding it. cleanPath carries the
+// client's ESCAPED path, so it must land in url.URL.RawPath: url.URL.String()
+// only honors RawPath when it decodes exactly to Path, hence the paired
+// assignment. Assigning an escaped string straight into Path would double-encode
+// ("%25" -> "%2525"), and assigning the decoded form loses "%2F" as a separator.
+func setForwardedPath(u *url.URL, cleanPath string) {
+	joined := strings.TrimSuffix(u.EscapedPath(), "/") + "/" + strings.TrimPrefix(cleanPath, "/")
+	if decoded, err := url.PathUnescape(joined); err == nil {
+		u.Path = decoded
+	} else {
+		// Malformed escapes ("%zz"): leave the string alone so the standard
+		// escaper treats it as opaque text instead of failing the request.
+		u.Path = joined
+	}
+	u.RawPath = joined
+}
+
 // DetectProvider resolves the exact provider using configured dynamic routes, headers, URL path, or API key signature.
+//
+// The path it returns is the caller's ESCAPED path (url.URL.EscapedPath), not
+// the decoded url.URL.Path: this value is forwarded upstream verbatim and is
+// also what route matching and catalog classification split on. Decoding first
+// is lossy for "%2F" -- it becomes a real separator that no later step can put
+// back -- which both rewrote the upstream request target and turned a
+// "/v1/models/<id>" catalog call with a hub-style model name
+// ("meta-llama%2FLlama-3") into an extra path segment, misrouting it into the
+// traced inference path. Every consumer here compares ASCII prefixes
+// (mount labels, "/proxy/<slug>", "v1/"), so escaped input behaves identically
+// except in the case that was previously broken.
 func (p *GatewayProxy) DetectProvider(r *http.Request) (provider string, targetBaseURL string, cleanPath string) {
-	path := r.URL.Path
+	path := normalizePathColons(r.URL.EscapedPath())
 	customUpstream := r.Header.Get("X-Target-Upstream")
 	if customUpstream == "" {
 		customUpstream = r.Header.Get("X-Upstream-Base")
@@ -757,7 +805,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "wrongtrace proxy: could not parse upstream URL "+targetBase, http.StatusInternalServerError)
 		return
 	}
-	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + cleanPath
+	setForwardedPath(base, cleanPath)
 	// Merge the caller's query with any query embedded in the configured base by
 	// JOINING THE RAW STRINGS, never by round-tripping them through
 	// url.Values.Parse/Encode. url.Values stores decoded values and Encode()
@@ -1117,7 +1165,7 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "wrongtrace proxy: could not parse upstream URL "+targetBase, http.StatusInternalServerError)
 		return
 	}
-	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + strings.TrimPrefix(cleanPath, "/")
+	setForwardedPath(base, cleanPath)
 	// Same raw-join rule as ServeHTTP: a catalog relay must be transparent, so
 	// the client's query bytes are forwarded unchanged instead of being decoded
 	// and re-escaped through url.Values (which double-encodes "%2F" -> "%252F",
@@ -1598,9 +1646,53 @@ func runeSafeSuffix(s string, max int) string {
 	return s[start:]
 }
 
-// sanitizeURLForRecord scrubs credential-looking query parameters (key, apikey,
-// api_key, token, access_token, signature…) from a URL string for logging and
-// traffic records. Parsing failures return the raw path without query.
+// isCredentialParam reports whether a query-parameter NAME carries a credential,
+// independent of how the vendor spelled its separator. It exists because two
+// hand-written lists in this package had drifted: maskSecretValue already treats
+// the headers "x-api-key", "api-key" and "x-goog-api-key" as credentials, while
+// the redactor below matched only apikey/api_key -- so "?api-key=" (Azure
+// OpenAI's real query form) fell through and the upstream key was stored in
+// traffic records whole. Canonicalising the name rather than enumerating spellings
+// is what keeps the next variant from leaking.
+//
+// Over-redaction here is display-only and acceptable: sanitizeURLForRecord is a
+// record/log-only surface (see its CONTRACT comment and the tests pinning it),
+// and the request cache scope reads raw headers instead, so widening this
+// predicate cannot drop a credential from a forwarded request or a cache key.
+func isCredentialParam(name string) bool {
+	canonical := strings.NewReplacer("-", "", "_", "").Replace(strings.ToLower(name))
+	// Token-COUNT metadata is not a credential. isCredentialKey already refuses to
+	// mask these on the body path (E2E caught prompt_tokens being redacted), and
+	// this predicate matches any name containing "token", so the same guard is
+	// required here: a recorded URL like "?api-version=x&max_tokens=64" must stay
+	// readable. Ordered before the matches below, and "token" itself stays a
+	// credential (only the count-shaped names are exempt).
+	switch canonical {
+	case "tokens", "prompttokens", "completiontokens", "totaltokens",
+		"maxtokens", "maxcompletiontokens", "reasoningtokens", "cachedtokens",
+		"inputtokens", "outputtokens", "tokencount", "cursortoken", "continuationtoken":
+		return false
+	}
+	switch canonical {
+	case "key", "token", "secret", "signature", "authorization", "password", "auth":
+		return true
+	}
+	// Qualified vendor shapes: apikey, xapikey, xgoogapikey, accesstoken,
+	// authtoken, bearertoken, sessiontoken, securitytoken, clientsecret,
+	// proxyauthorization, subscriptionkey.
+	for _, part := range []string{"apikey", "token", "secret", "password", "authorization", "signature", "credential"} {
+		if strings.Contains(canonical, part) {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeURLForRecord scrubs credential-looking query parameters (see
+// isCredentialParam: key, apikey/api_key/api-key/x-api-key/x-goog-api-key,
+// token/access_token/bearer…, signature, secret, password, authorization) from a
+// URL string for logging and traffic records. Parsing failures return the raw path
+// without query.
 //
 // CONTRACT: this is a RECORD/LOG-ONLY surface. Its output must NEVER be used to
 // build a forwarded request URL or a cache key. Two independent reasons:
@@ -1636,10 +1728,7 @@ func sanitizeURLForRecord(rawURL string) string {
 	q := u.Query()
 	changed := false
 	for k := range q {
-		lk := strings.ToLower(k)
-		if lk == "key" || lk == "apikey" || lk == "api_key" || lk == "token" ||
-			lk == "access_token" || lk == "access-token" || lk == "signature" ||
-			lk == "secret" || strings.Contains(lk, "password") {
+		if isCredentialParam(k) {
 			q.Set(k, "[redacted]")
 			changed = true
 		}
