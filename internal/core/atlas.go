@@ -487,6 +487,39 @@ func resolvePackageScope(filePath string) (pkgPath string, pkgName string, works
 		second = rest[:secondSlash]
 	}
 
+	// Absolute input means no project root was known: Atlas() falls back to the
+	// stored absolute path when no registered project contains the file. The
+	// leading segment is then a filesystem root or a volume marker -- "" after a
+	// leading "/" or "C:" on Windows -- and treating it as a package scope made
+	// every directory under it share ONE package ("C:/Users", workspace "C:",
+	// or "/tmp" with an empty workspace on POSIX). That is precisely the junk
+	// grouping Atlas()'s sibling guard comment warns about, and it silently
+	// merges distinct packages such as internal/database, web/routes and
+	// cmd/server. Scope by the two deepest real directories instead: distinct
+	// directories stay distinct, and no root or volume prefix can become an
+	// identity. The relative-path conventions below are left untouched.
+	if first == "" || (len(first) == 2 && first[1] == ':') {
+		segs := make([]string, 0, 4)
+		for _, s := range strings.Split(clean, "/") {
+			if s == "" {
+				continue
+			}
+			if len(s) == 2 && s[1] == ':' {
+				continue // bare drive marker, not a directory
+			}
+			segs = append(segs, s)
+		}
+		switch len(segs) {
+		case 0:
+			return "root", "root", "root"
+		case 1:
+			return segs[0], segs[0], segs[0]
+		default:
+			pkg := segs[len(segs)-2] + "/" + segs[len(segs)-1]
+			return pkg, segs[len(segs)-1], segs[len(segs)-2]
+		}
+	}
+
 	// Monorepo containers: packages/xyz, apps/xyz, services/xyz, libs/xyz, modules/xyz
 	if first == "packages" || first == "apps" || first == "services" || first == "libs" || first == "modules" {
 		ws := first + "/" + second
