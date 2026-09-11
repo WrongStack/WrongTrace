@@ -282,7 +282,7 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 		// value as the SUBJECT, not the pattern, so those stay untouched --
 		// escaping a subject would make it never match.
 		whereClauses = append(whereClauses, "(e.file_path = ? OR REPLACE(e.file_path, '\\', '/') = ? OR REPLACE(e.file_path, '\\', '/') LIKE '%' || ? ESCAPE '\\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\\', '/'), '%', '\\%'), '_', '\\_') ESCAPE '\\' OR LOWER(REPLACE(e.file_path, '\\', '/')) LIKE '%' || LOWER(?) ESCAPE '\\')")
-		args = append(args, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
+		args = append(args, filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash))
 	}
 
 	if !since.IsZero() {
@@ -638,7 +638,7 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 			OR REPLACE(file_path, '\', '/') LIKE '%/' || ? ESCAPE '\'
 			OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%/' || LOWER(?) ESCAPE '\')
 		  AND event_time >= datetime('now', '-1 day')
-	`, filePath, normSlash, lowerNorm, escapeLike(normSlash), escapeLike(lowerNorm))
+	`, filePath, normSlash, escapeLike(normSlash), escapeLike(lowerNorm), escapeLike(lowerNorm))
 	if err := row.Scan(&edits, &sigs); err != nil {
 		return out, fmt.Errorf("file health scan: %w", err)
 	}
@@ -1415,7 +1415,7 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			ORDER BY e.event_time ASC
 			LIMIT ?
 		`
-		args = []any{filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash), cleanSig, cleanSig, escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
+		args = []any{filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
 	} else if normSlash != "" {
 		query = `
 			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
@@ -1431,7 +1431,7 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			ORDER BY e.event_time ASC
 			LIMIT ?
 		`
-		args = []any{filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash), limit}
+		args = []any{filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash), limit}
 	} else if cleanSig != "" {
 		query = `
 			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
@@ -1447,7 +1447,7 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			ORDER BY e.event_time ASC
 			LIMIT ?
 		`
-		args = []any{cleanSig, cleanSig, escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
+		args = []any{escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
 	} else {
 		query = `
 			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
@@ -1525,7 +1525,7 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
 		GROUP BY model_name
 	`
-	rRows, err := s.db.QueryContext(ctx, readQuery, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
+	rRows, err := s.db.QueryContext(ctx, readQuery, filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash))
 	if err == nil {
 		defer rRows.Close()
 		for rRows.Next() {
@@ -1559,7 +1559,7 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 		WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
 		GROUP BY r.model_name
 	`
-	wRows, err := s.db.QueryContext(ctx, writeQuery, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
+	wRows, err := s.db.QueryContext(ctx, writeQuery, filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash))
 	if err == nil {
 		defer wRows.Close()
 		for wRows.Next() {
