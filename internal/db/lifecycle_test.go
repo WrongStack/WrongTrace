@@ -65,6 +65,44 @@ func TestOpen_ReusesExistingFile(t *testing.T) {
 	}
 }
 
+// TestOpen_HostileCharactersInPath verifies that Open correctly handles
+// database paths containing SQLite URI-hostile characters (#, %).
+//
+// The modernc driver splits the DSN at the first '?' and truncates at '#',
+// so each must be percent-encoded (%23 and %25 respectively) before being
+// embedded in the file: URI.  SQLite's URI layer decodes them back to the
+// exact on-disk name, so the configured path is opened unambiguously.
+//
+// Note: '?' (SQLITE_CANTOPEN trigger) is a reserved NTFS character and
+// cannot be tested on Windows; the encoding covers it for POSIX paths.
+func TestOpen_HostileCharactersInPath(t *testing.T) {
+	for _, ext := range []string{"#test.db", "pct%25test.db"} {
+		path := filepath.Join(t.TempDir(), ext)
+		s1, err := Open(path)
+		if err != nil {
+			t.Fatalf("open %q: %v", path, err)
+		}
+		if err := s1.Migrate(); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		seedRun(t, s1, RunRecord{RunID: "r1", ModelName: "m"})
+		_ = s1.Close()
+
+		s2, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen %q: %v", path, err)
+		}
+		t.Cleanup(func() { _ = s2.Close() })
+		ov, err := s2.Overview()
+		if err != nil {
+			t.Fatalf("overview after reopen: %v", err)
+		}
+		if ov.TotalRuns != 1 || ov.UniqueModels != 1 {
+			t.Errorf("%q: data did not survive reopen: %+v", path, ov)
+		}
+	}
+}
+
 func TestUpsertRun_UpdatesExistingRow(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Now().UTC().Add(-time.Hour)
