@@ -1064,6 +1064,12 @@ func (s *Store) InsertReadEvent(r FileReadRecord) error {
 	if r.StartLine <= 0 {
 		r.StartLine = 1
 	}
+	// Clamp EndLine to StartLine if inverted; a negative EndLine corrupts
+	// heatmap aggregations (GetFileReadHeatmap filters end_line > 0, but an
+	// unfiltered row poisons the read-count baseline in caller tools).
+	if r.EndLine < r.StartLine {
+		r.EndLine = r.StartLine
+	}
 	if r.LinesReadCount <= 0 && r.EndLine >= r.StartLine {
 		r.LinesReadCount = r.EndLine - r.StartLine + 1
 	}
