@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
@@ -27,15 +29,18 @@ func withIsolatedProjectsHome(t *testing.T) string {
 // into out (when non-nil).
 func projReq(t *testing.T, ts *httptest.Server, method, url string, body interface{}, out interface{}) *http.Response {
 	t.Helper()
-	var rdr *bytes.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
+	var rdr io.Reader
+	switch b := body.(type) {
+	case io.Reader:
+		rdr = b
+	case nil:
+		rdr = bytes.NewReader(nil)
+	default:
+		data, err := json.Marshal(body)
 		if err != nil {
 			t.Fatalf("marshal body: %v", err)
 		}
-		rdr = bytes.NewReader(b)
-	} else {
-		rdr = bytes.NewReader(nil)
+		rdr = bytes.NewReader(data)
 	}
 	req, err := http.NewRequest(method, ts.URL+url, rdr)
 	if err != nil {
@@ -103,6 +108,67 @@ func TestUpdateProject_URLParamIsAuthoritative(t *testing.T) {
 	resp = projReq(t, ts, "PUT", "/api/projects/proj-nosuch", map[string]string{"name": "x"}, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("unknown project: status %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestAddProject_MalformedJSONNotMaskedByPathRequired is the regression test for the
+// bug where AddProject's err != nil || req.Path == "" short-circuit misreported
+// malformed JSON parse errors (wrong type, syntax error, oversize body) as "path is required".
+// The client receives the wrong diagnostic and cannot self-correct.
+func TestAddProject_MalformedJSONNotMaskedByPathRequired(t *testing.T) {
+	withIsolatedProjectsHome(t)
+	_, _, ts := newTestServer(t)
+
+	// Genuinely malformed JSON: object with wrong types triggers json.Unmarshal error,
+	// not the path check. decodeJSON must surface the parse error, not mask it.
+	resp := projReq(t, ts, "POST", "/api/projects", []byte(`{"name": 123, "path": 456}`), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed JSON: status %d, want 400", resp.StatusCode)
+	}
+	var errBody map[string]string
+	json.NewDecoder(resp.Body).Decode(&errBody)
+	// Must describe the actual type error, not a missing-field error.
+	if strings.Contains(errBody["error"], "json: cannot unmarshal") == false && strings.Contains(errBody["message"], "json: cannot unmarshal") == false {
+		t.Fatalf("malformed JSON error was masked: got error=%q — should describe the name type error, not a missing-field error", errBody["error"])
+	}
+	// Should describe a JSON syntax / decode error.
+	if errBody["error"] == "" && errBody["message"] == "" {
+		t.Fatalf("error body missing: %+v", errBody)
+	}
+
+	// Valid JSON but wrong types — decode succeeds but Path is wrong type.
+	type wrongTypeBody struct {
+		Name int `json:"name"`
+		Path int `json:"path"`
+	}
+	b, _ := json.Marshal(wrongTypeBody{Name: 123, Path: 456})
+	resp = projReq(t, ts, "POST", "/api/projects", bytes.NewReader(b), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("wrong-type JSON: status %d, want 400", resp.StatusCode)
+	}
+	json.NewDecoder(resp.Body).Decode(&errBody)
+	if strings.Contains(errBody["error"], "expected string for field 'name'") == false && strings.Contains(errBody["message"], "expected string for field 'name'") == false {
+		t.Fatalf("wrong-type JSON error was masked: got error=%q", errBody["error"])
+	}
+
+	// Empty body — decode fails with "EOF".
+	resp = projReq(t, ts, "POST", "/api/projects", bytes.NewReader(nil), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty body: status %d, want 400", resp.StatusCode)
+	}
+	json.NewDecoder(resp.Body).Decode(&errBody)
+	if strings.Contains(errBody["error"], "invalid request body") == false && strings.Contains(errBody["message"], "invalid request body") == false {
+		t.Fatalf("empty body error was masked: got error=%q", errBody["error"])
+	}
+
+	// Valid JSON, empty string path — should report "path is required".
+	resp = projReq(t, ts, "POST", "/api/projects", map[string]string{"name": "ok", "path": ""}, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty path: status %d, want 400", resp.StatusCode)
+	}
+	json.NewDecoder(resp.Body).Decode(&errBody)
+	if errBody["error"] != "path is required" && errBody["message"] != "path is required" {
+		t.Fatalf("empty path: got error=%q, want 'path is required'", errBody["error"])
 	}
 }
 

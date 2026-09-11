@@ -532,3 +532,71 @@ func TestModelFrictionMatrix_IgnoresLowConfidenceAttribution(t *testing.T) {
 		t.Fatalf("low-confidence attribution produced %d collision(s)", report.TotalCollisions)
 	}
 }
+
+// TestInsertReadEvent_EndLineClampedToStartLine verifies the fix for the bug where
+// an inverted endLine (< startLine) was stored as-is, corrupting the heatmap
+// aggregation. The function clamps endLine to startLine before inserting.
+func TestInsertReadEvent_EndLineClampedToStartLine(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+
+	// Case 1: endLine < startLine — clamp should normalize to startLine.
+	rec := FileReadRecord{
+		ReadID:    "inv-read-1",
+		RunID:     "r1",
+		SessionID: "s1",
+		RepoName:  "test-repo",
+		FilePath:  "src/main.go",
+		AgentName: "test-agent",
+		ModelName: "gpt-4",
+		Provider:  "openai",
+		ToolName:  "Read",
+		StartLine: 50,
+		EndLine:   10, // inverted: end < start
+		ReadTime:  now,
+	}
+	if err := s.InsertReadEvent(rec); err != nil {
+		t.Fatalf("InsertReadEvent with inverted endLine failed: %v", err)
+	}
+
+	// Case 2: endLine == startLine — should succeed unchanged.
+	rec.ReadID = "eq-read-2"
+	rec.StartLine = 20
+	rec.EndLine = 20
+	if err := s.InsertReadEvent(rec); err != nil {
+		t.Fatalf("InsertReadEvent with equal endLine/startLine failed: %v", err)
+	}
+
+	// Case 3: endLine > startLine — should succeed unchanged.
+	rec.ReadID = "norm-read-3"
+	rec.StartLine = 1
+	rec.EndLine = 15
+	if err := s.InsertReadEvent(rec); err != nil {
+		t.Fatalf("InsertReadEvent with normal endLine failed: %v", err)
+	}
+
+	// Verify all three rows exist and endLine was not stored inverted.
+	reads, err := s.GetRecentFileReads(10)
+	if err != nil {
+		t.Fatalf("GetRecentFileReads failed: %v", err)
+	}
+	found := make(map[string]int)
+	for _, r := range reads {
+		found[r.ReadID] = r.EndLine
+	}
+	if endLine, ok := found["inv-read-1"]; !ok {
+		t.Fatal("inv-read-1 not found after insert")
+	} else if endLine < 50 {
+		t.Fatalf("inv-read-1 endLine was stored as %d, expected clamped to startLine=50", endLine)
+	}
+	if endLine, ok := found["eq-read-2"]; !ok {
+		t.Fatal("eq-read-2 not found after insert")
+	} else if endLine != 20 {
+		t.Fatalf("eq-read-2 endLine was stored as %d, expected 20", endLine)
+	}
+	if endLine, ok := found["norm-read-3"]; !ok {
+		t.Fatal("norm-read-3 not found after insert")
+	} else if endLine != 15 {
+		t.Fatalf("norm-read-3 endLine was stored as %d, expected 15", endLine)
+	}
+}

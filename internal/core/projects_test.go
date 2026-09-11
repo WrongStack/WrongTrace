@@ -180,6 +180,74 @@ func TestProjectLifecycle(t *testing.T) {
 	}
 }
 
+// TestUpdateProject_EmptyStringClearsLogPaths verifies that sending an empty
+// log-path field clears a previously-stored value (rather than being silently
+// ignored by a != "" guard).  Regression for a path-corruption defect where
+// UpdateProject's log-path fields used != "" as the "has-value" guard, so
+// {"claudeLogsPath": ""} on a project with an existing log path left the old
+// path in place and broke log collection routing.
+func TestUpdateProject_EmptyStringClearsLogPaths(t *testing.T) {
+	tempBase := t.TempDir()
+	t.Setenv("WRONGTRACE_HOME", tempBase)
+
+	dbPath := filepath.Join(tempBase, "root.db")
+	store, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	dir := filepath.Join(tempBase, "sample_repo")
+	_ = os.MkdirAll(dir, 0755)
+
+	astEng, _ := ast.NewEngine()
+	defer astEng.Close()
+
+	engine := NewEngine(Config{
+		RepoName: "sample_repo",
+		Store:    store,
+		AST:      astEng,
+	})
+
+	// Seed a project with log paths set.
+	created, err := engine.AddProject("sample_repo", dir)
+	if err != nil {
+		t.Fatalf("AddProject: %v", err)
+	}
+	created.ClaudeLogsPath = "/old/claude/log"
+	created.CursorLogsPath = "/old/cursor/log"
+	created.CustomLogsPath = "/old/custom/log"
+	seeded, err := engine.UpdateProject(created)
+	if err != nil {
+		t.Fatalf("seed UpdateProject: %v", err)
+	}
+
+	// Send an update that explicitly clears all log paths via empty strings.
+	cleared, err := engine.UpdateProject(ProjectProfile{
+		ID:             seeded.ID,
+		ClaudeLogsPath: "",
+		CursorLogsPath: "",
+		CustomLogsPath: "",
+	})
+	if err != nil {
+		t.Fatalf("UpdateProject clear: %v", err)
+	}
+
+	// All log paths must be empty after the update.
+	if cleared.ClaudeLogsPath != "" {
+		t.Errorf("ClaudeLogsPath: got %q, want \"\"", cleared.ClaudeLogsPath)
+	}
+	if cleared.CursorLogsPath != "" {
+		t.Errorf("CursorLogsPath: got %q, want \"\"", cleared.CursorLogsPath)
+	}
+	if cleared.CustomLogsPath != "" {
+		t.Errorf("CustomLogsPath: got %q, want \"\"", cleared.CustomLogsPath)
+	}
+}
+
 func TestSessionScanCacheIsBoundedAndPrunesExpired(t *testing.T) {
 	sessScanMu.Lock()
 	previous := sessScanCache

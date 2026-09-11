@@ -837,15 +837,64 @@ func (h *Handlers) ListProjects(w http.ResponseWriter, _ *http.Request) {
 
 // AddProject registers a workspace directory to observe.
 func (h *Handlers) AddProject(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name string `json:"name"`
-		Path string `json:"path"`
+	// Save body bytes before decodeJSON consumes r.Body, so we can re-examine
+	// the raw JSON when raw.Path is nil to distinguish "absent field" from
+	// "wrong-type field that Unmarshal couldn't store into []byte".
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
 	}
-	if err := decodeJSON(w, r, &req); err != nil || req.Path == "" {
+	var raw struct {
+		Name json.RawMessage `json:"name"`
+		Path json.RawMessage `json:"path"`
+	}
+	// Decode from saved bytes so we can re-examine them when raw.Path is nil.
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	var name, path string
+	// Validate field types BEFORE the primary unmarshal so type errors surface
+	// regardless of whether the field was present in the JSON. json.RawMessage
+	// silently leaves its field nil on type mismatch, so we must use the map
+	// trick here too, regardless of whether raw.Name/raw.Path are nil.
+	var m map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &m); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	// Validate field types BEFORE checking raw.Path == nil, so type errors surface
+	// even when both name and path are wrong-type (name checked first = first error).
+	if v, ok := m["name"]; ok && v != nil && fmt.Sprintf("%T", v) != "string" {
+		writeError(w, http.StatusBadRequest, "invalid request body: expected string for field 'name', got "+fmt.Sprintf("%T", v))
+		return
+	}
+	if raw.Path == nil {
+		// raw.Path is nil: could be genuinely absent (-> "path is required")
+		// OR a wrong-type value that json.Unmarshal couldn't store into []byte.
+		if v, ok := m["path"]; !ok {
+			writeError(w, http.StatusBadRequest, "path is required")
+			return
+		} else if v != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: expected string for field 'path', got "+fmt.Sprintf("%T", v))
+			return
+		}
+	}
+	// Now extract values — raw.Name and raw.Path are guaranteed non-nil strings.
+	if err := json.Unmarshal(raw.Name, &name); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := json.Unmarshal(raw.Path, &path); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if path == "" {
 		writeError(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	p, err := h.Engine.AddProject(req.Name, req.Path)
+	p, err := h.Engine.AddProject(name, path)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

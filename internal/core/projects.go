@@ -736,18 +736,29 @@ func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 	}
 	if p.ClaudeLogsPath != "" {
 		existing.ClaudeLogsPath = p.ClaudeLogsPath
+	} else if p.ClaudeLogsPath == "" && p.ClaudeLogsPath != existing.ClaudeLogsPath {
+		// Empty string explicitly clears the stored path (client sent the field as "").
+		existing.ClaudeLogsPath = ""
 	}
 	if p.CursorLogsPath != "" {
 		existing.CursorLogsPath = p.CursorLogsPath
+	} else if p.CursorLogsPath == "" && p.CursorLogsPath != existing.CursorLogsPath {
+		existing.CursorLogsPath = ""
 	}
 	if p.ClineLogsPath != "" {
 		existing.ClineLogsPath = p.ClineLogsPath
+	} else if p.ClineLogsPath == "" && p.ClineLogsPath != existing.ClineLogsPath {
+		existing.ClineLogsPath = ""
 	}
 	if p.AiderLogsPath != "" {
 		existing.AiderLogsPath = p.AiderLogsPath
+	} else if p.AiderLogsPath == "" && p.AiderLogsPath != existing.AiderLogsPath {
+		existing.AiderLogsPath = ""
 	}
 	if p.CustomLogsPath != "" {
 		existing.CustomLogsPath = p.CustomLogsPath
+	} else if p.CustomLogsPath == "" && p.CustomLogsPath != existing.CustomLogsPath {
+		existing.CustomLogsPath = ""
 	}
 
 	e.projects[p.ID] = existing
