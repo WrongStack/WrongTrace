@@ -51,8 +51,8 @@ func (h *Hub) Broadcast(ev WSEvent) {
 	if ev.At.IsZero() {
 		ev.At = time.Now().UTC()
 	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if len(h.clients) > 0 {
 		// Encode once here: every subscriber would otherwise marshal the
 		// identical payload in its own writer goroutine. Diff snippets make

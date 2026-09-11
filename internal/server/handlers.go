@@ -305,6 +305,9 @@ func (h *Handlers) SymbolHistory(w http.ResponseWriter, r *http.Request) {
 			limit = val
 		}
 	}
+	if limit > maxRecentEventsLimit {
+		limit = maxRecentEventsLimit
+	}
 	history, err := h.Engine.GetSymbolHistory(filePath, signature, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
