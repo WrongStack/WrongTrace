@@ -869,13 +869,17 @@ This repository is monitored by **WrongTrace AI Observability**.
 }
 
 // wrongTraceHookMarker identifies hooks this tool owns: install refuses to
-// replace a foreign hook and uninstall refuses to remove one.
-const wrongTraceHookMarker = "WrongTrace"
+// replace a foreign hook and uninstall refuses to remove one. The marker is
+// the full telemetry comment line the installer writes — a foreign hook that
+// merely mentions WrongTrace must not be treated as ours.
+const wrongTraceHookMarker = "WrongTrace automatic post-commit telemetry ping"
 
 func runHook(cmd *cobra.Command, args []string) error {
 	action := strings.ToLower(args[0])
 
-	// Find .git directory starting from cwd and walking up
+	// Find the git directory starting from cwd and walking up. Handles both
+	// a regular repo (.git is a directory) and a linked worktree (.git is a
+	// "gitdir: <path>" pointer file; shared hooks live in the common dir).
 	dir, err := os.Getwd()
 	if err != nil {
 		dir = "."
@@ -883,9 +887,17 @@ func runHook(cmd *cobra.Command, args []string) error {
 	var gitRoot string
 	for {
 		candidate := filepath.Join(dir, ".git")
-		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
-			gitRoot = candidate
-			break
+		if info, err := os.Stat(candidate); err == nil {
+			if info.IsDir() {
+				gitRoot = candidate
+				break
+			}
+			if info.Mode().IsRegular() {
+				if common, ok := commonDirFromGitdirFile(candidate, dir); ok {
+					gitRoot = common
+					break
+				}
+			}
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -895,7 +907,7 @@ func runHook(cmd *cobra.Command, args []string) error {
 	}
 
 	if gitRoot == "" {
-		return fmt.Errorf("current directory is not a git repository (.git folder not found)")
+		return fmt.Errorf("current directory is not a git repository (.git directory or worktree pointer not found)")
 	}
 	gitHooksDir := filepath.Join(gitRoot, "hooks")
 	_ = os.MkdirAll(gitHooksDir, 0755)
@@ -931,6 +943,38 @@ fi
 		return fmt.Errorf("unknown hook action: %s (supported: install, uninstall)", action)
 	}
 	return nil
+}
+
+// commonDirFromGitdirFile resolves a linked worktree's `.git` pointer file
+// ("gitdir: <main>/.git/worktrees/<name>") to the repository's common dir
+// (<main>/.git), where git looks up hooks shared by every worktree. Returns
+// false when the file is not a gitdir pointer or its target is unusable.
+func commonDirFromGitdirFile(gitFile, containingDir string) (string, bool) {
+	data, err := os.ReadFile(gitFile)
+	if err != nil {
+		return "", false
+	}
+	const prefix = "gitdir:"
+	line := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(line, prefix) {
+		return "", false
+	}
+	target := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	if target == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(containingDir, target)
+	}
+	// <main>/.git/worktrees/<name> → <main>/.git (git's stable worktree layout)
+	common := filepath.Dir(filepath.Dir(filepath.Clean(target)))
+	if filepath.Base(common) != ".git" {
+		return "", false
+	}
+	if info, err := os.Stat(common); err != nil || !info.IsDir() {
+		return "", false
+	}
+	return common, true
 }
 
 func fileExists(p string) bool {
