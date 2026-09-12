@@ -282,7 +282,14 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 		// value as the SUBJECT, not the pattern, so those stay untouched --
 		// escaping a subject would make it never match.
 		whereClauses = append(whereClauses, "(e.file_path = ? OR REPLACE(e.file_path, '\\', '/') = ? OR REPLACE(e.file_path, '\\', '/') LIKE '%' || ? ESCAPE '\\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\\', '/'), '%', '\\%'), '_', '\\_') ESCAPE '\\' OR LOWER(REPLACE(e.file_path, '\\', '/')) LIKE '%' || LOWER(?) ESCAPE '\\')")
-		args = append(args, filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash))
+		// Arm 4's placeholder is the LIKE SUBJECT (only its PATTERN comes
+		// from the stored column), and ESCAPE processing touches the pattern
+		// alone — a backslash escapeLike injected into the subject would be
+		// a literal character there, so a '_'/'%'-bearing absolute caller
+		// path could never match its stored relative row. Bind it raw;
+		// arms 3 and 5 keep the quoted value because THEIR placeholders are
+		// pattern-side.
+		args = append(args, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
 	}
 
 	if !since.IsZero() {

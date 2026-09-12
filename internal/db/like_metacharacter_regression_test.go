@@ -231,3 +231,58 @@ func TestMetacharacterQueries_KeepIntendedSuffixMatching(t *testing.T) {
 		t.Errorf("RecentThrashingCount = %d, want 1 for the same file stored absolute", fh.RecentThrashingCount)
 	}
 }
+
+// TestRecentEventsFiltered_AbsoluteCallerSubjectStaysRaw pins the round-90
+// fix: the fourth arm of RecentEventsFiltered's filePath clause binds the
+// CALLER path as the LIKE SUBJECT ("? LIKE '%' || <quoted stored path>
+// ESCAPE '\'"), and ESCAPE processing affects only the pattern side, so the
+// arm-4 value must stay RAW. Binding escapeLike(normSlash) there (the
+// round-90 bug) made the injected backslashes literal subject characters:
+// an absolute caller path containing '_' or '%' — the only arm that matches
+// a caller path LONGER than the stored row — found nothing, so external
+// IPC/MCP/HTTP callers passing workspace-absolute paths got zero events for
+// exactly the everyday underscore-bearing file names.
+func TestRecentEventsFiltered_AbsoluteCallerSubjectStaysRaw(t *testing.T) {
+	st := openMetaStore(t)
+	seedMetaEvent(t, st, "a1", underscorePath, "function:x.go::Fn")
+	seedMetaEvent(t, st, "a2", "assets/100%.png", "function:x.go::Fn")
+
+	// Absolute caller whose stored row is the relative suffix, '_'-bearing.
+	events, err := st.RecentFileEvents("/repo/root/"+underscorePath, 50)
+	if err != nil {
+		t.Fatalf("RecentFileEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].FilePath != underscorePath {
+		t.Errorf("absolute '_' caller rows = %d %v, want exactly [%q]",
+			len(events), eventFilePaths(events), underscorePath)
+	}
+
+	// Same mechanics with '%' in the caller path.
+	events, err = st.RecentFileEvents("/srv/assets/100%.png", 50)
+	if err != nil {
+		t.Fatalf("RecentFileEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].FilePath != "assets/100%.png" {
+		t.Errorf("absolute '%%' caller rows = %d %v, want exactly [assets/100%%.png]",
+			len(events), eventFilePaths(events))
+	}
+
+	// Isolation: the dash sibling stays out — the PATTERN side keeps its
+	// quoting, so a raw subject must not turn '_' into a wildcard.
+	events, err = st.RecentFileEvents("/repo/root/internal/svc/file-read.go", 50)
+	if err != nil {
+		t.Fatalf("RecentFileEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("dash sibling leaked: rows = %d %v, want 0", len(events), eventFilePaths(events))
+	}
+}
+
+// eventFilePaths formats rows for assertion messages only.
+func eventFilePaths(events []EventRecord) []string {
+	out := make([]string, 0, len(events))
+	for _, e := range events {
+		out = append(out, e.FilePath)
+	}
+	return out
+}
