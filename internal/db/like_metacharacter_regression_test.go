@@ -385,3 +385,73 @@ func TestSymbolHistory_AbsoluteCallerSubjectStaysRaw(t *testing.T) {
 		t.Errorf("sig control rows = %d, want exactly the Do_One row", len(recs))
 	}
 }
+
+// TestFileModelActivity_AbsoluteCallerSubjectStaysRaw pins the round-92 fix:
+// FileModelActivity's read and write queries each carry a copy of the
+// five-arm filePath clause, and arm 4 (? LIKE '%' || <quoted stored path>
+// ESCAPE '\') binds the CALLER path as the LIKE SUBJECT, which must stay
+// raw. The round-90/91 fixes repaired the RecentEventsFiltered, FileHealth,
+// and SymbolHistory copies — FileModelActivity's two copies still returned
+// zero rows for '_'/'%'-bearing absolute caller paths, hiding the file's
+// entire per-model read/write telemetry. AllFileModelActivity has no path
+// filter at all (global aggregates), so it carries no LIKE arm to fix.
+func TestFileModelActivity_AbsoluteCallerSubjectStaysRaw(t *testing.T) {
+	st := openMetaStore(t)
+	seedRead(t, st, "fm1", underscorePath, "model-a", 0.25)
+	seedMetaEvent(t, st, "fm2", underscorePath, "function:x.go::Fn")
+	if err := st.UpsertRun(RunRecord{
+		RunID: "fm-run", TaskID: "t1", AgentName: "agent",
+		ModelName: "model-w", Provider: "prov",
+	}); err != nil {
+		t.Fatalf("UpsertRun: %v", err)
+	}
+	if err := st.InsertEvent(EventRecord{
+		EventID: "fm3", RunID: "fm-run", RepoName: "meta", FilePath: underscorePath,
+		Signature: "function:x.go::Fn", NodeType: "function",
+		Action: "MODIFIED", BodyHash: "hash", LOC: 5,
+		OccurredAt: time.Now().UTC().Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+
+	// absolute '_' caller: arm 4 is the only arm that can match, on BOTH queries.
+	acts, err := st.FileModelActivity("/repo/root/" + underscorePath)
+	if err != nil {
+		t.Fatalf("FileModelActivity: %v", err)
+	}
+	var reads, writes *ModelActivitySummary
+	for i := range acts {
+		switch acts[i].ModelName {
+		case "model-a":
+			reads = &acts[i]
+		case "model-w":
+			writes = &acts[i]
+		}
+	}
+	if reads == nil || reads.ReadCount != 1 {
+		t.Errorf("absolute '_' caller: read side for model-a missing (rows=%d) — arm-4 subject must stay raw", len(acts))
+	}
+	if writes == nil || writes.WriteEvents != 1 {
+		t.Errorf("absolute '_' caller: write side for model-w missing (rows=%d) — arm-4 subject must stay raw", len(acts))
+	}
+
+	// dash sibling absolute query must stay out before AND after the fix.
+	acts, err = st.FileModelActivity("/repo/root/internal/svc/file-read.go")
+	if err != nil {
+		t.Fatalf("FileModelActivity: %v", err)
+	}
+	if len(acts) != 0 {
+		t.Errorf("dash sibling leaked: %d summaries, want 0", len(acts))
+	}
+
+	// exact-caller control (arm 2) stays green: model-a (read) + model-w
+	// (attributed write) + 'unknown' (fm2 has no RunID, and the write query's
+	// LEFT JOIN + COALESCE legitimately surfaces it as the sentinel).
+	acts, err = st.FileModelActivity(underscorePath)
+	if err != nil {
+		t.Fatalf("FileModelActivity: %v", err)
+	}
+	if len(acts) != 3 {
+		t.Errorf("exact caller rows = %d, want 3 (model-a + model-w + 'unknown')", len(acts))
+	}
+}

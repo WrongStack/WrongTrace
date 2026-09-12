@@ -1552,7 +1552,10 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
 		GROUP BY model_name
 	`
-	rRows, err := s.db.QueryContext(ctx, readQuery, filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash))
+	// filePath arm 4 binds the caller path as the LIKE SUBJECT (the stored
+	// path is the quoted pattern side), so it stays raw — this clause is
+	// RecentEventsFiltered's copy and carried the same round-90 defect.
+	rRows, err := s.db.QueryContext(ctx, readQuery, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
 	if err == nil {
 		defer rRows.Close()
 		for rRows.Next() {
@@ -1586,7 +1589,8 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 		WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
 		GROUP BY r.model_name
 	`
-	wRows, err := s.db.QueryContext(ctx, writeQuery, filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash))
+	// filePath arm 4: LIKE SUBJECT — stays raw (same reason as the read query).
+	wRows, err := s.db.QueryContext(ctx, writeQuery, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
 	if err == nil {
 		defer wRows.Close()
 		for wRows.Next() {
