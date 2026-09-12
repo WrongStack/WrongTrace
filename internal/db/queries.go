@@ -636,6 +636,13 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
+	// Arm 3 of the path clause is a plain EQUALITY arm, so its value must be
+	// the plain lowercased path: binding escapeLike(normSlash) there (round-91
+	// bug) injected literal backslashes and left the case mixed, killing the
+	// case-insensitive exact match for every '_'/'%'-bearing or mixed-case
+	// path — and arms 4/5 cannot rescue an exact query because they require
+	// the stored path to end with '/'+caller. Bind lowerNorm; arms 4/5 keep
+	// escapeLike (their placeholders are pattern-side).
 	row := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*), COUNT(DISTINCT node_signature)
 		FROM code_node_events
@@ -645,7 +652,7 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 			OR REPLACE(file_path, '\', '/') LIKE '%/' || ? ESCAPE '\'
 			OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%/' || LOWER(?) ESCAPE '\')
 		  AND event_time >= datetime('now', '-1 day')
-	`, filePath, normSlash, escapeLike(normSlash), escapeLike(lowerNorm), escapeLike(lowerNorm))
+	`, filePath, normSlash, lowerNorm, escapeLike(lowerNorm), escapeLike(lowerNorm))
 	if err := row.Scan(&edits, &sigs); err != nil {
 		return out, fmt.Errorf("file health scan: %w", err)
 	}
@@ -1428,7 +1435,13 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			ORDER BY e.event_time ASC
 			LIMIT ?
 		`
-		args = []any{filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
+		// filePath arm 4 binds the caller path as the LIKE SUBJECT (the stored
+		// path is the quoted pattern side), so it stays raw — this clause is
+		// RecentEventsFiltered's copy and carried the same round-90 defect.
+		// The signature clause's equality arms are inert either way (the
+		// escaped contains arm subsumes them in the OR), so they keep
+		// escapeLike.
+		args = []any{filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
 	} else if normSlash != "" {
 		query = `
 			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
@@ -1444,7 +1457,8 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			ORDER BY e.event_time ASC
 			LIMIT ?
 		`
-		args = []any{filePath, normSlash, escapeLike(normSlash), escapeLike(normSlash), escapeLike(normSlash), limit}
+		// filePath arm 4: LIKE SUBJECT — stays raw (same reason as variant A).
+		args = []any{filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash), limit}
 	} else if cleanSig != "" {
 		query = `
 			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,

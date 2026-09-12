@@ -286,3 +286,102 @@ func eventFilePaths(events []EventRecord) []string {
 	}
 	return out
 }
+
+// TestFileHealth_CaseInsensitiveExactSurvivesMetacharacters pins the round-91
+// fix: arm 3 of FileHealth's path clause is a plain EQUALITY arm
+// (LOWER(REPLACE(file_path,'\','/')) = ?), so its value must be the plain
+// lowercased path. Binding escapeLike(normSlash) there (the round-91 bug)
+// corrupted the value with literal backslashes and left the case mixed, so
+// the ONLY arm that matches a casing-divergent EXACT query returned zero
+// churn for every '_'/'%'-bearing or mixed-case path — the guardrail read
+// health 100 for a file that actually churned. The underscore-free casing
+// case stayed green because escapeLike is a no-op there, which is why the
+// round-41 casing test (parser.go) did not catch it.
+func TestFileHealth_CaseInsensitiveExactSurvivesMetacharacters(t *testing.T) {
+	st := openMetaStore(t)
+	seedMetaEvent(t, st, "fh1", `D:\Codebox\PROJECTS\WrongTrace\internal\svc\file_read.go`, "function:x.go::Fn")
+	seedMetaEvent(t, st, "fh2", `D:\Codebox\PROJECTS\WrongTrace\internal\ast\parser.go`, "function:x.go::Fn")
+
+	// casing-divergent exact, '_'-bearing: arm 3 is the only matching arm.
+	h, err := st.FileHealth(`d:/codebox/projects/wrongtrace/internal/svc/file_read.go`)
+	if err != nil {
+		t.Fatalf("FileHealth: %v", err)
+	}
+	if h.RecentThrashingCount != 1 || h.HealthScore != 92 {
+		t.Errorf("'_' recased exact: count=%d health=%d, want 1/92 (arm-3 equality value must stay plain+lowered)",
+			h.RecentThrashingCount, h.HealthScore)
+	}
+
+	// mixed-case exact, underscore-free: pins the LOWERED half of the value.
+	h, err = st.FileHealth(`D:/Codebox/Projects/WrongTrace/internal/ast/Parser.go`)
+	if err != nil {
+		t.Fatalf("FileHealth: %v", err)
+	}
+	if h.RecentThrashingCount != 1 || h.HealthScore != 92 {
+		t.Errorf("mixed-case exact: count=%d health=%d, want 1/92 (arm-3 value must be lowered)",
+			h.RecentThrashingCount, h.HealthScore)
+	}
+
+	// same-casing control (arm 2) stays green.
+	h, err = st.FileHealth(`D:\Codebox\PROJECTS\WrongTrace\internal\svc\file_read.go`)
+	if err != nil {
+		t.Fatalf("FileHealth: %v", err)
+	}
+	if h.RecentThrashingCount != 1 || h.HealthScore != 92 {
+		t.Errorf("same-casing control: count=%d health=%d, want 1/92", h.RecentThrashingCount, h.HealthScore)
+	}
+
+	// dash sibling must stay out before AND after the fix.
+	h, err = st.FileHealth(`d:/codebox/projects/wrongtrace/internal/svc/file-read.go`)
+	if err != nil {
+		t.Fatalf("FileHealth: %v", err)
+	}
+	if h.RecentThrashingCount != 0 {
+		t.Errorf("dash sibling leaked: count=%d, want 0", h.RecentThrashingCount)
+	}
+}
+
+// TestSymbolHistory_AbsoluteCallerSubjectStaysRaw pins the round-91 fix:
+// SymbolHistory's filePath clause is RecentEventsFiltered's five-arm clause
+// copied verbatim, and arm 4 (? LIKE '%' || <quoted stored path> ESCAPE '\')
+// binds the CALLER path as the LIKE SUBJECT, which must stay raw. The
+// round-90 fix repaired only the RecentEventsFiltered copy — SymbolHistory
+// still returned zero rows for '_'/'%'-bearing absolute caller paths
+// (external IPC/MCP/HTTP callers passing workspace-absolute paths).
+func TestSymbolHistory_AbsoluteCallerSubjectStaysRaw(t *testing.T) {
+	st := openMetaStore(t)
+	seedMetaEvent(t, st, "sh1", underscorePath, "function:x.go::Fn")
+	seedMetaEvent(t, st, "sh2", underscorePath, "function:x.go::Do_One")
+
+	// absolute '_' caller: arm 4 is the only arm that can match.
+	recs, err := st.SymbolHistory("/repo/root/"+underscorePath, "", 50)
+	if err != nil {
+		t.Fatalf("SymbolHistory: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("absolute '_' caller rows = %d, want 2 (arm-4 subject must stay raw)", len(recs))
+	}
+	for _, r := range recs {
+		if r.FilePath != underscorePath {
+			t.Errorf("SymbolHistory returned %q, want only %q", r.FilePath, underscorePath)
+		}
+	}
+
+	// dash sibling absolute query must stay out before AND after the fix.
+	recs, err = st.SymbolHistory("/repo/root/internal/svc/file-read.go", "", 50)
+	if err != nil {
+		t.Fatalf("SymbolHistory: %v", err)
+	}
+	if len(recs) != 0 {
+		t.Errorf("dash sibling leaked: rows = %d, want 0", len(recs))
+	}
+
+	// signature-contains control: the sig clause is unchanged by the fix.
+	recs, err = st.SymbolHistory(underscorePath, "function:x.go::Do_One", 50)
+	if err != nil {
+		t.Fatalf("SymbolHistory: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Signature != "function:x.go::Do_One" {
+		t.Errorf("sig control rows = %d, want exactly the Do_One row", len(recs))
+	}
+}
