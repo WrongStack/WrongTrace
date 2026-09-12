@@ -2,6 +2,7 @@ package db
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -453,5 +454,82 @@ func TestFileModelActivity_AbsoluteCallerSubjectStaysRaw(t *testing.T) {
 	}
 	if len(acts) != 3 {
 		t.Errorf("exact caller rows = %d, want 3 (model-a + model-w + 'unknown')", len(acts))
+	}
+}
+
+// TestRecentEventsFiltered_SameSecondTiesAreDeterministic pins the round-93
+// fix: fmtDBTime stores event_time at SECOND granularity, so same-second
+// rows tie under `ORDER BY e.event_time DESC` and SQLite returns them in
+// physical (rowid) order — the feed order then depended on insertion order,
+// not on the data (mirrored insertion into two identical stores produced
+// reversed feeds; the same artifact was observed directly in round 90).
+// event_time DESC stays the primary key and event_id DESC breaks ties — the
+// same remedy the friction query's LAG window received in round 25.
+func TestRecentEventsFiltered_SameSecondTiesAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	st1, err := Open(filepath.Join(dir, "one.db"))
+	if err != nil {
+		t.Fatalf("open one: %v", err)
+	}
+	defer st1.Close()
+	st2, err := Open(filepath.Join(dir, "two.db"))
+	if err != nil {
+		t.Fatalf("open two: %v", err)
+	}
+	defer st2.Close()
+	if err := st1.Migrate(); err != nil {
+		t.Fatalf("migrate one: %v", err)
+	}
+	if err := st2.Migrate(); err != nil {
+		t.Fatalf("migrate two: %v", err)
+	}
+
+	base := time.Date(2026, 9, 13, 10, 0, 0, 0, time.UTC)
+	ids := []string{"ev-1", "ev-2", "ev-3", "ev-4", "ev-5"}
+	at := func(i int) time.Time { return base.Add(time.Duration(i) * 100 * time.Millisecond) }
+	seed := func(st *Store, id string, at2 time.Time) {
+		if err := st.InsertEvent(EventRecord{
+			EventID: id, RepoName: "meta", FilePath: underscorePath,
+			Signature: "function:x.go::Fn", NodeType: "function",
+			Action: "MODIFIED", BodyHash: "hash", LOC: 5,
+			OccurredAt: at2,
+		}); err != nil {
+			t.Fatalf("InsertEvent %s: %v", id, err)
+		}
+	}
+
+	// Identical logical rows, opposite physical insertion orders.
+	for i, id := range ids {
+		seed(st1, id, at(i))
+	}
+	seed(st1, "ev-0", base.Add(2*time.Second))
+	seed(st2, "ev-0", base.Add(2*time.Second))
+	for i := len(ids) - 1; i >= 0; i-- {
+		seed(st2, ids[i], at(i))
+	}
+
+	order := func(st *Store) []string {
+		t.Helper()
+		evs, err := st.RecentEventsFiltered(50, "", "", time.Time{})
+		if err != nil {
+			t.Fatalf("RecentEventsFiltered: %v", err)
+		}
+		out := make([]string, 0, len(evs))
+		for _, e := range evs {
+			out = append(out, e.EventID)
+		}
+		return out
+	}
+
+	ord1 := order(st1)
+	ord2 := order(st2)
+	if len(ord1) != len(ids)+1 || len(ord2) != len(ids)+1 {
+		t.Fatalf("rows = %d/%d, want %d each", len(ord1), len(ord2), len(ids)+1)
+	}
+	if !reflect.DeepEqual(ord1, ord2) {
+		t.Errorf("identical logical data, mirrored insertion order: orders differ\none: %v\ntwo: %v", ord1, ord2)
+	}
+	if ord1[0] != "ev-0" {
+		t.Errorf("first row = %q, want ev-0 (event_time DESC must dominate the tiebreak)", ord1[0])
 	}
 }

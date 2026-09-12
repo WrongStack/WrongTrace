@@ -302,6 +302,12 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
 	}
 
+	// event_time is stored at SECOND granularity, so same-second rows tie and
+	// SQLite returns ties in physical (rowid) order — the output then depends
+	// on insertion order, not on the data (round-93 proof: mirrored insertion
+	// into two identical stores produced reversed feeds). Break ties with the
+	// logical primary key, exactly as the friction query's LAG window has done
+	// since round 25.
 	query := fmt.Sprintf(`
 		SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
 		       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
@@ -312,7 +318,7 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 		FROM code_node_events e
 		LEFT JOIN agent_runs r ON e.run_id = r.run_id
 		%s
-		ORDER BY e.event_time DESC
+		ORDER BY e.event_time DESC, e.event_id DESC
 		LIMIT ?
 	`, whereSQL)
 	args = append(args, limit)
