@@ -1,5 +1,6 @@
 # WrongTrace build artifacts and local state.
 bin/
+tmp/
 web/dist/*
 !web/dist/index.html
 web/node_modules/
