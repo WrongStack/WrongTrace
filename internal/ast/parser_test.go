@@ -299,6 +299,71 @@ func TestParse_MultiLanguage(t *testing.T) {
 	}
 }
 
+// TestDetectLanguage_KotlinDartAlignment pins the round-89 contract between
+// internal/core/projects.go (which counts .kt/.kts/.dart in DetectPrimaryLanguage
+// and labels workspaces "Kotlin" or "Dart") and internal/ast/supported.go
+// (which must map those same extensions to non-LangUnknown so Engine.Parse
+// returns a populated snapshot). Before the fix DetectLanguage returned
+// LangUnknown for all three extensions — every Kotlin/Dart file was dropped
+// before any AST work: no snapshot, no diff events, no guardrail health, no
+// atlas coverage — contradicting the alignment comment in projects.go:1398-1403.
+//
+// Scope of this test: the AST-layer gate only. It does NOT assert that
+// parseGenericSource extracts a specific declaration shape for thin fixtures;
+// that fallback has its own brace/keyword heuristics shared with every other
+// generic-parsed language (Rust, C, C++, Java, C#, PHP, Ruby) and is out of
+// round-89 scope. Snapshot-population on rich class bodies is covered by
+// parseGenericSource's own suite.
+func TestDetectLanguage_KotlinDartAlignment(t *testing.T) {
+	cases := []struct {
+		path string
+		want Language
+	}{
+		{"src/main/kotlin/Widget.kt", LangKotlin},
+		{"build.gradle.kts", LangKotlin},
+		{"Build.KTS", LangKotlin},
+		{"main.Kts", LangKotlin},
+		{"deep/nested/script.kts", LangKotlin},
+		{"lib/main.dart", LangDart},
+		{"LIB/MAIN.DART", LangDart},
+	}
+	for _, tc := range cases {
+		if got := DetectLanguage(tc.path); got != tc.want {
+			t.Errorf("DetectLanguage(%q) = %v, want %v (round-89 alignment contract)", tc.path, got, tc.want)
+		}
+	}
+
+	// Language.String() must return the lowercase DB labels that
+	// projects.go:1398-1403 uses when it speaks of "the AST layer's Kotlin
+	// and Dart grammars" — so any consumer that filters events by the
+	// persisted language string stays consistent after round-89.
+	if got := DetectLanguage("a.kt").String(); got != "kotlin" {
+		t.Errorf("Language.String() for .kt = %q, want %q", got, "kotlin")
+	}
+	if got := DetectLanguage("a.dart").String(); got != "dart" {
+		t.Errorf("Language.String() for .dart = %q, want %q", got, "dart")
+	}
+
+	// Engine.Parse must reach a non-nil snapshot for each extension — the
+	// AST pipeline no longer drops these files at DetectLanguage.
+	eng, err := NewEngine()
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer eng.Close()
+	src := "class Widget {\n    fun render(): String { return \"hi\" }\n}\n"
+	for _, path := range []string{"Widget.kt", "build.gradle.kts", "main.dart"} {
+		snap, err := eng.Parse(path, []byte(src))
+		if err != nil {
+			t.Errorf("Parse(%s): %v", path, err)
+			continue
+		}
+		if snap == nil {
+			t.Errorf("Parse(%s): nil snapshot — DetectLanguage still returns LangUnknown (round-89 regression)", path)
+		}
+	}
+}
+
 // TestParse_Concurrent drives Parse + snapshot accessors from many
 // goroutines at once, mirroring the real load shape: the watcher fires
 // debounce callbacks on one goroutine per pending path. Under -race this

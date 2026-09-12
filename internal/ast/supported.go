@@ -24,6 +24,12 @@ const (
 	LangCSharp
 	LangPHP
 	LangRuby
+	// LangKotlin and LangDart are appended at the end of the iota so the
+	// ordinals of pre-existing languages stay stable: DetectLanguage feeds
+	// Engine.Parse and the language string is persisted to DB, so reordering
+	// them would silently shift every stored "go"/"python"/... row.
+	LangKotlin
+	LangDart
 )
 
 // String returns a short, lower-case identifier suitable for DB columns.
@@ -49,6 +55,10 @@ func (l Language) String() string {
 		return "php"
 	case LangRuby:
 		return "ruby"
+	case LangKotlin:
+		return "kotlin"
+	case LangDart:
+		return "dart"
 	default:
 		return "unknown"
 	}
@@ -83,6 +93,21 @@ func DetectLanguage(path string) Language {
 		return LangPHP
 	case ".rb":
 		return LangRuby
+	// Kotlin sources: .kt is the standard extension, .kts is the Kotlin DSL
+	// form (Gradle build scripts, kotlinc -script). Both must reach the AST
+	// pipeline so Engine.Parse returns a populated snapshot -- internal/core/
+	// projects.go:1398-1403 explicitly claims these are parsed by the AST
+	// layer and aligns the PrimaryLanguage label with them. The repo has no
+	// compiled tree-sitter Kotlin grammar, so they fall through to the
+	// documented parseGenericSource fallback, identical to how Rust/C/Java/
+	// C#/PHP/Ruby are handled.
+	case ".kt", ".kts":
+		return LangKotlin
+	// Dart sources. Same rationale as Kotlin: projects.go claims alignment,
+	// and parseGenericSource is the established path for languages without a
+	// native tree-sitter binding.
+	case ".dart":
+		return LangDart
 	}
 
 	// Config files to skip (evaluated lazily only when extension didn't match).
