@@ -381,14 +381,25 @@ func TestHandleFileGone_EmitsDeletedAndDropsSnapshot(t *testing.T) {
 	if len(events3) != 4 {
 		t.Errorf("after re-create got %d total events, want 4 (2 DELETED + 2 ADDED)", len(events3))
 	}
-	added := 0
-	for _, ev := range events3[:2] { // most recent first
-		if ev.Action == "ADDED" {
+	// Order-independent by design: RecentEvents breaks same-second ties by
+	// random event_id (the round-93 contract pinned by
+	// TestRecentEventsFiltered_SameSecondTiesAreDeterministic), and all
+	// four events of this test land inside one wall-clock second — so the
+	// relative position of the DELETED and ADDED pairs is stable per
+	// database but not arrival-ordered. The re-create contract is the
+	// event SET: the gone phase's two DELETED events plus exactly two
+	// ADDED events for the re-created symbols.
+	added, deleted := 0, 0
+	for _, ev := range events3 {
+		switch ev.Action {
+		case "ADDED":
 			added++
+		case "DELETED":
+			deleted++
 		}
 	}
-	if added != 2 {
-		t.Errorf("re-create did not emit 2 ADDED events: %+v", events3)
+	if added != 2 || deleted != 2 {
+		t.Errorf("re-create event set = %d ADDED / %d DELETED, want 2/2: %+v", added, deleted, events3)
 	}
 }
 
