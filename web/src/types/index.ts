@@ -12,7 +12,7 @@ export interface Overview {
 
 export interface ThrashingRow {
   file_path: string;
-  signature: string;
+  node_signature: string;
   edit_count: number;
   first_event: string;
   last_event: string;
@@ -92,6 +92,7 @@ export interface EventRecord {
   attribution_confidence?: number;
   author_model?: string;
   event_time: string;
+  timestamp?: string;
 }
 
 export interface ActiveRun {
@@ -189,20 +190,20 @@ export type WSMessage =
   | { type: 'metrics_refresh'; payload: MetricsSnapshot; at: string };
 
 export interface WsCodeEvent {
-  RunID: string;
-  RepoName: string;
-  FilePath: string;
-  Signature: string;
-  NodeType: NodeKind;
-  Action: Action;
-  BodyHash: string;
-  LOC: number;
-  StartLine?: number;
-  EndLine?: number;
-  DiffSnippet?: string;
-  AddedLines?: number;
-  DeletedLines?: number;
-  OccurredAt: string;
+  run_id: string;
+  repo_name: string;
+  file_path: string;
+  node_signature: string;
+  node_type: NodeKind;
+  action: Action;
+  ast_content_hash: string;
+  lines_of_code: number;
+  start_line?: number;
+  end_line?: number;
+  diff_snippet?: string;
+  added_lines?: number;
+  deleted_lines?: number;
+  event_time: string;
 }
 
 export interface AtlasSymbol {
@@ -408,11 +409,6 @@ export interface ImportFromWrongStackResult {
 }
 
 export interface AppSettings {
-  auto_vacuum_enabled?: boolean;
-  retention_days?: number;
-  enable_webhook_alerts?: boolean;
-  webhook_url?: string;
-  webhook_type?: 'slack' | 'discord' | 'custom';
   debounce_ms?: number;
   thrashing_threshold?: number;
   fragility_cutoff?: number;
@@ -424,6 +420,8 @@ export interface AppSettings {
   custom_webhook_url?: string;
   ignore_patterns?: string[];
   db_path?: string;
+  socket_path?: string;
+  version?: string;
 }
 
 export interface RuntimeTrace {

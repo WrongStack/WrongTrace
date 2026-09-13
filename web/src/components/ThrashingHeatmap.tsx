@@ -41,7 +41,7 @@ export function ThrashingHeatmap({ rows, loading }: ThrashingHeatmapProps) {
           const intensity = intensityFor(r.edit_count);
           return (
             <li
-              key={`${r.file_path}:${r.signature}`}
+              key={`${r.file_path}:${r.node_signature}`}
               className="py-2.5 grid grid-cols-12 items-center gap-3"
             >
               <div
@@ -52,8 +52,8 @@ export function ThrashingHeatmap({ rows, loading }: ThrashingHeatmapProps) {
                 title={`${r.edit_count} edits`}
               />
               <div className="col-span-7 min-w-0">
-                <div className="font-mono text-xs truncate text-slate-200" title={r.signature}>
-                  {r.signature}
+                <div className="font-mono text-xs truncate text-slate-200" title={r.node_signature}>
+                  {r.node_signature}
                 </div>
                 <div className="font-mono text-[11px] text-slate-500 truncate" title={r.file_path}>
                   {r.file_path}
