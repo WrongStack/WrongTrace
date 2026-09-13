@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Testing & Tooling
+- **Web SSR guard harnesses silenced false React "unique key" warnings**: the guards' jsx-runtime shim delegates to `createElement`, whose legacy child validation flags the static JSX siblings the real jsx-runtime exempts — created elements are now marked pre-validated, dropping ~877 false warnings across 7 guards while all assertions stay green (`npm run regressions` 14/14).
+
 ---
 
 ## [0.3.13] - 2026-09-13
