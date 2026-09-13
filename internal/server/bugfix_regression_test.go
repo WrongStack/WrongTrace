@@ -394,3 +394,109 @@ func TestLockFileRejectsOverflowingTTL(t *testing.T) {
 		})
 	}
 }
+
+// TestAddProject_RejectsOversizedBodyNamingTheLimit pins that a project
+// registration body larger than the handler's 10 MiB cap is REJECTED with a
+// message that names the server's limit, rather than being truncated and
+// blamed on the sender.
+//
+// AddProject read io.ReadAll(io.LimitReader(r.Body, 10<<20)) and never
+// compared the length, so an over-cap body lost its tail. encoding/json then
+// failed on the truncated prefix and the endpoint answered
+//
+//	400 {"error":"invalid request body: unexpected end of JSON input"}
+//
+// for a well-formed payload — the server's own limit reported as the
+// sender's malformed JSON. Every other untrusted-body read in this package
+// detects overflow (decodeJSON's http.MaxBytesReader, IngestOTLPTraces'
+// limit+1 probe — see otlp_body_limit_test.go, which pins the same contract
+// for the profiler mounts); AddProject was the last outlier.
+//
+// Status stays 400 by design: a sender whose body fits is untouched, so this
+// is a diagnostic fix, not a contract change. The exactly-at-cap row is the
+// off-by-one guard for the "+1" read: a body of exactly the cap is
+// legitimate data and must not be reported as too large.
+func TestAddProject_RejectsOversizedBodyNamingTheLimit(t *testing.T) {
+	withIsolatedProjectsHome(t)
+	_, _, ts := newTestServer(t)
+
+	// addProjectBody builds a well-formed {"blob","name","path"} body whose
+	// total length is exactly total bytes; the pad rides in an ignored field.
+	addProjectBody := func(t *testing.T, dir string, total int) string {
+		t.Helper()
+		fields := map[string]string{"name": "proj", "path": dir, "blob": ""}
+		base, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatalf("marshal base body: %v", err)
+		}
+		pad := total - len(base)
+		if pad < 0 {
+			t.Fatalf("SETUP: base body is %d bytes, already over the %d-byte target", len(base), total)
+		}
+		fields["blob"] = strings.Repeat("a", pad)
+		padded, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatalf("marshal padded body: %v", err)
+		}
+		if len(padded) != total {
+			t.Fatalf("SETUP: built %d bytes, want exactly %d", len(padded), total)
+		}
+		return string(padded)
+	}
+
+	const cap = 10 << 20
+	dir := t.TempDir()
+
+	t.Run("oversized_rejected_by_name", func(t *testing.T) {
+		body := addProjectBody(t, dir, cap+1024) // one KiB over the cap
+		resp := projReq(t, ts, http.MethodPost, "/api/projects", strings.NewReader(body), nil)
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read response body: %v", err)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("FAIL: status = %d, want 400", resp.StatusCode)
+		}
+		low := strings.ToLower(string(b))
+		if !strings.Contains(low, "too large") || !strings.Contains(low, "exceeds") {
+			t.Errorf("FAIL: response does not name the server's body limit: %.300s", b)
+		}
+		if strings.Contains(string(b), "unexpected end of JSON input") {
+			t.Errorf("FAIL: server-side truncation still surfaced as malformed sender JSON: %.300s", b)
+		}
+		if strings.Contains(low, "unmarshal") {
+			t.Errorf("FAIL: parse error reported for a body the server refused to read whole: %.300s", b)
+		}
+	})
+
+	t.Run("exactly_at_cap_is_accepted", func(t *testing.T) {
+		body := addProjectBody(t, dir, cap)
+		resp := projReq(t, ts, http.MethodPost, "/api/projects", strings.NewReader(body), nil)
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read response body: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("FAIL: body of exactly the cap rejected -- off-by-one in the overflow check: status=%d body=%.200s", resp.StatusCode, b)
+		}
+		if strings.Contains(string(b), "too large") {
+			t.Errorf("FAIL: exactly-at-cap body reported as too large: %.300s", b)
+		}
+	})
+
+	t.Run("controls", func(t *testing.T) {
+		// Control (unchanged by the fix): a small body missing path is a
+		// plain validation 400, not a size rejection.
+		resp := projReq(t, ts, http.MethodPost, "/api/projects", map[string]string{"name": "n"}, nil)
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(b), "path is required") {
+			t.Errorf("CONTROL BROKEN (not this round's bug): missing-path status=%d body=%.200s", resp.StatusCode, b)
+		}
+		// Control: a small valid body still registers the project.
+		resp = projReq(t, ts, http.MethodPost, "/api/projects", map[string]string{"name": "small", "path": dir}, nil)
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Errorf("CONTROL BROKEN (not this round's bug): valid small body rejected: status=%d body=%.200s", resp.StatusCode, b)
+		}
+	})
+}

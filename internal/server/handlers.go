@@ -840,9 +840,21 @@ func (h *Handlers) AddProject(w http.ResponseWriter, r *http.Request) {
 	// Save body bytes before decodeJSON consumes r.Body, so we can re-examine
 	// the raw JSON when raw.Path is nil to distinguish "absent field" from
 	// "wrong-type field that Unmarshal couldn't store into []byte".
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	//
+	// Read ONE byte past the cap so overflow is DETECTED instead of silently
+	// truncating: the previous LimitReader(10MB) with no length check turned
+	// an over-cap body into "invalid request body: unexpected end of JSON
+	// input" — the server's own limit reported as the sender's malformed
+	// JSON. decodeJSON's http.MaxBytesReader and IngestOTLPTraces' limit+1
+	// probe already follow this convention; AddProject was the last outlier.
+	const maxAddProjectBodyBytes = 10 << 20
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxAddProjectBodyBytes+1))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if len(bodyBytes) > maxAddProjectBodyBytes {
+		writeError(w, http.StatusBadRequest, "request body too large: AddProject payload exceeds the 10 MiB limit")
 		return
 	}
 	var raw struct {
