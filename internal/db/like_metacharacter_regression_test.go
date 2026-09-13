@@ -533,3 +533,425 @@ func TestRecentEventsFiltered_SameSecondTiesAreDeterministic(t *testing.T) {
 		t.Errorf("first row = %q, want ev-0 (event_time DESC must dominate the tiebreak)", ord1[0])
 	}
 }
+
+// TestSymbolHistory_SameSecondTiesAreDeterministic pins the round-94 fix,
+// the last member of the round-93 tie class: SymbolHistory's four query
+// variants ordered by bare e.event_time, which fmtDBTime stores at SECOND
+// granularity, so same-second rows tied and SQLite returned them in physical
+// (rowid) order — the revision timeline depended on insertion order, not on
+// the data. event_id now breaks ties in the same direction as the time
+// column (ASC variants chronological, DESC variant reverse), the same remedy
+// RecentEventsFiltered received in round 93.
+func TestSymbolHistory_SameSecondTiesAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	st1, err := Open(filepath.Join(dir, "one.db"))
+	if err != nil {
+		t.Fatalf("open one: %v", err)
+	}
+	defer st1.Close()
+	st2, err := Open(filepath.Join(dir, "two.db"))
+	if err != nil {
+		t.Fatalf("open two: %v", err)
+	}
+	defer st2.Close()
+	if err := st1.Migrate(); err != nil {
+		t.Fatalf("migrate one: %v", err)
+	}
+	if err := st2.Migrate(); err != nil {
+		t.Fatalf("migrate two: %v", err)
+	}
+
+	const (
+		path = "internal/svc/sym.go"
+		sig  = "func:sym.go::Handle"
+	)
+	ids := []string{"ev-aaa1", "ev-bbb2", "ev-ccc3"}    // lexical == pinned ASC tie order
+	at := time.Date(2026, 9, 13, 10, 0, 0, 0, time.UTC) // one shared second
+	seed := func(st *Store, id string) {
+		t.Helper()
+		if err := st.InsertEvent(EventRecord{
+			EventID: id, RepoName: "meta", FilePath: path,
+			Signature: sig, NodeType: "function",
+			Action: "MODIFIED", BodyHash: "hash", LOC: 5,
+			OccurredAt: at,
+		}); err != nil {
+			t.Fatalf("InsertEvent %s: %v", id, err)
+		}
+	}
+
+	// Identical logical rows, opposite physical insertion orders.
+	for _, id := range []string{"ev-ccc3", "ev-aaa1", "ev-bbb2"} {
+		seed(st1, id)
+	}
+	for _, id := range []string{"ev-bbb2", "ev-ccc3", "ev-aaa1"} {
+		seed(st2, id)
+	}
+
+	order := func(st *Store, filePathArg, sigArg string) []string {
+		t.Helper()
+		recs, err := st.SymbolHistory(filePathArg, sigArg, 50)
+		if err != nil {
+			t.Fatalf("SymbolHistory(%q,%q): %v", filePathArg, sigArg, err)
+		}
+		out := make([]string, 0, len(recs))
+		for _, r := range recs {
+			out = append(out, r.EventID)
+		}
+		if len(out) != len(ids) {
+			t.Fatalf("SymbolHistory(%q,%q) rows = %d, want %d", filePathArg, sigArg, len(out), len(ids))
+		}
+		return out
+	}
+
+	asc := []string{"ev-aaa1", "ev-bbb2", "ev-ccc3"}
+	desc := []string{"ev-ccc3", "ev-bbb2", "ev-aaa1"}
+	for _, tc := range []struct {
+		variant       string
+		filePath, sig string
+		want          []string
+	}{
+		{"file+signature", path, sig, asc},
+		{"file-only", path, "", asc},
+		{"signature-only", "", sig, asc},
+		{"global", "", "", desc},
+	} {
+		t.Run(tc.variant, func(t *testing.T) {
+			ord1 := order(st1, tc.filePath, tc.sig)
+			ord2 := order(st2, tc.filePath, tc.sig)
+			if !reflect.DeepEqual(ord1, ord2) {
+				t.Errorf("identical logical data, mirrored insertion order: orders differ\none: %v\ntwo: %v", ord1, ord2)
+			}
+			if !reflect.DeepEqual(ord1, tc.want) {
+				t.Errorf("tie order = %v, want %v (event_id must break same-second ties in the time column's direction)", ord1, tc.want)
+			}
+		})
+	}
+}
+
+// TestRecentTraces_SameSecondTiesAreDeterministic pins the round-95 fix,
+// another member of the round-93 tie class: RecentTraces ordered by bare
+// `timestamp`, which InsertTrace writes at SECOND granularity (fmtDBTime /
+// CURRENT_TIMESTAMP fallback), so same-second rows tied and SQLite returned
+// them in physical (rowid) order — the runtime-traces feed depended on
+// insertion order, not on the data. Ties are routine here: a whole OTLP span
+// batch is inserted synchronously inside one wall-clock second. trace_id now
+// breaks ties DESC, the same direction as the time column (the rounds
+// 25/93/94 remedy).
+func TestRecentTraces_SameSecondTiesAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	st1, err := Open(filepath.Join(dir, "one.db"))
+	if err != nil {
+		t.Fatalf("open one: %v", err)
+	}
+	defer st1.Close()
+	st2, err := Open(filepath.Join(dir, "two.db"))
+	if err != nil {
+		t.Fatalf("open two: %v", err)
+	}
+	defer st2.Close()
+	if err := st1.Migrate(); err != nil {
+		t.Fatalf("migrate one: %v", err)
+	}
+	if err := st2.Migrate(); err != nil {
+		t.Fatalf("migrate two: %v", err)
+	}
+
+	ids := []string{"tr-aaa1", "tr-bbb2", "tr-ccc3"}    // lexical == pinned tie order
+	at := time.Date(2026, 9, 13, 10, 0, 0, 0, time.UTC) // one shared second
+	seed := func(st *Store, id string) {
+		t.Helper()
+		if err := st.InsertTrace(RuntimeTraceRecord{
+			TraceID:       id,
+			ServiceName:   "meta",
+			NodeSignature: "func:proof.go::Handle",
+			DurationMs:    1.5,
+			StatusCode:    200,
+			ProfilerType:  "custom",
+			MetadataJSON:  "{}",
+			Timestamp:     at,
+		}); err != nil {
+			t.Fatalf("InsertTrace %s: %v", id, err)
+		}
+	}
+
+	// Identical logical rows, opposite physical insertion orders.
+	for _, id := range []string{"tr-ccc3", "tr-aaa1", "tr-bbb2"} {
+		seed(st1, id)
+	}
+	for _, id := range []string{"tr-bbb2", "tr-ccc3", "tr-aaa1"} {
+		seed(st2, id)
+	}
+
+	order := func(st *Store) []string {
+		t.Helper()
+		recs, err := st.RecentTraces(50)
+		if err != nil {
+			t.Fatalf("RecentTraces: %v", err)
+		}
+		out := make([]string, 0, len(recs))
+		for _, r := range recs {
+			out = append(out, r.TraceID)
+		}
+		if len(out) != len(ids) {
+			t.Fatalf("RecentTraces rows = %d, want %d", len(out), len(ids))
+		}
+		return out
+	}
+
+	want := []string{"tr-ccc3", "tr-bbb2", "tr-aaa1"} // timestamp DESC, trace_id DESC
+	ord1, ord2 := order(st1), order(st2)
+	if !reflect.DeepEqual(ord1, ord2) {
+		t.Errorf("identical logical data, mirrored insertion order: orders differ\none: %v\ntwo: %v", ord1, ord2)
+	}
+	if !reflect.DeepEqual(ord1, want) {
+		t.Errorf("tie order = %v, want %v (trace_id must break same-second ties in the time column's direction)", ord1, want)
+	}
+}
+
+// TestGetRecentFileReads_SameSecondTiesAreDeterministic pins the round-97
+// fix, the fifth member of the round-93 tie class: GetRecentFileReads (both
+// variants) ordered by bare read_time, which InsertReadEvent writes at
+// SECOND granularity (fmtDBTime / CURRENT_TIMESTAMP fallback), so
+// same-second reads tied and SQLite returned them in physical (rowid) order
+// — the recent-reads feed depended on insertion order, not on the data.
+// read_id now breaks ties DESC, the same direction as the time column (the
+// rounds 25/93/94/95 remedy).
+func TestGetRecentFileReads_SameSecondTiesAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	st1, err := Open(filepath.Join(dir, "one.db"))
+	if err != nil {
+		t.Fatalf("open one: %v", err)
+	}
+	defer st1.Close()
+	st2, err := Open(filepath.Join(dir, "two.db"))
+	if err != nil {
+		t.Fatalf("open two: %v", err)
+	}
+	defer st2.Close()
+	if err := st1.Migrate(); err != nil {
+		t.Fatalf("migrate one: %v", err)
+	}
+	if err := st2.Migrate(); err != nil {
+		t.Fatalf("migrate two: %v", err)
+	}
+
+	ids := []string{"rd-aaa1", "rd-bbb2", "rd-ccc3"}    // lexical == pinned tie order
+	at := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC) // one shared second
+	seed := func(st *Store, id string) {
+		t.Helper()
+		if err := st.InsertReadEvent(FileReadRecord{
+			ReadID: id, RepoName: "meta", FilePath: "internal/svc/reads.go",
+			AgentName: "agent", ModelName: "model-a", Provider: "prov",
+			ToolName: "read_file", LinesReadCount: 10,
+			ReadTime: at,
+		}); err != nil {
+			t.Fatalf("InsertReadEvent %s: %v", id, err)
+		}
+	}
+
+	// Identical logical rows, opposite physical insertion orders.
+	for _, id := range []string{"rd-ccc3", "rd-aaa1", "rd-bbb2"} {
+		seed(st1, id)
+	}
+	for _, id := range []string{"rd-bbb2", "rd-ccc3", "rd-aaa1"} {
+		seed(st2, id)
+	}
+
+	order := func(st *Store, repo string) []string {
+		t.Helper()
+		recs, err := st.GetRecentFileReads(50, repo)
+		if err != nil {
+			t.Fatalf("GetRecentFileReads: %v", err)
+		}
+		out := make([]string, 0, len(recs))
+		for _, r := range recs {
+			out = append(out, r.ReadID)
+		}
+		if len(out) != len(ids) {
+			t.Fatalf("GetRecentFileReads rows = %d, want %d", len(out), len(ids))
+		}
+		return out
+	}
+
+	want := []string{"rd-ccc3", "rd-bbb2", "rd-aaa1"} // read_time DESC, read_id DESC
+	for _, tc := range []struct{ name, repo string }{
+		{"no-repo", ""},
+		{"repo-filtered", "meta"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ord1 := order(st1, tc.repo)
+			ord2 := order(st2, tc.repo)
+			if !reflect.DeepEqual(ord1, ord2) {
+				t.Errorf("identical logical data, mirrored insertion order: orders differ\none: %v\ntwo: %v", ord1, ord2)
+			}
+			if !reflect.DeepEqual(ord1, want) {
+				t.Errorf("tie order = %v, want %v (read_id must break same-second ties in the time column's direction)", ord1, want)
+			}
+		})
+	}
+}
+
+// TestGetFileReadStats_RecentReads_SameSecondTiesAreDeterministic pins the
+// round-97 fix for GetFileReadStats's recent-reads section: same-second
+// reads tied under bare `ORDER BY read_time DESC` (read_time is stored at
+// SECOND granularity), so the per-file timeline depended on insertion
+// order. read_id breaks ties DESC like every other feed in this package.
+func TestGetFileReadStats_RecentReads_SameSecondTiesAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	st1, err := Open(filepath.Join(dir, "one.db"))
+	if err != nil {
+		t.Fatalf("open one: %v", err)
+	}
+	defer st1.Close()
+	st2, err := Open(filepath.Join(dir, "two.db"))
+	if err != nil {
+		t.Fatalf("open two: %v", err)
+	}
+	defer st2.Close()
+	if err := st1.Migrate(); err != nil {
+		t.Fatalf("migrate one: %v", err)
+	}
+	if err := st2.Migrate(); err != nil {
+		t.Fatalf("migrate two: %v", err)
+	}
+
+	const readsPath = "internal/svc/reads.go"
+	ids := []string{"rd-aaa1", "rd-bbb2", "rd-ccc3"}
+	at := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	seed := func(st *Store, id string) {
+		t.Helper()
+		if err := st.InsertReadEvent(FileReadRecord{
+			ReadID: id, RepoName: "meta", FilePath: readsPath,
+			AgentName: "agent", ModelName: "model-a", Provider: "prov",
+			ToolName: "read_file", LinesReadCount: 10,
+			ReadTime: at,
+		}); err != nil {
+			t.Fatalf("InsertReadEvent %s: %v", id, err)
+		}
+	}
+	for _, id := range []string{"rd-ccc3", "rd-aaa1", "rd-bbb2"} {
+		seed(st1, id)
+	}
+	for _, id := range []string{"rd-bbb2", "rd-ccc3", "rd-aaa1"} {
+		seed(st2, id)
+	}
+
+	order := func(st *Store) []string {
+		t.Helper()
+		fs, err := st.GetFileReadStats(readsPath)
+		if err != nil {
+			t.Fatalf("GetFileReadStats: %v", err)
+		}
+		out := make([]string, 0, len(fs.RecentReads))
+		for _, r := range fs.RecentReads {
+			out = append(out, r.ReadID)
+		}
+		if len(out) != len(ids) {
+			t.Fatalf("RecentReads rows = %d, want %d", len(out), len(ids))
+		}
+		return out
+	}
+
+	want := []string{"rd-ccc3", "rd-bbb2", "rd-aaa1"}
+	ord1, ord2 := order(st1), order(st2)
+	if !reflect.DeepEqual(ord1, ord2) {
+		t.Errorf("identical logical data, mirrored insertion order: orders differ\none: %v\ntwo: %v", ord1, ord2)
+	}
+	if !reflect.DeepEqual(ord1, want) {
+		t.Errorf("tie order = %v, want %v (read_id must break same-second ties in the time column's direction)", ord1, want)
+	}
+}
+
+// TestModelFrictionMatrix_SameSecondTiesAreDeterministic pins the round-97
+// fix for the friction report's outer ORDER BY. The LAG windows were
+// already deterministic (event_time, event_id — round 25), but the outer
+// SELECT ordered by bare event_time, so same-second collisions came back in
+// whatever order the query plan produced (observed: the CTE's
+// window-materialization order) and WHICH rows survive LIMIT followed that
+// plan-dependent order too. event_id now breaks ties DESC, matching the
+// report's reverse-chronological direction.
+func TestModelFrictionMatrix_SameSecondTiesAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	st1, err := Open(filepath.Join(dir, "one.db"))
+	if err != nil {
+		t.Fatalf("open one: %v", err)
+	}
+	defer st1.Close()
+	st2, err := Open(filepath.Join(dir, "two.db"))
+	if err != nil {
+		t.Fatalf("open two: %v", err)
+	}
+	defer st2.Close()
+	if err := st1.Migrate(); err != nil {
+		t.Fatalf("migrate one: %v", err)
+	}
+	if err := st2.Migrate(); err != nil {
+		t.Fatalf("migrate two: %v", err)
+	}
+
+	at := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	runs := map[string]string{"run-a": "model-a", "run-b": "model-b"}
+	modelOf := func(id string) string {
+		if id == "ev-bbb2" {
+			return runs["run-b"]
+		}
+		return runs["run-a"]
+	}
+	runOf := func(id string) string {
+		if id == "ev-bbb2" {
+			return "run-b"
+		}
+		return "run-a"
+	}
+	seed := func(st *Store, id string) {
+		t.Helper()
+		if err := st.UpsertRun(RunRecord{
+			RunID: runOf(id), AgentName: "agent-" + runOf(id),
+			ModelName: modelOf(id), Provider: "prov",
+		}); err != nil {
+			t.Fatalf("UpsertRun %s: %v", id, err)
+		}
+		if err := st.InsertEvent(EventRecord{
+			EventID: id, RunID: runOf(id), RepoName: "meta",
+			FilePath: "internal/svc/fr.go", Signature: "func:fr.go::Handle",
+			NodeType: "function", Action: "MODIFIED", BodyHash: "hash", LOC: 5,
+			AttributionConfidence: 1.0,
+			OccurredAt:            at,
+		}); err != nil {
+			t.Fatalf("InsertEvent %s: %v", id, err)
+		}
+	}
+	for _, id := range []string{"ev-ccc3", "ev-aaa1", "ev-bbb2"} {
+		seed(st1, id)
+	}
+	for _, id := range []string{"ev-bbb2", "ev-ccc3", "ev-aaa1"} {
+		seed(st2, id)
+	}
+
+	order := func(st *Store) []string {
+		t.Helper()
+		rep, err := st.ModelFrictionMatrix(50)
+		if err != nil {
+			t.Fatalf("ModelFrictionMatrix: %v", err)
+		}
+		out := make([]string, 0, len(rep.RecentCollisions))
+		for _, ev := range rep.RecentCollisions {
+			out = append(out, ev.EventID)
+		}
+		// The partition's first row has no LAG author and is filtered out;
+		// exactly two collisions must survive in both stores.
+		if len(out) != 2 {
+			t.Fatalf("collisions = %d, want 2", len(out))
+		}
+		return out
+	}
+
+	want := []string{"ev-ccc3", "ev-bbb2"} // event_time DESC, event_id DESC
+	ord1, ord2 := order(st1), order(st2)
+	if !reflect.DeepEqual(ord1, ord2) {
+		t.Errorf("identical logical data, mirrored insertion order: orders differ\none: %v\ntwo: %v", ord1, ord2)
+	}
+	if !reflect.DeepEqual(ord1, want) {
+		t.Errorf("tie order = %v, want %v (event_id must break same-second ties in the time column's direction)", ord1, want)
+	}
+}
