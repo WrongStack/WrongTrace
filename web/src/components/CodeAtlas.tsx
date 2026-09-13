@@ -164,7 +164,7 @@ function PackageNode({ data }: NodeProps<Node<PackageNodeData>>) {
       </div>
 
       <div className="mt-2.5 pt-2 border-t border-white/5 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-        <span className="text-slate-300">{pkg.files.length} files</span>
+        <span className="text-slate-300">{(pkg.files ?? []).length} files</span>
         <span className="text-indigo-300 font-semibold">{pkg.total_loc.toLocaleString()} LOC</span>
       </div>
       <Handle type="source" position={Position.Right} className="!bg-indigo-400 !w-2.5 !h-2.5 !border !border-white" />
@@ -391,7 +391,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
     const files = new Set<string>();
     atlas.packages.forEach((p) => {
       folders.add(p.path);
-      p.files.forEach((f) => files.add(f.path));
+      (p.files ?? []).forEach((f) => files.add(f.path));
     });
     setExpandedFolders(folders);
     setExpandedFiles(files);
@@ -417,9 +417,9 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
         return true;
       })
       .map((pkg) => {
-        const filteredFiles = pkg.files
+        const filteredFiles = (pkg.files ?? [])
           .map((file) => {
-            const filteredSymbols = file.symbols.filter((sym) => {
+            const filteredSymbols = (file.symbols ?? []).filter((sym) => {
               if (selectedKind !== 'all' && sym.kind !== selectedKind) return false;
               if (selectedFilter === 'modified' && sym.status !== 'MODIFIED') return false;
               if (selectedFilter === 'fragile' && sym.edit_count < 3) return false;
@@ -444,7 +444,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
 
             return { ...file, symbols: filteredSymbols };
           })
-          .filter((f): f is AtlasFile => f !== null);
+          .filter((f) => f !== null);
 
         if (filteredFiles.length === 0 && q && !pkg.name.toLowerCase().includes(q) && !pkg.path.toLowerCase().includes(q)) {
           return null;
@@ -452,7 +452,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
 
         return { ...pkg, files: filteredFiles };
       })
-      .filter((p): p is AtlasPackage => p !== null);
+      .filter((p) => p !== null);
   }, [atlas, deferredQuery, selectedWorkspace, selectedKind, selectedFilter]);
 
   const [focusedScope, setFocusedScope] = useState<
@@ -471,7 +471,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
     const seen = new Set<string>();
     const opts: { path: string; name: string }[] = [];
     atlas.packages.forEach((p) =>
-      p.files.forEach((f) => {
+      (p.files ?? []).forEach((f) => {
         if (!seen.has(f.path)) {
           seen.add(f.path);
           opts.push({ path: f.path, name: f.name });
@@ -495,7 +495,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
 
     const handleSelectFile = (file: AtlasFile, pkg?: AtlasPackage) => {
       setSelectedItem({ type: 'file', file });
-      const parentPkg = pkg || (focusedScope.level !== 'all' ? focusedScope.pkg : filteredPackages.find((p) => p.files.some((f) => f.path === file.path)));
+      const parentPkg = pkg || (focusedScope.level !== 'all' ? focusedScope.pkg : filteredPackages.find((p) => (p.files ?? []).some((f) => f.path === file.path)));
       if (parentPkg) {
         setFocusedScope({ level: 'file', pkg: parentPkg, file });
       }
@@ -620,7 +620,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
       const pkgNodeId = `pkg-focus-${pkg.path}`;
 
       const MAX_CANVAS_FILES = 14;
-      const sortedFiles = [...pkg.files].sort((a, b) => {
+      const sortedFiles = [...(pkg.files ?? [])].sort((a, b) => {
         if (a.is_fragile !== b.is_fragile) return b.is_fragile ? 1 : -1;
         return b.total_loc - a.total_loc;
       });
@@ -738,7 +738,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
       const fileNodeId = `file-focus-${file.path}`;
 
       const MAX_CANVAS_SYMBOLS = 14;
-      const sortedSymbols = [...file.symbols].sort((a, b) => {
+      const sortedSymbols = [...(file.symbols ?? [])].sort((a, b) => {
         // Rank-based weak ordering: MODIFIED first, then edit_count desc, then
         // lines_of_code desc. The previous ternary returned 1 for BOTH
         // directions of any non-MODIFIED status pair, breaking antisymmetry —
@@ -1148,7 +1148,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
             <Flame className="h-3.5 w-3.5 text-rose-400" />
           </div>
           <div className="font-mono text-lg font-bold text-rose-400 mt-1">
-            {atlas?.packages?.reduce((acc, p) => acc + p.files.filter((f) => f.is_fragile || f.recent_thrashing_count >= 3).length, 0) ?? 0}
+            {atlas?.packages?.reduce((acc, p) => acc + (p.files ?? []).filter((f) => f.is_fragile || f.recent_thrashing_count >= 3).length, 0) ?? 0}
           </div>
           <div className="text-[10px] text-slate-500 font-mono">≥3x rewritten in 24h</div>
         </div>
@@ -1368,7 +1368,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                         <span className="text-[11px] text-slate-500 font-mono">({pkg.path})</span>
                       </div>
                       <div className="flex items-center gap-2 text-xs font-mono text-slate-400">
-                        <span>{pkg.files.length} files</span>
+                        <span>{(pkg.files ?? []).length} files</span>
                         <span>·</span>
                         <span>{pkg.total_loc.toLocaleString()} LOC</span>
                       </div>
@@ -1376,7 +1376,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
 
                     {isFolderOpen && (
                       <div className="p-2 space-y-2">
-                        {pkg.files.map((file) => {
+                        {(pkg.files ?? []).map((file) => {
                           const isFileOpen = expandedFiles.has(file.path);
                           const isFileSelected = selectedItem?.type === 'file' && selectedItem.file?.path === file.path;
 
@@ -1411,14 +1411,14 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                                   <span className="text-[10px] text-slate-500 uppercase font-mono">{file.language}</span>
                                 </div>
                                 <div className="flex items-center gap-2">
-                                  <span className="text-[10px] font-mono text-slate-400">{file.symbols.length} symbols</span>
+                                  <span className="text-[10px] font-mono text-slate-400">{(file.symbols ?? []).length} symbols</span>
                                   <span className="text-[11px] font-mono text-emerald-400">{file.health_score}% health</span>
                                 </div>
                               </div>
 
                               {isFileOpen && (
                                 <div className="pl-6 pb-2 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-1.5">
-                                  {file.symbols.map((sym) => {
+                                  {(file.symbols ?? []).map((sym) => {
                                     const isSymSelected =
                                       selectedItem?.type === 'symbol' &&
                                       selectedItem.symbol?.node_signature === sym.node_signature;
@@ -1634,7 +1634,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                   <div className="panel-raised p-2.5">
                     <div className="text-slate-400 text-[11px]">Total Symbols</div>
                     <div className="font-mono text-slate-200 mt-0.5">
-                      {selectedItem.file.symbols.length} nodes
+                      {(selectedItem.file.symbols ?? []).length} nodes
                     </div>
                   </div>
                 </div>
@@ -1655,7 +1655,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                 <div className="panel-raised p-2.5">
                   <div className="text-slate-400 text-[11px]">Files Contained</div>
                   <div className="font-medium text-slate-200 mt-0.5">
-                    {selectedItem.pkg.files.length} files ({selectedItem.pkg.total_loc} total LOC)
+                    {(selectedItem.pkg.files ?? []).length} files ({selectedItem.pkg.total_loc} total LOC)
                   </div>
                 </div>
               </div>
