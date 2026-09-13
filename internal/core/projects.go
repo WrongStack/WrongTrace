@@ -950,6 +950,7 @@ func ScanAgentSessions(root string) map[string]int {
 	// 2. Claude Code (Check specific workspace directory under ~/.claude/projects/ & local .claude)
 	if homeDir != "" {
 		claudeProjectsDir := filepath.Join(homeDir, ".claude", "projects")
+		encodedRoot := strings.ToLower(encodeClaudeProjectDir(normRoot))
 		if entries, err := os.ReadDir(claudeProjectsDir); err == nil {
 			var claudeSessCount int
 			for _, e := range entries {
@@ -957,8 +958,15 @@ func ScanAgentSessions(root string) map[string]int {
 					continue
 				}
 				dirNameLower := strings.ToLower(e.Name())
-				// Claude encodes path by replacing separators/colons with - or --
-				if strings.Contains(dirNameLower, rootBase) {
+				// Claude Code names each project directory after its FULL cwd,
+				// every non-alphanumeric byte replaced by '-' — one directory
+				// per project cwd (verified against a live ~/.claude/projects:
+				// "D:\Codebox\PROJECTS\WrongTrace" -> "d--Codebox-PROJECTS-WrongTrace").
+				// Equality on the encoded root is the identity test; matching
+				// the bare base name made any sibling path that merely contains
+				// it (WrongTrace-docs, WrongTrace-v2) leak its transcript count
+				// into this workspace's claude_code.
+				if dirNameLower == encodedRoot {
 					projDir := filepath.Join(claudeProjectsDir, e.Name())
 					if pFiles, err := os.ReadDir(projDir); err == nil {
 						for _, pf := range pFiles {
@@ -1225,6 +1233,25 @@ func dirExists(p string) bool {
 func fileExists(p string) bool {
 	info, err := os.Stat(p)
 	return err == nil && !info.IsDir()
+}
+
+// encodeClaudeProjectDir mirrors Claude Code's ~/.claude/projects directory
+// naming: every non-alphanumeric byte of the project cwd becomes '-' with case
+// preserved ("D:\a\My.site" -> "D--a-My-site"). Runes are handled one at a
+// time so multi-byte letters collapse to a single dash, matching the
+// character-level upstream encoding. Callers compare lowercased on both sides.
+func encodeClaudeProjectDir(path string) string {
+	var b strings.Builder
+	b.Grow(len(path))
+	for _, c := range path {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			b.WriteRune(c)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
 }
 
 // ignorePatterns returns the effective directory ignore patterns from the
