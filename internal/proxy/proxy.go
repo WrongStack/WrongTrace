@@ -1779,6 +1779,9 @@ func isCredentialParam(name string) bool {
 //
 // When nothing looks like a credential the input is returned verbatim, so the
 // normalizations above only ever affect the already-redacted record form.
+// A redacting record also drops the URL fragment: it is client-side only
+// (never forwarded upstream), and leaving it verbatim leaked credential
+// values — FuzzSanitizeURLForRecord caught "?token=v#v" emitting "#v".
 // Pinned by TestSanitizeURLForRecord_PinsRecordSurfaceSemantics.
 func sanitizeURLForRecord(rawURL string) string {
 	u, err := url.Parse(rawURL)
@@ -1794,8 +1797,14 @@ func sanitizeURLForRecord(rawURL string) string {
 	}
 	q := u.Query()
 	changed := false
+	var longValues []string
 	for k := range q {
 		if isCredentialParam(k) {
+			for _, v := range q[k] {
+				if len(v) >= 12 {
+					longValues = append(longValues, v)
+				}
+			}
 			q.Set(k, "[redacted]")
 			changed = true
 		}
@@ -1803,8 +1812,25 @@ func sanitizeURLForRecord(rawURL string) string {
 	if !changed {
 		return rawURL
 	}
+	// The fragment is client-side only — it is never forwarded upstream, so it
+	// carries zero diagnostic value in the record while remaining a live
+	// credential surface (OAuth implicit "#access_token=...", or an adversarial
+	// echo of the value redacted above). url.Parse splits it away from RawQuery,
+	// so the query redaction never touched it; both spellings must be cleared or
+	// String() re-emits the escaped form (RawFragment wins when set).
+	u.Fragment, u.RawFragment = "", ""
 	u.RawQuery = q.Encode()
-	return u.String()
+	out := u.String()
+	// A redacted value can also be smuggled into the record OUTSIDE its own
+	// parameter — as a sibling parameter's name or value ("?token=v&v" ->
+	// "v=&token=%5Bredacted%5D"). Scrub every remaining verbatim occurrence of
+	// each redacted value; the 12-character floor mirrors the fuzz oracle's own
+	// plausibility threshold, so innocently short names and values are never
+	// rewritten.
+	for _, v := range longValues {
+		out = strings.ReplaceAll(out, v, "[redacted]")
+	}
+	return out
 }
 
 func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, promptTokens, completionTokens int64, costUSD float64) (string, int64, int64, float64) {
