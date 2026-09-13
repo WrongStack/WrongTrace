@@ -940,6 +940,12 @@ func (s *Store) RecentTraces(limit int) ([]RuntimeTraceRecord, error) {
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
+	// timestamp is written at SECOND granularity (fmtDBTime / CURRENT_TIMESTAMP
+	// fallback), so same-second rows tie and SQLite returns them in physical
+	// (rowid) order — the feed then depended on insertion order, not on the
+	// data. trace_id breaks ties in the same direction as the time column; a
+	// whole OTLP span batch routinely lands inside one wall-clock second
+	// (round-93 tie-class remedy, as RecentEventsFiltered and SymbolHistory).
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT trace_id, COALESCE(run_id, ''), service_name, COALESCE(node_signature, ''),
 		       COALESCE(file_path, ''), COALESCE(duration_ms, 0.0), COALESCE(cpu_usage_pct, 0.0),
@@ -947,7 +953,7 @@ func (s *Store) RecentTraces(limit int) ([]RuntimeTraceRecord, error) {
 		       profiler_type, COALESCE(metadata_json, '{}'),
 		       COALESCE(timestamp, '')
 		FROM runtime_traces
-		ORDER BY timestamp DESC
+		ORDER BY timestamp DESC, trace_id DESC
 		LIMIT ?
 	`, limit)
 	if err != nil {
@@ -1112,7 +1118,14 @@ func (s *Store) InsertReadEvent(r FileReadRecord) error {
 	return err
 }
 
-// GetRecentFileReads returns the most recent file read events, optionally filtered by repo_name.
+// GetRecentFileReads returns the most recent file read events, optionally
+// filtered by repo_name.
+//
+// read_time is written at SECOND granularity (fmtDBTime / CURRENT_TIMESTAMP
+// fallback), so same-second reads tie and SQLite returns them in physical
+// (rowid) order — the feed depended on insertion order, and LIMIT truncation
+// on it too. read_id breaks ties in the time column's direction (round-93
+// tie-class remedy, as RecentEventsFiltered/SymbolHistory/RecentTraces).
 func (s *Store) GetRecentFileReads(limit int, repoFilter ...string) ([]FileReadRecord, error) {
 	limit = clampLimit(limit, 50)
 	var repo string
@@ -1132,7 +1145,7 @@ func (s *Store) GetRecentFileReads(limit int, repoFilter ...string) ([]FileReadR
 			       lines_read_count, prompt_tokens, cached_tokens, cost_usd, COALESCE(intent, ''),
 			       COALESCE(read_time, CURRENT_TIMESTAMP)
 			FROM file_read_events
-			ORDER BY read_time DESC
+			ORDER BY read_time DESC, read_id DESC
 			LIMIT ?
 		`
 		args = []any{limit}
@@ -1144,7 +1157,7 @@ func (s *Store) GetRecentFileReads(limit int, repoFilter ...string) ([]FileReadR
 			       COALESCE(read_time, CURRENT_TIMESTAMP)
 			FROM file_read_events
 			WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL)
-			ORDER BY read_time DESC
+			ORDER BY read_time DESC, read_id DESC
 			LIMIT ?
 		`
 		args = []any{repo, limit}
@@ -1252,7 +1265,10 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		_ = pRows.Close()
 	}
 
-	// 4. Recent Reads
+	// 4. Recent Reads. read_id breaks same-second read_time ties —
+	// read_time is written at SECOND granularity, so bare ordering made
+	// the per-file timeline insertion-order-dependent (see
+	// GetRecentFileReads).
 	rRows, err := s.db.QueryContext(ctx, `
 		SELECT read_id, COALESCE(run_id, ''), COALESCE(session_id, ''), repo_name, file_path,
 		       agent_name, model_name, provider, tool_name, start_line, end_line,
@@ -1260,7 +1276,7 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		       COALESCE(read_time, CURRENT_TIMESTAMP)
 		FROM file_read_events
 		WHERE file_path = ? OR file_path LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\'
-		ORDER BY read_time DESC
+		ORDER BY read_time DESC, read_id DESC
 		LIMIT 20
 	`, filePath, "%"+escapeLike(normPath), "%"+escapeLike(normPath))
 	if err == nil {
@@ -1422,6 +1438,12 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 		// e.g. "Engine.LockFile" -> try matching "LockFile" or full
 	}
 
+	// All four variants order by e.event_time, which fmtDBTime stores at
+	// SECOND granularity, so same-second rows tie and SQLite returns them
+	// in physical (rowid) order — the timeline then depended on insertion
+	// order, not on the data. e.event_id breaks ties in the same direction
+	// as the time column, the round-93 remedy mirrored from
+	// RecentEventsFiltered.
 	var query string
 	var args []any
 
@@ -1438,7 +1460,7 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
 			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
 			  AND (e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%' || LOWER(?) || '%' ESCAPE '\' OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) ESCAPE '\' OR LOWER(e.node_signature) LIKE '%:' || LOWER(?) ESCAPE '\')
-			ORDER BY e.event_time ASC
+			ORDER BY e.event_time ASC, e.event_id ASC
 			LIMIT ?
 		`
 		// filePath arm 4 binds the caller path as the LIKE SUBJECT (the stored
@@ -1460,7 +1482,7 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
 			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
-			ORDER BY e.event_time ASC
+			ORDER BY e.event_time ASC, e.event_id ASC
 			LIMIT ?
 		`
 		// filePath arm 4: LIKE SUBJECT — stays raw (same reason as variant A).
@@ -1477,7 +1499,7 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
 			WHERE (e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%' || LOWER(?) || '%' ESCAPE '\' OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) ESCAPE '\' OR LOWER(e.node_signature) LIKE '%:' || LOWER(?) ESCAPE '\')
-			ORDER BY e.event_time ASC
+			ORDER BY e.event_time ASC, e.event_id ASC
 			LIMIT ?
 		`
 		args = []any{escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
@@ -1492,7 +1514,7 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			       COALESCE(r.cost_usd, 0.0)
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			ORDER BY e.event_time DESC
+			ORDER BY e.event_time DESC, e.event_id DESC
 			LIMIT ?
 		`
 		args = []any{limit}
@@ -1799,6 +1821,11 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 
 	limit = clampLimit(limit, 200)
 
+	// The outer ORDER BY carries the same event_id tiebreak as the LAG
+	// windows below: event_time has SECOND granularity, so same-second
+	// collisions otherwise came back — and got LIMIT-truncated — in
+	// whatever order the query plan produced.
+
 	const q = `
 		WITH OrderedEvents AS (
 			SELECT 
@@ -1827,7 +1854,7 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 			author_model, author_run_id, author_time
 		FROM OrderedEvents
 		WHERE author_model IS NOT NULL AND action IN ('MODIFIED', 'DELETED')
-		ORDER BY event_time DESC
+		ORDER BY event_time DESC, event_id DESC
 		LIMIT ?;
 	`
 
