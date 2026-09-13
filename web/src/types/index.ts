@@ -229,14 +229,17 @@ export interface AtlasFile {
   is_fragile: boolean;
   recent_thrashing_count: number;
   total_loc: number;
-  symbols: AtlasSymbol[];
+  symbols: AtlasSymbol[] | null;
 }
 
 export interface AtlasPackage {
   path: string;
   name: string;
   workspace?: string;
-  files: AtlasFile[];
+  files?: AtlasFile[];
+  file_count: number;
+  fragile_files_count: number;
+  avg_health_score: number;
   total_loc: number;
   is_fragile: boolean;
 }
@@ -298,6 +301,9 @@ export interface AtlasSnapshot {
   generated_at: string;
   is_monorepo?: boolean;
   workspaces?: string[];
+  total_packages: number;
+  limit?: number;
+  offset?: number;
   packages: AtlasPackage[];
   total_files: number;
   total_loc: number;

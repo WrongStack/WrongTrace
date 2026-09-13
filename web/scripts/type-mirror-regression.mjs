@@ -34,6 +34,12 @@ const PAIRS = [
   { goFile: 'internal/ast/diff.go', go: 'Event', ts: 'WsCodeEvent' },
   { goFile: 'internal/core/settings.go', go: 'AppSettings', ts: 'AppSettings' },
   { goFile: 'internal/db/queries.go', go: 'EventRecord', ts: 'EventRecord' },
+  // Round-94: the atlas wire contracts carried the same name-set drift —
+  // AtlasPackage computes file_count/fragile_files_count/avg_health_score
+  // (internal/core/atlas.go) and AtlasSnapshot sends total_packages/limit/
+  // offset (handlers.go pagination), all absent from the TS mirror.
+  { goFile: 'internal/core/atlas.go', go: 'AtlasPackage', ts: 'AtlasPackage' },
+  { goFile: 'internal/core/atlas.go', go: 'AtlasSnapshot', ts: 'AtlasSnapshot' },
   // Controls (verified agreements):
   { goFile: 'internal/db/queries.go', go: 'ModelRow', ts: 'ModelRow' },
   { goFile: 'internal/core/metrics.go', go: 'MetricsSnapshot', ts: 'MetricsSnapshot' },
@@ -87,4 +93,4 @@ if (drifts.length > 0) {
   for (const d of drifts) console.error(`  - ${d}`);
   process.exit(1);
 }
-console.log(`PASS: ${pairs.length} Go<->TS interface mirrors agree (ThrashingRow, WsCodeEvent, AppSettings, EventRecord + 2 controls)`);
+console.log(`PASS: ${pairs.length} Go<->TS interface mirrors agree (ThrashingRow, WsCodeEvent, AppSettings, EventRecord, AtlasPackage, AtlasSnapshot + 2 controls)`);
