@@ -80,6 +80,10 @@ const lucideStub = new Proxy({}, { get: () => () => null });
 const allElements = [];
 const recordingElement = (type, props, key) => {
   const el = RealReact.createElement(type, key !== undefined ? { ...props, key } : props);
+  // createElement (legacy API) validates every array child — including the
+  // static JSX siblings the real jsx-runtime exempts — so mark created
+  // elements to keep the harness free of false "unique key" warnings.
+  if (el && el._store) el._store.validated = true;
   if (el && typeof el === 'object') allElements.push(el);
   return el;
 };

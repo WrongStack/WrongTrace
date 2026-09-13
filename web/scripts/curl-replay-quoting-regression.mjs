@@ -70,8 +70,15 @@ const curlRecord = {
 
 const lucideStub = new Proxy({}, { get: () => () => null });
 const chartsStub = new Proxy({}, { get: () => () => null });
-const realElement = (type, props, key) =>
-  RealReact.createElement(type, key !== undefined ? { ...props, key } : props);
+const realElement = (type, props, key) => {
+  // createElement (legacy API) validates every array child — including the
+  // static JSX siblings the real jsx-runtime exempts — so unpatched this
+  // harness drowns in false "unique key" warnings for clean trees (the app
+  // ships with the production jsx-runtime, which never validates).
+  const el = RealReact.createElement(type, key !== undefined ? { ...props, key } : props);
+  if (el && el._store) el._store.validated = true;
+  return el;
+};
 
 function makeHooks(store) {
   return {
