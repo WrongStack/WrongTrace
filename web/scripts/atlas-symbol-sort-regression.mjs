@@ -30,7 +30,7 @@ const componentPath = path.join(root, 'web', 'src', 'components', 'CodeAtlas.tsx
 const source = fs.readFileSync(componentPath, 'utf8');
 
 // --- Setup: slice the production comparator body verbatim -------------------
-const anchor = 'const sortedSymbols = [...file.symbols].sort((a, b) => {';
+const anchor = 'const sortedSymbols = [...(file.symbols ?? [])].sort((a, b) => {';
 const occurrences = source.split(anchor).length - 1;
 if (occurrences !== 1) {
   console.log(`FAIL: setup — expected exactly 1 symbol-sort anchor in CodeAtlas.tsx, found ${occurrences}`);
