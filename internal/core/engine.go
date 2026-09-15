@@ -302,19 +302,8 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 	e.persistAndBroadcast(res)
 }
 
-// handleFileGone emits a DELETED event for every cached node in the now-gone
-// file, then drops the snapshot.
-func (e *Engine) handleFileGone(ctx context.Context, path string) {
-	if e.cfg.AST == nil {
-		return
-	}
-	unlock := e.pathLocks.lock(path)
-	defer unlock()
-	e.handleFileGoneLocked(ctx, path)
-}
-
-// handleFileGoneLocked is handleFileGone for callers already holding the
-// path lock.
+// handleFileGoneLocked emits a DELETED event for every cached node in the
+// now-gone file, then drops the snapshot. Callers must hold the path lock.
 func (e *Engine) handleFileGoneLocked(_ context.Context, path string) {
 	if e.cfg.AST == nil {
 		return
