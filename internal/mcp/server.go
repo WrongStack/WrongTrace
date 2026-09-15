@@ -6,7 +6,9 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -71,6 +73,18 @@ func ServeStdio(sink EngineSink) error {
 
 	for {
 		line, err := readMessage(in)
+		if errors.Is(err, errMessageTooLong) {
+			// readMessage drained the oversized line to its newline, so the
+			// stream is still framed: report it and keep the session alive.
+			if err := writeMessage(out, jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      nil,
+				Error:   &rpcError{Code: -32600, Message: fmt.Sprintf("invalid request: message line exceeds %d bytes", maxMCPLineBytes)},
+			}); err != nil {
+				return err
+			}
+			continue
+		}
 		if err != nil {
 			if err == io.EOF {
 				return nil
@@ -107,23 +121,35 @@ const maxMCPLineBytes = 16 * 1024 * 1024 // 16 MB max line length to protect aga
 // is the only entrypoint left without a bound.
 const maxMCPHistoryLimit = 1000
 
+// errMessageTooLong reports a line over maxMCPLineBytes whose remainder has
+// already been discarded; the session can continue with the next line.
+var errMessageTooLong = fmt.Errorf("mcp: message line exceeded maximum limit of %d bytes", maxMCPLineBytes)
+
 func readMessage(r *bufio.Reader) ([]byte, error) {
 	for {
 		var line []byte
+		tooLong := false
 		for {
 			chunk, isPrefix, err := r.ReadLine()
 			if err != nil {
 				return nil, err
 			}
-			if len(line)+len(chunk) > maxMCPLineBytes {
-				return nil, fmt.Errorf("mcp: message line exceeded maximum limit of %d bytes", maxMCPLineBytes)
+			if !tooLong {
+				if len(line)+len(chunk) > maxMCPLineBytes {
+					tooLong = true
+					line = nil // drop the buffered prefix; drain to newline
+				} else {
+					line = append(line, chunk...)
+				}
 			}
-			line = append(line, chunk...)
 			if !isPrefix {
 				break
 			}
 		}
-		if len(line) > 0 {
+		if tooLong {
+			return nil, errMessageTooLong
+		}
+		if len(bytes.TrimSpace(line)) > 0 {
 			return line, nil
 		}
 		// A blank line is not end-of-stream: real EOF surfaces as an error
@@ -173,6 +199,25 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 	return resp
 }
 
+// toolError builds the MCP-spec shape for a tool whose execution failed: a
+// normal result flagged isError, so the model sees the failure text and can
+// react. JSON-RPC errors are reserved for protocol problems (unknown tool,
+// invalid arguments).
+func toolError(resp jsonRPCResponse, msg string, data interface{}) jsonRPCResponse {
+	result := map[string]interface{}{
+		"content": []map[string]interface{}{
+			{"type": "text", "text": msg},
+		},
+		"isError": true,
+	}
+	if data != nil {
+		result["data"] = data
+	}
+	resp.Result = result
+	resp.Error = nil
+	return resp
+}
+
 func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 	resp := jsonRPCResponse{JSONRPC: "2.0", ID: req.ID}
 	name, _ := req.Params["name"].(string)
@@ -216,8 +261,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		}
 		runID, err := sink.ReportRunMCP(model, provider, taskID, intent, promptTokens, completionTokens, cost)
 		if err != nil {
-			resp.Error = &rpcError{Code: -32010, Message: err.Error()}
-			return resp
+			return toolError(resp, "report_telemetry failed: "+err.Error(), nil)
 		}
 		resp.Result = map[string]interface{}{
 			"content": []map[string]interface{}{
@@ -232,8 +276,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		}
 		h, err := sink.FileHealth(path)
 		if err != nil {
-			resp.Error = &rpcError{Code: -32011, Message: err.Error()}
-			return resp
+			return toolError(resp, "get_file_health_score failed: "+err.Error(), nil)
 		}
 		text := fmt.Sprintf("health_score=%d fragile=%v recent_thrashing_count=%d is_locked=%v warning=%q",
 			h.HealthScore, h.IsFragile, h.RecentThrashingCount, h.IsLocked, h.Warning)
@@ -276,8 +319,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		}
 		h, err := sink.FileHealth(path)
 		if err != nil {
-			resp.Error = &rpcError{Code: -32011, Message: err.Error()}
-			return resp
+			return toolError(resp, "check_guardrail failed: "+err.Error(), nil)
 		}
 		if h.IsLocked {
 			rec := fmt.Sprintf("GUARDRAIL BLOCKED: File %s is locked (%s).", path, h.LockReason)
@@ -358,6 +400,20 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		// assertions matched no production sink, so lock_file silently took
 		// no lock while reporting success.
 		if locker, ok := sink.(interface {
+			TryLockFile(path, reason, owner, ownerRunID string, ttl time.Duration, force bool) (core.LockInfo, error)
+		}); ok {
+			// Refuse to steal another owner's lock: the engine performs the
+			// owner-conflict check atomically with the write.
+			if _, err := locker.TryLockFile(path, reason, owner, ownerRunID, ttl, false); err != nil {
+				var conflict *core.LockConflictError
+				if errors.As(err, &conflict) {
+					return toolError(resp, fmt.Sprintf("GUARDRAIL CONFLICT: %s (reason=%q, expires_at=%s). The lock was not taken.",
+						conflict.Error(), conflict.Existing.Reason, conflict.Existing.ExpiresAt.Format(time.RFC3339)),
+						map[string]interface{}{"status": "conflict", "existing": conflict.Existing})
+				}
+				return toolError(resp, "lock_file failed: "+err.Error(), nil)
+			}
+		} else if locker, ok := sink.(interface {
 			LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) core.LockInfo
 		}); ok {
 			locker.LockFileWithOptions(path, reason, owner, ownerRunID, ttl)
@@ -429,8 +485,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			ReadTime:     time.Now().UTC(),
 		})
 		if err != nil {
-			resp.Error = &rpcError{Code: -32012, Message: err.Error()}
-			return resp
+			return toolError(resp, "report_file_read failed: "+err.Error(), nil)
 		}
 		resp.Result = map[string]interface{}{
 			"content": []map[string]interface{}{
@@ -445,8 +500,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		}
 		stats, err := sink.GetFileReadStats(path)
 		if err != nil {
-			resp.Error = &rpcError{Code: -32013, Message: err.Error()}
-			return resp
+			return toolError(resp, "get_file_read_stats failed: "+err.Error(), nil)
 		}
 		summary := fmt.Sprintf("file=%s total_reads=%d total_lines_read=%d total_cost=$%.4f unique_models=%d",
 			stats.FilePath, stats.TotalReads, stats.TotalLinesRead, stats.TotalCostUSD, stats.UniqueModels)
@@ -473,8 +527,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			events, err = sink.GetRecentEvents(limit)
 		}
 		if err != nil {
-			resp.Error = &rpcError{Code: -32014, Message: err.Error()}
-			return resp
+			return toolError(resp, "get_file_diff_history failed: "+err.Error(), nil)
 		}
 		summary := fmt.Sprintf("Found %d diff events for file filter %q.", len(events), path)
 		resp.Result = map[string]interface{}{
@@ -484,7 +537,8 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			"data": events,
 		}
 	default:
-		resp.Error = &rpcError{Code: -32601, Message: "unknown tool: " + name}
+		// MCP spec: an unknown tool name is an invalid-params protocol error.
+		resp.Error = &rpcError{Code: -32602, Message: "unknown tool: " + name}
 	}
 	return resp
 }

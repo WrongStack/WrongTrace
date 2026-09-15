@@ -31,14 +31,45 @@ func (e *Engine) LockFile(path, reason string) LockInfo {
 	return e.LockFileWithOptions(path, reason, "", "", 15*time.Minute)
 }
 
+// LockConflictError is returned by TryLockFile when another owner holds the lock.
+type LockConflictError = ipc.LockConflictError
+
+// ErrLockConflict matches every *LockConflictError via errors.Is.
+var ErrLockConflict = ipc.ErrLockConflict
+
 // LockFileWithOptions locks a file with explicit owner, run ID, and duration.
+// It is the unconditional (administrative/force) form: it replaces any
+// existing lock. Agent-facing surfaces must use TryLockFile, which refuses to
+// steal a lock held by a different owner.
 func (e *Engine) LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) LockInfo {
+	info, _ := e.TryLockFile(path, reason, owner, ownerRunID, ttl, true)
+	return info
+}
+
+// TryLockFile acquires a lock like LockFileWithOptions, but — unless force is
+// set — returns a *LockConflictError (matching ErrLockConflict) when an
+// unexpired lock on the same or a nesting path is held by a different named
+// owner. The check and the write happen under one critical section, so two
+// agents racing for the same file cannot both succeed. Same-owner re-locks
+// refresh the lock; anonymous (owner-less) and expired locks stay takeable.
+func (e *Engine) TryLockFile(path, reason, owner, ownerRunID string, ttl time.Duration, force bool) (LockInfo, error) {
 	e.lockMu.Lock()
 	defer e.lockMu.Unlock()
 	if e.lockedFiles == nil {
 		e.lockedFiles = make(map[string]LockInfo)
 	}
 	norm := normalizeLockPath(path)
+	if !force {
+		now := time.Now().UTC()
+		for k, existing := range e.lockedFiles {
+			if now.After(existing.ExpiresAt) || !lockPathMatch(k, norm) {
+				continue
+			}
+			if existing.Owner != "" && existing.Owner != owner {
+				return existing, &LockConflictError{Path: path, Existing: existing}
+			}
+		}
+	}
 	if reason == "" {
 		reason = "file is explicitly locked by administrator guardrail"
 	}
@@ -55,7 +86,7 @@ func (e *Engine) LockFileWithOptions(path, reason, owner, ownerRunID string, ttl
 		ExpiresAt:  now.Add(ttl),
 	}
 	e.lockedFiles[norm] = info
-	return info
+	return info, nil
 }
 
 // UnlockFile removes a lock on a file.

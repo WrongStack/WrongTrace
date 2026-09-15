@@ -3,6 +3,7 @@ package mcp
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -385,11 +386,17 @@ func TestCallTool_ReportTelemetry_SinkFailure(t *testing.T) {
 	sink := &fakeSink{reportErr: errors.New("sqlite: disk full")}
 	resp := callTool(sink, toolCallReq(4, "report_telemetry",
 		`{"model":"m","provider":"p","task_id":"t","intent":"i"}`))
-	if resp.Error == nil || resp.Error.Code != -32010 {
-		t.Fatalf("want -32010, got %+v", resp.Error)
+	// MCP spec: a tool execution failure is a result flagged isError, not a
+	// JSON-RPC error (those are reserved for unknown tools / bad params).
+	if resp.Error != nil {
+		t.Fatalf("sink failure must be an isError tool result, got rpc error %+v", resp.Error)
 	}
-	if !strings.Contains(resp.Error.Message, "disk full") {
-		t.Errorf("message %q should propagate sink cause", resp.Error.Message)
+	res := wireResult(t, resp)
+	if res["isError"] != true {
+		t.Fatalf("isError = %v, want true (%v)", res["isError"], res)
+	}
+	if !strings.Contains(fmt.Sprint(res["content"]), "disk full") {
+		t.Errorf("content %v should propagate sink cause", res["content"])
 	}
 }
 
@@ -442,15 +449,19 @@ func TestCallTool_GetFileHealth_MissingPath(t *testing.T) {
 func TestCallTool_GetFileHealth_SinkFailure(t *testing.T) {
 	sink := &fakeSink{healthErr: errors.New("connection refused")}
 	resp := callTool(sink, toolCallReq(7, "get_file_health_score", `{"file_path":"x.go"}`))
-	if resp.Error == nil || resp.Error.Code != -32011 {
-		t.Fatalf("want -32011, got %+v", resp.Error)
+	if resp.Error != nil {
+		t.Fatalf("sink failure must be an isError tool result, got rpc error %+v", resp.Error)
+	}
+	if res := wireResult(t, resp); res["isError"] != true ||
+		!strings.Contains(fmt.Sprint(res["content"]), "connection refused") {
+		t.Fatalf("want isError result carrying the cause, got %v", res)
 	}
 }
 
 func TestCallTool_UnknownTool(t *testing.T) {
 	resp := callTool(&fakeSink{}, toolCallReq(8, "delete_everything", `{}`))
-	if resp.Error == nil || resp.Error.Code != -32601 {
-		t.Fatalf("want -32601, got %+v", resp.Error)
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Fatalf("want -32602 (MCP spec: unknown tool), got %+v", resp.Error)
 	}
 	if !strings.Contains(resp.Error.Message, "unknown tool") {
 		t.Errorf("message %q should say unknown tool", resp.Error.Message)
@@ -718,8 +729,8 @@ func TestMCP_ToolsAndErrorHandling(t *testing.T) {
 	// 4. Unknown tool error
 	req = toolCallReq(15, "no_such_tool", `{}`)
 	resp = dispatch(sink, req)
-	if resp.Error == nil || resp.Error.Code != -32601 {
-		t.Errorf("expected error -32601 for unknown tool, got %+v", resp.Error)
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Errorf("expected error -32602 for unknown tool, got %+v", resp.Error)
 	}
 
 	// 5. Unknown method error

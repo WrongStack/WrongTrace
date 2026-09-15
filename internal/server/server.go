@@ -46,6 +46,7 @@ type EngineAPI interface {
 	CheckGuardrail(path string) (core.GuardrailResult, error)
 	LockFile(path, reason string) core.LockInfo
 	LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) core.LockInfo
+	TryLockFile(path, reason, owner, ownerRunID string, ttl time.Duration, force bool) (core.LockInfo, error)
 	UnlockFile(path string)
 	IsFileLocked(path string) (bool, core.LockInfo)
 	ListLocks() []core.LockInfo
@@ -107,7 +108,17 @@ type Config struct {
 	// unauthenticated loopback behavior. Falls back to WRONGTRACE_TOKEN when
 	// unset so operators never have to plumb it through code.
 	AuthToken string
+	// BaseContext, when set, is the parent context of every request. The
+	// daemon passes its lifetime context so long-lived handlers (SSE streams,
+	// WebSockets, streaming proxy relays) observe shutdown instead of pinning
+	// goroutines past it.
+	BaseContext context.Context
 }
+
+// allowedHostsEnv lists extra Host names (comma-separated) the DNS-rebinding
+// guard accepts, e.g. "host.docker.internal" for a container reaching a
+// daemon bound to 0.0.0.0. IP literals and localhost are always accepted.
+const allowedHostsEnv = "WRONGTRACE_ALLOWED_HOSTS"
 
 // authCookieName carries the per-process session nonce minted by GET /auth so
 // the browser dashboard can authenticate (browsers cannot attach Authorization
@@ -124,6 +135,7 @@ type Server struct {
 
 	authToken    string // expected shared secret; empty disables enforcement
 	sessionNonce string // random value accepted as the auth cookie
+	allowedHosts []string
 }
 
 // New constructs a Server with all routes wired.
@@ -146,6 +158,11 @@ func New(cfg Config) *Server {
 			log.Printf("http: session nonce unavailable (%v); header/query token auth still enforced", err)
 		}
 	}
+	for _, h := range strings.Split(os.Getenv(allowedHostsEnv), ",") {
+		if h = normalizeHostName(h); h != "" {
+			s.allowedHosts = append(s.allowedHosts, h)
+		}
+	}
 	s.router = s.buildRouter()
 	return s
 }
@@ -163,6 +180,17 @@ func (s *Server) Start() error {
 			"rewrite settings, and release guardrail locks to every reachable host. Set WRONGTRACE_TOKEN.",
 			host)
 	}
+	hs := s.newHTTPServer(addr)
+	s.setHS(hs)
+	log.Printf("http: listening on http://%s", addr)
+	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// newHTTPServer builds the listener config Start serves with.
+func (s *Server) newHTTPServer(addr string) *http.Server {
 	hs := &http.Server{
 		Addr:              addr,
 		Handler:           s.router,
@@ -170,12 +198,10 @@ func (s *Server) Start() error {
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
-	s.setHS(hs)
-	log.Printf("http: listening on http://%s", addr)
-	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	if base := s.cfg.BaseContext; base != nil {
+		hs.BaseContext = func(net.Listener) context.Context { return base }
 	}
-	return nil
+	return hs
 }
 
 // Shutdown gracefully drains in-flight requests. Safe to call before Start
@@ -222,12 +248,90 @@ func loopbackCORS(next http.Handler) http.Handler {
 	})
 }
 
+// isSameOriginRequest accepts Origin == Host only when hostGuard vetted the
+// Host first. A bare comparison is exactly what DNS rebinding defeats: a page
+// on attacker.test:3444 re-resolved to 127.0.0.1 sends Origin and Host that
+// match each other while naming the attacker's domain.
 func isSameOriginRequest(origin string, r *http.Request) bool {
 	u, err := url.Parse(origin)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || r == nil {
 		return false
 	}
-	return strings.EqualFold(u.Host, r.Host)
+	return hostVerified(r) && strings.EqualFold(u.Host, r.Host)
+}
+
+type ctxKey int
+
+const hostVerifiedKey ctxKey = iota
+
+// hostVerified reports whether the request passed hostGuard.
+func hostVerified(r *http.Request) bool {
+	v, _ := r.Context().Value(hostVerifiedKey).(bool)
+	return v
+}
+
+// normalizeHostName strips brackets, a trailing root dot, and case.
+func normalizeHostName(h string) string {
+	h = strings.TrimSpace(h)
+	h = strings.TrimSuffix(strings.Trim(h, "[]"), ".")
+	return strings.ToLower(h)
+}
+
+// hostGuard blocks DNS rebinding. When the daemon is bound to loopback, or no
+// token protects it, the Host header must name the daemon: localhost, an IP
+// literal (a literal involves no DNS, so it cannot be rebound — and a page
+// served from it is the daemon itself), the configured bind host, or an entry
+// in WRONGTRACE_ALLOWED_HOSTS. A token-protected non-loopback bind accepts any
+// Host, since the token is what stands between the network and the API.
+func (s *Server) hostGuard(next http.Handler) http.Handler {
+	enforce := isLoopbackHost(s.cfg.Host) || s.authToken == ""
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if enforce && !s.hostAllowed(r.Host) {
+			writeError(w, http.StatusForbidden,
+				"request Host not allowed (DNS rebinding protection); use localhost or an IP address, or add the name to "+allowedHostsEnv)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), hostVerifiedKey, true)))
+	})
+}
+
+func (s *Server) hostAllowed(hostport string) bool {
+	h := hostport
+	if hh, _, err := net.SplitHostPort(hostport); err == nil {
+		h = hh
+	}
+	h = normalizeHostName(h)
+	switch {
+	case h == "", h == "localhost":
+		return true
+	case net.ParseIP(h) != nil:
+		return true
+	}
+	if bind := normalizeHostName(s.cfg.Host); bind != "" && h == bind {
+		return true
+	}
+	for _, a := range s.allowedHosts {
+		if h == a {
+			return true
+		}
+	}
+	return false
+}
+
+// healthDetailAllowed gates the diagnostic fields of /api/health (repo name,
+// IPC socket path, WebSocket client count). With a token they require the
+// same credentials as the rest of the API; without one only loopback peers
+// get them. The liveness fields stay public either way.
+func (s *Server) healthDetailAllowed(r *http.Request) bool {
+	if s.authToken != "" {
+		return s.authorized(r)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func isLoopbackOrigin(origin string) bool {
@@ -360,6 +464,9 @@ func (s *Server) buildRouter() chi.Router {
 	// requestLogger logs and that the gateway proxy records into telemetry.
 	r.Use(requestLogger)
 	r.Use(middleware.Recoverer)
+	// Host validation runs before CORS: the same-origin shortcut in CORS and
+	// the WebSocket origin check trust only a Host this guard accepted.
+	r.Use(s.hostGuard)
 	// Loopback CORS only. The dashboard is served same-origin and the vite
 	// dev server proxies API calls server-side, so no cross-origin reads are
 	// ever legitimate; a "*" policy would let any webpage the developer
@@ -380,8 +487,9 @@ func (s *Server) buildRouter() chi.Router {
 	}
 
 	h := &Handlers{
-		Engine:     s.cfg.Engine,
-		SocketPath: s.cfg.SocketPath,
+		Engine:       s.cfg.Engine,
+		SocketPath:   s.cfg.SocketPath,
+		HealthDetail: s.healthDetailAllowed,
 		Profiler: profiler.NewCollector(profiler.Config{
 			Store: store,
 			GetStore: func() *db.Store {

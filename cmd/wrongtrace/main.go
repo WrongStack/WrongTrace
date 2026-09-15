@@ -17,6 +17,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,6 +38,10 @@ import (
 // version is overridden via -ldflags at release build time.
 var version = "dev"
 
+// supervisedShutdownGrace bounds how long shutdown waits for supervised
+// components to return after cancellation.
+const supervisedShutdownGrace = 10 * time.Second
+
 var rootCmd = &cobra.Command{
 	Use:   "wrongtrace",
 	Short: "AI-native code churn & agent observability daemon",
@@ -45,6 +50,11 @@ lifecycle of code nodes (functions, classes, methods) and correlates them with
 agent telemetry to expose churn, thrashing, model survival, and token ROI.`,
 	Version: version,
 	RunE:    runStart,
+	// A runtime failure (duplicate daemon, unreachable DB, a traced command
+	// exiting non-zero) is not a usage mistake: dumping the whole usage text
+	// buried the one line that mattered. main prints the error exactly once.
+	SilenceUsage:  true,
+	SilenceErrors: true,
 }
 
 var startCmd = &cobra.Command{
@@ -119,13 +129,37 @@ func init() {
 
 	reportCmd.Flags().String("format", "markdown", "report format: markdown, html, or json")
 	reportCmd.Flags().String("out", "", "output file path (default stdout)")
+
+	// With usage silenced globally, a genuine flag mistake still points the
+	// user at help instead of failing with a bare parse error.
+	rootCmd.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
+		return fmt.Errorf("%w (run '%s --help' for usage)", err, c.CommandPath())
+	})
 }
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		code, msg := exitStatus(err)
+		if msg != "" {
+			fmt.Fprintln(os.Stderr, "Error:", msg)
+		}
+		os.Exit(code)
 	}
+}
+
+// exitStatus maps a command error to the process exit code and the message to
+// print. A traced child's non-zero exit is propagated verbatim and not
+// re-printed (the child already wrote its own diagnostics), so
+// `wrongtrace trace -- go test ./...` behaves like the wrapped command in
+// scripts and CI. Every other error exits 1 with its message.
+func exitStatus(err error) (int, string) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if code := exitErr.ExitCode(); code > 0 {
+			return code, ""
+		}
+	}
+	return 1, err.Error()
 }
 
 // resolvePort applies the flag → WRONGTRACE_PORT → PORT precedence shared by
@@ -178,9 +212,9 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	instanceLock, err := lock.Acquire(dataDir, port)
 	if err != nil {
 		if errors.Is(err, lock.ErrAlreadyRunning) {
-			log.Printf("daemon: %v — refusing duplicate execution", err)
-			fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
-			return nil
+			// Non-zero exit: a supervisor or script that ran `start` must be
+			// able to tell "I started the daemon" from "one was already up".
+			return fmt.Errorf("refusing duplicate execution: %w", err)
 		}
 		log.Printf("daemon: lock warning: %v", err)
 	} else {
@@ -225,6 +259,10 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		AST:      astEngine,
 		WatchDir: abs,
 	})
+	// Registered after the store/AST defers so it runs BEFORE them: it stops
+	// the engine's sampler and background indexing, which still use both.
+	// Deferred calls run after the supervised-goroutine wait below.
+	defer engine.Close()
 	engine.PrimeDirectory(abs)
 
 	// Filesystem watcher with debouncing + ignore rules.
@@ -253,16 +291,19 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		defer ipcServer.Stop()
 	}
 
-	// Embedded HTTP server + WebSocket hub.
-	httpServer := server.New(server.Config{
-		Port:       port,
-		Host:       bindHost,
-		Engine:     engine,
-		SocketPath: socketPath,
-	})
-
+	// Daemon lifetime context: cancelled on the first shutdown signal.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Embedded HTTP server + WebSocket hub. BaseContext ties every request to
+	// the daemon lifetime so SSE/WebSocket handlers exit on shutdown.
+	httpServer := server.New(server.Config{
+		Port:        port,
+		Host:        bindHost,
+		Engine:      engine,
+		SocketPath:  socketPath,
+		BaseContext: ctx,
+	})
 
 	// Hand idle heap back to the OS after bursts instead of sitting at peak RSS.
 	startScavenger(ctx.Done())
@@ -336,7 +377,19 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	// Each long-lived component runs under superviseLoop: panics and errors
 	// restart the component with backoff instead of taking the daemon down,
 	// and every wait is cancellable so shutdown stays prompt.
-	go superviseLoop(ctx, "http server", func() error {
+	// They are tracked so shutdown waits for them to return before the
+	// deferred Close calls tear down the store, watcher, and AST engine
+	// underneath still-running goroutines.
+	var supervised sync.WaitGroup
+	goSupervised := func(name string, fn func() error) {
+		supervised.Add(1)
+		go func() {
+			defer supervised.Done()
+			superviseLoop(ctx, name, fn)
+		}()
+	}
+
+	goSupervised("http server", func() error {
 		// Start returns nil on graceful close; a real bind failure comes back
 		// as an error and drives the backoff.
 		err := httpServer.Start()
@@ -346,12 +399,12 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		return err
 	})
 
-	go superviseLoop(ctx, "watcher", func() error {
+	goSupervised("watcher", func() error {
 		w.Run(ctx)
 		return nil
 	})
 
-	go superviseLoop(ctx, "engine", func() error {
+	goSupervised("engine", func() error {
 		engine.Run(ctx)
 		return nil
 	})
@@ -374,13 +427,19 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
-	log.Printf("received signal %s (%T), shutting down daemon", sig, sig)
+	// Restore default signal handling so a second Ctrl+C force-exits a
+	// shutdown that is taking too long instead of being swallowed.
+	signal.Stop(sigCh)
+	log.Printf("received signal %s (%T), shutting down daemon (press Ctrl+C again to force exit)", sig, sig)
 
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("http shutdown error: %v", err)
+	}
+	if !waitTimeout(&supervised, supervisedShutdownGrace) {
+		log.Printf("shutdown: supervised components still running after %s; closing resources anyway", supervisedShutdownGrace)
 	}
 	log.Printf("wrongtrace stopped gracefully")
 	return nil
@@ -404,6 +463,8 @@ func runMCP(cmd *cobra.Command, _ []string) error {
 		Store:    store,
 		AST:      nil, // MCP mode never parses files; only reports/queries telemetry.
 	})
+	defer engine.Close() // runs before the deferred store.Close
+
 	mcp.SetVersion(version)
 	return mcp.ServeStdio(engine)
 }
@@ -560,7 +621,10 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = os.Stderr
 
-	fmt.Printf("⏱  [WrongTrace] Profiling command: %s\n", strings.Join(args, " "))
+	// Banners go to stderr: stdout belongs to the traced command so
+	// `wrongtrace trace -- cmd | jq` pipes only cmd's output.
+	banner := cmd.ErrOrStderr()
+	fmt.Fprintf(banner, "⏱  [WrongTrace] Profiling command: %s\n", strings.Join(args, " "))
 	runErr := execCmd.Run()
 	duration := time.Since(startTime)
 	durationMs := float64(duration.Microseconds()) / 1000.0
@@ -629,7 +693,7 @@ func runTrace(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("\n📊 [WrongTrace] Captured Execution Trace: duration=%.2fms status=%d node=%s\n",
+	fmt.Fprintf(banner, "\n📊 [WrongTrace] Captured Execution Trace: duration=%.2fms status=%d node=%s\n",
 		durationMs, statusCode, nodeSig)
 
 	return runErr

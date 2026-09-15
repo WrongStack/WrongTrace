@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,7 +47,10 @@ type EngineSink interface {
 	RecordReadEvent(rec db.FileReadRecord) error
 	FileHealth(p string) (FileHealthReply, error)
 	CheckGuardrail(p string) (GuardrailResult, error)
-	LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) LockInfo
+	// TryLockFile must refuse (returning a *LockConflictError) when a
+	// different owner already holds an unexpired lock; force=false always
+	// on this agent-facing surface.
+	TryLockFile(path, reason, owner, ownerRunID string, ttl time.Duration, force bool) (LockInfo, error)
 	UnlockFile(path string)
 	ListLocks() []LockInfo
 	GetFileReadStats(filePath string) (db.FileReadStats, error)
@@ -75,7 +79,22 @@ type Config struct {
 	SocketPath string
 	Engine     EngineSink
 	Version    string
+	// MaxConns caps concurrently served connections; extra connections are
+	// closed immediately. Zero selects DefaultMaxConns.
+	MaxConns int
+	// IdleTimeout closes a connection that sends nothing for this long. It is
+	// re-armed before every read, so a persistent client that keeps talking
+	// is never cut off. Zero selects DefaultIdleTimeout.
+	IdleTimeout time.Duration
 }
+
+const (
+	// DefaultMaxConns bounds goroutines and 128 KiB of per-connection buffers
+	// a local process can pin by opening sockets and never closing them.
+	DefaultMaxConns = 256
+	// DefaultIdleTimeout reaps connections left open with no traffic.
+	DefaultIdleTimeout = 10 * time.Minute
+)
 
 // Server is the agent-facing IPC endpoint.
 type Server struct {
@@ -86,14 +105,28 @@ type Server struct {
 	connsMu   sync.Mutex
 	conns     map[net.Conn]struct{}
 	connected atomic.Int64
+	rejected  atomic.Int64
+	sem       chan struct{}
 	startedAt time.Time
+	// boundPath is the socket file actually bound (differs from SocketPath
+	// after the POSIX long-path fallback); linkPath is the discovery symlink
+	// this server created, if any. Both are removed by Stop.
+	boundPath string
+	linkPath  string
 }
 
 // NewServer returns a Server ready to be started with Start.
 func NewServer(cfg Config) *Server {
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = DefaultMaxConns
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultIdleTimeout
+	}
 	return &Server{
 		cfg:       cfg,
 		conns:     make(map[net.Conn]struct{}),
+		sem:       make(chan struct{}, cfg.MaxConns),
 		startedAt: time.Now(),
 	}
 }
@@ -107,11 +140,12 @@ func (s *Server) Start() error {
 		return errors.New("ipc: socket path is required")
 	}
 
-	ln, err := bindSocket(s.cfg.SocketPath)
+	ln, bound, link, err := bindSocketPaths(s.cfg.SocketPath)
 	if err != nil {
 		return fmt.Errorf("bind socket: %w", err)
 	}
 	s.ln = ln
+	s.boundPath, s.linkPath = bound, link
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
@@ -137,8 +171,25 @@ func (s *Server) Stop() {
 	}
 	s.connsMu.Unlock()
 	s.wg.Wait()
-	if runtime.GOOS != "windows" && s.cfg.SocketPath != "" {
-		_ = os.Remove(s.cfg.SocketPath)
+	if runtime.GOOS == "windows" {
+		return
+	}
+	// Drop the discovery symlink only while it still points at our socket: a
+	// newer daemon (or another user) may have replaced it since.
+	if s.linkPath != "" {
+		if dest, err := os.Readlink(s.linkPath); err == nil && dest == s.boundPath {
+			if err := os.Remove(s.linkPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("ipc: remove discovery symlink %s: %v", s.linkPath, err)
+			}
+		}
+		s.linkPath = ""
+	}
+	// Only the path actually bound: after the long-path fallback the
+	// configured SocketPath was never created by us.
+	if s.boundPath != "" {
+		if err := os.Remove(s.boundPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("ipc: remove socket %s: %v", s.boundPath, err)
+		}
 	}
 }
 
@@ -158,10 +209,23 @@ func (s *Server) acceptLoop(ctx context.Context) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		select {
+		case s.sem <- struct{}{}:
+		default:
+			// At capacity: refuse instead of spawning an unbounded handler.
+			// Log the first rejection and then every 100th so a flood cannot
+			// also flood the daemon log.
+			if n := s.rejected.Add(1); n == 1 || n%100 == 0 {
+				log.Printf("ipc: connection limit (%d) reached, rejecting connection (%d rejected so far)", s.cfg.MaxConns, n)
+			}
+			_ = conn.Close()
+			continue
+		}
 		s.track(conn, true)
 		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
+			defer func() { <-s.sem }()
 			defer s.track(c, false)
 			s.handleConn(ctx, c)
 		}(conn)
@@ -199,12 +263,31 @@ func isClientDisconnect(err error) bool {
 		strings.Contains(msg, "wsarecv")
 }
 
+// wireRequest decodes a request line while keeping the raw id member, so a
+// JSON-RPC notification (no "id" member at all) can be told apart from an
+// explicit "id": null, which still gets a response.
+type wireRequest struct {
+	JSONRPC string                 `json:"jsonrpc"`
+	Method  string                 `json:"method"`
+	Params  map[string]interface{} `json:"params,omitempty"`
+	ID      json.RawMessage        `json:"id,omitempty"`
+}
+
 // handleConn reads newline-delimited JSON-RPC requests and writes one response
-// per request until EOF, error, or cancellation.
+// per request (none for notifications) until EOF, error, idle timeout, or
+// cancellation.
 func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 	reader := bufio.NewReaderSize(c, 64*1024)
 	writer := bufio.NewWriterSize(c, 64*1024)
 	defer func() { _ = writer.Flush() }()
+
+	writeErrorLine := func(code int, msg string) bool {
+		payload, mErr := json.Marshal(Response{JSONRPC: "2.0", ID: nil, Error: &RPCError{Code: code, Message: msg}})
+		if mErr != nil {
+			return true
+		}
+		return writeJSONLine(writer, payload) == nil
+	}
 
 	for {
 		select {
@@ -212,25 +295,44 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 			return
 		default:
 		}
+		if s.cfg.IdleTimeout > 0 {
+			_ = c.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
+		}
 		line, err := readJSONLine(reader)
+		if errors.Is(err, errLineTooLong) {
+			// The oversized line was drained up to its newline, so framing is
+			// intact: report it and keep serving the connection.
+			if !writeErrorLine(-32600, fmt.Sprintf("invalid request: line exceeds %d bytes", maxJSONLineBytes)) {
+				return
+			}
+			continue
+		}
 		if err != nil {
-			if !isClientDisconnect(err) {
+			var ne net.Error
+			switch {
+			case errors.As(err, &ne) && ne.Timeout():
+				log.Printf("ipc: closing connection idle for %s", s.cfg.IdleTimeout)
+			case !isClientDisconnect(err):
 				log.Printf("ipc: read error: %v", err)
 			}
 			return
 		}
-		var req Request
-		if err := json.Unmarshal(line, &req); err != nil {
-			parseErrPayload, mErr := json.Marshal(Response{
-				JSONRPC: "2.0",
-				ID:      nil,
-				Error:   &RPCError{Code: -32700, Message: "parse error: " + err.Error()},
-			})
-			if mErr != nil {
-				continue
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue // blank separator lines are not requests
+		}
+		var wire wireRequest
+		if err := json.Unmarshal(line, &wire); err != nil {
+			if !writeErrorLine(-32700, "parse error: "+err.Error()) {
+				return
 			}
-			_ = writeJSONLine(writer, parseErrPayload)
 			continue
+		}
+		isNotification := wire.ID == nil
+		req := Request{JSONRPC: wire.JSONRPC, Method: wire.Method, Params: wire.Params}
+		if !isNotification {
+			if err := json.Unmarshal(wire.ID, &req.ID); err != nil {
+				req.ID = nil
+			}
 		}
 		start := time.Now()
 		resp := s.dispatch(&req)
@@ -264,6 +366,11 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 			})
 		}
 
+		if isNotification {
+			// JSON-RPC 2.0 §4.1: the server MUST NOT reply to a notification.
+			// It is still dispatched (fire-and-forget telemetry) and recorded.
+			continue
+		}
 		if err := writeJSONLine(writer, respPayload); err != nil {
 			if !isClientDisconnect(err) {
 				log.Printf("ipc: write error: %v", err)
@@ -450,7 +557,19 @@ func (s *Server) dispatch(req *Request) Response {
 		} else {
 			ttl = 15 * time.Minute
 		}
-		info := s.cfg.Engine.LockFileWithOptions(filePath, p.Reason, p.Owner, p.OwnerRunID, ttl)
+		info, err := s.cfg.Engine.TryLockFile(filePath, p.Reason, p.Owner, p.OwnerRunID, ttl, false)
+		if err != nil {
+			var conflict *LockConflictError
+			if errors.As(err, &conflict) {
+				resp.Error = &RPCError{Code: -32602, Message: conflict.Error(), Data: map[string]interface{}{
+					"status":   "conflict",
+					"existing": conflict.Existing,
+				}}
+				return resp
+			}
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+			return resp
+		}
 		resp.Result = info
 
 	case "unlock_file", "guardrail/unlock", "telemetry/unlock_file":
@@ -590,13 +709,26 @@ func callAtlas(engine any, filter string) (any, error) {
 	return nil, errors.New("unexpected atlas return signature")
 }
 
+// discoveryLinkPath is the well-known POSIX symlink third-party agents probe.
+// A variable only so tests can point it at a temp dir instead of real /tmp.
+var discoveryLinkPath = "/tmp/wrongtrace.sock"
+
 // bindSocket opens a Unix Domain Socket or Named Pipe, depending on platform.
 func bindSocket(path string) (net.Listener, error) {
+	ln, _, _, err := bindSocketPaths(path)
+	return ln, err
+}
+
+// bindSocketPaths binds like bindSocket and also reports the socket file
+// actually bound and the discovery symlink it created ("" when none), so Stop
+// can clean both up.
+func bindSocketPaths(path string) (net.Listener, string, string, error) {
 	if runtime.GOOS == "windows" {
 		if dir := filepath.Dir(path); dir != "" && dir != "." && !strings.HasPrefix(path, `\\.\pipe`) {
 			_ = os.MkdirAll(dir, 0o755)
 		}
-		return bindWindowsPipe(path)
+		ln, err := bindWindowsPipe(path)
+		return ln, path, "", err
 	}
 
 	// POSIX Unix Domain Socket handling
@@ -615,27 +747,59 @@ func bindSocket(path string) (net.Listener, error) {
 
 	if dir := filepath.Dir(targetPath); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, err
+			return nil, "", "", err
 		}
 	}
 
-	// Clean stale socket from a previous run; ignore "not exist" errors.
-	if _, err := os.Stat(targetPath); err == nil {
-		_ = os.Remove(targetPath)
+	// Clean a stale socket from a previous run. The fallback lives in a
+	// shared, world-writable directory, so never delete an entry another user
+	// planted there: refuse to bind rather than serve (or clobber) theirs.
+	if fi, err := os.Lstat(targetPath); err == nil {
+		if !ownedByCurrentUser(fi) {
+			return nil, "", "", fmt.Errorf("refusing to replace %s: it is owned by another user", targetPath)
+		}
+		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("ipc: remove stale socket %s: %v", targetPath, err)
+		}
 	}
 	ln, err := net.Listen("unix", targetPath)
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
 
-	// On POSIX, if primary socket is ~/.wrongtrace/wrongtrace.sock, also create /tmp/wrongtrace.sock
-	// symlink for zero-config discovery by third-party agents looking in /tmp.
-	if targetPath != "/tmp/wrongtrace.sock" {
-		_ = os.Remove("/tmp/wrongtrace.sock")
-		_ = os.Symlink(targetPath, "/tmp/wrongtrace.sock")
+	// On POSIX, if the primary socket is ~/.wrongtrace/wrongtrace.sock, also
+	// publish a /tmp/wrongtrace.sock symlink for zero-config discovery.
+	link := ""
+	if targetPath != discoveryLinkPath && publishDiscoveryLink(targetPath, discoveryLinkPath) {
+		link = discoveryLinkPath
 	}
+	return ln, targetPath, link, nil
+}
 
-	return ln, nil
+// publishDiscoveryLink points linkPath at target. An existing entry is
+// replaced only when it is a symlink owned by the current user (a previous
+// run of ours); anything else — another user's socket, file, or symlink
+// squatting the well-known name — is logged and left untouched so agents are
+// never silently redirected. Reports whether the symlink was created.
+func publishDiscoveryLink(target, linkPath string) bool {
+	if fi, err := os.Lstat(linkPath); err == nil {
+		if fi.Mode()&os.ModeSymlink == 0 || !ownedByCurrentUser(fi) {
+			log.Printf("ipc: leaving %s untouched: not a symlink owned by this user (discovery link not published)", linkPath)
+			return false
+		}
+		if err := os.Remove(linkPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("ipc: replace discovery symlink %s: %v", linkPath, err)
+			return false
+		}
+	} else if !os.IsNotExist(err) {
+		log.Printf("ipc: inspect discovery symlink %s: %v", linkPath, err)
+		return false
+	}
+	if err := os.Symlink(target, linkPath); err != nil {
+		log.Printf("ipc: create discovery symlink %s -> %s: %v", linkPath, target, err)
+		return false
+	}
+	return true
 }
 
 // maxIPCHistoryLimit caps positive client-supplied history limits, matching
@@ -645,20 +809,33 @@ const maxIPCHistoryLimit = 1000
 
 const maxJSONLineBytes = 16 * 1024 * 1024 // 16 MB max line length to protect against unbounded RAM allocation
 
+// errLineTooLong reports a request line over maxJSONLineBytes. The rest of the
+// line has already been discarded, so the stream is positioned at the next
+// request and the caller may keep serving.
+var errLineTooLong = errors.New("ipc: line too long, exceeded maximum buffer limit")
+
 func readJSONLine(r *bufio.Reader) ([]byte, error) {
 	var line []byte
+	tooLong := false
 	for {
 		chunk, isPrefix, err := r.ReadLine()
 		if err != nil {
 			return nil, err
 		}
-		if len(line)+len(chunk) > maxJSONLineBytes {
-			return nil, errors.New("ipc: line too long, exceeded maximum buffer limit")
+		if !tooLong {
+			if len(line)+len(chunk) > maxJSONLineBytes {
+				tooLong = true
+				line = nil // release what was buffered; drain the rest
+			} else {
+				line = append(line, chunk...)
+			}
 		}
-		line = append(line, chunk...)
 		if !isPrefix {
 			break
 		}
+	}
+	if tooLong {
+		return nil, errLineTooLong
 	}
 	return line, nil
 }

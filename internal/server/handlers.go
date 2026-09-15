@@ -27,6 +27,9 @@ type Handlers struct {
 	Profiler   *profiler.Collector
 	Proxy      *proxy.GatewayProxy
 	SocketPath string
+	// HealthDetail decides whether /api/health may include diagnostics
+	// (repo, socket_path, ws_clients). Nil means never.
+	HealthDetail func(*http.Request) bool
 }
 
 // writeJSON serializes v and writes it with the appropriate content type.
@@ -75,21 +78,26 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
 // Health is a cheap readiness probe: no DB hit, no fsnotify check. It answers
 // "did the HTTP listener come up?" plus live diagnostics, including the IPC
 // endpoint agents should connect to (empty when IPC is disabled).
-func (h *Handlers) Health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
+	body := map[string]interface{}{
 		// "service" identifies the daemon unambiguously. Single-instance
 		// startup probes the configured port and used to treat ANY 200 as
 		// "WrongTrace is already running" -- {"ok":true,"status":"ok"} is a
 		// generic health shape, so an unrelated dev server on the same port
 		// blocked startup with a wrong diagnosis. Do not rename this value.
-		"service":     "wrongtrace",
-		"ok":          true,
-		"status":      "ok",
-		"repo":        h.Engine.Repo(),
-		"timestamp":   time.Now().UTC(),
-		"ws_clients":  h.Engine.Hub().ClientCount(),
-		"socket_path": h.SocketPath,
-	})
+		"service":   "wrongtrace",
+		"ok":        true,
+		"status":    "ok",
+		"timestamp": time.Now().UTC(),
+	}
+	// The route is exempt from token auth for liveness probes, so the
+	// diagnostic fields are only disclosed to callers the server vouches for.
+	if h.HealthDetail != nil && h.HealthDetail(r) {
+		body["repo"] = h.Engine.Repo()
+		body["ws_clients"] = h.Engine.Hub().ClientCount()
+		body["socket_path"] = h.SocketPath
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (h *Handlers) getProjectFilter(r *http.Request) string {
@@ -634,24 +642,6 @@ func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
 		ownerRunID = req.RunID
 	}
 
-	if locked, existing := h.Engine.IsFileLocked(targetPath); locked {
-		if existing.Owner != "" && existing.Owner != owner && !req.Force {
-			writeJSON(w, http.StatusConflict, map[string]interface{}{
-				"ok":           false,
-				"status":       "conflict",
-				"error":        "file is already locked",
-				"message":      fmt.Sprintf("file %s is already locked by %s", targetPath, existing.Owner),
-				"path":         existing.Path,
-				"reason":       existing.Reason,
-				"owner":        existing.Owner,
-				"owner_run_id": existing.OwnerRunID,
-				"locked_at":    existing.LockedAt,
-				"expires_at":   existing.ExpiresAt,
-			})
-			return
-		}
-	}
-
 	// A client TTL is an integer that can be pushed past int64 nanoseconds:
 	// ttl_seconds=18446744074 overflows into a ~0.29s lock and
 	// ttl_minutes=153722868 wraps negative into the engine's 15-minute
@@ -689,7 +679,30 @@ func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
 		ttl = d
 	}
 
-	info := h.Engine.LockFileWithOptions(targetPath, req.Reason, owner, ownerRunID, ttl)
+	// Owner-conflict detection lives in the engine (TryLockFile) so the check
+	// and the write are atomic and the IPC/MCP surfaces enforce the same rule.
+	info, err := h.Engine.TryLockFile(targetPath, req.Reason, owner, ownerRunID, ttl, req.Force)
+	if err != nil {
+		var conflict *core.LockConflictError
+		if !errors.As(err, &conflict) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		existing := conflict.Existing
+		writeJSON(w, http.StatusConflict, map[string]interface{}{
+			"ok":           false,
+			"status":       "conflict",
+			"error":        "file is already locked",
+			"message":      fmt.Sprintf("file %s is already locked by %s", targetPath, existing.Owner),
+			"path":         existing.Path,
+			"reason":       existing.Reason,
+			"owner":        existing.Owner,
+			"owner_run_id": existing.OwnerRunID,
+			"locked_at":    existing.LockedAt,
+			"expires_at":   existing.ExpiresAt,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":           true,
 		"status":       "locked",

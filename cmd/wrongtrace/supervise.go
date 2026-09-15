@@ -4,8 +4,28 @@ import (
 	"context"
 	"log"
 	"runtime/debug"
+	"sync"
 	"time"
 )
+
+// waitTimeout waits for wg, giving up after d. It reports whether every
+// goroutine finished; shutdown uses it so a wedged component delays exit by at
+// most d instead of hanging the daemon forever.
+func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
 
 // supervisePolicy is the restart timing for one supervised component.
 type supervisePolicy struct {

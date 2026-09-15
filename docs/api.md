@@ -352,6 +352,10 @@ probes keep working on an authenticated daemon.
   Windows, Unix socket elsewhere). Empty when IPC is disabled.
 * `ws_clients` is the current number of connected dashboard WebSocket
   clients.
+* `repo`, `socket_path` and `ws_clients` are **diagnostics**, returned only to
+  trusted callers: a request carrying a valid token, or a loopback caller when
+  no token is configured. Everyone else receives only the public liveness
+  fields `service`, `ok`, `status` and `timestamp`.
 
 ---
 ## 3. Error Handling Format

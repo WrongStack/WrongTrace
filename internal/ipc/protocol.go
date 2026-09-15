@@ -5,7 +5,11 @@
 // dashboard via the WebSocket hub.
 package ipc
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 // Request is the JSON-RPC 2.0 envelope used by the IPC channel. It is
 // deliberately minimal: every method accepts a free-form Params map and
@@ -26,8 +30,9 @@ type Response struct {
 }
 
 type RPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
 }
 
 // LockInfo records guardrail lock metadata including ownership and expiry TTL.
@@ -39,6 +44,25 @@ type LockInfo struct {
 	LockedAt   time.Time `json:"locked_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
 }
+
+// ErrLockConflict is the sentinel every *LockConflictError matches via
+// errors.Is: the file is already held by a different, unexpired owner.
+var ErrLockConflict = errors.New("file is already locked")
+
+// LockConflictError reports a refused lock acquisition and carries the lock
+// that is still in force, so each surface (HTTP 409, IPC/MCP errors) can
+// describe the holder without a second, racy IsFileLocked lookup.
+type LockConflictError struct {
+	Path     string
+	Existing LockInfo
+}
+
+func (e *LockConflictError) Error() string {
+	return fmt.Sprintf("file %s is already locked by %s", e.Path, e.Existing.Owner)
+}
+
+// Is makes errors.Is(err, ErrLockConflict) true for every conflict.
+func (e *LockConflictError) Is(target error) bool { return target == ErrLockConflict }
 
 // GuardrailResult indicates whether an agent should proceed editing a file.
 type GuardrailResult struct {

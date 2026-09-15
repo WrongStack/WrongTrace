@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -56,8 +57,19 @@ func TestLoopbackCORSRejectsForeignOriginBeforeHandler(t *testing.T) {
 		t.Fatalf("foreign origin code=%d called=%v", foreignResult.Code, called)
 	}
 
+	// Origin == Host alone is what a DNS-rebinding page produces, so the
+	// same-origin shortcut requires a Host that hostGuard already vetted.
+	unvetted := httptest.NewRequest(http.MethodPost, "http://wrongtrace.example/api/settings", strings.NewReader("{}"))
+	unvetted.Header.Set("Origin", "http://wrongtrace.example")
+	unvettedResult := httptest.NewRecorder()
+	h.ServeHTTP(unvettedResult, unvetted)
+	if unvettedResult.Code != http.StatusForbidden || called {
+		t.Fatalf("same-origin request on an unvetted Host code=%d called=%v, want 403", unvettedResult.Code, called)
+	}
+
 	sameOrigin := httptest.NewRequest(http.MethodPost, "http://wrongtrace.example/api/settings", strings.NewReader("{}"))
 	sameOrigin.Header.Set("Origin", "http://wrongtrace.example")
+	sameOrigin = sameOrigin.WithContext(context.WithValue(sameOrigin.Context(), hostVerifiedKey, true))
 	sameOriginResult := httptest.NewRecorder()
 	h.ServeHTTP(sameOriginResult, sameOrigin)
 	if sameOriginResult.Code != http.StatusNoContent || !called {
@@ -106,6 +118,9 @@ func (f *failingEngine) LockFile(string, string) core.LockInfo {
 }
 func (f *failingEngine) LockFileWithOptions(string, string, string, string, time.Duration) core.LockInfo {
 	return core.LockInfo{}
+}
+func (f *failingEngine) TryLockFile(string, string, string, string, time.Duration, bool) (core.LockInfo, error) {
+	return core.LockInfo{}, nil
 }
 func (f *failingEngine) UnlockFile(string) {}
 func (f *failingEngine) IsFileLocked(string) (bool, core.LockInfo) {

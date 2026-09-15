@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wrongstack/wrongtrace/internal/db"
+	"github.com/wrongstack/wrongtrace/internal/lock"
 )
 
 func TestRootCmd_HelpAndVersion(t *testing.T) {
@@ -192,9 +194,10 @@ func TestSingleInstance_PreventDuplicate(t *testing.T) {
 		t.Fatalf("write pid: %v", err)
 	}
 
-	// Calling runStart should detect the running instance and return nil gracefully
-	if err := runStart(rootCmd, []string{}); err != nil {
-		t.Errorf("expected runStart to return nil on duplicate instance, got: %v", err)
+	// runStart must detect the running instance and refuse with an error, so
+	// the process exits non-zero instead of pretending it started a daemon.
+	if err := runStart(rootCmd, []string{}); !errors.Is(err, lock.ErrAlreadyRunning) {
+		t.Errorf("expected runStart to return ErrAlreadyRunning on duplicate instance, got: %v", err)
 	}
 }
 

@@ -28,18 +28,16 @@ func checkOrigin(r *http.Request) bool {
 	if origin == "" {
 		return true // non-browser clients do not send Origin
 	}
+	if isLoopbackOrigin(origin) {
+		return true
+	}
+	// Same-host origins are trusted only after hostGuard validated the Host;
+	// a bare Origin==Host match is what a DNS-rebinding page produces.
 	u, err := url.Parse(origin)
-	if err != nil {
+	if err != nil || u.Host == "" {
 		return false
 	}
-	if strings.EqualFold(u.Host, r.Host) {
-		return true
-	}
-	switch u.Hostname() {
-	case "localhost", "127.0.0.1", "::1":
-		return true
-	}
-	return false
+	return hostVerified(r) && strings.EqualFold(u.Host, r.Host)
 }
 
 // writeWait bounds how long a single write may block before we declare the

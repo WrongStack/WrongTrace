@@ -25,6 +25,7 @@ type fakeSink struct {
 	// Round-40 capture: what dispatch actually forwarded for the capped calls.
 	gotLockTTL      time.Duration
 	lockCalls       int
+	lockErr         error
 	gotHistoryLimit int
 	historyCalls    int
 }
@@ -49,10 +50,14 @@ func (f *fakeSink) CheckGuardrail(p string) (GuardrailResult, error) {
 	return GuardrailResult{Allowed: true, HealthScore: 100}, nil
 }
 
-func (f *fakeSink) LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) LockInfo {
+func (f *fakeSink) TryLockFile(path, reason, owner, ownerRunID string, ttl time.Duration, force bool) (LockInfo, error) {
 	f.lockCalls++
 	f.gotLockTTL = ttl
-	return LockInfo{Path: path, Reason: reason, Owner: owner, OwnerRunID: ownerRunID, LockedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(ttl)}
+	info := LockInfo{Path: path, Reason: reason, Owner: owner, OwnerRunID: ownerRunID, LockedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(ttl)}
+	if f.lockErr != nil {
+		return LockInfo{}, f.lockErr
+	}
+	return info, nil
 }
 
 func (f *fakeSink) UnlockFile(path string) {}
