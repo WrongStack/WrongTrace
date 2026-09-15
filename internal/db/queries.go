@@ -244,6 +244,49 @@ func escapeLike(s string) string {
 	return strings.NewReplacer(likeEscape, likeEscape+likeEscape, `%`, likeEscape+`%`, `_`, likeEscape+`_`).Replace(s)
 }
 
+// pathMatchClause is the shared per-file filter used by RecentEventsFiltered,
+// SymbolHistory and FileModelActivity (col is the file_path column, possibly
+// alias-qualified). Bind pathMatchArgs in the same order.
+//
+//  1. col = ?                          raw caller path (exact)
+//  2. norm(col) = ?                    slash-normalized caller path (exact)
+//  3. LOWER(norm(col)) LIKE LOWER(?)   case-insensitive exact, no wildcard
+//  4. norm(col) LIKE '%/' || ?         stored path ends with "/<caller>"
+//  5. ? LIKE '%/' || quoted(norm(col)) caller path ends with "/<stored>"
+//  6. LOWER(norm(col)) LIKE '%/' || LOWER(?)  case-insensitive arm 4
+//
+// Every suffix arm is anchored on '/'. The unanchored '%' || x form this
+// replaces had no directory boundary, so a query for "main.go" also matched
+// "cmd/domain.go" (and a stored "a.go" answered "internal/data.go"), silently
+// merging another file's history. Exact matches are carried by arms 1-3, so a
+// suffix arm only has to cover a proper path-component suffix -- the shape
+// FileHealth has always used.
+//
+// Arms 3, 4 and 6 bind the caller path on the PATTERN side, so the value is
+// escapeLike-quoted and the arm declares ESCAPE (SQLite gives LIKE no escape
+// character otherwise). Arm 5 binds the caller path as the LIKE SUBJECT: ESCAPE
+// processing touches only the pattern, so a backslash escapeLike injected there
+// would be a literal character and a '_'/'%'-bearing absolute caller path could
+// never match its stored relative row (the round-90 defect) -- it stays raw,
+// while the stored path, now pattern-side, is quoted in SQL.
+func pathMatchClause(col string) string {
+	n := "REPLACE(" + col + `, '\', '/')`
+	return "(" + col + " = ?" +
+		" OR " + n + " = ?" +
+		" OR LOWER(" + n + `) LIKE LOWER(?) ESCAPE '\'` +
+		" OR " + n + ` LIKE '%/' || ? ESCAPE '\'` +
+		` OR ? LIKE '%/' || REPLACE(REPLACE(` + n + `, '%', '\%'), '_', '\_') ESCAPE '\'` +
+		" OR LOWER(" + n + `) LIKE '%/' || LOWER(?) ESCAPE '\'` +
+		")"
+}
+
+// pathMatchArgs returns the bind values for pathMatchClause. normSlash is the
+// caller path with backslashes turned into '/' (and any "./" prefix trimmed).
+func pathMatchArgs(filePath, normSlash string) []any {
+	q := escapeLike(normSlash)
+	return []any{filePath, normSlash, q, q, normSlash, q}
+}
+
 // RecentEvents returns the N most recent events for the live feed, optionally filtered by repo_name.
 func (s *Store) RecentEvents(limit int, repoFilter ...string) ([]EventRecord, error) {
 	var repo string
@@ -275,21 +318,8 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 	if filePath != "" {
 		normSlash := strings.ReplaceAll(strings.TrimSpace(filePath), "\\", "/")
 		normSlash = strings.TrimPrefix(normSlash, "./")
-		// Arms 3 and 5 build a LIKE PATTERN from the caller's path, so the
-		// value bound there must have the LIKE metacharacters quoted and the
-		// expression must declare ESCAPE (SQLite gives LIKE no escape character
-		// otherwise). Arms 1, 2 compare literally and arm 4 binds the caller
-		// value as the SUBJECT, not the pattern, so those stay untouched --
-		// escaping a subject would make it never match.
-		whereClauses = append(whereClauses, "(e.file_path = ? OR REPLACE(e.file_path, '\\', '/') = ? OR REPLACE(e.file_path, '\\', '/') LIKE '%' || ? ESCAPE '\\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\\', '/'), '%', '\\%'), '_', '\\_') ESCAPE '\\' OR LOWER(REPLACE(e.file_path, '\\', '/')) LIKE '%' || LOWER(?) ESCAPE '\\')")
-		// Arm 4's placeholder is the LIKE SUBJECT (only its PATTERN comes
-		// from the stored column), and ESCAPE processing touches the pattern
-		// alone — a backslash escapeLike injected into the subject would be
-		// a literal character there, so a '_'/'%'-bearing absolute caller
-		// path could never match its stored relative row. Bind it raw;
-		// arms 3 and 5 keep the quoted value because THEIR placeholders are
-		// pattern-side.
-		args = append(args, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
+		whereClauses = append(whereClauses, pathMatchClause("e.file_path"))
+		args = append(args, pathMatchArgs(filePath, normSlash)...)
 	}
 
 	if !since.IsZero() {
@@ -375,33 +405,49 @@ func (s *Store) Thrashing(minEdits int, lookbackDays int, repoFilter ...string) 
 		repo = repoFilter[0]
 	}
 
-	var query string
-	var args []any
-	if repo == "" {
-		query = `
-			SELECT file_path, node_signature, COUNT(*) AS edit_count,
-			       MIN(event_time) AS first_event, MAX(event_time) AS last_event
-			FROM code_node_events
-			WHERE event_time >= datetime('now', ?)
-			GROUP BY file_path, node_signature
-			HAVING edit_count >= ? AND (julianday(MAX(event_time)) - julianday(MIN(event_time))) <= 1.0
-			ORDER BY edit_count DESC
-			LIMIT 100
-		`
-		args = []any{fmt.Sprintf("-%d days", lookbackDays), minEdits}
-	} else {
-		query = `
-			SELECT file_path, node_signature, COUNT(*) AS edit_count,
-			       MIN(event_time) AS first_event, MAX(event_time) AS last_event
-			FROM code_node_events
-			WHERE event_time >= datetime('now', ?) AND (repo_name = ? OR repo_name = '' OR repo_name IS NULL)
-			GROUP BY file_path, node_signature
-			HAVING edit_count >= ? AND (julianday(MAX(event_time)) - julianday(MIN(event_time))) <= 1.0
-			ORDER BY edit_count DESC
-			LIMIT 100
-		`
-		args = []any{fmt.Sprintf("-%d days", lookbackDays), repo, minEdits}
+	// Each (file, node) pair is scored by its densest ROLLING 24h window, not
+	// by MAX-MIN over the whole lookback: that old test meant one stale edit
+	// days earlier widened the span past 24h and hid a live burst entirely.
+	// For every edit the frame counts the pair's edits in the 24h ending at
+	// it (RANGE over epoch seconds, so the boundary is exact and inclusive);
+	// the pair's reported window is the densest one, the most recent on ties.
+	// EditCount / FirstEvent / LastEvent / WindowHours therefore keep their
+	// meaning: the edits inside one <=24h window, and that window's span.
+	repoClause := ""
+	args := []any{fmt.Sprintf("-%d days", lookbackDays)}
+	if repo != "" {
+		repoClause = "AND (repo_name = ? OR repo_name = '' OR repo_name IS NULL)"
+		args = append(args, repo)
 	}
+	args = append(args, minEdits)
+	query := `
+		WITH win AS (
+			SELECT file_path, node_signature, event_id, event_time,
+			       COUNT(*)        OVER w AS edit_count,
+			       MIN(event_time) OVER w AS first_event,
+			       MAX(event_time) OVER w AS last_event
+			FROM code_node_events
+			WHERE event_time >= datetime('now', ?) ` + repoClause + `
+			WINDOW w AS (
+				PARTITION BY file_path, node_signature
+				ORDER BY CAST(strftime('%s', event_time) AS INTEGER)
+				RANGE BETWEEN 86400 PRECEDING AND CURRENT ROW
+			)
+		),
+		ranked AS (
+			SELECT file_path, node_signature, edit_count, first_event, last_event,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY file_path, node_signature
+			           ORDER BY edit_count DESC, last_event DESC, event_id DESC
+			       ) AS rn
+			FROM win
+		)
+		SELECT file_path, node_signature, edit_count, first_event, last_event
+		FROM ranked
+		WHERE rn = 1 AND edit_count >= ?
+		ORDER BY edit_count DESC, last_event DESC, file_path, node_signature
+		LIMIT 100
+	`
 
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
@@ -458,38 +504,53 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 		repo = repoFilter[0]
 	}
 
-	var query string
-	var args []any
-	if repo == "" {
-		query = `
-		WITH lifecycle AS (
-			SELECT e.node_signature,
+	// Node lifecycle is computed over ALL of a node's events, keyed by
+	// (file_path, node_signature), and the node is attributed to its CREATOR:
+	// the model of its first event (event_time, event_id). Grouping by
+	// (node_signature, model) used to split one node across every model that
+	// touched it -- a node ADDED by model-a and DELETED by model-b counted as a
+	// survivor for model-a and a dead phantom for model-b -- and keying by the
+	// signature alone merged same-named files in different directories
+	// (signatures embed only the basename). Liveness is the last event's
+	// action; ROI survivors are nodes added >= 14 days ago and never deleted.
+	const nodeLifecycleCTEs = `
+		ev AS (
+			SELECT e.file_path, e.node_signature, e.action, e.event_time,
 			       COALESCE(r.model_name, 'unknown') AS model_name,
-			       MIN(e.event_time) AS birth_time,
-			       MAX(CASE WHEN e.action = 'DELETED' THEN e.event_time END) AS death_time,
-			       MAX(e.event_time) AS last_event_time
+			       ROW_NUMBER() OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time ASC,  e.event_id ASC)  AS rn_first,
+			       ROW_NUMBER() OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time DESC, e.event_id DESC) AS rn_last
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			GROUP BY e.node_signature, COALESCE(r.model_name, 'unknown')
+			%s
+		),
+		lifecycle AS (
+			SELECT MAX(CASE WHEN rn_first = 1 THEN model_name END)          AS model_name,
+			       MIN(event_time)                                          AS birth_time,
+			       MAX(event_time)                                          AS last_event_time,
+			       MAX(CASE WHEN rn_last = 1 AND action = 'DELETED' THEN 1 ELSE 0 END) AS is_dead,
+			       MAX(CASE WHEN action = 'DELETED' THEN 1 ELSE 0 END)      AS ever_deleted,
+			       MIN(CASE WHEN action = 'ADDED' THEN event_time END)      AS first_added_time
+			FROM ev
+			GROUP BY file_path, node_signature
 		),
 		lc AS (
 			SELECT model_name,
 			       COUNT(*) AS total_nodes,
-			       SUM(CASE WHEN death_time IS NULL OR last_event_time > death_time THEN 1 ELSE 0 END) AS active_nodes,
-			       AVG(julianday(COALESCE(CASE WHEN last_event_time > death_time THEN NULL ELSE death_time END, CURRENT_TIMESTAMP)) - julianday(birth_time)) AS avg_longevity
+			       SUM(1 - is_dead) AS active_nodes,
+			       AVG(julianday(CASE WHEN is_dead = 1 THEN last_event_time ELSE CURRENT_TIMESTAMP END) - julianday(birth_time)) AS avg_longevity,
+			       SUM(CASE WHEN ever_deleted = 0 AND first_added_time <= datetime('now', '-14 days') THEN 1 ELSE 0 END) AS survived_count
 			FROM lifecycle
 			GROUP BY model_name
 		),
 		roi AS (
-			SELECT COALESCE(r.model_name, 'unknown') AS model_name,
-			       COUNT(DISTINCT e.node_signature) AS survived_count
-			FROM code_node_events e
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE e.action = 'ADDED'
-			  AND e.event_time <= datetime('now', '-14 days')
-			  AND NOT EXISTS (SELECT 1 FROM code_node_events d WHERE d.node_signature = e.node_signature AND d.action = 'DELETED')
-			GROUP BY COALESCE(r.model_name, 'unknown')
-		),
+			SELECT model_name, survived_count FROM lc
+		),`
+
+	var query string
+	var args []any
+	if repo == "" {
+		query = `
+		WITH ` + fmt.Sprintf(nodeLifecycleCTEs, "") + `
 		spend AS (
 			SELECT model_name,
 			       SUM(COALESCE(cost_usd, 0)) AS total_cost,
@@ -519,36 +580,7 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 		args = []any{}
 	} else {
 		query = `
-		WITH lifecycle AS (
-			SELECT e.node_signature,
-			       COALESCE(r.model_name, 'unknown') AS model_name,
-			       MIN(e.event_time) AS birth_time,
-			       MAX(CASE WHEN e.action = 'DELETED' THEN e.event_time END) AS death_time,
-			       MAX(e.event_time) AS last_event_time
-			FROM code_node_events e
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
-			GROUP BY e.node_signature, COALESCE(r.model_name, 'unknown')
-		),
-		lc AS (
-			SELECT model_name,
-			       COUNT(*) AS total_nodes,
-			       SUM(CASE WHEN death_time IS NULL OR last_event_time > death_time THEN 1 ELSE 0 END) AS active_nodes,
-			       AVG(julianday(COALESCE(CASE WHEN last_event_time > death_time THEN NULL ELSE death_time END, CURRENT_TIMESTAMP)) - julianday(birth_time)) AS avg_longevity
-			FROM lifecycle
-			GROUP BY model_name
-		),
-		roi AS (
-			SELECT COALESCE(r.model_name, 'unknown') AS model_name,
-			       COUNT(DISTINCT e.node_signature) AS survived_count
-			FROM code_node_events e
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)
-			  AND e.action = 'ADDED'
-			  AND e.event_time <= datetime('now', '-14 days')
-			  AND NOT EXISTS (SELECT 1 FROM code_node_events d WHERE d.node_signature = e.node_signature AND d.action = 'DELETED' AND (d.repo_name = ? OR d.repo_name = '' OR d.repo_name IS NULL))
-			GROUP BY COALESCE(r.model_name, 'unknown')
-		),
+		WITH ` + fmt.Sprintf(nodeLifecycleCTEs, "WHERE (e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)") + `
 		spend AS (
 			SELECT model_name,
 			       SUM(COALESCE(cost_usd, 0)) AS total_cost,
@@ -580,7 +612,7 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 		LEFT JOIN spend ON spend.model_name = m.model_name
 		ORDER BY m.model_name
 		`
-		args = []any{repo, repo, repo, repo, repo, repo}
+		args = []any{repo, repo, repo, repo}
 	}
 
 	ctx, cancel := s.withTimeout(context.Background())
@@ -712,7 +744,7 @@ func (s *Store) AllFilesHealth(repoFilter ...string) (map[string]FileHealth, err
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return out, err
+		return nil, fmt.Errorf("all files health query: %w", err)
 	}
 	defer rows.Close()
 
@@ -720,7 +752,7 @@ func (s *Store) AllFilesHealth(repoFilter ...string) (map[string]FileHealth, err
 		var path string
 		var edits, sigs int
 		if err := rows.Scan(&path, &edits, &sigs); err != nil {
-			continue
+			return nil, fmt.Errorf("scan file health: %w", err)
 		}
 		penalty := edits * 8
 		if sigs >= 3 {
@@ -740,6 +772,9 @@ func (s *Store) AllFilesHealth(repoFilter ...string) (map[string]FileHealth, err
 		}
 		out[path] = fh
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate file health: %w", err)
+	}
 	return out, nil
 }
 
@@ -753,43 +788,58 @@ type NodeStat struct {
 	LastEventAt time.Time `json:"last_event_time"`
 }
 
-// AllNodeStats queries aggregate metrics for every known AST node signature, optionally filtered by repo_name.
+// NodeStatKey is the AllNodeStats map key for one node: the slash-normalized
+// file path and the signature. Signatures embed only the file's BASENAME
+// (kind:<basename>::name), so a signature alone is not unique across
+// directories -- cmd/a/main.go and cmd/b/main.go both carry
+// "function:main.go::main".
+func NodeStatKey(filePath, signature string) string {
+	return strings.ReplaceAll(filePath, `\`, "/") + "\x00" + signature
+}
+
+// LookupNodeStat finds the stat for signature under the first of paths that
+// has one (callers pass the path spellings they know for the file).
+func LookupNodeStat(stats map[string]NodeStat, signature string, paths ...string) (NodeStat, bool) {
+	for _, p := range paths {
+		if ns, ok := stats[NodeStatKey(p, signature)]; ok {
+			return ns, true
+		}
+	}
+	return NodeStat{}, false
+}
+
+// AllNodeStats queries aggregate metrics for every known AST node, keyed by
+// NodeStatKey(file_path, node_signature), optionally filtered by repo_name.
 func (s *Store) AllNodeStats(repoFilter ...string) (map[string]NodeStat, error) {
 	var repo string
 	if len(repoFilter) > 0 {
 		repo = repoFilter[0]
 	}
 
-	var query string
+	// One window pass per (file_path, node_signature): the count over the
+	// partition and the latest row by (event_time DESC, event_id DESC). The
+	// previous shape grouped by node_signature alone (merging same-named
+	// files in different directories) and re-joined on
+	// event_time = MAX(event_time) under a bare GROUP BY, so a same-second tie
+	// returned an arbitrary row's action/model/file.
+	where := ""
 	var args []any
-	if repo == "" {
-		query = `
-			SELECT stats.node_signature, e.file_path, stats.edit_count, e.action, COALESCE(r.model_name, 'unknown'), stats.max_event_time
-			FROM (
-				SELECT node_signature, COUNT(*) AS edit_count, MAX(event_time) AS max_event_time
-				FROM code_node_events
-				GROUP BY node_signature
-			) stats
-			JOIN code_node_events e ON e.node_signature = stats.node_signature AND e.event_time = stats.max_event_time
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			GROUP BY stats.node_signature
-		`
-		args = []any{}
-	} else {
-		query = `
-			SELECT stats.node_signature, e.file_path, stats.edit_count, e.action, COALESCE(r.model_name, 'unknown'), stats.max_event_time
-			FROM (
-				SELECT node_signature, COUNT(*) AS edit_count, MAX(event_time) AS max_event_time
-				FROM code_node_events
-				WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL)
-				GROUP BY node_signature
-			) stats
-			JOIN code_node_events e ON e.node_signature = stats.node_signature AND e.event_time = stats.max_event_time
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			GROUP BY stats.node_signature
-		`
+	if repo != "" {
+		where = "WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL)"
 		args = []any{repo}
 	}
+	query := `
+		SELECT x.node_signature, x.file_path, x.edit_count, x.action, COALESCE(r.model_name, 'unknown'), x.event_time
+		FROM (
+			SELECT node_signature, file_path, action, run_id, event_time,
+			       COUNT(*) OVER (PARTITION BY file_path, node_signature) AS edit_count,
+			       ROW_NUMBER() OVER (PARTITION BY file_path, node_signature ORDER BY event_time DESC, event_id DESC) AS rn
+			FROM code_node_events
+			` + where + `
+		) x
+		LEFT JOIN agent_runs r ON x.run_id = r.run_id
+		WHERE x.rn = 1
+	`
 
 	out := make(map[string]NodeStat)
 	ctx, cancel := s.withTimeout(context.Background())
@@ -808,7 +858,7 @@ func (s *Store) AllNodeStats(repoFilter ...string) (map[string]NodeStat, error) 
 			return nil, fmt.Errorf("scan node stat: %w", err)
 		}
 		ns.LastEventAt = parseDBTime(ts)
-		out[ns.Signature] = ns
+		out[NodeStatKey(ns.FilePath, ns.Signature)] = ns
 	}
 	return out, rows.Err()
 }
@@ -1203,6 +1253,11 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 	}
 
 	normPath := strings.ReplaceAll(filePath, "\\", "/")
+	// readPathArgs binds readPathClause: raw equality, a wildcard-free LIKE
+	// (slash-normalized, ASCII case-insensitive exact match) and a suffix arm
+	// anchored on '/'. The suffix arm used to be '%' || path with no
+	// directory boundary, so stats for "main.go" absorbed "cmd/domain.go".
+	readPathArgs := []any{filePath, escapeLike(normPath), "%/" + escapeLike(normPath)}
 
 	// 1. Overall Aggregates
 	row := s.db.QueryRowContext(ctx, `
@@ -1213,8 +1268,7 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		       COALESCE(SUM(cached_tokens), 0),
 		       COUNT(DISTINCT model_name)
 		FROM file_read_events
-		WHERE file_path = ? OR file_path LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\'
-	`, filePath, "%"+escapeLike(normPath), "%"+escapeLike(normPath))
+		WHERE `+readPathClause, readPathArgs...)
 
 	if err := row.Scan(
 		&stats.TotalReads,
@@ -1227,42 +1281,38 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		return stats, fmt.Errorf("scan read stats: %w", err)
 	}
 
-	// 2. Model Breakdown
-	mRows, err := s.db.QueryContext(ctx, `
-		SELECT model_name, COUNT(*)
-		FROM file_read_events
-		WHERE file_path = ? OR file_path LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\'
-		GROUP BY model_name
-		ORDER BY COUNT(*) DESC
-	`, filePath, "%"+escapeLike(normPath), "%"+escapeLike(normPath))
-	if err == nil {
-		for mRows.Next() {
-			var model string
+	// 2 + 3. Model and provider breakdowns. Query, scan and iteration errors
+	// are returned: they used to be swallowed, handing callers a
+	// partially-empty breakdown that looked like real data.
+	breakdown := func(col string, into map[string]int) error {
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT `+col+`, COUNT(*)
+			FROM file_read_events
+			WHERE `+readPathClause+`
+			GROUP BY `+col+`
+			ORDER BY COUNT(*) DESC
+		`, readPathArgs...)
+		if err != nil {
+			return fmt.Errorf("read stats %s breakdown: %w", col, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var key string
 			var count int
-			if err := mRows.Scan(&model, &count); err == nil && model != "" {
-				stats.ModelBreakdown[model] = count
+			if err := rows.Scan(&key, &count); err != nil {
+				return fmt.Errorf("scan read stats %s breakdown: %w", col, err)
+			}
+			if key != "" {
+				into[key] = count
 			}
 		}
-		_ = mRows.Close()
+		return rows.Err()
 	}
-
-	// 3. Provider Breakdown
-	pRows, err := s.db.QueryContext(ctx, `
-		SELECT provider, COUNT(*)
-		FROM file_read_events
-		WHERE file_path = ? OR file_path LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\'
-		GROUP BY provider
-		ORDER BY COUNT(*) DESC
-	`, filePath, "%"+escapeLike(normPath), "%"+escapeLike(normPath))
-	if err == nil {
-		for pRows.Next() {
-			var prov string
-			var count int
-			if err := pRows.Scan(&prov, &count); err == nil && prov != "" {
-				stats.ProviderBreakdown[prov] = count
-			}
-		}
-		_ = pRows.Close()
+	if err := breakdown("model_name", stats.ModelBreakdown); err != nil {
+		return stats, err
+	}
+	if err := breakdown("provider", stats.ProviderBreakdown); err != nil {
+		return stats, err
 	}
 
 	// 4. Recent Reads. read_id breaks same-second read_time ties —
@@ -1275,32 +1325,42 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		       lines_read_count, prompt_tokens, cached_tokens, cost_usd, COALESCE(intent, ''),
 		       COALESCE(read_time, CURRENT_TIMESTAMP)
 		FROM file_read_events
-		WHERE file_path = ? OR file_path LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\'
+		WHERE `+readPathClause+`
 		ORDER BY read_time DESC, read_id DESC
 		LIMIT 20
-	`, filePath, "%"+escapeLike(normPath), "%"+escapeLike(normPath))
-	if err == nil {
-		for rRows.Next() {
-			var (
-				rec FileReadRecord
-				ts  string
-			)
-			if err := rRows.Scan(
-				&rec.ReadID, &rec.RunID, &rec.SessionID, &rec.RepoName, &rec.FilePath,
-				&rec.AgentName, &rec.ModelName, &rec.Provider, &rec.ToolName,
-				&rec.StartLine, &rec.EndLine, &rec.LinesReadCount,
-				&rec.PromptTokens, &rec.CachedTokens, &rec.CostUSD,
-				&rec.Intent, &ts,
-			); err == nil {
-				rec.ReadTime = parseDBTime(ts)
-				stats.RecentReads = append(stats.RecentReads, rec)
-			}
+	`, readPathArgs...)
+	if err != nil {
+		return stats, fmt.Errorf("read stats recent reads: %w", err)
+	}
+	defer rRows.Close()
+	for rRows.Next() {
+		var (
+			rec FileReadRecord
+			ts  string
+		)
+		if err := rRows.Scan(
+			&rec.ReadID, &rec.RunID, &rec.SessionID, &rec.RepoName, &rec.FilePath,
+			&rec.AgentName, &rec.ModelName, &rec.Provider, &rec.ToolName,
+			&rec.StartLine, &rec.EndLine, &rec.LinesReadCount,
+			&rec.PromptTokens, &rec.CachedTokens, &rec.CostUSD,
+			&rec.Intent, &ts,
+		); err != nil {
+			return stats, fmt.Errorf("scan read stats recent read: %w", err)
 		}
-		_ = rRows.Close()
+		rec.ReadTime = parseDBTime(ts)
+		stats.RecentReads = append(stats.RecentReads, rec)
+	}
+	if err := rRows.Err(); err != nil {
+		return stats, fmt.Errorf("iterate read stats recent reads: %w", err)
 	}
 
 	return stats, nil
 }
+
+// readPathClause is the per-file filter of GetFileReadStats and
+// GetFileReadHeatmap over file_read_events; bind [raw path,
+// escapeLike(normalized path), "%/"+escapeLike(normalized path)].
+const readPathClause = `(file_path = ? OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\')`
 
 // GetFileReadHeatmap computes line-range frequencies for inspecting hot read regions.
 func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
@@ -1311,12 +1371,12 @@ func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT start_line, end_line, COUNT(*)
 		FROM file_read_events
-		WHERE (file_path = ? OR file_path LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\')
+		WHERE `+readPathClause+`
 		  AND (start_line > 0 OR end_line > 0)
 		GROUP BY start_line, end_line
 		ORDER BY COUNT(*) DESC
 		LIMIT 50
-	`, filePath, "%"+escapeLike(normPath), "%"+escapeLike(normPath))
+	`, filePath, escapeLike(normPath), "%/"+escapeLike(normPath))
 	if err != nil {
 		return nil, fmt.Errorf("read heatmap query: %w", err)
 	}
@@ -1444,80 +1504,52 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 	// order, not on the data. e.event_id breaks ties in the same direction
 	// as the time column, the round-93 remedy mirrored from
 	// RecentEventsFiltered.
-	var query string
-	var args []any
+	const symbolCols = `
+			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
+			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
+			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
+			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
+			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
+			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
+			       COALESCE(r.cost_usd, 0.0)
+			FROM code_node_events e
+			LEFT JOIN agent_runs r ON e.run_id = r.run_id`
+	// The signature clause's equality arms are inert either way (the escaped
+	// contains arm subsumes them in the OR), so they keep escapeLike.
+	const sigClause = `(e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%' || LOWER(?) || '%' ESCAPE '\' OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) ESCAPE '\' OR LOWER(e.node_signature) LIKE '%:' || LOWER(?) ESCAPE '\')`
+	sigArgs := func() []any {
+		q := escapeLike(cleanSig)
+		return []any{q, q, q, q, q}
+	}
 
-	if normSlash != "" && cleanSig != "" {
-		query = `
-			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
-			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
-			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
-			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
-			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
-			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
-			       COALESCE(r.cost_usd, 0.0)
-			FROM code_node_events e
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
-			  AND (e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%' || LOWER(?) || '%' ESCAPE '\' OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) ESCAPE '\' OR LOWER(e.node_signature) LIKE '%:' || LOWER(?) ESCAPE '\')
-			ORDER BY e.event_time ASC, e.event_id ASC
-			LIMIT ?
-		`
-		// filePath arm 4 binds the caller path as the LIKE SUBJECT (the stored
-		// path is the quoted pattern side), so it stays raw — this clause is
-		// RecentEventsFiltered's copy and carried the same round-90 defect.
-		// The signature clause's equality arms are inert either way (the
-		// escaped contains arm subsumes them in the OR), so they keep
-		// escapeLike.
-		args = []any{filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
-	} else if normSlash != "" {
-		query = `
-			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
-			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
-			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
-			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
-			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
-			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
-			       COALESCE(r.cost_usd, 0.0)
-			FROM code_node_events e
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
-			ORDER BY e.event_time ASC, e.event_id ASC
-			LIMIT ?
-		`
-		// filePath arm 4: LIKE SUBJECT — stays raw (same reason as variant A).
-		args = []any{filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash), limit}
-	} else if cleanSig != "" {
-		query = `
-			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
-			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
-			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
-			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
-			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
-			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
-			       COALESCE(r.cost_usd, 0.0)
-			FROM code_node_events e
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE (e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%' || LOWER(?) || '%' ESCAPE '\' OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) ESCAPE '\' OR LOWER(e.node_signature) LIKE '%:' || LOWER(?) ESCAPE '\')
-			ORDER BY e.event_time ASC, e.event_id ASC
-			LIMIT ?
-		`
-		args = []any{escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), escapeLike(cleanSig), limit}
+	var where []string
+	var args []any
+	if normSlash != "" {
+		where = append(where, pathMatchClause("e.file_path"))
+		args = append(args, pathMatchArgs(filePath, normSlash)...)
+	}
+	if cleanSig != "" {
+		where = append(where, sigClause)
+		args = append(args, sigArgs()...)
+	}
+	args = append(args, limit)
+
+	var query string
+	if len(where) == 0 {
+		query = symbolCols + `
+			ORDER BY e.event_time DESC, e.event_id DESC
+			LIMIT ?`
 	} else {
-		query = `
-			SELECT e.event_id, COALESCE(e.run_id, ''), e.repo_name, e.file_path, e.node_signature, e.node_type,
-			       e.action, COALESCE(e.ast_content_hash, ''), COALESCE(e.lines_of_code, 0),
-			       COALESCE(e.start_line, 0), COALESCE(e.end_line, 0), COALESCE(e.diff_snippet, ''),
-			       COALESCE(e.added_lines, 0), COALESCE(e.deleted_lines, 0), e.event_time,
-			       COALESCE(r.agent_name, ''), COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''),
-			       COALESCE(r.intent, ''), COALESCE(r.prompt_tokens, 0), COALESCE(r.completion_tokens, 0),
-			       COALESCE(r.cost_usd, 0.0)
-			FROM code_node_events e
-			LEFT JOIN agent_runs r ON e.run_id = r.run_id
+		// Filtered variants return a chronological timeline, but the LIMIT
+		// must keep the NEWEST rows: sorting ASC before LIMIT returned the
+		// oldest N revisions and hid every recent change once a symbol had
+		// more history than the limit. Select newest-first, then re-order
+		// ascending (event_id breaks same-second ties in both directions).
+		query = `SELECT * FROM (` + symbolCols + `
+			WHERE ` + strings.Join(where, " AND ") + `
 			ORDER BY e.event_time DESC, e.event_id DESC
 			LIMIT ?
-		`
-		args = []any{limit}
+		) ORDER BY event_time ASC, event_id ASC`
 	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -1570,90 +1602,12 @@ func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, erro
 
 	normSlash := strings.ReplaceAll(strings.TrimSpace(filePath), "\\", "/")
 	normSlash = strings.TrimPrefix(normSlash, "./")
-	activityMap := make(map[string]*ModelActivitySummary)
+	args := pathMatchArgs(filePath, normSlash)
 
-	// 1. Read operations per model
-	readQuery := `
-		SELECT model_name, provider, COUNT(*), COALESCE(SUM(lines_read_count), 0),
-		       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cost_usd), 0.0), MAX(read_time)
-		FROM file_read_events
-		WHERE (file_path = ? OR REPLACE(file_path, '\', '/') = ? OR REPLACE(file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
-		GROUP BY model_name
-	`
-	// filePath arm 4 binds the caller path as the LIKE SUBJECT (the stored
-	// path is the quoted pattern side), so it stays raw — this clause is
-	// RecentEventsFiltered's copy and carried the same round-90 defect.
-	rRows, err := s.db.QueryContext(ctx, readQuery, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
-	if err == nil {
-		defer rRows.Close()
-		for rRows.Next() {
-			var (
-				model, prov, maxTime string
-				count, linesRead     int
-				tokens               int64
-				cost                 float64
-			)
-			if err := rRows.Scan(&model, &prov, &count, &linesRead, &tokens, &cost, &maxTime); err == nil {
-				t := parseDBTime(maxTime)
-				activityMap[model] = &ModelActivitySummary{
-					ModelName:      model,
-					Provider:       prov,
-					ReadCount:      count,
-					LinesRead:      linesRead,
-					ReadTokens:     tokens,
-					ReadCostUSD:    cost,
-					LastActivityAt: t,
-				}
-			}
-		}
-	}
-
-	// 2. Write / AST mutation operations per model
-	writeQuery := `
-		SELECT COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''), COUNT(e.event_id),
-		       COALESCE(SUM(e.added_lines), 0), COALESCE(SUM(e.deleted_lines), 0), MAX(e.event_time)
-		FROM code_node_events e
-		LEFT JOIN agent_runs r ON e.run_id = r.run_id
-		WHERE (e.file_path = ? OR REPLACE(e.file_path, '\', '/') = ? OR REPLACE(e.file_path, '\', '/') LIKE '%' || ? ESCAPE '\' OR ? LIKE '%' || REPLACE(REPLACE(REPLACE(e.file_path, '\', '/'), '%', '\%'), '_', '\_') ESCAPE '\' OR LOWER(REPLACE(e.file_path, '\', '/')) LIKE '%' || LOWER(?) ESCAPE '\')
-		GROUP BY r.model_name
-	`
-	// filePath arm 4: LIKE SUBJECT — stays raw (same reason as the read query).
-	wRows, err := s.db.QueryContext(ctx, writeQuery, filePath, normSlash, escapeLike(normSlash), normSlash, escapeLike(normSlash))
-	if err == nil {
-		defer wRows.Close()
-		for wRows.Next() {
-			var (
-				model, prov, maxTime      string
-				count, linesAdd, linesDel int
-			)
-			if err := wRows.Scan(&model, &prov, &count, &linesAdd, &linesDel, &maxTime); err == nil {
-				t := parseDBTime(maxTime)
-				entry, ok := activityMap[model]
-				if !ok {
-					entry = &ModelActivitySummary{
-						ModelName: model,
-						Provider:  prov,
-					}
-					activityMap[model] = entry
-				}
-				if entry.Provider == "" && prov != "" {
-					entry.Provider = prov
-				}
-				entry.WriteEvents += count
-				entry.LinesAdded += linesAdd
-				entry.LinesDeleted += linesDel
-				if t.After(entry.LastActivityAt) {
-					entry.LastActivityAt = t
-				}
-			}
-		}
-	}
-
-	out := make([]ModelActivitySummary, 0, len(activityMap))
-	for _, entry := range activityMap {
-		out = append(out, *entry)
-	}
-	return out, nil
+	return s.modelActivity(ctx,
+		"WHERE "+pathMatchClause("file_path"), args,
+		"WHERE "+pathMatchClause("e.file_path"), args,
+		0)
 }
 
 // AllFileModelActivity returns aggregated per-model read and write metrics across all monitored files.
@@ -1663,78 +1617,101 @@ func (s *Store) AllFileModelActivity(limit int) ([]ModelActivitySummary, error) 
 	}
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
+	return s.modelActivity(ctx, "", nil, "", nil, limit)
+}
 
+// modelActivity merges per-model read aggregates (file_read_events) with
+// per-model write aggregates (code_node_events), optionally filtered, sorted by
+// total activity then model name, and capped at limit when limit > 0.
+//
+// Query, scan and iteration errors are returned; they used to be swallowed,
+// so a failed read or write query silently produced a half-populated summary.
+// Provider is MAX(provider) within the model group -- a bare column under
+// GROUP BY model_name let SQLite return the provider of an arbitrary row.
+// The write side groups by the same COALESCEd model name it selects.
+func (s *Store) modelActivity(ctx context.Context, readWhere string, readArgs []any, writeWhere string, writeArgs []any, limit int) ([]ModelActivitySummary, error) {
 	activityMap := make(map[string]*ModelActivitySummary)
 
 	// 1. Read operations per model
-	readQuery := `
-		SELECT model_name, provider, COUNT(*), COALESCE(SUM(lines_read_count), 0),
-		       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cost_usd), 0.0), MAX(read_time)
+	rRows, err := s.db.QueryContext(ctx, `
+		SELECT model_name, COALESCE(MAX(provider), ''), COUNT(*), COALESCE(SUM(lines_read_count), 0),
+		       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cost_usd), 0.0), COALESCE(MAX(read_time), '')
 		FROM file_read_events
+		`+readWhere+`
 		GROUP BY model_name
-	`
-	rRows, err := s.db.QueryContext(ctx, readQuery)
-	if err == nil {
-		defer rRows.Close()
-		for rRows.Next() {
-			var (
-				model, prov, maxTime string
-				count, linesRead     int
-				tokens               int64
-				cost                 float64
-			)
-			if err := rRows.Scan(&model, &prov, &count, &linesRead, &tokens, &cost, &maxTime); err == nil {
-				t := parseDBTime(maxTime)
-				activityMap[model] = &ModelActivitySummary{
-					ModelName:      model,
-					Provider:       prov,
-					ReadCount:      count,
-					LinesRead:      linesRead,
-					ReadTokens:     tokens,
-					ReadCostUSD:    cost,
-					LastActivityAt: t,
-				}
-			}
+	`, readArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("model activity reads: %w", err)
+	}
+	for rRows.Next() {
+		var (
+			model, prov, maxTime string
+			count, linesRead     int
+			tokens               int64
+			cost                 float64
+		)
+		if err := rRows.Scan(&model, &prov, &count, &linesRead, &tokens, &cost, &maxTime); err != nil {
+			rRows.Close()
+			return nil, fmt.Errorf("scan model activity read: %w", err)
 		}
+		activityMap[model] = &ModelActivitySummary{
+			ModelName:      model,
+			Provider:       prov,
+			ReadCount:      count,
+			LinesRead:      linesRead,
+			ReadTokens:     tokens,
+			ReadCostUSD:    cost,
+			LastActivityAt: parseDBTime(maxTime),
+		}
+	}
+	err = rRows.Err()
+	rRows.Close()
+	if err != nil {
+		return nil, fmt.Errorf("iterate model activity reads: %w", err)
 	}
 
 	// 2. Write / AST mutation operations per model
-	writeQuery := `
-		SELECT COALESCE(r.model_name, 'unknown'), COALESCE(r.provider, ''), COUNT(e.event_id),
-		       COALESCE(SUM(e.added_lines), 0), COALESCE(SUM(e.deleted_lines), 0), MAX(e.event_time)
+	wRows, err := s.db.QueryContext(ctx, `
+		SELECT COALESCE(r.model_name, 'unknown'), COALESCE(MAX(r.provider), ''), COUNT(e.event_id),
+		       COALESCE(SUM(e.added_lines), 0), COALESCE(SUM(e.deleted_lines), 0), COALESCE(MAX(e.event_time), '')
 		FROM code_node_events e
 		LEFT JOIN agent_runs r ON e.run_id = r.run_id
-		GROUP BY r.model_name
-	`
-	wRows, err := s.db.QueryContext(ctx, writeQuery)
-	if err == nil {
-		defer wRows.Close()
-		for wRows.Next() {
-			var (
-				model, prov, maxTime      string
-				count, linesAdd, linesDel int
-			)
-			if err := wRows.Scan(&model, &prov, &count, &linesAdd, &linesDel, &maxTime); err == nil {
-				t := parseDBTime(maxTime)
-				entry, ok := activityMap[model]
-				if !ok {
-					entry = &ModelActivitySummary{
-						ModelName: model,
-						Provider:  prov,
-					}
-					activityMap[model] = entry
-				}
-				if entry.Provider == "" && prov != "" {
-					entry.Provider = prov
-				}
-				entry.WriteEvents += count
-				entry.LinesAdded += linesAdd
-				entry.LinesDeleted += linesDel
-				if t.After(entry.LastActivityAt) {
-					entry.LastActivityAt = t
-				}
-			}
+		`+writeWhere+`
+		GROUP BY COALESCE(r.model_name, 'unknown')
+	`, writeArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("model activity writes: %w", err)
+	}
+	defer wRows.Close()
+	for wRows.Next() {
+		var (
+			model, prov, maxTime      string
+			count, linesAdd, linesDel int
+		)
+		if err := wRows.Scan(&model, &prov, &count, &linesAdd, &linesDel, &maxTime); err != nil {
+			return nil, fmt.Errorf("scan model activity write: %w", err)
 		}
+		t := parseDBTime(maxTime)
+		entry, ok := activityMap[model]
+		if !ok {
+			entry = &ModelActivitySummary{
+				ModelName: model,
+				Provider:  prov,
+			}
+			activityMap[model] = entry
+		}
+		if entry.Provider == "" && prov != "" {
+			entry.Provider = prov
+		}
+		entry.WriteEvents += count
+		entry.LinesAdded += linesAdd
+		entry.LinesDeleted += linesDel
+		if t.After(entry.LastActivityAt) {
+			entry.LastActivityAt = t
+		}
+	}
+	if err := wRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate model activity writes: %w", err)
 	}
 
 	out := make([]ModelActivitySummary, 0, len(activityMap))
@@ -1744,7 +1721,8 @@ func (s *Store) AllFileModelActivity(limit int) ([]ModelActivitySummary, error) 
 
 	// Sort deterministically: descending by total activity (reads + writes), then by
 	// model name for stable output order. This is required so that the limit cap
-	// produces consistent, reproducible results.
+	// produces consistent, reproducible results -- and so the per-file variant
+	// no longer returns random Go map order.
 	sort.Slice(out, func(i, j int) bool {
 		a := out[i].ReadCount + out[i].WriteEvents
 		b := out[j].ReadCount + out[j].WriteEvents
@@ -1753,7 +1731,7 @@ func (s *Store) AllFileModelActivity(limit int) ([]ModelActivitySummary, error) 
 		}
 		return out[i].ModelName < out[j].ModelName
 	})
-	if len(out) > limit {
+	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
 	return out, nil
@@ -1826,7 +1804,12 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 	// collisions otherwise came back — and got LIMIT-truncated — in
 	// whatever order the query plan produced.
 
-	const q = `
+	// Collisions is shared by both statements below. The aggregates (edges,
+	// TotalCollisions, CrossAgentRatio, TopFrictionPair) come from an
+	// UNLIMITED GROUP BY over it; only RecentCollisions is LIMITed. They used
+	// to be tallied from the LIMITed row set, so every summary number silently
+	// described just the newest `limit` collisions.
+	const collisionsCTE = `
 		WITH OrderedEvents AS (
 			SELECT 
 				e.event_id,
@@ -1847,30 +1830,63 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 			WHERE e.run_id IS NOT NULL
 			  AND e.run_id <> ''
 			  AND COALESCE(e.attribution_confidence, 0.0) >= 0.8
-		)
-		SELECT 
-			event_id, file_path, node_signature, action, added_lines, deleted_lines,
-			diff_snippet, event_time, overwriter_model, overwriter_run_id,
-			author_model, author_run_id, author_time
-		FROM OrderedEvents
-		WHERE author_model IS NOT NULL AND action IN ('MODIFIED', 'DELETED')
-		ORDER BY event_time DESC, event_id DESC
-		LIMIT ?;
-	`
-
-	rows, err := s.db.QueryContext(ctx, q, limit)
-	if err != nil {
-		return nil, fmt.Errorf("query model friction: %w", err)
-	}
-	defer rows.Close()
+		),
+		Collisions AS (
+			SELECT * FROM OrderedEvents
+			WHERE author_model IS NOT NULL AND action IN ('MODIFIED', 'DELETED')
+		)`
 
 	var (
 		events          []CrossThrashEvent
-		edgeMap         = make(map[string]*ModelFrictionEdge)
+		edges           []ModelFrictionEdge
 		totalCollisions int
 		crossCount      int
 		topPair         string
 	)
+
+	aggRows, err := s.db.QueryContext(ctx, collisionsCTE+`
+		SELECT author_model, overwriter_model, COUNT(*), COALESCE(SUM(added_lines), 0), COALESCE(SUM(deleted_lines), 0)
+		FROM Collisions
+		GROUP BY author_model, overwriter_model
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query model friction edges: %w", err)
+	}
+	for aggRows.Next() {
+		var e ModelFrictionEdge
+		if err := aggRows.Scan(&e.AuthorModel, &e.OverwriterModel, &e.ConflictCount, &e.LinesModified, &e.LinesDeleted); err != nil {
+			aggRows.Close()
+			return nil, fmt.Errorf("scan model friction edge: %w", err)
+		}
+		e.SelfThrash = e.AuthorModel == e.OverwriterModel
+		edges = append(edges, e)
+		totalCollisions += e.ConflictCount
+		if frictionPair(e.AuthorModel, e.OverwriterModel) {
+			crossCount += e.ConflictCount
+		}
+	}
+	err = aggRows.Err()
+	aggRows.Close()
+	if err != nil {
+		return nil, fmt.Errorf("iterate model friction edges: %w", err)
+	}
+	if edges == nil {
+		edges = make([]ModelFrictionEdge, 0)
+	}
+
+	rows, err := s.db.QueryContext(ctx, collisionsCTE+`
+		SELECT
+			event_id, file_path, node_signature, action, added_lines, deleted_lines,
+			diff_snippet, event_time, overwriter_model, overwriter_run_id,
+			author_model, author_run_id, author_time
+		FROM Collisions
+		ORDER BY event_time DESC, event_id DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query model friction: %w", err)
+	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var (
@@ -1894,7 +1910,7 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 			&ev.AuthorRunID,
 			&authorTimeStr,
 		); err != nil {
-			continue
+			return nil, fmt.Errorf("scan model friction collision: %w", err)
 		}
 
 		ev.AddedLines = added
@@ -1907,36 +1923,16 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 		ev.IsCrossAgent = frictionPair(ev.AuthorModel, ev.OverwriterModel)
 
 		events = append(events, ev)
-		totalCollisions++
-		if ev.IsCrossAgent {
-			crossCount++
-		}
-
-		edgeKey := fmt.Sprintf("%s->%s", ev.AuthorModel, ev.OverwriterModel)
-		edge, ok := edgeMap[edgeKey]
-		if !ok {
-			edge = &ModelFrictionEdge{
-				AuthorModel:     ev.AuthorModel,
-				OverwriterModel: ev.OverwriterModel,
-				SelfThrash:      ev.AuthorModel == ev.OverwriterModel,
-			}
-			edgeMap[edgeKey] = edge
-		}
-		edge.ConflictCount++
-		edge.LinesModified += added
-		edge.LinesDeleted += deleted
 	}
-
-	edges := make([]ModelFrictionEdge, 0, len(edgeMap))
-	for _, e := range edgeMap {
-		edges = append(edges, *e)
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate model friction collisions: %w", err)
 	}
 
 	// Order the edges completely: highest conflict count first, then
 	// OverwriterModel and AuthorModel, so no two distinct edges compare equal.
-	// sort.Slice is not stable and edgeMap arrives in random Go map order, so a
-	// partial order would leave tied edges in an arbitrary sequence -- precisely
-	// what makes the summary below non-deterministic.
+	// sort.Slice is not stable and the GROUP BY rows carry no guaranteed
+	// order, so a partial order would leave tied edges in an arbitrary
+	// sequence -- precisely what makes the summary below non-deterministic.
 	sort.Slice(edges, func(i, j int) bool {
 		if edges[i].ConflictCount != edges[j].ConflictCount {
 			return edges[i].ConflictCount > edges[j].ConflictCount

@@ -242,7 +242,7 @@ func TestAllNodeStats_And_Thrashing(t *testing.T) {
 	if len(stats) != 1 {
 		t.Fatalf("expected 1 node stat, got %d", len(stats))
 	}
-	stat := stats["func:foo"]
+	stat := stats[NodeStatKey("f.go", "func:foo")]
 	if stat.EditCount != 3 {
 		t.Errorf("expected 3 edits, got %d", stat.EditCount)
 	}
