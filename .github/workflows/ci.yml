@@ -71,18 +71,21 @@ jobs:
 
       # Fail fast on type errors before any build artefact is produced. --noEmit
       # proves the frontend is type-safe without touching the output directory.
-      - name: pnpm tsc --noEmit
+      # npx, not pnpm: the runner only provisions npm, so `pnpm` failed with
+      # "command not found" and turned every frontend job red.
+      - name: tsc --noEmit
         working-directory: web
-        run: pnpm tsc --noEmit
+        run: npx --no-install tsc --noEmit
 
       - name: npm run build
         working-directory: web
         run: npm run build
 
-      # The eleven standalone regression guards are SSR harnesses over the real
+      # The standalone regression guards are SSR harnesses over the real
       # components; a successful vite build proves nothing about filter scoping
       # or honest clipboard failure — both defects passed `npm run build`.
-      # run-all.mjs streams each guard's output and fails on any non-zero exit.
-      - name: npm run regressions (11 web guards)
+      # run-all.mjs discovers every guard, streams its output and fails on any
+      # non-zero exit.
+      - name: npm run regressions (web guards)
         working-directory: web
         run: npm run regressions
