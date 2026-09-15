@@ -141,21 +141,29 @@ func (e *Engine) PrimeDirectory(dir string) {
 			return nil
 		}
 
-		// Protect against giant non-code files (e.g. 50MB minified bundles, data dumps)
-		if info, sErr := d.Info(); sErr == nil && info.Size() > 1024*1024 {
+		// Protect against giant non-code files (e.g. 50MB minified bundles,
+		// data dumps). Same ceiling HandleFileChange applies, so a file is
+		// either baselined here or never parsed live -- see maxParseFileBytes.
+		if info, sErr := d.Info(); sErr == nil && info.Size() > maxParseFileBytes {
 			skipped++
 			return nil
 		}
 
 		eligible++
+		// Hold the per-path lock across read -> parse -> store so a live
+		// HandleFileChange for the same file cannot interleave and have its
+		// newer snapshot overwritten by this pass's older read.
+		unlock := e.pathLocks.lock(path)
 		src, rerr := os.ReadFile(path)
 		if rerr != nil {
+			unlock()
 			failed++
 			return nil
 		}
 
 		// Fast-path: if existing snapshot matches file hash, skip Tree-sitter AST parsing
 		if existing, ok := e.cfg.AST.Snapshot(path); ok && existing != nil && existing.Hash == ast.HashBytes(src) {
+			unlock()
 			indexed++
 			pacer.step()
 			return nil
@@ -163,10 +171,18 @@ func (e *Engine) PrimeDirectory(dir string) {
 
 		snap, perr := e.cfg.AST.Parse(path, src)
 		if perr != nil || snap == nil {
+			unlock()
 			failed++
 			return nil
 		}
+		// A superseded job (project switch) must not store into the cache
+		// that was just Reset for the new project.
+		if ctx.Err() != nil {
+			unlock()
+			return filepath.SkipAll
+		}
 		e.cfg.AST.SetSnapshot(snap)
+		unlock()
 		indexed++
 
 		// Bound the indexer to a share of one core so a cold start never
@@ -246,7 +262,7 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	e.cacheMu.RLock()
 	if cached, ok := e.atlasCache[filter]; ok && cached.gen == e.cacheGen && time.Since(cached.cachedAt) < 3*time.Second {
 		e.cacheMu.RUnlock()
-		return cached.snapshot, nil
+		return cloneAtlasSnapshot(cached.snapshot), nil
 	}
 	e.cacheMu.RUnlock()
 
@@ -273,12 +289,12 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	activeProj := e.GetActiveProject()
 	var activePath string
 	if filter != "" {
-		for _, p := range e.ListProjects() {
-			if strings.EqualFold(p.Name, filter) || strings.EqualFold(p.ID, filter) {
-				activePath = filepath.Clean(p.Path)
-				snap.Repo = p.Name
-				break
-			}
+		// Deterministic resolution: names are not unique, and taking the
+		// first same-named project from a map iteration scoped the atlas to a
+		// random checkout. The active project wins among same-named ones.
+		if p, ok := e.resolveProject(filter); ok {
+			activePath = filepath.Clean(p.Path)
+			snap.Repo = p.Name
 		}
 	}
 	if activePath == "" && activeProj != nil && activeProj.Path != "" {
@@ -378,7 +394,7 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 					Hash:      n.Hash,
 				}
 
-				if stat, ok := nodeStats[sig]; ok {
+				if stat, ok := db.LookupNodeStat(nodeStats, sig, path, cleanPath, relPath); ok {
 					sym.EditCount = stat.EditCount
 					sym.LastAction = stat.LastAction
 					sym.LastModel = stat.LastModel
@@ -459,7 +475,42 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	}
 	e.cacheMu.Unlock()
 
-	return snap, nil
+	// Hand the caller its own slice headers: the cached value shares them
+	// otherwise, and the HTTP handler rewrites Packages[i].Files[j] in place.
+	return cloneAtlasSnapshot(snap), nil
+}
+
+// cloneAtlasSnapshot returns a copy whose Packages, Workspaces, and every
+// package's Files slice are freshly allocated. Returning the cached snapshot
+// "by value" copied only the slice headers, so a caller clearing
+// pkg.Files[i].Symbols (the include_symbols=false path) mutated the cache for
+// every later request and raced with concurrent readers. Symbol slices are
+// shared on purpose: callers replace them rather than editing elements, and a
+// deep copy would duplicate the largest part of the payload per request.
+func cloneAtlasSnapshot(s AtlasSnapshot) AtlasSnapshot {
+	out := s
+	if s.Workspaces != nil {
+		out.Workspaces = append([]string(nil), s.Workspaces...)
+	}
+	if s.Packages != nil {
+		out.Packages = make([]AtlasPackage, len(s.Packages))
+		for i, pkg := range s.Packages {
+			if pkg.Files != nil {
+				pkg.Files = append(make([]AtlasFile, 0, len(pkg.Files)), pkg.Files...)
+			}
+			out.Packages[i] = pkg
+		}
+	}
+	return out
+}
+
+// resolveProject resolves an atlas filter (project ID or name) against the
+// registry deterministically, preferring the active project among same-named
+// candidates.
+func (e *Engine) resolveProject(ref string) (ProjectProfile, bool) {
+	e.lockMu.RLock()
+	defer e.lockMu.RUnlock()
+	return resolveProjectRef(e.projects, ref, e.activeProjectID)
 }
 
 func resolvePackageScope(filePath string) (pkgPath string, pkgName string, workspace string) {

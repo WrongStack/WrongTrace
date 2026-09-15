@@ -297,12 +297,18 @@ func TestHandleFileChange_UnsupportedAndCosmetic(t *testing.T) {
 			if err != nil {
 				t.Fatalf("recent events: %v", err)
 			}
-			// The FIRST sight of a source file legitimately emits ADDED (no
-			// prior snapshot). The contract under test is that the SECOND,
-			// cosmetic-only pass emits nothing further.
+			// The FIRST sight of a freshly created source file emits ADDED
+			// when the filesystem reports a recent birth time (a pre-existing
+			// file without a snapshot baselines silently instead). The
+			// contract under test is that the SECOND, cosmetic-only pass
+			// emits nothing further.
 			wantAdded := 0
 			if strings.HasSuffix(tc.rel, ".go") {
-				wantAdded = 1
+				if info, sErr := os.Stat(path); sErr == nil {
+					if _, ok := fileBirthTime(path, info); ok {
+						wantAdded = 1
+					}
+				}
 			}
 			added, modified := 0, 0
 			for _, ev := range events {

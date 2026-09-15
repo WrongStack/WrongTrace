@@ -82,6 +82,27 @@ type Engine struct {
 	rootMu    sync.RWMutex
 	watchRoot string
 
+	// pathLocks serializes read-snapshot -> parse -> store -> persist per file
+	// so two change deliveries for one path cannot diff against the same
+	// previous snapshot and emit duplicate events.
+	pathLocks keyedMutex
+
+	tombMu     sync.Mutex
+	tombstones map[string]time.Time
+
+	// samplerMu guards the webhook-occupancy sampler goroutine SetWatcher
+	// starts; samplerStop closes it, samplerClosed refuses restarts after Close.
+	samplerMu     sync.Mutex
+	samplerStop   chan struct{}
+	samplerClosed bool
+
+	// projSaveSeq is bumped under lockMu for every registry snapshot; the
+	// projects.json write happens outside lockMu under projSaveMu, and a
+	// snapshot older than the last one written is dropped (latest wins).
+	projSaveSeq  uint64
+	projSaveMu   sync.Mutex
+	projSavedSeq uint64
+
 	cacheMu      sync.RWMutex
 	cacheGen     uint64
 	atlasCache   map[string]cachedAtlas
@@ -128,18 +149,16 @@ func NewEngine(cfg Config) *Engine {
 	settings := globalSettings
 	settingsMu.RUnlock()
 
+	// Deterministic resolution: names are not unique, and picking the first
+	// match while ranging a map activated a random same-named project.
 	activeProjID := ""
-	for id, p := range loadedProjects {
-		if cfg.RepoName != "" && cfg.RepoName != "default" {
-			if strings.EqualFold(p.Name, cfg.RepoName) || strings.EqualFold(p.ID, cfg.RepoName) {
-				activeProjID = id
-				break
-			}
-		} else if p.IsActive {
-			activeProjID = id
-			cfg.RepoName = p.Name
-			break
+	if cfg.RepoName != "" && cfg.RepoName != "default" {
+		if p, ok := resolveProjectRef(loadedProjects, cfg.RepoName, ""); ok {
+			activeProjID = p.ID
 		}
+	} else if p, ok := firstActiveProject(loadedProjects); ok {
+		activeProjID = p.ID
+		cfg.RepoName = p.Name
 	}
 	if activeProjID != "" {
 		changed := false
@@ -221,17 +240,25 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 	if e.cfg.AST == nil {
 		return
 	}
+	// Serialize per path: the watcher fires debounce callbacks from
+	// independent time.AfterFunc goroutines, and read-snapshot -> parse ->
+	// store is not atomic. Two overlapping deliveries both diffed against the
+	// same previous snapshot and persisted duplicate events.
+	unlock := e.pathLocks.lock(path)
+	defer unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			e.handleFileGone(ctx, path)
+			e.handleFileGoneLocked(ctx, path)
 			return
 		}
 		log.Printf("engine: stat %s: %v", path, err)
 		return
 	}
-	// Skip directories, files over 5MB (avoids parsing huge logs/binaries), and ignored paths
-	if info.IsDir() || info.Size() > 5*1024*1024 || e.shouldSkip(path) {
+	// Skip directories, files over the shared parse ceiling (the same limit
+	// PrimeDirectory applies), and ignored paths.
+	if info.IsDir() || info.Size() > maxParseFileBytes || e.shouldSkip(path) {
 		return
 	}
 
@@ -256,6 +283,16 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 	if err != nil || snap == nil {
 		return
 	}
+	if prev == nil && !e.firstSightIsCreation(path, info) {
+		// No cached snapshot for a file that already existed: it was skipped
+		// or not yet reached by indexing, belongs to a non-active project,
+		// was dropped by a project-switch Reset, or was evicted from the AST
+		// cache. Diffing against nil reported EVERY declaration as ADDED on
+		// the first edit. Record a silent baseline so the next edit produces
+		// a true semantic diff.
+		e.cfg.AST.SetSnapshot(snap)
+		return
+	}
 	res := ast.Diff(repoName, prev, snap)
 	e.cfg.AST.SetSnapshot(snap)
 
@@ -267,7 +304,18 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 
 // handleFileGone emits a DELETED event for every cached node in the now-gone
 // file, then drops the snapshot.
-func (e *Engine) handleFileGone(_ context.Context, path string) {
+func (e *Engine) handleFileGone(ctx context.Context, path string) {
+	if e.cfg.AST == nil {
+		return
+	}
+	unlock := e.pathLocks.lock(path)
+	defer unlock()
+	e.handleFileGoneLocked(ctx, path)
+}
+
+// handleFileGoneLocked is handleFileGone for callers already holding the
+// path lock.
+func (e *Engine) handleFileGoneLocked(_ context.Context, path string) {
 	if e.cfg.AST == nil {
 		return
 	}
@@ -280,6 +328,9 @@ func (e *Engine) handleFileGone(_ context.Context, path string) {
 		return
 	}
 	e.cfg.AST.Forget(path)
+	// DELETED is being reported for these symbols; remember it so a
+	// re-creation of the same path reports ADDED instead of a silent baseline.
+	e.recordTombstone(path, time.Now())
 	res := ast.Diff(repoName, prev, nil)
 	e.persistAndBroadcast(res)
 }
@@ -383,6 +434,18 @@ func (e *Engine) adoptWatchRoot(dir string) {
 	}
 }
 
+// setWatchRoot unconditionally replaces the watch root; SwitchActiveProject
+// uses it so root-relative hints follow the active project.
+func (e *Engine) setWatchRoot(dir string) {
+	root := absClean(dir)
+	if root == "" {
+		return
+	}
+	e.rootMu.Lock()
+	e.watchRoot = root
+	e.rootMu.Unlock()
+}
+
 // WatchRoot returns the directory ignore rules are scoped to, or "" when the
 // engine has not been given one.
 func (e *Engine) WatchRoot() string {
@@ -424,7 +487,7 @@ func (e *Engine) parseEligible(path string) bool {
 	if ast.DetectLanguage(path) == ast.LangUnknown {
 		return false
 	}
-	if info, err := os.Stat(path); err == nil && info.Size() > 4*1024*1024 {
+	if info, err := os.Stat(path); err == nil && info.Size() > maxParseFileBytes {
 		return false
 	}
 	return true

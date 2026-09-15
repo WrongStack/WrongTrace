@@ -51,17 +51,27 @@ func (h *Hub) Broadcast(ev WSEvent) {
 	if ev.At.IsZero() {
 		ev.At = time.Now().UTC()
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if len(h.clients) > 0 {
-		// Encode once here: every subscriber would otherwise marshal the
-		// identical payload in its own writer goroutine. Diff snippets make
-		// these frames large enough that N× encodes showed up as real GC
-		// pressure with several dashboards open.
-		if b, err := json.Marshal(ev); err == nil {
-			ev.Wire = b
-		}
+	h.mu.RLock()
+	n := len(h.clients)
+	h.mu.RUnlock()
+	if n == 0 {
+		return
 	}
+	// Encode once here: every subscriber would otherwise marshal the
+	// identical payload in its own writer goroutine. Diff snippets make
+	// these frames large enough that N× encodes showed up as real GC
+	// pressure with several dashboards open. The encode runs OUTSIDE the
+	// lock: holding the write lock across it serialized every broadcaster
+	// and blocked Subscribe/Unsubscribe for the duration of a large marshal.
+	if b, err := json.Marshal(ev); err == nil {
+		ev.Wire = b
+	}
+	// Sends only need the read lock. Unsubscribe closes a channel under the
+	// WRITE lock, so no channel can be closed while any sender holds RLock —
+	// a send on a closed channel is impossible. Sends are non-blocking, so
+	// concurrent broadcasters sharing the read lock cannot stall each other.
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	for _, ch := range h.clients {
 		select {
 		case ch <- ev:

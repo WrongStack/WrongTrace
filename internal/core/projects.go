@@ -60,20 +60,63 @@ type WatcherAPI interface {
 // SetWatcher links a file watcher instance to the engine and starts a background
 // goroutine that samples the webhook dispatcher's in-flight count every 200ms,
 // feeding it to the watcher so fsnotify events carry live semaphore occupancy.
+//
+// Re-calling SetWatcher stops the previous sampler before starting a new one,
+// SetWatcher(nil) just stops it, and Engine.Close stops it for good. The
+// original goroutine had no exit at all: one leaked ticker per call.
 func (e *Engine) SetWatcher(w WatcherAPI) {
 	e.lockMu.Lock()
-	defer e.lockMu.Unlock()
 	e.watcher = w
+	e.lockMu.Unlock()
+
+	e.samplerMu.Lock()
+	defer e.samplerMu.Unlock()
+	if e.samplerStop != nil {
+		close(e.samplerStop)
+		e.samplerStop = nil
+	}
+	if w == nil || e.webhooks == nil || e.samplerClosed {
+		return
+	}
+	stop := make(chan struct{})
+	e.samplerStop = stop
+	dispatcher := e.webhooks
 	go func() {
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			<-ticker.C
-			if e.webhooks != nil {
-				w.UpdateSemOccupied(e.webhooks.InFlight())
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				w.UpdateSemOccupied(dispatcher.InFlight())
 			}
 		}
 	}()
+}
+
+// Close stops the engine's background helpers: the webhook-occupancy sampler
+// and any in-flight PrimeDirectory job. It is idempotent. The store and AST
+// engine are owned by the caller and are NOT closed here.
+func (e *Engine) Close() {
+	e.samplerMu.Lock()
+	e.samplerClosed = true
+	if e.samplerStop != nil {
+		close(e.samplerStop)
+		e.samplerStop = nil
+	}
+	e.samplerMu.Unlock()
+	e.cancelPrime()
+}
+
+// cancelPrime cancels the in-flight PrimeDirectory job, if any.
+func (e *Engine) cancelPrime() {
+	e.primeMu.Lock()
+	if e.primeCancel != nil {
+		e.primeCancel()
+		e.primeCancel = nil
+	}
+	e.primeMu.Unlock()
 }
 
 // ListProjects returns all currently registered project profiles.
@@ -102,28 +145,76 @@ func (e *Engine) GetProject(id string) (ProjectProfile, error) {
 func (e *Engine) GetActiveProject() *ProjectProfile {
 	e.lockMu.RLock()
 	defer e.lockMu.RUnlock()
-	if e.cfg.RepoName != "" && e.cfg.RepoName != "default" {
-		for _, p := range e.projects {
-			if strings.EqualFold(p.Name, e.cfg.RepoName) || strings.EqualFold(p.ID, e.cfg.RepoName) {
-				cp := p
-				return &cp
-			}
-		}
-		return nil
-	}
+	// The tracked ID is authoritative: project names are not unique (two
+	// checkouts named "api"), and resolving cfg.RepoName by name while ranging
+	// a Go map returned a random one of the same-named projects per call.
 	if e.activeProjectID != "" {
 		if p, ok := e.projects[e.activeProjectID]; ok {
 			cp := p
 			return &cp
 		}
 	}
-	for _, p := range e.projects {
-		if p.IsActive {
-			cp := p
-			return &cp
+	if e.cfg.RepoName != "" && e.cfg.RepoName != "default" {
+		if p, ok := resolveProjectRef(e.projects, e.cfg.RepoName, ""); ok {
+			return &p
 		}
+		return nil
+	}
+	if p, ok := firstActiveProject(e.projects); ok {
+		return &p
 	}
 	return nil
+}
+
+// resolveProjectRef deterministically resolves a project reference that may
+// be an ID or a (non-unique) name, case-insensitively: an exact ID match wins,
+// then among same-named projects preferID, then the one flagged IsActive,
+// then the lexically smallest ID.
+func resolveProjectRef(projects map[string]ProjectProfile, ref, preferID string) (ProjectProfile, bool) {
+	if ref == "" {
+		return ProjectProfile{}, false
+	}
+	if p, ok := projects[ref]; ok {
+		return p, true
+	}
+	var matches []ProjectProfile
+	for _, p := range projects {
+		if strings.EqualFold(p.ID, ref) {
+			return p, true
+		}
+		if strings.EqualFold(p.Name, ref) {
+			matches = append(matches, p)
+		}
+	}
+	if len(matches) == 0 {
+		return ProjectProfile{}, false
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].ID < matches[j].ID })
+	if preferID != "" {
+		for _, p := range matches {
+			if p.ID == preferID {
+				return p, true
+			}
+		}
+	}
+	for _, p := range matches {
+		if p.IsActive {
+			return p, true
+		}
+	}
+	return matches[0], true
+}
+
+// firstActiveProject returns the IsActive project with the smallest ID.
+func firstActiveProject(projects map[string]ProjectProfile) (ProjectProfile, bool) {
+	var best ProjectProfile
+	found := false
+	for _, p := range projects {
+		if p.IsActive && (!found || p.ID < best.ID) {
+			best, found = p, true
+		}
+	}
+	return best, found
 }
 
 // FindProjectForFile finds the registered project whose root directory contains the given file path.
@@ -207,12 +298,23 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 	target.IsActive = true
 	e.projects[id] = target
 	e.cfg.RepoName = target.Name
-	SaveProjectsIndex(e.projects)
+	// Track identity by ID: names are not unique, so GetActiveProject must
+	// not have to guess among same-named projects.
+	e.activeProjectID = id
+	indexSnap := e.snapshotProjectsLocked()
 	oldStore := e.cfg.Store
 	if newStore != nil {
 		e.cfg.Store = newStore
 	}
 	e.lockMu.Unlock()
+	e.persistProjects(indexSnap)
+
+	// Relative tool-path hints (RegisterFileOperation "src/x.go") and ignore
+	// scoping resolve against the watch root; it previously stayed on the
+	// first project forever because adoptWatchRoot only fills an empty root.
+	if target.Path != "" {
+		e.setWatchRoot(target.Path)
+	}
 
 	if newStore != nil && oldStore != nil && oldStore != newStore {
 		// Close now, not on a timer: a lingering handle keeps the
@@ -224,6 +326,11 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 		// the cheaper side of the trade-off.
 		_ = oldStore.Close()
 	}
+
+	// Cancel the previous project's indexing job BEFORE the reset: resetting
+	// first let a still-running PrimeDirectory walk keep refilling the cache
+	// with the old project's snapshots right after it was cleared.
+	e.cancelPrime()
 
 	// Reset in-memory AST snapshot cache so old repository symbols do not leak
 	if e.cfg.AST != nil {
@@ -290,14 +397,54 @@ func sanitizeSlug(name string) string {
 
 // SaveProjectsIndex persists the registered project profiles to ~/.wrongtrace/projects.json
 func SaveProjectsIndex(projects map[string]ProjectProfile) {
-	dir := UserWrongTraceDir()
-	_ = os.MkdirAll(dir, 0o755)
-	indexPath := filepath.Join(dir, "projects.json")
+	writeProjectsIndex(projectList(projects))
+}
 
+// projectList copies the registry into an ID-sorted slice (stable file
+// output across saves).
+func projectList(projects map[string]ProjectProfile) []ProjectProfile {
 	list := make([]ProjectProfile, 0, len(projects))
 	for _, p := range projects {
 		list = append(list, p)
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
+	return list
+}
+
+// projectsIndexSnapshot is a registry copy taken under lockMu for a later
+// write outside it.
+type projectsIndexSnapshot struct {
+	seq  uint64
+	list []ProjectProfile
+}
+
+// snapshotProjectsLocked copies the registry for persistence. The caller
+// must hold lockMu for writing.
+func (e *Engine) snapshotProjectsLocked() projectsIndexSnapshot {
+	e.projSaveSeq++
+	return projectsIndexSnapshot{seq: e.projSaveSeq, list: projectList(e.projects)}
+}
+
+// persistProjects writes a registry snapshot to projects.json WITHOUT holding
+// lockMu. Saving under the registry write lock stalled every reader -- the
+// synchronous IPC guardrail checks, Store(), repoName() -- for the duration of
+// a JSON encode plus disk write and rename. projSaveMu keeps writes ordered,
+// and a snapshot older than the newest one already written is dropped, so
+// the file always converges on the latest registry state.
+func (e *Engine) persistProjects(s projectsIndexSnapshot) {
+	e.projSaveMu.Lock()
+	defer e.projSaveMu.Unlock()
+	if s.seq <= e.projSavedSeq {
+		return
+	}
+	writeProjectsIndex(s.list)
+	e.projSavedSeq = s.seq
+}
+
+func writeProjectsIndex(list []ProjectProfile) {
+	dir := UserWrongTraceDir()
+	_ = os.MkdirAll(dir, 0o755)
+	indexPath := filepath.Join(dir, "projects.json")
 
 	data, err := json.MarshalIndent(map[string]interface{}{"projects": list}, "", "  ")
 	if err != nil {
@@ -479,9 +626,10 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	// it let two concurrent adds both mark themselves active.
 	proj.IsActive = len(e.projects) == 0
 	e.projects[id] = proj
-	SaveProjectsIndex(e.projects)
+	indexSnap := e.snapshotProjectsLocked()
 	watcher := e.watcher
 	e.lockMu.Unlock()
+	e.persistProjects(indexSnap)
 
 	// Prime atlas directory for the active project only; non-active projects are primed on demand when switched to
 	if proj.IsActive {
@@ -762,8 +910,9 @@ func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 	}
 
 	e.projects[p.ID] = existing
-	SaveProjectsIndex(e.projects)
+	indexSnap := e.snapshotProjectsLocked()
 	e.lockMu.Unlock()
+	e.persistProjects(indexSnap)
 
 	// Re-scan sessions outside the lock: ScanAgentSessions walks many user
 	// directories and easily takes seconds — holding lockMu that long stalls
@@ -771,14 +920,19 @@ func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 	sessions := ScanAgentSessions(existing.Path)
 
 	e.lockMu.Lock()
+	saved := false
 	if cur, ok := e.projects[p.ID]; ok {
 		// Keep any metadata applied concurrently while we scanned.
 		cur.DiscoveredSessions = sessions
 		existing = cur
 		e.projects[p.ID] = cur
-		SaveProjectsIndex(e.projects)
+		indexSnap = e.snapshotProjectsLocked()
+		saved = true
 	}
 	e.lockMu.Unlock()
+	if saved {
+		e.persistProjects(indexSnap)
+	}
 
 	return existing, nil
 }
@@ -792,9 +946,10 @@ func (e *Engine) RemoveProject(id string) error {
 		return fmt.Errorf("project not found: %s", id)
 	}
 	delete(e.projects, id)
-	SaveProjectsIndex(e.projects)
+	indexSnap := e.snapshotProjectsLocked()
 	watcher := e.watcher
 	e.lockMu.Unlock()
+	e.persistProjects(indexSnap)
 
 	if watcher != nil {
 		_ = watcher.RemoveWatchDir(proj.Path)
@@ -823,8 +978,9 @@ func (e *Engine) RescanProject(id string) (*ProjectProfile, error) {
 	}
 	proj.DiscoveredSessions = sessions
 	e.projects[id] = proj
-	SaveProjectsIndex(e.projects)
+	indexSnap := e.snapshotProjectsLocked()
 	e.lockMu.Unlock()
+	e.persistProjects(indexSnap)
 	return &proj, nil
 }
 
@@ -852,12 +1008,13 @@ func (e *Engine) RescanAllProjects() []ProjectProfile {
 			e.projects[id] = proj
 		}
 	}
-	SaveProjectsIndex(e.projects)
+	indexSnap := e.snapshotProjectsLocked()
 	out := make([]ProjectProfile, 0, len(e.projects))
 	for _, p := range e.projects {
 		out = append(out, p)
 	}
 	e.lockMu.Unlock()
+	e.persistProjects(indexSnap)
 	return out
 }
 
@@ -883,7 +1040,11 @@ func ScanAgentSessions(root string) map[string]int {
 		return counts
 	}
 	normRoot := strings.ToLower(filepath.Clean(root))
-	rootBase := strings.ToLower(filepath.Base(root))
+	// Editor-hosted agents are matched at path-component boundaries against
+	// this normalized spelling (see session_match.go). The previous bare
+	// substring test also matched the root's BASE NAME, so any sibling
+	// checkout or unrelated text containing "wrongtrace" leaked sessions in.
+	mentionRoot := normalizedSessionRoot(filepath.Clean(root))
 
 	sessScanMu.RLock()
 	if c, ok := sessScanCache[normRoot]; ok && time.Since(c.scannedAt) < sessScanCacheTTL {
@@ -1002,8 +1163,7 @@ func ScanAgentSessions(root string) map[string]int {
 						buf := make([]byte, 4096)
 						n, _ := f.Read(buf)
 						_ = f.Close()
-						contentLower := strings.ToLower(string(buf[:n]))
-						if strings.Contains(contentLower, normRoot) || strings.Contains(contentLower, rootBase) {
+						if contentMentionsRoot(string(buf[:n]), mentionRoot) {
 							agyCount++
 						}
 					}
@@ -1032,17 +1192,13 @@ func ScanAgentSessions(root string) map[string]int {
 				stateFile := filepath.Join(wsDir, "state.vscdb")
 				matched := false
 				if data, err := os.ReadFile(wsFile); err == nil {
-					if strings.Contains(strings.ToLower(string(data)), normRoot) || strings.Contains(strings.ToLower(string(data)), rootBase) {
-						matched = true
-					}
+					matched = workspaceStorageMatches(data, mentionRoot)
 				} else if fileExists(stateFile) {
 					if f, err := os.Open(stateFile); err == nil {
 						buf := make([]byte, 8192)
 						n, _ := f.Read(buf)
 						_ = f.Close()
-						if strings.Contains(strings.ToLower(string(buf[:n])), normRoot) || strings.Contains(strings.ToLower(string(buf[:n])), rootBase) {
-							matched = true
-						}
+						matched = contentMentionsRoot(string(buf[:n]), mentionRoot)
 					}
 				}
 				if matched {
@@ -1070,7 +1226,7 @@ func ScanAgentSessions(root string) map[string]int {
 				wsDir := filepath.Join(windsurfStorage, e.Name())
 				wsFile := filepath.Join(wsDir, "workspace.json")
 				if data, err := os.ReadFile(wsFile); err == nil {
-					if strings.Contains(strings.ToLower(string(data)), normRoot) || strings.Contains(strings.ToLower(string(data)), rootBase) {
+					if workspaceStorageMatches(data, mentionRoot) {
 						wsCount++
 					}
 				}
@@ -1096,7 +1252,7 @@ func ScanAgentSessions(root string) map[string]int {
 				wsDir := filepath.Join(traeStorage, e.Name())
 				wsFile := filepath.Join(wsDir, "workspace.json")
 				if data, err := os.ReadFile(wsFile); err == nil {
-					if strings.Contains(strings.ToLower(string(data)), normRoot) || strings.Contains(strings.ToLower(string(data)), rootBase) {
+					if workspaceStorageMatches(data, mentionRoot) {
 						traeCount++
 					}
 				}
@@ -1129,7 +1285,7 @@ func ScanAgentSessions(root string) map[string]int {
 								buf := make([]byte, 4096)
 								n, _ := f.Read(buf)
 								_ = f.Close()
-								if strings.Contains(strings.ToLower(string(buf[:n])), normRoot) || strings.Contains(strings.ToLower(string(buf[:n])), rootBase) {
+								if contentMentionsRoot(string(buf[:n]), mentionRoot) {
 									matched = true
 									break
 								}
