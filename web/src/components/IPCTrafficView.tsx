@@ -43,8 +43,11 @@ export function IPCTrafficView({ limit = 100 }: IPCTrafficViewProps) {
         return false;
       }
       if (!q) return true;
-      const raw = JSON.stringify(item).toLowerCase();
-      return raw.includes(q);
+      // The list holds summaries (server keeps only a few scalar params and
+      // drops result), so search exactly the fields a summary carries.
+      const p = item.params || {};
+      return [item.method, p.path, p.file_path, p.model, p.model_name, p.agent, p.agent_name, p.run_id, item.client_addr]
+        .some((v) => typeof v === 'string' && v.toLowerCase().includes(q));
     });
   }, [traffic, limit, methodFilter, search]);
 
@@ -109,7 +112,7 @@ export function IPCTrafficView({ limit = 100 }: IPCTrafficViewProps) {
             <Search className="h-3 w-3 absolute left-2 top-1/2 -translate-y-1/2 text-slate-500" />
             <input
               type="text"
-              placeholder="Search IPC payload…"
+              placeholder="Search method, path, model, agent…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               className="pl-7 pr-2.5 py-1 text-xs bg-slate-900 border border-white/10 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-400 w-36 sm:w-48"

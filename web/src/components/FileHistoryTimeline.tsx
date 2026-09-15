@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { useRecentFileEvents } from '../hooks/useMetrics';
 import { RichDiffViewer } from './RichDiffViewer';
+import { selectRevisionWindow, visibleCountToInclude } from '../lib/revisionWindow';
 import type { EventRecord } from '../types';
 
 // A "revision" collapses bursts of AST mutation events that happened within
@@ -241,15 +242,27 @@ export function FileHistoryTimeline({ filePath }: FileHistoryTimelineProps) {
     return { added, deleted, models: models.size };
   }, [revisions]);
 
-  const displayed = useMemo(() => {
-    const capped = revisions.slice(0, visibleCount);
-    return newestFirst ? [...capped].reverse() : capped;
-  }, [revisions, visibleCount, newestFirst]);
+  // Always the NEWEST visibleCount revisions: the "Current" revision stays
+  // rendered and "Show older" only ever reveals older history.
+  const { displayed, hiddenCount } = useMemo(
+    () => selectRevisionWindow(revisions, visibleCount, newestFirst),
+    [revisions, visibleCount, newestFirst],
+  );
+  const [scrollTargetKey, setScrollTargetKey] = useState<string | null>(null);
 
   useEffect(() => {
     setExpandedKey(null);
     setVisibleCount(INITIAL_VISIBLE_REVISIONS);
   }, [filePath]);
+
+  // Scroll after the commit that renders the target: a sparkline bar may point
+  // at a revision outside the visible window until visibleCount grows.
+  useEffect(() => {
+    if (!scrollTargetKey) return;
+    const el = document.getElementById(`fh-rev-${filePath}-${scrollTargetKey}`);
+    el?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    setScrollTargetKey(null);
+  }, [scrollTargetKey, filePath]);
 
   const maxDelta = useMemo(
     () => Math.max(1, ...revisions.map((r) => Math.max(r.added, r.deleted))),
@@ -258,8 +271,8 @@ export function FileHistoryTimeline({ filePath }: FileHistoryTimelineProps) {
 
   const focusRevision = (key: string) => {
     setExpandedKey(key);
-    const el = document.getElementById(`fh-rev-${filePath}-${key}`);
-    el?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    setVisibleCount((c) => visibleCountToInclude(revisions, key, c));
+    setScrollTargetKey(key);
   };
 
   if (isLoading) {
@@ -283,6 +296,18 @@ export function FileHistoryTimeline({ filePath }: FileHistoryTimelineProps) {
   const firstTime = revisions[0]?.startTime;
   const lastTime = revisions[revisions.length - 1]?.endTime;
   const isBursty = revisions.length > 0 && revisions.some((r) => r.symbolsTouched >= 5);
+
+  // Hidden revisions are always the OLDEST ones, so the control sits at the
+  // old end of the list: bottom for newest-first, top for oldest-first.
+  const showOlderButton = hiddenCount > 0 && (
+    <button
+      type="button"
+      onClick={() => setVisibleCount((c) => c + INITIAL_VISIBLE_REVISIONS)}
+      className="w-full py-1.5 text-[11px] font-mono text-slate-400 hover:text-white rounded-lg border border-dashed border-white/10 hover:border-white/25 transition-all"
+    >
+      Show {Math.min(INITIAL_VISIBLE_REVISIONS, hiddenCount)} older revisions ({hiddenCount} hidden)
+    </button>
+  );
 
   return (
     <div className="space-y-3 p-3.5 rounded-xl bg-slate-950/80 border border-cyan-500/20 shadow-inner">
@@ -399,6 +424,7 @@ export function FileHistoryTimeline({ filePath }: FileHistoryTimelineProps) {
       <div ref={listRef}>
         {orientation === 'vertical' ? (
           <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1 relative before:absolute before:left-3 before:top-2 before:bottom-2 before:w-0.5 before:bg-gradient-to-b before:from-cyan-500/50 before:via-indigo-500/30 before:to-slate-800">
+            {!newestFirst && showOlderButton}
             {displayed.map((rev) => {
               const isExpanded = expandedKey === rev.key;
               const isLatest = rev.key === revisions[revisions.length - 1].key;
@@ -457,16 +483,7 @@ export function FileHistoryTimeline({ filePath }: FileHistoryTimelineProps) {
                 </div>
               );
             })}
-            {revisions.length > visibleCount && (
-              <button
-                type="button"
-                onClick={() => setVisibleCount((c) => c + INITIAL_VISIBLE_REVISIONS)}
-                className="w-full py-1.5 text-[11px] font-mono text-slate-400 hover:text-white rounded-lg border border-dashed border-white/10 hover:border-white/25 transition-all"
-              >
-                Show {Math.min(INITIAL_VISIBLE_REVISIONS, revisions.length - visibleCount)} older revisions (
-                {revisions.length - visibleCount} hidden)
-              </button>
-            )}
+            {newestFirst && showOlderButton}
           </div>
         ) : (
           <div className="space-y-2">
@@ -543,16 +560,7 @@ export function FileHistoryTimeline({ filePath }: FileHistoryTimelineProps) {
                 })()}
               </div>
             )}
-            {revisions.length > visibleCount && (
-              <button
-                type="button"
-                onClick={() => setVisibleCount((c) => c + INITIAL_VISIBLE_REVISIONS)}
-                className="w-full py-1.5 text-[11px] font-mono text-slate-400 hover:text-white rounded-lg border border-dashed border-white/10 hover:border-white/25 transition-all"
-              >
-                Show {Math.min(INITIAL_VISIBLE_REVISIONS, revisions.length - visibleCount)} older revisions (
-                {revisions.length - visibleCount} hidden)
-              </button>
-            )}
+            {showOlderButton}
           </div>
         )}
       </div>

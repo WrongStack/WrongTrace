@@ -157,7 +157,7 @@ export function useProxyTraffic(projectId?: string | null) {
   const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<import('../types').ProxyTrafficRecord[]>({
     queryKey: ['proxy_traffic', projectId || 'active'],
-    queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic${q}${q ? '&' : '?'}detail=false`, signal),
+    queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic${q}${q ? '&' : '?'}detail=false&limit=100`, signal),
     staleTime: 2_000,
   });
 }

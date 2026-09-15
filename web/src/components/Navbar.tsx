@@ -41,11 +41,21 @@ export function Navbar({
       }
       setSwitchError(null);
       await refetchProjects();
-      await queryClient.invalidateQueries();
       const switched = projects.find((p: Project) => p.id === projectId) || null;
+      // Select first: project-id-keyed queries then fetch under their NEW keys
+      // on their own, so invalidating them here would only refetch the old
+      // project's data. Everything else ('active'-keyed or unkeyed views such
+      // as proxy traffic, profiler, IPC, per-file panels) reads whichever store
+      // the daemon just activated and must still be refreshed.
       if (onProjectChange) {
         onProjectChange(switched);
       }
+      const projectIds = new Set(projects.map((p: Project) => p.id));
+      void queryClient.invalidateQueries({
+        predicate: (q) =>
+          q.queryKey[0] !== 'projects' &&
+          !q.queryKey.some((part) => typeof part === 'string' && projectIds.has(part)),
+      });
     } catch (err) {
       setSwitchError(err instanceof Error ? err.message : 'Failed to switch project');
     }

@@ -125,8 +125,9 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
         t.provider.toLowerCase().includes(q) ||
         t.target_url.toLowerCase().includes(q) ||
         t.incoming_path.toLowerCase().includes(q) ||
-        t.request_body.toLowerCase().includes(q) ||
-        t.response_body.toLowerCase().includes(q)
+        // List rows are summaries: request/response bodies arrive blank, so
+        // searching them silently matched nothing. Search metadata only.
+        (t.agent_name || '').toLowerCase().includes(q)
       );
     });
   }, [traffic, trafficFilter, statusFilter, projectScope, currentProject]);
@@ -486,8 +487,24 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
   };
 
   // Export full wire traffic log as JSON
-  const handleExportTraffic = () => {
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(traffic, null, 2));
+  // The list query holds metadata-only summaries (bodies/headers blanked by
+  // the server), so the export fetches the full records on demand.
+  const handleExportTraffic = async () => {
+    setActionError(null);
+    let full: ProxyTrafficRecord[];
+    try {
+      const res = await fetch('/api/proxy/traffic?limit=100', { headers: { Accept: 'application/json' } });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        setActionError(data?.error || `Failed to export traffic log (${res.status})`);
+        return;
+      }
+      full = await res.json();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to export traffic log');
+      return;
+    }
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(full, null, 2));
     const downloadAnchor = document.createElement('a');
     downloadAnchor.setAttribute("href", dataStr);
     downloadAnchor.setAttribute("download", `wrongtrace-wire-traffic-${new Date().toISOString().slice(0, 10)}.json`);
@@ -916,7 +933,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
                 type="text"
                 value={trafficFilter}
                 onChange={(e) => setTrafficFilter(e.target.value)}
-                placeholder="Search raw payload, model, provider, path..."
+                placeholder="Search model, provider, path, agent..."
                 className="w-full bg-slate-950/80 border border-white/10 rounded-lg px-2.5 py-1 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
               />
               {currentProject && (

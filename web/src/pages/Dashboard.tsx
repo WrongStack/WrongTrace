@@ -12,6 +12,7 @@ import { LiveEventFeed } from '../components/LiveEventFeed';
 import { ROIAnalysis } from '../components/ROIAnalysis';
 import { useHealth, useModels, useOverview, useRecentEvents, useThrashing, useAtlas, useProjects } from '../hooks/useMetrics';
 import { useWebSocket } from '../hooks/useWebSocket';
+import { nextCoalesceMs } from '../lib/wsCoalesce';
 import type { WSMessage } from '../types';
 
 const EMPTY_ARRAY: any[] = [];
@@ -74,7 +75,12 @@ export function Dashboard() {
 	// full refresh storms per second -- roughly thirty requests a second, each
 	// re-rendering the whole dashboard. The window widens under sustained
 	// traffic and snaps back as soon as things go quiet.
+	// The window is armed by the first frame after a flush, so its delay is
+	// chosen from the PREVIOUS window's frames (see nextCoalesceMs); resetting
+	// to zero before that choice made the 500/1000ms tiers unreachable.
 	const wsBurstRef = useRef(0);
+	const wsWindowStartRef = useRef(0);
+	const wsPrevWindowRef = useRef({ frames: 0, startedAt: 0 });
 	const missedWhileHiddenRef = useRef(false);
 
   // Aggregate socket notifications without putting every frame into React
@@ -85,7 +91,11 @@ export function Dashboard() {
 		if (seenHelloRef.current) {
 			// A second hello means the socket reconnected. Refresh only mounted
 			// queries to close any event gap while the connection was down.
-			void queryClient.invalidateQueries({ refetchType: 'active' });
+			// Rows may have been pruned or the daemon may have restarted on
+			// another store, and useRecentEvents' incremental `since` merge never
+			// drops rows -- reset it so it performs a full fetch instead.
+			void queryClient.invalidateQueries({ refetchType: 'active', predicate: (q) => q.queryKey[0] !== 'recent' });
+			void queryClient.resetQueries({ queryKey: ['recent'] });
 		}
 		seenHelloRef.current = true;
 		return;
@@ -103,9 +113,13 @@ export function Dashboard() {
 
     if (wsTimerRef.current) return;
 
-    const coalesceMs = wsBurstRef.current > 20 ? 1000 : wsBurstRef.current > 5 ? 500 : 250;
+    const now = Date.now();
+    const prevWindow = wsPrevWindowRef.current;
+    const coalesceMs = nextCoalesceMs(prevWindow.frames, now - prevWindow.startedAt);
+    wsWindowStartRef.current = now;
     wsTimerRef.current = setTimeout(() => {
       wsTimerRef.current = null;
+      wsPrevWindowRef.current = { frames: wsBurstRef.current, startedAt: wsWindowStartRef.current };
       wsBurstRef.current = 0;
       const pending = pendingWsTypesRef.current;
       pendingWsTypesRef.current = new Set();
@@ -157,7 +171,9 @@ export function Dashboard() {
 		invalidate(['models']);
 	  }
       if (pending.has('project_switched')) {
-        ['projects', 'overview', 'thrashing', 'models', 'recent', 'atlas', 'proxy_traffic', 'profiler_traces'].forEach((key) => invalidate([key]));
+        ['projects', 'overview', 'thrashing', 'models', 'atlas', 'proxy_traffic', 'profiler_traces'].forEach((key) => invalidate([key]));
+        // The incremental `since` merge would keep the previous store's rows.
+        void queryClient.resetQueries({ queryKey: ['recent'] });
       }
     }, coalesceMs);
   }, [queryClient]);

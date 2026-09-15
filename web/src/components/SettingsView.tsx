@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { Settings, Save, ShieldAlert, Cpu, HardDrive, DollarSign, Check, Sliders, BellRing, Trash2, Wrench, X, FolderTree, Plus, Database, Sparkles, FolderPlus, ArrowRight, Download, AlertTriangle, Eye, RefreshCw } from 'lucide-react';
 import { useSettings, useProjects } from '../hooks/useMetrics';
 import type { AppSettings, Project, ImportFromWrongStackResult, PreviewFromWrongStackResult } from '../types';
 
 export function SettingsView() {
+  const queryClient = useQueryClient();
   const { data: initialSettings, refetch: refetchSettings } = useSettings();
   const { data: projects = [], refetch: refetchProjects } = useProjects();
 
@@ -339,6 +341,10 @@ export function SettingsView() {
       }
       const data = await res.json().catch(() => ({}));
       const count = data.deleted ?? data.deleted_rows ?? 0;
+      // useRecentEvents merges incremental `since` pages into its cache and
+      // never drops rows on its own; reset it so the next read is a full fetch
+      // without the pruned events.
+      void queryClient.resetQueries({ queryKey: ['recent'] });
       setPruneMsg(`Deleted ${count} stale events (> 30 days)`);
       setTimeout(() => setPruneMsg(null), 4000);
     } catch (err) {
