@@ -249,7 +249,30 @@ type sseStreamChunk struct {
 		ID    string                 `json:"id"`
 		Model string                 `json:"model"`
 		Usage map[string]interface{} `json:"usage"`
+		// Content is a string in Ollama's native /api/chat chunks but an
+		// array in Anthropic's message_start; RawMessage keeps either from
+		// failing the whole chunk decode.
+		Content  json.RawMessage `json:"content"`
+		Thinking string          `json:"thinking"`
 	} `json:"message"`
+	// Ollama native NDJSON: /api/generate streams "response" text; the final
+	// line carries done_reason and the prompt/eval token counts. Response is
+	// raw because OpenAI Responses API events use "response" for an object.
+	Response        json.RawMessage `json:"response"`
+	DoneReason      string          `json:"done_reason"`
+	PromptEvalCount float64         `json:"prompt_eval_count"`
+	EvalCount       float64         `json:"eval_count"`
+	// Gemini generateContent / streamGenerateContent chunks.
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text    string `json:"text"`
+				Thought bool   `json:"thought"`
+			} `json:"parts"`
+		} `json:"content"`
+		FinishReason string `json:"finishReason"`
+	} `json:"candidates"`
+	ModelVersion string `json:"modelVersion"`
 	ContentBlock *struct {
 		Type string `json:"type"`
 		ID   string `json:"id"`
@@ -269,28 +292,10 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 	}
 	toolMap := make(map[int]*toolBuffer)
 
-	remaining := data
-	for len(remaining) > 0 {
-		var line []byte
-		if idx := bytes.IndexByte(remaining, '\n'); idx >= 0 {
-			line = remaining[:idx]
-			remaining = remaining[idx+1:]
-		} else {
-			line = remaining
-			remaining = nil
-		}
-		line = bytes.TrimSpace(line)
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		jsonPart := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		if bytes.Equal(jsonPart, []byte("[DONE]")) || len(jsonPart) == 0 {
-			continue
-		}
-
+	handleChunk := func(jsonPart []byte) {
 		var chunk sseStreamChunk
 		if err := json.Unmarshal(jsonPart, &chunk); err != nil {
-			continue
+			return
 		}
 
 		if chunk.ID != "" {
@@ -386,6 +391,96 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 					pa.FinishReason = chunk.Delta.StopReason
 				}
 			}
+		}
+
+		// Gemini candidates (SSE with alt=sse, or JSON-array framing).
+		if chunk.ModelVersion != "" {
+			pa.WireModel = chunk.ModelVersion
+		}
+		if len(chunk.Candidates) > 0 {
+			cand := chunk.Candidates[0]
+			if cand.FinishReason != "" {
+				pa.FinishReason = cand.FinishReason
+			}
+			for _, part := range cand.Content.Parts {
+				if part.Thought {
+					reasoningBuilder.WriteString(part.Text)
+				} else {
+					textBuilder.WriteString(part.Text)
+				}
+			}
+		}
+
+		// Ollama native NDJSON chunks.
+		if chunk.Message != nil {
+			if len(chunk.Message.Content) > 0 && chunk.Message.Content[0] == '"' {
+				var text string
+				if json.Unmarshal(chunk.Message.Content, &text) == nil {
+					textBuilder.WriteString(text)
+				}
+			}
+			if chunk.Message.Thinking != "" {
+				reasoningBuilder.WriteString(chunk.Message.Thinking)
+			}
+		}
+		if len(chunk.Response) > 0 && chunk.Response[0] == '"' {
+			var text string
+			if json.Unmarshal(chunk.Response, &text) == nil {
+				textBuilder.WriteString(text)
+			}
+		}
+		if chunk.DoneReason != "" {
+			pa.FinishReason = chunk.DoneReason
+		}
+		if chunk.PromptEvalCount > 0 {
+			pa.PromptTokens = int64(chunk.PromptEvalCount)
+		}
+		if chunk.EvalCount > 0 {
+			pa.CompletionTokens = int64(chunk.EvalCount)
+		}
+		if (chunk.PromptEvalCount > 0 || chunk.EvalCount > 0) && pa.TotalTokens < pa.PromptTokens+pa.CompletionTokens {
+			pa.TotalTokens = pa.PromptTokens + pa.CompletionTokens
+		}
+	}
+
+	// Gemini streamGenerateContent without alt=sse streams ONE JSON array
+	// whose elements are the chunks. Only a complete capture parses; a
+	// head/tail-truncated one falls through to the line scan below.
+	parsedArray := false
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '[' {
+		var elems []json.RawMessage
+		if json.Unmarshal(trimmed, &elems) == nil {
+			parsedArray = true
+			for _, e := range elems {
+				handleChunk(e)
+			}
+		}
+	}
+
+	remaining := data
+	if parsedArray {
+		remaining = nil
+	}
+	for len(remaining) > 0 {
+		var line []byte
+		if idx := bytes.IndexByte(remaining, '\n'); idx >= 0 {
+			line = remaining[:idx]
+			remaining = remaining[idx+1:]
+		} else {
+			line = remaining
+			remaining = nil
+		}
+		line = bytes.TrimSpace(line)
+		switch {
+		case bytes.HasPrefix(line, []byte("data:")):
+			jsonPart := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if bytes.Equal(jsonPart, []byte("[DONE]")) || len(jsonPart) == 0 {
+				continue
+			}
+			handleChunk(jsonPart)
+		case len(line) > 0 && line[0] == '{':
+			// NDJSON (Ollama native streaming): one bare JSON object per line.
+			handleChunk(line)
 		}
 	}
 

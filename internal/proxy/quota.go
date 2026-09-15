@@ -92,6 +92,8 @@ func budgetWarning(scope string, limit, spend float64) string {
 }
 
 // CheckSpend verifies if adding the cost is within budget without mutating state.
+// It is a probe only: concurrent callers all see the same headroom, so an
+// admission gate must reserve with CheckAndRecordSpend instead.
 // remainingUSD is the headroom left on the BINDING budget -- the tighter of this
 // key's own budget and the global aggregate. When no budget applies, remainingUSD
 // is reported as remainingUnbounded rather than a fabricated balance.
@@ -144,6 +146,32 @@ func (q *QuotaLimiter) RecordSpend(key string, costUSD float64) {
 	defer q.mu.Unlock()
 	q.checkResetDayLocked()
 	q.recordLocked(key, costUSD)
+}
+
+// AdjustSpend applies a signed correction to the key's and the global daily
+// spend. The gateway uses it to reconcile an admission reservation
+// (CheckAndRecordSpend of the projected cost) with the actual cost, and to
+// refund a reservation whose request produced no billable exchange. Spend is
+// clamped at zero so a refund that crosses a UTC day reset cannot drive the
+// new day's meter negative.
+func (q *QuotaLimiter) AdjustSpend(key string, deltaUSD float64) {
+	if deltaUSD == 0 {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.checkResetDayLocked()
+	apply := func(k string) {
+		v := q.dailySpend[k] + deltaUSD
+		if v < 0 {
+			v = 0
+		}
+		q.dailySpend[k] = v
+	}
+	apply(key)
+	if key != globalBudgetKey {
+		apply(globalBudgetKey)
+	}
 }
 
 // GetSpend returns today's spend for a given key.

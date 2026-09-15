@@ -87,6 +87,10 @@ type ProxyTrafficRecord struct {
 	SystemPrompt     string            `json:"system_prompt,omitempty"`
 	MessageCount     int               `json:"message_count"`
 	FinishReason     string            `json:"finish_reason,omitempty"`
+	// Truncated marks a streamed exchange that did not end with a clean
+	// upstream EOF, or whose client stopped accepting bytes mid-stream. Its
+	// captured body and token counts are partial and it is never cached.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // Config configures the transparent LLM gateway proxy.
@@ -134,7 +138,13 @@ type GatewayProxy struct {
 	finalizeCh      chan finalizeJob
 	finalizeWG      sync.WaitGroup
 	finalizeDropped atomic.Int64
-	closeOnce       sync.Once
+	// finalizeMu guards finalizeClosed and serializes Close against
+	// enqueueFinalize. Enqueuers hold the read lock across the closed check,
+	// WaitGroup.Add and the channel send, so Close (write lock) can never
+	// close the channel under an in-flight send, and no Add can start once
+	// Close has moved on to Wait.
+	finalizeMu     sync.RWMutex
+	finalizeClosed bool
 }
 
 // NewGatewayProxy creates a new GatewayProxy instance with standard provider registries, route manager, cache, and quota limiter.
@@ -199,7 +209,61 @@ type finalizeJob struct {
 	cacheKey     string
 	cacheEnabled bool
 	isStream     bool
-	analysis     *PayloadAnalysis // precomputed (cache-hit path); nil → analyzed here
+	// cacheHit marks a response replayed from the response cache: the record
+	// is already final ($0 cost) and only wire analysis, correlation and
+	// traffic persistence remain.
+	cacheHit bool
+	// replayHeader is the unmasked upstream header set a cache fill stores for
+	// replay on later hits (nil when the cache is not in play).
+	replayHeader http.Header
+	// quota is the budget reservation taken at admission; finalize reconciles
+	// it against the actual cost.
+	quota quotaReservation
+}
+
+// quotaReservation is the projected cost a budgeted request reserved at
+// admission via CheckAndRecordSpend. It must be settled exactly once: by
+// finalize (actual - reserved) or, when the request never produces a billable
+// exchange, released in full.
+type quotaReservation struct {
+	key    string
+	amount float64
+	active bool
+}
+
+// relayOpts carries the per-request state the relay functions hand to the
+// finalize pipeline.
+type relayOpts struct {
+	reqBody       []byte
+	cacheKey      string
+	cacheEnabled  bool
+	policyEnabled bool
+	replayHeader  http.Header
+	quota         quotaReservation
+}
+
+// releaseReservation refunds an admission reservation in full, for requests
+// that end without a billable upstream exchange.
+func (p *GatewayProxy) releaseReservation(res quotaReservation) {
+	if res.active && p.Quotas != nil {
+		p.Quotas.AdjustSpend(res.key, -res.amount)
+	}
+}
+
+// settleSpend charges actualUSD to the budget. A reserved request is
+// reconciled by the difference to its reservation (refunding any excess);
+// an unreserved one is charged directly under fallbackKey.
+func (p *GatewayProxy) settleSpend(res quotaReservation, fallbackKey string, actualUSD float64) {
+	if p.Quotas == nil {
+		return
+	}
+	if res.active {
+		p.Quotas.AdjustSpend(res.key, actualUSD-res.amount)
+		return
+	}
+	if actualUSD > 0 {
+		p.Quotas.RecordSpend(fallbackKey, actualUSD)
+	}
 }
 
 const finalizeQueueCap = 256
@@ -210,7 +274,20 @@ const finalizeQueueCap = 256
 // queue the job is dropped (counted, logged) rather than stalling a coding
 // agent's keep-alive connection — mirroring Hub.Broadcast's drop-for-slow-
 // readers policy.
+//
+// A job arriving after Close (a handler that outlived a timed-out HTTP
+// shutdown) is dropped instead of panicking with a send on the closed channel.
+// Its quota reservation, if any, is left standing: the actual cost is unknown
+// and the estimate is the best available charge.
 func (p *GatewayProxy) enqueueFinalize(job finalizeJob) {
+	p.finalizeMu.RLock()
+	defer p.finalizeMu.RUnlock()
+	if p.finalizeClosed {
+		if n := p.finalizeDropped.Add(1); n == 1 || n%100 == 0 {
+			proxyLogf("[%s] telemetry finalize pipeline closed; dropped late job #%d", job.rec.ID, n)
+		}
+		return
+	}
 	p.finalizeWG.Add(1)
 	select {
 	case p.finalizeCh <- job:
@@ -257,8 +334,16 @@ func (p *GatewayProxy) waitFinalize() { p.finalizeWG.Wait() }
 // Close drains the finalize pipeline: no further jobs are accepted and all
 // queued analysis/recording completes before it returns. Call only after the
 // HTTP listener has shut down, so no handler can still enqueue.
+//
+// Close is idempotent and safe against handlers that are still running (e.g.
+// when the HTTP shutdown deadline expired): their late jobs are dropped.
 func (p *GatewayProxy) Close() {
-	p.closeOnce.Do(func() { close(p.finalizeCh) })
+	p.finalizeMu.Lock()
+	if !p.finalizeClosed {
+		p.finalizeClosed = true
+		close(p.finalizeCh)
+	}
+	p.finalizeMu.Unlock()
 	p.finalizeWG.Wait()
 }
 
@@ -272,19 +357,43 @@ func (p *GatewayProxy) finalize(job finalizeJob) {
 	rec := job.rec
 	rec.RequestBody = string(job.reqBody)
 
-	if job.analysis != nil {
+	rec.ResponseBody = string(job.respBytes)
+
+	if job.cacheHit {
 		// Cache-hit path: the record is already final ($0 cost, cache-savings
-		// accounting, px-* ID kept unique). Only run correlation and traffic
-		// persistence remain.
-		runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, rec.PromptTokens, rec.CompletionTokens, 0, job.analysis.UserIntent)
+		// accounting, px-* ID kept unique). Wire analysis runs here rather
+		// than on the request goroutine, so the replayed bytes are flushed
+		// without waiting on a JSON walk of the cached body.
+		analysis := AnalyzeWirePayloads(job.reqBody, job.respBytes, job.isStream)
+		if analysis.WireModel != "" && (rec.Model == "" || rec.Model == "unknown-model") {
+			rec.Model = analysis.WireModel
+		}
+		// A cached provider payload reuses the original wire ID. Keep this
+		// request's px-* ID unique so traffic detail links are unambiguous.
+		if analysis.PromptTokens > 0 || analysis.CompletionTokens > 0 {
+			rec.PromptTokens = analysis.PromptTokens
+			rec.CompletionTokens = analysis.CompletionTokens
+			rec.TotalTokens = analysis.PromptTokens + analysis.CompletionTokens
+			rec.CachedTokens = rec.TotalTokens
+		}
+		rec.ReasoningTokens = analysis.ReasoningTokens
+		rec.ToolCalls = analysis.ToolCalls
+		rec.ToolCount = analysis.ToolCount
+		rec.AssistantReply = analysis.AssistantReply
+		rec.Reasoning = analysis.Reasoning
+		rec.SystemPrompt = analysis.SystemPrompt
+		rec.MessageCount = analysis.MessageCount
+		rec.FinishReason = analysis.FinishReason
+
+		runID := p.recordRun(rec.Model, rec.Provider, rec.AgentName, rec.TaskID, rec.ProjectID, rec.ProjectSlug, rec.RunID, rec.SessionKey, rec.PromptTokens, rec.CompletionTokens, 0, analysis.UserIntent)
 		if runID != "" {
 			rec.RunID = runID
 		}
 		p.recordTraffic(rec)
+		// Served from cache: nothing was billed, so any reservation is refunded.
+		p.settleSpend(job.quota, "", 0)
 		return
 	}
-
-	rec.ResponseBody = string(job.respBytes)
 
 	analysis := AnalyzeWirePayloads(job.reqBody, job.respBytes, job.isStream)
 
@@ -343,20 +452,24 @@ func (p *GatewayProxy) finalize(job finalizeJob) {
 	}
 	p.recordTraffic(rec)
 
-	if p.Quotas != nil && rec.CostUSD > 0 {
-		quotaKey := rec.ProjectSlug
-		if quotaKey == "" {
-			quotaKey = rec.AgentName
-		}
-		p.Quotas.RecordSpend(quotaKey, rec.CostUSD)
+	// Only a successful exchange is billable; upstream error responses refund
+	// the admission reservation instead of consuming budget.
+	quotaKey := rec.ProjectSlug
+	if quotaKey == "" {
+		quotaKey = rec.AgentName
 	}
+	billedUSD := 0.0
+	if rec.StatusCode >= 200 && rec.StatusCode < 300 {
+		billedUSD = rec.CostUSD
+	}
+	p.settleSpend(job.quota, quotaKey, billedUSD)
 
 	// Save to response cache if successful. cacheKey is the lookup-time
 	// response-cache key; reusing it for the store (instead of recomputing
 	// from rec.RequestBody/rec.Model, which analysis may have rewritten) is
 	// what makes future lookups actually hit.
 	if job.cacheEnabled && rec.StatusCode == http.StatusOK && p.Cache != nil && len(job.respBytes) > 0 && job.cacheKey != "" {
-		p.Cache.Set(job.cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, job.respBytes, job.isStream, promptTokens+completionTokens, costUSD, 24*time.Hour)
+		p.Cache.SetWithReplayHeader(job.cacheKey, rec.Provider, rec.Model, rec.StatusCode, rec.ResponseHeaders, job.replayHeader, job.respBytes, job.isStream, promptTokens+completionTokens, costUSD, 24*time.Hour)
 	}
 }
 
@@ -731,8 +844,11 @@ func declaredOutputCap(maxTokens, maxCompletionTokens *float64) *float64 {
 // reuse EstimatePromptTokens -- the same estimator the finalize path falls back to
 // -- so projection and eventual charge stay consistent. Completion is bounded by
 // the client's own declared cap; when none was declared the projection covers the
-// prompt only, which keeps the residual overshoot to a single response that
-// RecordSpend still accounts for afterwards. No request content is logged here.
+// prompt only. ServeHTTP RESERVES this projection atomically at admission and
+// finalize reconciles it against the actual cost, so concurrent requests cannot
+// all pass the gate against the same headroom; the residual overshoot is bounded
+// by each in-flight request's unprojected completion. No request content is
+// logged here.
 func estimateRequestCostUSD(provider, model string, reqBody []byte, maxOutput *float64) float64 {
 	promptTokens := EstimatePromptTokens(reqBody)
 	var completionTokens int64
@@ -825,7 +941,8 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// safeTargetURL is the credential-scrubbed form used ONLY for logs and
 	// traffic records; the forwarded request keeps the real URL so
 	// query-authenticated providers (e.g. Gemini ?key=...) keep working.
-	safeTargetURL := sanitizeURLForRecord(base.String())
+	targetURL := base.String()
+	safeTargetURL := sanitizeURLForRecord(targetURL)
 
 	reqID := randomID("px")
 
@@ -862,7 +979,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the body once in the background finalize pipeline instead.
 	var parsedReq struct {
 		Model               string   `json:"model"`
-		Stream              bool     `json:"stream"`
+		Stream              *bool    `json:"stream"`
 		MaxTokens           *float64 `json:"max_tokens"`
 		MaxCompletionTokens *float64 `json:"max_completion_tokens"`
 	}
@@ -918,18 +1035,25 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if quotaKey == "" {
 		quotaKey = agentName
 	}
+	var reservation quotaReservation
 	if policyEnabled {
 		allowed, remaining, quotaMsg := p.Quotas.CheckSpend(quotaKey, 0.0)
 		if allowed && remaining != remainingUnbounded {
-			// A budget is configured, so admission has to account for THIS
-			// request's projected cost. The real charge only lands later, in the
-			// async finalize path (RecordSpend), so a zero-cost probe lets the
-			// daily cap be overshot by exactly one request. The extra body
-			// decode is paid only by budgeted tenants -- unbounded traffic keeps
-			// its byte-preserving, allocation-light fast path.
-			allowed, _, quotaMsg = p.Quotas.CheckSpend(quotaKey,
-				estimateRequestCostUSD(provider, modelName, reqBody,
-					declaredOutputCap(parsedReq.MaxTokens, parsedReq.MaxCompletionTokens)))
+			// A budget is configured, so admission RESERVES this request's
+			// projected cost atomically (check and charge under one lock). The
+			// real charge is only known later, in the async finalize path, and a
+			// check-only gate let every concurrent request pass against the same
+			// headroom before any of them was charged. finalize reconciles the
+			// reservation to the actual cost (actual - estimate); paths that end
+			// without a billable exchange refund it. The extra body decode is
+			// paid only by budgeted tenants -- unbounded traffic keeps its
+			// byte-preserving, allocation-light fast path.
+			estimate := estimateRequestCostUSD(provider, modelName, reqBody,
+				declaredOutputCap(parsedReq.MaxTokens, parsedReq.MaxCompletionTokens))
+			allowed, _, quotaMsg = p.Quotas.CheckAndRecordSpend(quotaKey, estimate)
+			if allowed {
+				reservation = quotaReservation{key: quotaKey, amount: estimate, active: true}
+			}
 		}
 		if !allowed {
 			w.Header().Set("Content-Type", "application/json")
@@ -949,7 +1073,8 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// streaming if missing. This MUST run before the cache lookup below: the
 	// cache key is hashed from the forwarded body, so mutating it afterwards
 	// stored entries under a key no lookup could ever hit.
-	isStream := parsedReq.Stream || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+	parsedStream := parsedReq.Stream != nil && *parsedReq.Stream
+	isStream := parsedStream || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 	if policyEnabled && isStream && bytes.Contains(reqBody, []byte(`"stream"`)) && !bytes.Contains(reqBody, []byte(`"stream_options"`)) {
 		var reqMap map[string]interface{}
 		if err := json.Unmarshal(reqBody, &reqMap); err == nil {
@@ -970,15 +1095,31 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bypassCache := !cacheEnabled || r.Header.Get("Cache-Control") == "no-cache" || r.Header.Get("X-Bypass-Cache") == "true"
 	var cacheKey string
 	if !bypassCache {
-		cacheKey = ComputeScopedKey(provider, modelName, requestCacheScope(r), reqBody)
+		// The key covers the method, forwarded path and the REAL target URL
+		// (query included) in addition to provider/model/scope/body: Gemini
+		// carries the model and verb in the path (":countTokens" vs
+		// ":generateContent" share a body and resolve to "unknown-model"),
+		// "?alt=sse" changes the wire format, and two X-Target-Upstream hosts
+		// can share one provider label. The URL is hashed, never retained.
+		cacheKey = ComputeRequestKey(provider, modelName, requestCacheScope(r), r.Method, base.EscapedPath(), targetURL, reqBody)
 	}
 
 	if !bypassCache && p.Cache != nil && cacheKey != "" {
 		if cached, hit := p.Cache.Get(cacheKey); hit {
-			for k, v := range cached.Headers {
-				w.Header().Set(k, v)
+			h := w.Header()
+			if cached.ReplayHeader != nil {
+				// Raw upstream values, one header line per value. The masked,
+				// comma-joined map is a record/display surface and corrupted
+				// replay (e.g. several Set-Cookie lines fused into one).
+				for k, vv := range cached.ReplayHeader {
+					h[k] = append([]string(nil), vv...)
+				}
+			} else {
+				for k, v := range cached.Headers {
+					h.Set(k, v)
+				}
 			}
-			w.Header().Set("X-WrongTrace-Cache", "HIT")
+			h.Set("X-WrongTrace-Cache", "HIT")
 			w.WriteHeader(cached.StatusCode)
 			_, _ = w.Write(cached.Body)
 
@@ -1002,9 +1143,7 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				StatusCode:      cached.StatusCode,
 				IsStream:        cached.IsStream,
 				RequestHeaders:  reqHeaders,
-				RequestBody:     string(reqBody),
 				ResponseHeaders: cached.Headers,
-				ResponseBody:    string(cached.Body),
 				PromptTokens:    cached.TokensSaved,
 				TotalTokens:     cached.TokensSaved,
 				CachedTokens:    cached.TokensSaved,
@@ -1012,38 +1151,20 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				CostUSD:         0.0, // $0 cost because served from exact cache!
 				CacheSavingsUSD: cached.CostSavedUSD,
 			}
-			analysis := AnalyzeWirePayloads(reqBody, cached.Body, cached.IsStream)
-			if analysis.WireModel != "" && (rec.Model == "" || rec.Model == "unknown-model") {
-				rec.Model = analysis.WireModel
-			}
-			// A cached provider payload reuses the original wire ID. Keep this
-			// request's px-* ID unique so traffic detail links are unambiguous.
-			if analysis.PromptTokens > 0 || analysis.CompletionTokens > 0 {
-				rec.PromptTokens = analysis.PromptTokens
-				rec.CompletionTokens = analysis.CompletionTokens
-				rec.TotalTokens = analysis.PromptTokens + analysis.CompletionTokens
-				rec.CachedTokens = rec.TotalTokens
-			}
-			rec.ReasoningTokens = analysis.ReasoningTokens
-			rec.ToolCalls = analysis.ToolCalls
-			rec.ToolCount = analysis.ToolCount
-			rec.AssistantReply = analysis.AssistantReply
-			rec.Reasoning = analysis.Reasoning
-			rec.SystemPrompt = analysis.SystemPrompt
-			rec.MessageCount = analysis.MessageCount
-			rec.FinishReason = analysis.FinishReason
+			// Wire analysis of the cached body (and the body string copies)
+			// run in finalize, off the request goroutine.
 			p.enqueueFinalize(finalizeJob{
-				rec:          rec,
-				reqBody:      reqBody,
-				respBytes:    cached.Body,
-				cacheKey:     cacheKey,
-				cacheEnabled: cacheEnabled,
-				isStream:     cached.IsStream,
-				analysis:     &analysis,
+				rec:       rec,
+				reqBody:   reqBody,
+				respBytes: cached.Body,
+				isStream:  cached.IsStream,
+				cacheHit:  true,
+				quota:     reservation,
 			})
 			// Enqueue BEFORE the flush: once these bytes reach the client the
 			// agent may immediately pipeline its next request, and the wait
-			// primitive must already see the pending job.
+			// primitive must already see the pending job. Enqueue is a
+			// non-blocking channel send.
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -1052,9 +1173,10 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build outgoing proxy request
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, base.String(), bytes.NewReader(reqBody))
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(reqBody))
 	if err != nil {
-		http.Error(w, "create proxy request failed: "+err.Error(), http.StatusInternalServerError)
+		p.releaseReservation(reservation)
+		http.Error(w, "create proxy request failed: "+scrubErrorString(err.Error()), http.StatusInternalServerError)
 		return
 	}
 
@@ -1075,10 +1197,15 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		safeErr := scrubErrorString(err.Error())
 		proxyLogf("[%s] upstream error for %s: %s", reqID, safeTargetURL, safeErr)
 		http.Error(w, "upstream error: "+safeErr, http.StatusBadGateway)
+		// No upstream exchange happened, so nothing was billed.
+		p.releaseReservation(reservation)
 
 		// Record error traffic. Stays synchronous: the 502 response bytes
 		// are tiny, and the failure path must be observable even under a
-		// wedged finalize pipeline.
+		// wedged finalize pipeline. The body is marshaled, not spliced: the
+		// error text can carry quotes and backslashes that would otherwise
+		// produce invalid JSON in the inspector.
+		errBody, _ := json.Marshal(map[string]string{"error": safeErr})
 		p.recordTraffic(ProxyTrafficRecord{
 			ID:             reqID,
 			Timestamp:      start,
@@ -1088,10 +1215,17 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			TargetURL:      safeTargetURL,
 			Provider:       provider,
 			Model:          modelName,
+			AgentName:      agentName,
+			TaskID:         taskID,
+			RunID:          sessionID,
+			SessionKey:     sessionKey,
+			ProjectID:      projectID,
+			ProjectSlug:    projectSlug,
 			StatusCode:     http.StatusBadGateway,
+			IsStream:       isStream,
 			RequestHeaders: reqHeaders,
 			RequestBody:    string(reqBody),
-			ResponseBody:   `{"error": "` + safeErr + `"}`,
+			ResponseBody:   string(errBody),
 		})
 		return
 	}
@@ -1100,25 +1234,46 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	duration := time.Since(start).Milliseconds()
 	proxyLogf("[%s] <- %s responded HTTP %d in %dms", reqID, safeTargetURL, resp.StatusCode, duration)
 
-	isStream = parsedReq.Stream || strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+	// Relay mode. Incremental relay applies to every response framed as a
+	// stream (SSE, NDJSON) and to successful responses of requests that asked
+	// for one -- including Gemini streamGenerateContent (a progressively
+	// written JSON array unless ?alt=sse) and Ollama's native /api/chat and
+	// /api/generate, which stream by default with no "stream" field. Buffering
+	// those held every token until generation finished.
+	respCT := strings.ToLower(resp.Header.Get("Content-Type"))
+	is2xx := resp.StatusCode >= 200 && resp.StatusCode < 300
+	relayStream := strings.Contains(respCT, "text/event-stream") ||
+		strings.Contains(respCT, "application/x-ndjson") ||
+		(is2xx && (parsedStream || isStreamingEndpoint(cleanPath, parsedReq.Stream, respCT)))
+	// SSE framing headers are forced only onto successful streams that are not
+	// JSON-framed: relabeling an upstream JSON error (or an NDJSON / JSON-array
+	// stream) as text/event-stream breaks the client's error handling.
+	forceSSEHeaders := relayStream && is2xx && !strings.Contains(respCT, "json")
 
-	// Copy response headers (omit Content-Length for streaming SSE responses)
+	// Copy response headers (omit Content-Length for streamed responses)
 	for k, vv := range resp.Header {
 		lowerK := strings.ToLower(k)
-		if isStream && (lowerK == "content-length" || lowerK == "transfer-encoding") {
+		if relayStream && (lowerK == "content-length" || lowerK == "transfer-encoding") {
 			continue
 		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
-	if isStream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
+	if forceSSEHeaders {
+		setSSEStreamHeaders(w.Header())
 	}
 	respHeaders := maskHeaders(resp.Header)
+
+	// A cache fill stores the raw upstream header set for faithful replay; the
+	// clone is only paid when this request can actually populate the cache.
+	var replayHeader http.Header
+	if cacheKey != "" && p.Cache != nil {
+		replayHeader = replayableHeader(resp.Header)
+		if forceSSEHeaders {
+			setSSEStreamHeaders(replayHeader)
+		}
+	}
 
 	baseRecord := ProxyTrafficRecord{
 		ID:           reqID,
@@ -1143,13 +1298,86 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ResponseHeaders: respHeaders,
 	}
 
-	baseRecord.IsStream = isStream
+	baseRecord.IsStream = parsedStream || relayStream
 
-	if isStream {
-		p.relayStreamingResponse(w, resp.Body, baseRecord, reqBody, cacheKey, cacheEnabled, policyEnabled)
-	} else {
-		p.relayJSONResponse(w, resp.Body, baseRecord, reqBody, cacheKey, cacheEnabled)
+	opts := relayOpts{
+		reqBody:       reqBody,
+		cacheKey:      cacheKey,
+		cacheEnabled:  cacheEnabled,
+		policyEnabled: policyEnabled,
+		replayHeader:  replayHeader,
+		quota:         reservation,
 	}
+	if relayStream {
+		p.relayStreamingResponse(w, resp.Body, baseRecord, opts)
+	} else {
+		p.relayJSONResponse(w, resp.Body, baseRecord, opts)
+	}
+}
+
+// isStreamingEndpoint reports whether a request addresses an API that streams
+// without the OpenAI-style "stream": true body flag: Gemini's
+// models/<m>:streamGenerateContent, and Ollama's native /api/chat and
+// /api/generate, whose "stream" field defaults to true when absent. respCT is
+// the lowercased upstream Content-Type; an Ollama answer explicitly typed JSON
+// is a non-streaming reply and stays on the buffered path.
+func isStreamingEndpoint(cleanPath string, stream *bool, respCT string) bool {
+	lower := strings.ToLower(cleanPath)
+	if strings.Contains(lower, ":streamgeneratecontent") {
+		return true
+	}
+	if stream != nil && !*stream {
+		return false
+	}
+	if strings.Contains(respCT, "json") {
+		return false
+	}
+	return strings.HasSuffix(lower, "api/chat") || strings.HasSuffix(lower, "api/generate")
+}
+
+// setSSEStreamHeaders applies the headers a relayed SSE stream needs so
+// intermediaries do not buffer it.
+func setSSEStreamHeaders(h http.Header) {
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+}
+
+// replayableHeader clones an upstream response header for cache replay,
+// dropping hop-by-hop headers (including any named by Connection), Set-Cookie
+// (a per-client session artifact that must never be replayed to another
+// caller) and Content-Length (the replayed body can differ in framing).
+func replayableHeader(src http.Header) http.Header {
+	out := make(http.Header, len(src))
+	var connTokens []string
+	for _, v := range src.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			if tok = strings.TrimSpace(tok); tok != "" {
+				connTokens = append(connTokens, http.CanonicalHeaderKey(tok))
+			}
+		}
+	}
+	for k, vv := range src {
+		switch http.CanonicalHeaderKey(k) {
+		case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+			"Te", "Trailer", "Trailers", "Transfer-Encoding", "Upgrade",
+			"Set-Cookie", "Content-Length":
+			continue
+		}
+		skip := false
+		for _, tok := range connTokens {
+			if http.CanonicalHeaderKey(k) == tok {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		out[k] = append([]string(nil), vv...)
+	}
+	return out
 }
 
 // relayCatalogRequest transparently forwards a model-catalog / metadata call
@@ -1212,15 +1440,17 @@ func (p *GatewayProxy) relayCatalogRequest(w http.ResponseWriter, r *http.Reques
 // buffer, which would otherwise sit unflushed until handler return. Recording
 // is handed to the finalize pipeline; see finalize for what moved off this
 // path.
-func (p *GatewayProxy) relayJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, reqBody []byte, cacheKey string, cacheEnabled bool) {
+func (p *GatewayProxy) relayJSONResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, opts relayOpts) {
 	const maxResponseBytes = 32 * 1024 * 1024
 	respBytes, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
 	if err != nil {
+		p.releaseReservation(opts.quota)
 		w.Header().Del("Content-Length")
 		http.Error(w, "cannot read upstream response", http.StatusBadGateway)
 		return
 	}
 	if len(respBytes) > maxResponseBytes {
+		p.releaseReservation(opts.quota)
 		w.Header().Del("Content-Length")
 		http.Error(w, "upstream response exceeds 32MB limit", http.StatusBadGateway)
 		return
@@ -1234,17 +1464,19 @@ func (p *GatewayProxy) relayJSONResponse(w http.ResponseWriter, body io.Reader, 
 	rec.DurationMs = time.Since(rec.Timestamp).Milliseconds()
 	p.enqueueFinalize(finalizeJob{
 		rec:          rec,
-		reqBody:      reqBody,
+		reqBody:      opts.reqBody,
 		respBytes:    respBytes,
-		cacheKey:     cacheKey,
-		cacheEnabled: cacheEnabled,
+		cacheKey:     opts.cacheKey,
+		cacheEnabled: opts.cacheEnabled,
+		replayHeader: opts.replayHeader,
+		quota:        opts.quota,
 	})
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
-func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, reqBody []byte, cacheKey string, cacheEnabled, policyEnabled bool) {
+func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Reader, rec ProxyTrafficRecord, opts relayOpts) {
 	w.WriteHeader(rec.StatusCode)
 	flusher, isFlusher := w.(http.Flusher)
 	// 32KB: fewer read/write syscalls on chunked non-SSE streams, while the
@@ -1257,12 +1489,14 @@ func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Rea
 	const capturedTailBytes = maxCapturedBytes - capturedHeadBytes
 	capturedTail := newCappedTailBuffer(capturedTailBytes)
 	cleanEOF := false
+	writeFailed := false
 
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
 			if _, wErr := w.Write(buf[:n]); wErr != nil {
 				// Downstream client disconnected (e.g. cancelled stream); stop reading from upstream
+				writeFailed = true
 				break
 			}
 			if isFlusher {
@@ -1288,7 +1522,7 @@ func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Rea
 	fullSSE := streamAnalysisPayload(capturedHead.Bytes(), capturedTail.Bytes())
 
 	// Guarantee terminal marker: if upstream closed stream cleanly without [DONE], emit terminal marker
-	if policyEnabled && cleanEOF && expectsDoneMarker(rec) && strings.Contains(fullSSE, "data:") && !strings.Contains(fullSSE, "[DONE]") {
+	if opts.policyEnabled && cleanEOF && !writeFailed && expectsDoneMarker(rec) && strings.Contains(fullSSE, "data:") && !strings.Contains(fullSSE, "[DONE]") {
 		terminalMarker := []byte("data: [DONE]\n\n")
 		_, _ = w.Write(terminalMarker)
 		if isFlusher {
@@ -1297,14 +1531,20 @@ func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Rea
 		fullSSE += string(terminalMarker)
 	}
 
+	// Only a stream that ended with a clean upstream EOF and was delivered in
+	// full is complete. A reset upstream or a disconnected client leaves a
+	// partial body that must never be cached and replayed as a 200.
+	rec.Truncated = !cleanEOF || writeFailed
 	rec.DurationMs = time.Since(rec.Timestamp).Milliseconds()
 	p.enqueueFinalize(finalizeJob{
 		rec:          rec,
-		reqBody:      reqBody,
+		reqBody:      opts.reqBody,
 		respBytes:    []byte(fullSSE),
-		cacheKey:     cacheKey,
-		cacheEnabled: cacheEnabled,
+		cacheKey:     opts.cacheKey,
+		cacheEnabled: opts.cacheEnabled && !rec.Truncated,
 		isStream:     true,
+		replayHeader: opts.replayHeader,
+		quota:        opts.quota,
 	})
 }
 

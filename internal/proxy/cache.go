@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,18 +13,23 @@ import (
 
 // CachedResponse stores a cached LLM response for identical prompt requests.
 type CachedResponse struct {
-	Key          string            `json:"key"`
-	StatusCode   int               `json:"status_code"`
-	Headers      map[string]string `json:"headers"`
-	Body         []byte            `json:"body"`
-	IsStream     bool              `json:"is_stream"`
-	Model        string            `json:"model"`
-	Provider     string            `json:"provider"`
-	TokensSaved  int64             `json:"tokens_saved"`
-	CostSavedUSD float64           `json:"cost_saved_usd"`
-	CreatedAt    time.Time         `json:"created_at"`
-	ExpiresAt    time.Time         `json:"expires_at"`
-	HitCount     int64             `json:"hit_count"`
+	Key        string            `json:"key"`
+	StatusCode int               `json:"status_code"`
+	Headers    map[string]string `json:"headers"`
+	// ReplayHeader is the unmasked upstream header set (hop-by-hop and
+	// Set-Cookie removed) written back on a hit. Headers above is masked and
+	// comma-joined for display and must not be replayed. Never serialized: it
+	// can carry provider-issued values the record surfaces redact.
+	ReplayHeader http.Header `json:"-"`
+	Body         []byte      `json:"body"`
+	IsStream     bool        `json:"is_stream"`
+	Model        string      `json:"model"`
+	Provider     string      `json:"provider"`
+	TokensSaved  int64       `json:"tokens_saved"`
+	CostSavedUSD float64     `json:"cost_saved_usd"`
+	CreatedAt    time.Time   `json:"created_at"`
+	ExpiresAt    time.Time   `json:"expires_at"`
+	HitCount     int64       `json:"hit_count"`
 
 	// lastAccessUnix tracks the most recent Get() hit (unix nanos) so the
 	// capacity eviction in Set can shed the coldest entries first — the LRU
@@ -94,6 +100,35 @@ func ComputeScopedKey(provider, model, scope string, body []byte) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
+// ComputeRequestKey is the response-cache key the gateway uses. Beyond
+// ComputeScopedKey's provider/model/scope/body it binds the HTTP method, the
+// escaped forwarded path and the full real target URL (query included), all
+// length-prefixed. Without them, requests with identical bodies collided
+// across endpoints the body does not name: Gemini ":countTokens" vs
+// ":generateContent" (model in the path, so model resolves to
+// "unknown-model"), "streamGenerateContent" with and without "?alt=sse", and
+// two X-Target-Upstream hosts sharing one provider label. The target URL may
+// carry a query credential; it only ever enters the hash.
+func ComputeRequestKey(provider, model, scope, method, forwardedPath, targetURL string, body []byte) string {
+	hasher := sha256.New()
+	writeField := func(s string) {
+		var l [8]byte
+		binary.BigEndian.PutUint64(l[:], uint64(len(s)))
+		hasher.Write(l[:])
+		_, _ = io.WriteString(hasher, s)
+	}
+	// Domain tag: a request key can never equal a ComputeScopedKey output.
+	writeField("wrongtrace-request-key-v2")
+	writeField(provider)
+	writeField(model)
+	writeField(scope)
+	writeField(method)
+	writeField(forwardedPath)
+	writeField(targetURL)
+	hasher.Write(body)
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
 // Get retrieves a valid, non-expired cached response.
 func (c *ResponseCache) Get(key string) (*CachedResponse, bool) {
 	c.mu.RLock()
@@ -136,6 +171,14 @@ func (c *ResponseCache) Get(key string) (*CachedResponse, bool) {
 
 // Set saves a response in the cache.
 func (c *ResponseCache) Set(key, provider, model string, statusCode int, headers map[string]string, body []byte, isStream bool, tokensSaved int64, costSavedUSD float64, ttl time.Duration) {
+	c.SetWithReplayHeader(key, provider, model, statusCode, headers, nil, body, isStream, tokensSaved, costSavedUSD, ttl)
+}
+
+// SetWithReplayHeader saves a response along with the raw header set to
+// replay on a hit. headers stays the masked record/display form; replay (when
+// non-nil) is what the gateway writes back to the client. The caller hands
+// over ownership of replay and must not mutate it afterwards.
+func (c *ResponseCache) SetWithReplayHeader(key, provider, model string, statusCode int, headers map[string]string, replay http.Header, body []byte, isStream bool, tokensSaved int64, costSavedUSD float64, ttl time.Duration) {
 	// Guard against caching excessively large bodies in memory (cap at 256KB per entry)
 	if len(body) > 256*1024 {
 		return
@@ -181,6 +224,7 @@ func (c *ResponseCache) Set(key, provider, model string, statusCode int, headers
 		Key:            key,
 		StatusCode:     statusCode,
 		Headers:        headers,
+		ReplayHeader:   replay,
 		Body:           body,
 		IsStream:       isStream,
 		Model:          model,

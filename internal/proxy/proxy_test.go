@@ -606,11 +606,11 @@ func TestDetectProvider(t *testing.T) {
 
 	req4, _ := http.NewRequest("POST", "/proxy/zai/chat/completions", nil)
 	prov4, upstream4, rem4 := p.DetectProvider(req4)
-	if prov4 != "zai" {
-		t.Errorf("expected zai provider, got %s", prov4)
+	if prov4 != "ZAI" {
+		t.Errorf("expected ZAI provider (the route's Name), got %s", prov4)
 	}
-	if upstream4 != "https://api.z.ai" {
-		t.Errorf("expected https://api.z.ai, got %s", upstream4)
+	if upstream4 != "https://api.z.ai/api/coding/paas/v4" {
+		t.Errorf("expected the route's TargetUpstream, got %s", upstream4)
 	}
 	if rem4 != "/chat/completions" {
 		t.Errorf("expected /chat/completions remaining, got %s", rem4)
@@ -759,7 +759,7 @@ func TestGatewayProxy_EnforceModeDoesNotHideTruncatedStream(t *testing.T) {
 		StatusCode:   http.StatusOK,
 		Model:        "test-model",
 		RequestBody:  `{"model":"test-model","stream":true}`,
-	}, nil, "", false, true)
+	}, relayOpts{policyEnabled: true})
 	p.waitFinalize()
 
 	if strings.Contains(w.Body.String(), "[DONE]") {
