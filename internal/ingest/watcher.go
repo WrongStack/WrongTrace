@@ -37,6 +37,12 @@ type SessionWatcher struct {
 	onToolCall     func(ToolCallEvent)
 	onReadEvent    func(FileReadEvent)
 
+	// seenEmitted counts events already delivered per whole-file transcript
+	// (Cline/Roo JSON, Aider history); seenFingerprints hashes the bytes just
+	// before each JSONL offset. Both persist with the offsets (cursor.go).
+	seenEmitted      map[string]int
+	seenFingerprints map[string]uint64
+
 	// dirCache remembers what each directory looked like on the previous poll
 	// so dormant ones can be skipped. It has its own mutex because directory
 	// enumeration runs outside mu, where event delivery happens. See scan.go.
@@ -53,10 +59,12 @@ type SessionWatcher struct {
 // NewSessionWatcher creates a watcher for agent log files.
 func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 	return &SessionWatcher{
-		seenFiles:   make(map[string]fileState),
-		seenOffsets: make(map[string]int64),
-		onToolCall:  onToolCall,
-		scanDepth:   maxScanDepthFromEnv(),
+		seenFiles:        make(map[string]fileState),
+		seenOffsets:      make(map[string]int64),
+		seenEmitted:      make(map[string]int),
+		seenFingerprints: make(map[string]uint64),
+		onToolCall:       onToolCall,
+		scanDepth:        maxScanDepthFromEnv(),
 	}
 }
 
@@ -220,6 +228,7 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 	if kind == kindNone {
 		return
 	}
+	wholeFile := kind == kindJSON || kind == kindAider
 	sw.mu.Lock()
 	st, seen := sw.seenFiles[path]
 	if !seen {
@@ -235,13 +244,21 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 			seen = true
 		}
 	}
+	emitted, countKnown := sw.seenEmitted[path]
+	fingerprint, hasFingerprint := sw.seenFingerprints[path]
+
+	// A whole-file transcript the cursor already knows but has no delivered
+	// count for — baselined on a fresh install, or restored from a checkpoint
+	// written before counts were persisted — is counted once, silently.
+	// Emitting there would replay its entire history as new events.
+	recount := wholeFile && seen && !countKnown
 
 	// Exact equality only: a file that SHRANK below its persisted offset was
 	// truncated or rewritten and must fall through to the truncation rule
 	// (re-ingest from byte 0), never be skipped. The mtime arm cannot save it
 	// on the checkpoint-restore path — there st.modTime is the file's current
 	// mtime, so the arm is always true.
-	if seen && currentSize == st.offset && !modTime.After(st.modTime) {
+	if seen && !recount && currentSize == st.offset && !modTime.After(st.modTime) {
 		sw.mu.Unlock()
 		return
 	}
@@ -249,17 +266,24 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 	lastOffset := st.offset
 	if currentSize < lastOffset {
 		lastOffset = 0 // File truncated or rewritten
+		hasFingerprint = false
 	}
 	sw.mu.Unlock()
 
 	var events []ToolCallEvent
 	var readEvents []FileReadEvent
 	var newOffset int64
+	var cursor jsonlCursor
 	var parseErr error
 
 	switch kind {
 	case kindJSONL:
-		events, readEvents, newOffset, parseErr = ParseJSONLTranscriptFromOffset(path, lastOffset)
+		events, readEvents, cursor, parseErr = parseJSONLResumable(path, jsonlCursor{
+			offset:         lastOffset,
+			fingerprint:    fingerprint,
+			hasFingerprint: hasFingerprint,
+		})
+		newOffset = cursor.offset
 	case kindJSON:
 		events, parseErr = ParseClineTask(path)
 		newOffset = currentSize
@@ -273,9 +297,37 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 		return
 	}
 
+	// Whole-file formats are re-parsed from the top on every change; only
+	// the events past the delivered count are new.
+	total := len(events)
+	if wholeFile {
+		switch {
+		case recount:
+			events = nil
+		case !countKnown:
+			// A file first seen now: everything in it is new.
+		case total >= emitted:
+			events = events[emitted:]
+		default:
+			// Fewer events than already delivered (a task checkpoint restore
+			// or an edited history): re-baseline rather than replay.
+			events = nil
+		}
+	}
+
 	sw.mu.Lock()
 	sw.seenOffsets[path] = newOffset
 	sw.seenFiles[path] = fileState{offset: newOffset, modTime: modTime}
+	if wholeFile {
+		sw.seenEmitted[path] = total
+	}
+	if kind == kindJSONL {
+		if cursor.hasFingerprint {
+			sw.seenFingerprints[path] = cursor.fingerprint
+		} else {
+			delete(sw.seenFingerprints, path)
+		}
+	}
 	sw.cursorDirty = true
 	sw.cursorVersion++
 	onToolCall := sw.onToolCall
@@ -341,6 +393,8 @@ func (sw *SessionWatcher) pruneMissingFiles(now time.Time) {
 		if !fileExists(path) {
 			delete(sw.seenFiles, path)
 			delete(sw.seenOffsets, path)
+			delete(sw.seenEmitted, path)
+			delete(sw.seenFingerprints, path)
 			sw.cursorDirty = true
 			sw.cursorVersion++
 		}

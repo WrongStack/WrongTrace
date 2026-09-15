@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	sitter "github.com/smacker/go-tree-sitter"
 
@@ -267,6 +268,23 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 			if len(parts) > 1 {
 				name = strings.Split(parts[1], "(")[0]
 			}
+		case lang == LangKotlin:
+			// Kotlin fun declarations: the only node kind for most .kt files,
+			// whose top-level funs previously produced no nodes at all — the
+			// files mapped onto this parser in the round-89 extension were
+			// "reaching the pipeline" as classes only, so function edits
+			// emitted no Diff events. `fun interface X` is a SAM interface
+			// declaration, not a function named "interface".
+			kind, name = kotlinDecl(trimmed)
+		case typedDeclLanguage(lang):
+			// Typed `Type name(args) {` declarations (Dart, Java, C#, C/C++):
+			// `void main() {` and `int inc(int v) {` were as invisible as the
+			// Kotlin funs above. Gated by language: Rust/Ruby/PHP/Python heads
+			// (`match parse(x) {`, `if let Some(v) = f() {`) share the shape
+			// but never declare anything.
+			if n := typedDeclName(trimmed); n != "" {
+				kind, name = NodeFunction, n
+			}
 		}
 
 		if name != "" && kind != "" {
@@ -282,7 +300,7 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 				// The scanner carries string/comment state across lines, so a
 				// '}' inside a multi-line block comment or multi-line string
 				// is no longer mistaken for the end of the body.
-				var scanner braceScanner
+				scanner := braceScanner{rust: lang == LangRust}
 				braceCount := scanner.lineDelta(line)
 				j := i + 1
 				for ; j < len(lines) && braceCount > 0; j++ {
@@ -312,6 +330,248 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 	return snap
 }
 
+// statementKeywords are words that begin (or sit inside) a statement or
+// expression head and therefore can never appear in the modifier/return-type
+// prefix of a typed declaration. Any of them before the parenthesised name
+// rejects the line: `for (int i = 0; i < size(); i++) {`, `return new Foo(x) {`,
+// `using (var s = Open()) {`, `lock (x) {`, `await for (...) {`.
+var statementKeywords = map[string]bool{
+	"if": true, "for": true, "while": true, "switch": true, "catch": true,
+	"else": true, "try": true, "do": true, "return": true, "foreach": true,
+	"match": true, "when": true, "using": true, "lock": true, "let": true,
+	"new": true, "throw": true, "throws": true, "case": true, "default": true,
+	"synchronized": true, "yield": true, "await": true, "in": true, "is": true,
+	"as": true, "instanceof": true, "goto": true, "sizeof": true, "typeof": true,
+	"delete": true, "assert": true, "fixed": true, "checked": true,
+	"unchecked": true, "on": true, "with": true, "var": true, "val": true,
+	"elif": true, "unless": true, "until": true, "loop": true, "defer": true,
+	"super": true, "this": true, "not": true, "and": true, "or": true,
+	"nameof": true, "stackalloc": true, "co_await": true, "co_return": true,
+	"finally": true, "from": true, "select": true, "where": true,
+}
+
+// typedDeclLanguage reports whether the `Type name(args) {` heuristic applies.
+// Only C-family languages declare functions in that shape; Kotlin uses `fun`
+// and Rust/Ruby/PHP/Python have their own keywords, where the same shape is
+// always a statement head.
+func typedDeclLanguage(lang Language) bool {
+	switch lang {
+	case LangJava, LangCSharp, LangCpp, LangDart:
+		return true
+	}
+	return false
+}
+
+// kotlinDecl classifies a Kotlin line: a `fun` declaration yields its name as
+// a function; `fun interface X` yields a class. Modifiers and annotations may
+// precede the keyword (private, suspend, override, @Annot), so the scan is
+// token-based. A type-parameter list (`fun <T> name(`, `fun <T, U>name(`,
+// `fun <T: Comparable<T>> name(`) is skipped as one balanced group, and an
+// extension receiver is kept (`fun <T> List<T>.second(`), matching how
+// non-generic extensions (`fun String.shout(`) have always been named.
+func kotlinDecl(trimmed string) (NodeKind, string) {
+	// Cheap reject before tokenizing: nearly every Kotlin line is not a fun.
+	idx := strings.Index(trimmed, "fun")
+	if idx < 0 {
+		return "", ""
+	}
+	for idx >= 0 {
+		end := idx + 3
+		boundaryBefore := idx == 0 || trimmed[idx-1] == ' ' || trimmed[idx-1] == '\t'
+		boundaryAfter := end < len(trimmed) && (trimmed[end] == ' ' || trimmed[end] == '\t' || trimmed[end] == '<')
+		if boundaryBefore && boundaryAfter {
+			return kotlinDeclAfterFun(strings.TrimLeft(trimmed[end:], " \t"))
+		}
+		next := strings.Index(trimmed[end:], "fun")
+		if next < 0 {
+			break
+		}
+		idx = end + next
+	}
+	return "", ""
+}
+
+func kotlinDeclAfterFun(rest string) (NodeKind, string) {
+	if rest == "" {
+		return "", ""
+	}
+	if rest[0] == '<' {
+		end := skipAngleGroup(rest)
+		if end < 0 {
+			return "", ""
+		}
+		rest = strings.TrimLeft(rest[end:], " \t")
+	} else if strings.HasPrefix(rest, "interface") && len(rest) > len("interface") &&
+		(rest[len("interface")] == ' ' || rest[len("interface")] == '\t') {
+		name := kotlinIdent(strings.TrimLeft(rest[len("interface"):], " \t"))
+		if name == "" {
+			return "", ""
+		}
+		return NodeClass, name
+	}
+	name := kotlinFunTarget(rest)
+	if name == "" || !isIdentStart(name[0]) {
+		return "", ""
+	}
+	return NodeFunction, name
+}
+
+// skipAngleGroup returns the index just past the '>' closing the '<' at s[0],
+// or -1 when the group is unbalanced on this line. A '>' that belongs to a
+// function-type arrow (`->`) does not close a level.
+func skipAngleGroup(s string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '<':
+			depth++
+		case '>':
+			if i > 0 && s[i-1] == '-' {
+				continue
+			}
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+// kotlinFunTarget reads `[Receiver.]name` up to the parameter list. Angle
+// brackets in a generic receiver (`Map<K, V>.name`) may contain spaces.
+func kotlinFunTarget(s string) string {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		case '(':
+			if depth == 0 {
+				return s[:i]
+			}
+		case ' ', '\t', '=', ':', '{':
+			if depth == 0 {
+				return s[:i]
+			}
+		}
+	}
+	if depth != 0 {
+		return ""
+	}
+	return s
+}
+
+// kotlinIdent returns the leading identifier of s.
+func kotlinIdent(s string) string {
+	i := 0
+	for i < len(s) && isIdentChar(s[i]) {
+		i++
+	}
+	if i == 0 || !isIdentStart(s[0]) {
+		return ""
+	}
+	return s[:i]
+}
+
+// typedDeclName returns the declared name of a `Type name(args) {` line — the
+// Dart/Java/C#/C/C++ function shape on the generic path — or "" when the line
+// declares nothing. The name is the head of the first field carrying a
+// parameter-list opener. Everything before it must read as modifiers and a
+// return type: at least one such field, no statement keyword, and no field
+// containing anything a type cannot (`=`, operators, a parenthesis, `&&`).
+// That is what keeps statement heads and calls nested in them out —
+// `for (int i = 0; i < size(); i++) {` would otherwise declare `size` and
+// overwrite the real declaration of that name.
+func typedDeclName(trimmed string) string {
+	// Cheap pre-checks before tokenizing: a declaration head ends in '{' and
+	// carries a parameter list; a statement head usually starts with '}' / '('.
+	n := len(trimmed)
+	if n < 4 || trimmed[n-1] != '{' || !isIdentStart(trimmed[0]) && trimmed[0] != '@' {
+		return ""
+	}
+	if strings.IndexByte(trimmed, '(') < 0 {
+		return ""
+	}
+	fields := strings.Fields(trimmed)
+	if statementKeywords[fields[0]] {
+		return ""
+	}
+	for j := 0; j < len(fields); j++ {
+		f := fields[j]
+		idx := strings.IndexByte(f, '(')
+		if idx < 0 {
+			if !plausibleTypeToken(f) {
+				return ""
+			}
+			continue
+		}
+		if j == 0 {
+			// `name(args) {` with no return type: a call, a constructor, or a
+			// macro — indistinguishable here, so never a declaration.
+			return ""
+		}
+		name := strings.TrimLeft(f[:idx], "*&")
+		if !plausibleDeclName(name) || statementKeywords[name] {
+			return ""
+		}
+		return name
+	}
+	return ""
+}
+
+// plausibleTypeToken reports whether a whitespace-separated field can be part
+// of a modifier/return-type prefix: identifiers, qualified names, generics,
+// arrays, pointers/references, nullable markers and annotations.
+func plausibleTypeToken(f string) bool {
+	if statementKeywords[f] || strings.Contains(f, "&&") || strings.Contains(f, "||") {
+		return false
+	}
+	hasIdent := false
+	for i := 0; i < len(f); i++ {
+		c := f[i]
+		switch {
+		case isIdentChar(c):
+			hasIdent = true
+		case c == '.', c == ':', c == '<', c == '>', c == ',', c == '[', c == ']',
+			c == '*', c == '&', c == '?', c == '@', c == '~':
+		default:
+			return false
+		}
+	}
+	// A bare '*'/'&' separates a C pointer declarator (`char * name(`); any
+	// other identifier-free token (`<`, `>`, `::`) is an operator.
+	return hasIdent || strings.Trim(f, "*&") == ""
+}
+
+// plausibleDeclName accepts an identifier, optionally C++-qualified
+// (`Foo::bar`, `Foo::~Foo`). Member access (`a.b`) is a call, not a name.
+func plausibleDeclName(name string) bool {
+	if name == "" || !isIdentStart(name[0]) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if isIdentChar(c) || c == ':' || c == '~' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isIdentStart(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isIdentChar(c byte) bool {
+	return isIdentStart(c) || (c >= '0' && c <= '9')
+}
+
 // braceScanner tracks the string/comment lexer state of one declaration body
 // across successive lines. Scanning each line in isolation (as the previous
 // per-line brace counting did) loses that state at the newline, so a
@@ -324,6 +584,34 @@ type braceScanner struct {
 	inString       byte
 	inLineComment  bool
 	inBlockComment bool
+	// rust makes '\'' a char-literal opener only when it actually opens a
+	// char literal ('x', '\n', '\u{1F600}', 'é'). Otherwise it is a lifetime
+	// (`fn a<'a>(x: &'a str) {`) whose lone quote used to open a "string"
+	// that never closed, swallowing every brace to the end of the file.
+	rust bool
+}
+
+// rustCharLiteralEnd returns the index of the closing quote when line[i] (a
+// '\”) opens a Rust char literal, or -1 when it is a lifetime / label.
+func rustCharLiteralEnd(line string, i int) int {
+	j := i + 1
+	if j >= len(line) {
+		return -1
+	}
+	if line[j] == '\\' {
+		// Escapes: '\n', '\'', '\\', '\x7f', '\u{10FFFF}'.
+		for k := j + 2; k < len(line) && k <= j+11; k++ {
+			if line[k] == '\'' {
+				return k
+			}
+		}
+		return -1
+	}
+	_, size := utf8.DecodeRuneInString(line[j:])
+	if k := j + size; k < len(line) && line[k] == '\'' {
+		return k
+	}
+	return -1
 }
 
 // lineDelta returns the net '{' minus '}' delta of one line and advances the
@@ -373,7 +661,16 @@ func (sc *braceScanner) lineDelta(line string) int {
 		case '#':
 			sc.inLineComment = true
 			continue
-		case '"', '\'', '`':
+		case '\'':
+			if sc.rust {
+				if end := rustCharLiteralEnd(line, i); end >= 0 {
+					i = end // skip the whole literal, including '{' / '}'
+				}
+				continue // a lifetime or label: not a string opener
+			}
+			sc.inString = c
+			continue
+		case '"', '`':
 			sc.inString = c
 			continue
 		case '{':

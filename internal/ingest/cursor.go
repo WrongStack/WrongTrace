@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -14,9 +15,20 @@ const (
 	maxOffsetCheckpointBytes = 16 * 1024 * 1024
 )
 
+// offsetCheckpoint is the on-disk cursor state. Emitted and Fingerprints were
+// added without a version bump: both are optional, so checkpoints written
+// before them load unchanged (their files are treated as described in
+// processFile), and older binaries simply ignore the new keys.
 type offsetCheckpoint struct {
 	Version int              `json:"version"`
 	Offsets map[string]int64 `json:"offsets"`
+	// Emitted counts events already delivered from whole-file formats (Cline/
+	// Roo task JSON, Aider history), which are re-parsed in full on change.
+	Emitted map[string]int `json:"emitted,omitempty"`
+	// Fingerprints hash the bytes just before each JSONL offset (hex FNV-1a),
+	// so a transcript replaced by a larger one restarts at byte 0 instead of
+	// resuming mid-line in unrelated content.
+	Fingerprints map[string]string `json:"fingerprints,omitempty"`
 }
 
 // EnablePersistentOffsets restores transcript cursors from path. Missing
@@ -58,6 +70,16 @@ func (sw *SessionWatcher) EnablePersistentOffsets(path string) error {
 			sw.seenOffsets[file] = offset
 		}
 	}
+	for file, n := range loaded.Emitted {
+		if n >= 0 {
+			sw.seenEmitted[file] = n
+		}
+	}
+	for file, fp := range loaded.Fingerprints {
+		if v, err := strconv.ParseUint(fp, 16, 64); err == nil {
+			sw.seenFingerprints[file] = v
+		}
+	}
 	sw.mu.Unlock()
 	return nil
 }
@@ -74,9 +96,28 @@ func (sw *SessionWatcher) saveOffsets(force bool) error {
 	for file, offset := range sw.seenOffsets {
 		offsets[file] = offset
 	}
+	var emitted map[string]int
+	if len(sw.seenEmitted) > 0 {
+		emitted = make(map[string]int, len(sw.seenEmitted))
+		for file, n := range sw.seenEmitted {
+			emitted[file] = n
+		}
+	}
+	var fingerprints map[string]string
+	if len(sw.seenFingerprints) > 0 {
+		fingerprints = make(map[string]string, len(sw.seenFingerprints))
+		for file, fp := range sw.seenFingerprints {
+			fingerprints[file] = strconv.FormatUint(fp, 16)
+		}
+	}
 	sw.mu.Unlock()
 
-	data, err := json.Marshal(offsetCheckpoint{Version: offsetCheckpointVersion, Offsets: offsets})
+	data, err := json.Marshal(offsetCheckpoint{
+		Version:      offsetCheckpointVersion,
+		Offsets:      offsets,
+		Emitted:      emitted,
+		Fingerprints: fingerprints,
+	})
 	if err != nil {
 		return err
 	}

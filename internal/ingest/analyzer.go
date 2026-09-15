@@ -127,7 +127,71 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 		return nil, nil, startOffset, fmt.Errorf("open transcript: %w", err)
 	}
 	defer f.Close()
+	return parseJSONLFile(f, filePath, startOffset)
+}
 
+// jsonlCursor is the resumable position in a JSONL transcript: the committed
+// offset plus a fingerprint of the bytes just before it.
+type jsonlCursor struct {
+	offset         int64
+	fingerprint    uint64
+	hasFingerprint bool
+}
+
+// fingerprintBytes is how much of the committed prefix identifies the file.
+// The bytes right before the offset are the tail of the last record read, so
+// a transcript replaced by different content almost never reproduces them.
+const fingerprintBytes = 64
+
+// tailFingerprint hashes (FNV-1a) up to fingerprintBytes bytes ending at
+// offset. ok is false when they cannot be read (the file is now shorter).
+func tailFingerprint(f *os.File, offset int64) (uint64, bool) {
+	if offset <= 0 {
+		return 0, false
+	}
+	n := min(offset, fingerprintBytes)
+	var buf [fingerprintBytes]byte
+	if _, err := f.ReadAt(buf[:n], offset-n); err != nil {
+		return 0, false
+	}
+	h := uint64(14695981039346656037)
+	for _, b := range buf[:n] {
+		h ^= uint64(b)
+		h *= 1099511628211
+	}
+	return h, true
+}
+
+// parseJSONLResumable resumes a transcript at cur, restarting from byte 0
+// when the stored fingerprint no longer matches: the file was replaced by a
+// different (and larger, or equal-sized) one, and resuming at the old offset
+// would start mid-line in unrelated content and drop its first records.
+// Cursors without a fingerprint (checkpoints from before fingerprints
+// existed) are trusted as before.
+func parseJSONLResumable(filePath string, cur jsonlCursor) ([]ToolCallEvent, []FileReadEvent, jsonlCursor, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, nil, cur, fmt.Errorf("open transcript: %w", err)
+	}
+	defer f.Close()
+
+	start := cur.offset
+	if start > 0 && cur.hasFingerprint {
+		if fp, ok := tailFingerprint(f, start); !ok || fp != cur.fingerprint {
+			start = 0
+		}
+	}
+	mods, reads, committed, err := parseJSONLFile(f, filePath, start)
+	next := jsonlCursor{offset: committed}
+	if err == nil {
+		next.fingerprint, next.hasFingerprint = tailFingerprint(f, committed)
+	}
+	return mods, reads, next, err
+}
+
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallEvent, []FileReadEvent, int64, error) {
 	if startOffset > 0 {
 		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
 			return nil, nil, startOffset, fmt.Errorf("seek transcript: %w", err)
@@ -156,13 +220,23 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 		} else if err != io.EOF {
 			return modEvents, readEvents, committed, err
 		}
-		// An unterminated tail (io.EOF) falls through to best-effort parsing
-		// below but is NOT committed: the writer may still be mid-line, and
-		// committing past it would permanently lose every event on that line.
-		// Once the newline lands, the next poll re-reads it; read events
-		// dedup naturally because ReadID is derived from lineStart.
-
+		// An unterminated tail (io.EOF) is committed only when it is already a
+		// complete JSON value: a writer that is still mid-line cannot have
+		// produced one (an object is not valid until its closing brace), and
+		// leaving a finished record uncommitted re-parsed and RE-EMITTED its
+		// tool calls on every poll until some later newline arrived — forever,
+		// for a transcript whose final record has no trailing newline. A
+		// partial tail is neither committed nor able to emit anything, so the
+		// next poll re-reads it once complete.
+		if lineStart == 0 {
+			// A UTF-8 BOM made the first record invalid JSON, silently
+			// dropping it.
+			lineBytes = bytes.TrimPrefix(lineBytes, utf8BOM)
+		}
 		trimmed := bytes.TrimSpace(lineBytes)
+		if !complete && len(trimmed) > 0 && json.Valid(trimmed) {
+			committed = currentOffset
+		}
 		if len(trimmed) > 0 {
 			// Fast pre-filter: skip JSON unmarshaling for lines that cannot contain tool calls, user input, model info, or usage
 			if !bytes.Contains(trimmed, bTool) &&
@@ -339,6 +413,11 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 			say, _ := mMap["say"].(string)
 			if say == "tool" || say == "command" {
 				text, _ := mMap["text"].(string)
+				// Cline/Roo stamp every message (`ts`, epoch milliseconds).
+				occurredAt := time.Now().UTC()
+				if ts, ok := mMap["ts"].(float64); ok && ts > 0 {
+					occurredAt = time.UnixMilli(int64(ts)).UTC()
+				}
 				events = append(events, ToolCallEvent{
 					SessionID:        sessionID,
 					AgentName:        "Cline/Roo",
@@ -348,7 +427,7 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 					PromptTokens:     promptTokens,
 					CompletionTokens: completionTokens,
 					CostUSD:          cost,
-					OccurredAt:       time.Now().UTC(),
+					OccurredAt:       occurredAt,
 				})
 			}
 		}

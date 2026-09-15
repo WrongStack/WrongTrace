@@ -11,7 +11,9 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,18 +83,22 @@ type Watcher struct {
 	// root is cfg.Dir made absolute and clean. Ignore rules are evaluated
 	// against paths relative to it so directories ABOVE the project never
 	// participate in matching.
-	root          string
-	fs            *fsnotify.Watcher
-	debounce      time.Duration
-	patterns      []string
-	patternsNorm  []string
-	patternsLower []string
-	// anchoredNorm/anchoredLower hold the root-anchored "/dir" lines with
-	// the leading slash stripped; anchoring is what keeps them from leaking
-	// onto nested trees of the same name.
-	anchoredNorm  []string
-	anchoredLower []string
-	ignoreSet     map[string]struct{}
+	root     string
+	fs       *fsnotify.Watcher
+	debounce time.Duration
+	// rules are the workspace .gitignore lines in file order; the LAST rule
+	// matching a path decides, so `!` negations re-include. See ignore rules.
+	rules []ignoreRule
+	// anchoredNegation is true when some negation could re-include a path
+	// below an excluded directory; false lets the matcher skip that probe.
+	anchoredNegation bool
+	ignoreSet        map[string]struct{}
+
+	// handleSem bounds concurrent HandleFileChange calls. Debounce timers
+	// fire on their own goroutines, one per pending path, so a build or
+	// checkout storm touching thousands of files would otherwise parse them
+	// all at once.
+	handleSem chan struct{}
 
 	// decisions memoizes pathIgnored. An editor save-burst, a build, or a
 	// dependency install replays the SAME handful of paths through the filter
@@ -123,11 +129,11 @@ type Watcher struct {
 
 // fsEvent is one captured fsnotify event in arrival order.
 type fsEvent struct {
-	Seq         uint64        // monotonic sequence number
-	Path        string        // absolute event path
-	Op         fsnotify.Op   // fsnotify.Create/Write/Rename/Remove/...
-	Time        time.Time     // wall-clock time of arrival from fsnotify
-	SemOccupied int           // len(inFlight) at moment of capture
+	Seq         uint64      // monotonic sequence number
+	Path        string      // absolute event path
+	Op          fsnotify.Op // fsnotify.Create/Write/Rename/Remove/...
+	Time        time.Time   // wall-clock time of arrival from fsnotify
+	SemOccupied int         // len(inFlight) at moment of capture
 }
 
 // captureEvent appends ev to the circular buffer when DebugFSEvents is enabled.
@@ -280,20 +286,12 @@ func New(cfg Config) (*Watcher, error) {
 		ignoreSet[strings.ToLower(filepath.Clean(ig))] = struct{}{}
 	}
 
-	patterns, anchored := loadGitIgnorePatterns(cfg.Dir)
-	patternsNorm := make([]string, len(patterns))
-	patternsLower := make([]string, len(patterns))
-	for i, pat := range patterns {
-		patNorm := filepath.ToSlash(pat)
-		patternsNorm[i] = patNorm
-		patternsLower[i] = strings.ToLower(patNorm)
-	}
-	anchoredNorm := make([]string, len(anchored))
-	anchoredLower := make([]string, len(anchored))
-	for i, pat := range anchored {
-		patNorm := filepath.ToSlash(pat)
-		anchoredNorm[i] = patNorm
-		anchoredLower[i] = strings.ToLower(patNorm)
+	rules := loadGitIgnoreRules(cfg.Dir)
+	anchoredNegation := false
+	for _, r := range rules {
+		if r.negate && r.anchored {
+			anchoredNegation = true
+		}
 	}
 
 	// Allocate the circular event buffer when debug capture is enabled.
@@ -303,18 +301,16 @@ func New(cfg Config) (*Watcher, error) {
 	}
 
 	w := &Watcher{
-		cfg:           cfg,
-		root:          absRoot(cfg.Dir),
-		fs:            fw,
-		debounce:      cfg.Debounce,
-		patterns:      patterns,
-		patternsNorm:  patternsNorm,
-		patternsLower: patternsLower,
-		anchoredNorm:  anchoredNorm,
-		anchoredLower: anchoredLower,
-		ignoreSet:     ignoreSet,
-		decisions:     make(map[string]bool, 256),
-		evBuf:        evBuf,
+		cfg:              cfg,
+		root:             absRoot(cfg.Dir),
+		fs:               fw,
+		debounce:         cfg.Debounce,
+		rules:            rules,
+		anchoredNegation: anchoredNegation,
+		ignoreSet:        ignoreSet,
+		handleSem:        make(chan struct{}, max(2, runtime.NumCPU())),
+		decisions:        make(map[string]bool, 256),
+		evBuf:            evBuf,
 	}
 
 	// Wire the SSE handler after w is allocated so it can capture w.
@@ -342,37 +338,190 @@ func absRoot(dir string) string {
 	return filepath.Clean(abs)
 }
 
-// loadGitIgnorePatterns reads the workspace .gitignore and splits it into
-// unanchored patterns and root-anchored ones (lines beginning with "/").
-// A leading slash in .gitignore means "only directly under the watched
-// root": "/generated" must ignore the root's generated tree while leaving
-// pkg/generated alone. computePathIgnored compares against root-relative
-// scoped paths, which carry no leading slash — so the anchor marker is kept
-// as list membership and the slash itself is stripped before matching.
-func loadGitIgnorePatterns(root string) (patterns, anchored []string) {
-	giPath := filepath.Join(root, ".gitignore")
-	data, err := os.ReadFile(giPath)
+// foldIgnoreCase mirrors git's core.ignorecase default: case-insensitive
+// .gitignore matching on the case-insensitive filesystems of Windows and
+// macOS, exact elsewhere. Every rule shape (literal, glob, anchored) folds
+// the same way; previously literals folded everywhere while globs never did.
+var foldIgnoreCase = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+
+// ignoreRule is one .gitignore line.
+type ignoreRule struct {
+	// segs is the pattern split on '/', case-folded when foldIgnoreCase.
+	// "**" as a whole segment matches any number of path segments.
+	segs   []string
+	negate bool
+	// anchored rules ("/x", "a/b", "**/gen", "docs/*.md") match the whole
+	// root-relative path; unanchored ones ("*.log", "logs/") match any
+	// single segment, i.e. a file or directory of that name at any depth.
+	anchored bool
+}
+
+// loadGitIgnoreRules reads the workspace .gitignore into ordered rules.
+// A leading slash, or a slash anywhere but the end, anchors the pattern to
+// the watched root ("/generated" ignores the root's generated tree but not
+// pkg/generated; "docs/*.md" is docs directly under the root). A trailing
+// slash is dropped: pathIgnored cannot tell directories from files, and a
+// file named like an ignored directory has always been filtered too.
+func loadGitIgnoreRules(root string) []ignoreRule {
+	data, err := os.ReadFile(filepath.Join(root, ".gitignore"))
 	if err != nil {
-		return nil, nil
+		return nil
 	}
-	lines := strings.Split(string(data), "\n")
-	for _, l := range lines {
+	var rules []ignoreRule
+	for _, l := range strings.Split(string(data), "\n") {
 		l = strings.TrimSpace(l)
-		if l == "" || strings.HasPrefix(l, "#") {
+		if l == "" || l[0] == '#' {
 			continue
 		}
-		rooted := strings.HasPrefix(l, "/")
-		l = strings.Trim(l, "/")
+		var r ignoreRule
+		switch {
+		case l[0] == '!':
+			r.negate = true
+			l = l[1:]
+		case strings.HasPrefix(l, `\!`), strings.HasPrefix(l, `\#`):
+			l = l[1:]
+		}
+		l = strings.TrimRight(l, "/")
+		if strings.HasPrefix(l, "/") {
+			r.anchored = true
+			l = strings.TrimLeft(l, "/")
+		}
 		if l == "" {
 			continue
 		}
-		if rooted {
-			anchored = append(anchored, l)
-		} else {
-			patterns = append(patterns, l)
+		if strings.Contains(l, "/") {
+			r.anchored = true
+		}
+		if foldIgnoreCase {
+			l = strings.ToLower(l)
+		}
+		for _, s := range strings.Split(l, "/") {
+			if s != "" {
+				r.segs = append(r.segs, s)
+			}
+		}
+		rules = append(rules, r)
+	}
+	return rules
+}
+
+// matches reports whether the rule matches the path given as segments.
+func (r *ignoreRule) matches(segs []string) bool {
+	if !r.anchored {
+		return globSegment(r.segs[0], segs[len(segs)-1])
+	}
+	return matchSegments(r.segs, segs)
+}
+
+// matchSegments matches pattern segments against path segments with "**"
+// spanning zero or more segments; a trailing "**" needs at least one
+// ("foo/**" is everything inside foo, not foo itself).
+func matchSegments(pat, p []string) bool {
+	for len(pat) > 0 {
+		if pat[0] == "**" {
+			rest := pat[1:]
+			if len(rest) == 0 {
+				return len(p) > 0
+			}
+			for i := 0; i <= len(p); i++ {
+				if matchSegments(rest, p[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(p) == 0 || !globSegment(pat[0], p[0]) {
+			return false
+		}
+		pat, p = pat[1:], p[1:]
+	}
+	return len(p) == 0
+}
+
+// couldMatchBelow reports whether some path strictly below dir could match
+// the pattern — i.e. whether dir must stay traversable for the pattern to
+// ever apply.
+func couldMatchBelow(pat, dir []string) bool {
+	for len(dir) > 0 {
+		if len(pat) == 0 {
+			return false
+		}
+		if pat[0] == "**" {
+			return true
+		}
+		if !globSegment(pat[0], dir[0]) {
+			return false
+		}
+		pat, dir = pat[1:], dir[1:]
+	}
+	return len(pat) > 0
+}
+
+func globSegment(pat, s string) bool {
+	if pat == s {
+		return true
+	}
+	if !strings.ContainsAny(pat, `*?[\`) {
+		return false
+	}
+	ok, _ := path.Match(pat, s)
+	return ok
+}
+
+// negationBelow reports whether a negation rule could re-include a path
+// inside the excluded directory dir. Such a directory must not be skipped:
+// the whitelist idiom `/*` + `!/src` excludes every root entry, and treating
+// that as final would ignore the whole project, src included.
+func (w *Watcher) negationBelow(dir []string) bool {
+	if !w.anchoredNegation {
+		return false
+	}
+	for i := range w.rules {
+		if r := &w.rules[i]; r.negate && r.anchored && couldMatchBelow(r.segs, dir) {
+			return true
 		}
 	}
-	return patterns, anchored
+	return false
+}
+
+// gitIgnored applies the rules to a root-relative slash path. Like git, each
+// ancestor is decided first (last matching rule wins) and an excluded
+// ancestor excludes everything below it — unless a negation could still
+// re-include something under it, in which case its descendants inherit
+// "excluded" but remain individually re-includable.
+func (w *Watcher) gitIgnored(norm string) bool {
+	if len(w.rules) == 0 {
+		return false
+	}
+	if foldIgnoreCase {
+		norm = strings.ToLower(norm)
+	}
+	segs := strings.Split(norm, "/")
+	inherited := false
+	for k := 1; k <= len(segs); k++ {
+		prefix := segs[:k]
+		excluded := inherited
+		for i := len(w.rules) - 1; i >= 0; i-- {
+			if w.rules[i].matches(prefix) {
+				excluded = !w.rules[i].negate
+				break
+			}
+		}
+		if !excluded {
+			inherited = false
+			continue
+		}
+		if !w.negationBelow(prefix) {
+			return true
+		}
+		if k == len(segs) {
+			// An excluded directory that still holds re-includable paths
+			// stays watched; core ignores directory events anyway.
+			return false
+		}
+		inherited = true
+	}
+	return false
 }
 
 // Close releases the underlying fsnotify resources.
@@ -409,19 +558,34 @@ func (w *Watcher) RemoveWatchDir(dir string) error {
 // Symlink loops and permission errors are logged and skipped rather than
 // aborting the whole watch.
 func (w *Watcher) addRecursive(root string) error {
-	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	return w.addRecursiveFiles(root, nil)
+}
+
+// addRecursiveFiles is addRecursive that also reports every non-ignored
+// regular file it passes to onFile (when non-nil). A directory's watch is
+// registered before its entries are read, so any file created after the
+// registration raises its own event and any file created before it is
+// listed here — together nothing inside a newly created tree is missed.
+func (w *Watcher) addRecursiveFiles(root string, onFile func(string)) error {
+	return filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
-			log.Printf("watcher: skip %s: %v", path, err)
+			log.Printf("watcher: skip %s: %v", p, err)
 			return nil
 		}
-		if d == nil || !d.IsDir() {
+		if d == nil {
 			return nil
 		}
-		if w.pathIgnored(path) {
+		if !d.IsDir() {
+			if onFile != nil && d.Type().IsRegular() && !w.pathIgnored(p) {
+				onFile(p)
+			}
+			return nil
+		}
+		if w.pathIgnored(p) {
 			return filepath.SkipDir
 		}
-		if err := w.fs.Add(path); err != nil {
-			log.Printf("watcher: cannot watch %s: %v", path, err)
+		if err := w.fs.Add(p); err != nil {
+			log.Printf("watcher: cannot watch %s: %v", p, err)
 		}
 		return nil
 	})
@@ -497,8 +661,7 @@ func (w *Watcher) computePathIgnored(p string) bool {
 	}
 	norm := filepath.ToSlash(scoped)
 	normLower := strings.ToLower(norm)
-	base := filepath.Base(scoped)
-	baseLower := strings.ToLower(base)
+	baseLower := strings.ToLower(filepath.Base(scoped))
 
 	// 1. Fast O(1) segment check without allocations
 	if _, ok := w.ignoreSet[baseLower]; ok {
@@ -519,37 +682,10 @@ func (w *Watcher) computePathIgnored(p string) bool {
 		}
 	}
 
-	// 2. Check .gitignore patterns using precomputed normalized patterns
-	for i, patNorm := range w.patternsNorm {
-		if matched, _ := filepath.Match(patNorm, base); matched {
-			return true
-		}
-		patLower := w.patternsLower[i]
-		if patLower == normLower ||
-			strings.HasPrefix(normLower, patLower+"/") ||
-			strings.HasSuffix(normLower, "/"+patLower) ||
-			strings.Contains(normLower, "/"+patLower+"/") {
-			return true
-		}
-	}
-
-	// 3. Root-anchored patterns ("/dir", "/*.log") match the path only as
-	// located from the watched root — never a nested tree of the same name.
-	// The full scoped path is matched (not just the base) so anchored globs
-	// stay root-level: "/*.secret" ignores app.secret but not sub/app.secret.
-	// Comparing these against the unanchored forms above would be wrong twice:
-	// the suffix/contains forms would leak the anchor onto nested trees.
-	for i, patNorm := range w.anchoredNorm {
-		if matched, _ := filepath.Match(patNorm, scoped); matched {
-			return true
-		}
-		patLower := w.anchoredLower[i]
-		if patLower == normLower || strings.HasPrefix(normLower, patLower+"/") {
-			return true
-		}
-	}
-
-	return false
+	// 2. .gitignore rules, in order, with negation. Root-anchored rules
+	// match only as located from the watched root — never a nested tree of
+	// the same name ("/*.secret" ignores app.secret but not sub/app.secret).
+	return w.gitIgnored(norm)
 }
 
 // debounceEntry is the per-path debounce state. The timer is reused via Reset
@@ -575,6 +711,13 @@ func (w *Watcher) Run(ctx context.Context) {
 	var pendingMu sync.Mutex
 	pending := make(map[string]*debounceEntry)
 
+	// discovered carries files found inside newly created directories back
+	// into this loop, so they go through the same debounce as real events.
+	// runDone unblocks those walkers when Run returns for any reason.
+	discovered := make(chan string, 256)
+	runDone := make(chan struct{})
+	defer close(runDone)
+
 	defer func() {
 		pendingMu.Lock()
 		for _, e := range pending {
@@ -584,6 +727,43 @@ func (w *Watcher) Run(ctx context.Context) {
 		}
 		pendingMu.Unlock()
 	}()
+
+	schedule := func(path string) {
+		pendingMu.Lock()
+		defer pendingMu.Unlock()
+		if entry := pending[path]; entry != nil {
+			entry.deadline = time.Now().Add(w.debounce)
+			entry.timer.Reset(w.debounce)
+			return
+		}
+		entry := &debounceEntry{deadline: time.Now().Add(w.debounce)}
+		entry.timer = time.AfterFunc(w.debounce, func() {
+			pendingMu.Lock()
+			cur := pending[path]
+			// Only the newest schedule for this path may consume the
+			// entry: an in-flight callback from before a Reset sees a
+			// deadline in the future and leaves it for the rearmed
+			// timer. Timers never fire early, so firing at or after
+			// the deadline means this callback owns the schedule.
+			if cur == nil || cur.timer != entry.timer || time.Now().Before(cur.deadline) {
+				pendingMu.Unlock()
+				return
+			}
+			delete(pending, path)
+			pendingMu.Unlock()
+			if ctx.Err() != nil {
+				return
+			}
+			select {
+			case w.handleSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-w.handleSem }()
+			w.cfg.Engine.HandleFileChange(ctx, path)
+		})
+		pending[path] = entry
+	}
 
 	for {
 		select {
@@ -601,9 +781,20 @@ func (w *Watcher) Run(ctx context.Context) {
 			}
 			if ev.Op&fsnotify.Create == fsnotify.Create {
 				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
+					dir := ev.Name
 					go func() {
-						if err := w.addRecursive(ev.Name); err != nil {
-							log.Printf("watcher: addRecursive %s: %v", ev.Name, err)
+						// Files that landed in the tree before its watch was
+						// registered (mkdir -p && write, unzip, a directory
+						// renamed in) raise no event of their own.
+						err := w.addRecursiveFiles(dir, func(file string) {
+							select {
+							case discovered <- file:
+							case <-runDone:
+							case <-ctx.Done():
+							}
+						})
+						if err != nil {
+							log.Printf("watcher: addRecursive %s: %v", dir, err)
 						}
 					}()
 				}
@@ -611,36 +802,9 @@ func (w *Watcher) Run(ctx context.Context) {
 			if !isRelevant(ev.Op) {
 				continue
 			}
-
-			path := ev.Name
-			pendingMu.Lock()
-			if entry := pending[path]; entry != nil {
-				entry.deadline = time.Now().Add(w.debounce)
-				entry.timer.Reset(w.debounce)
-			} else {
-				entry := &debounceEntry{deadline: time.Now().Add(w.debounce)}
-				entry.timer = time.AfterFunc(w.debounce, func() {
-					pendingMu.Lock()
-					cur := pending[path]
-					// Only the newest schedule for this path may consume the
-					// entry: an in-flight callback from before a Reset sees a
-					// deadline in the future and leaves it for the rearmed
-					// timer. Timers never fire early, so firing at or after
-					// the deadline means this callback owns the schedule.
-					if cur == nil || cur.timer != entry.timer || time.Now().Before(cur.deadline) {
-						pendingMu.Unlock()
-						return
-					}
-					delete(pending, path)
-					pendingMu.Unlock()
-					if ctx.Err() != nil {
-						return
-					}
-					w.cfg.Engine.HandleFileChange(ctx, path)
-				})
-				pending[path] = entry
-			}
-			pendingMu.Unlock()
+			schedule(ev.Name)
+		case file := <-discovered:
+			schedule(file)
 		case err, ok := <-w.fs.Errors:
 			if !ok {
 				return
