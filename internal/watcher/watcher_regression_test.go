@@ -115,13 +115,15 @@ func TestPathIgnored_GitignoreSlashAndDoubleStarPatterns(t *testing.T) {
 // every pattern shape. Literals used to fold on every OS while globs never
 // did, so `LOGS` ignored logs/ but `*.LOG` did not ignore a.log.
 func TestPathIgnored_GitignoreCaseFoldingIsConsistent(t *testing.T) {
-	w, root := newIgnoreWatcher(t, "LOGS\n*.LOG\n/Out/*.TMP\n")
-	for _, rel := range []string{"logs/x.txt", "a.log", "Out/f.tmp"} {
+	// The directory must not be a DefaultIgnoreDirs entry ("out" is one, and
+	// that set folds case on every OS), or the gitignore rule is never reached.
+	w, root := newIgnoreWatcher(t, "LOGS\n*.LOG\n/Stage/*.TMP\n")
+	for _, rel := range []string{"logs/x.txt", "a.log", "Stage/f.tmp"} {
 		if got := w.pathIgnored(filepath.Join(root, filepath.FromSlash(rel))); got != foldIgnoreCase {
 			t.Errorf("pathIgnored(%q) = %v, want %v (foldIgnoreCase)", rel, got, foldIgnoreCase)
 		}
 	}
-	for _, rel := range []string{"LOGS/x.txt", "A.LOG", "Out/F.TMP"} {
+	for _, rel := range []string{"LOGS/x.txt", "A.LOG", "Stage/F.TMP"} {
 		if !w.pathIgnored(filepath.Join(root, filepath.FromSlash(rel))) {
 			t.Errorf("pathIgnored(%q) = false, want exact-case match ignored", rel)
 		}
