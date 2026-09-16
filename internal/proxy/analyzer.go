@@ -209,6 +209,69 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 			}
 		}
 	}
+
+	// Gemini (generateContent) and Ollama-native non-stream bodies. Both carry
+	// the same fields their stream chunks do — candidates/parts/usageMetadata/
+	// modelVersion and message.content/response/prompt_eval_count/eval_count/
+	// done_reason — and parseSSEResponse's handleChunk already extracts them on
+	// the streaming side. Neither shape matched the OpenAI/Anthropic blocks
+	// above, so the reply and the real token counts were dropped here
+	// (AssistantReply empty, CompletionTokens 0, cost undercounted by
+	// finalize). Decode the same chunk struct and mirror that handler's
+	// extraction semantics. Bodies that took the OpenAI early return never
+	// reach this, and the generic usage map was already consumed above, so
+	// only the shapes it misses are handled here.
+	var chunk sseStreamChunk
+	if err := json.Unmarshal(data, &chunk); err == nil {
+		if chunk.ModelVersion != "" {
+			pa.WireModel = chunk.ModelVersion
+		}
+		if chunk.UsageMetadata != nil {
+			pa.extractUsage(chunk.UsageMetadata)
+		}
+		if len(chunk.Candidates) > 0 {
+			cand := chunk.Candidates[0]
+			if cand.FinishReason != "" {
+				pa.FinishReason = cand.FinishReason
+			}
+			for _, part := range cand.Content.Parts {
+				if part.Thought {
+					pa.Reasoning += part.Text
+				} else {
+					pa.AssistantReply += part.Text
+				}
+			}
+		}
+		if chunk.Message != nil {
+			if len(chunk.Message.Content) > 0 && chunk.Message.Content[0] == '"' {
+				var text string
+				if json.Unmarshal(chunk.Message.Content, &text) == nil {
+					pa.AssistantReply += text
+				}
+			}
+			if chunk.Message.Thinking != "" {
+				pa.Reasoning += chunk.Message.Thinking
+			}
+		}
+		if len(chunk.Response) > 0 && chunk.Response[0] == '"' {
+			var text string
+			if json.Unmarshal(chunk.Response, &text) == nil {
+				pa.AssistantReply += text
+			}
+		}
+		if chunk.DoneReason != "" {
+			pa.FinishReason = chunk.DoneReason
+		}
+		if chunk.PromptEvalCount > 0 {
+			pa.PromptTokens = int64(chunk.PromptEvalCount)
+		}
+		if chunk.EvalCount > 0 {
+			pa.CompletionTokens = int64(chunk.EvalCount)
+		}
+		if (chunk.PromptEvalCount > 0 || chunk.EvalCount > 0) && pa.TotalTokens < pa.PromptTokens+pa.CompletionTokens {
+			pa.TotalTokens = pa.PromptTokens + pa.CompletionTokens
+		}
+	}
 	return true
 }
 

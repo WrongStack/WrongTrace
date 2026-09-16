@@ -227,3 +227,71 @@ func TestExtractFileFromMap_DeterministicFallback(t *testing.T) {
 		t.Errorf("explicit extractFileKeys lost priority: got %q", listed)
 	}
 }
+
+// TestAnalyzeWirePayloads_OllamaNonStreamChat pins the non-stream analysis
+// contract for Ollama's native endpoints. With "stream":false (and on
+// /api/generate) the upstream answers application/json carrying the same
+// fields its NDJSON chunks do — message.content / response,
+// prompt_eval_count, eval_count, done_reason — and ServeHTTP relays those
+// bodies through relayJSONResponse -> finalize -> AnalyzeWirePayloads. A
+// token count dropped there becomes a zero-completion, prompt-only cost
+// record and an empty inspector reply. parseJSONResponse used to recognize
+// only the OpenAI/Anthropic shapes and returned true unconditionally, so
+// these bodies fell through every branch.
+func TestAnalyzeWirePayloads_OllamaNonStreamChat(t *testing.T) {
+	req := []byte(`{"model":"llama3","messages":[{"role":"user","content":"hi"}]}`)
+	chat := []byte(`{"model":"llama3","created_at":"2026-09-16T00:00:00Z","message":{"role":"assistant","content":"hello from ollama"},"done":true,"prompt_eval_count":30,"eval_count":10}`)
+	a := AnalyzeWirePayloads(req, chat, false)
+	if a.AssistantReply != "hello from ollama" {
+		t.Fatalf("AssistantReply = %q, want %q", a.AssistantReply, "hello from ollama")
+	}
+	if a.PromptTokens != 30 || a.CompletionTokens != 10 {
+		t.Fatalf("tokens = (%d, %d), want (30, 10)", a.PromptTokens, a.CompletionTokens)
+	}
+	if a.WireModel != "llama3" {
+		t.Errorf("WireModel = %q, want llama3", a.WireModel)
+	}
+
+	generate := []byte(`{"model":"llama3","response":"gen output","done":true,"done_reason":"stop","prompt_eval_count":9,"eval_count":4}`)
+	b := AnalyzeWirePayloads([]byte(`{"model":"llama3","prompt":"hi"}`), generate, false)
+	if b.AssistantReply != "gen output" {
+		t.Fatalf("AssistantReply = %q, want gen output", b.AssistantReply)
+	}
+	if b.PromptTokens != 9 || b.CompletionTokens != 4 {
+		t.Fatalf("tokens = (%d, %d), want (9, 4)", b.PromptTokens, b.CompletionTokens)
+	}
+	if b.FinishReason != "stop" {
+		t.Errorf("FinishReason = %q, want stop", b.FinishReason)
+	}
+}
+
+// TestAnalyzeWirePayloads_GeminiNonStreamGenerateContent pins the non-stream
+// analysis contract for Gemini generateContent: candidates[].content.parts
+// (thought parts feed Reasoning), finishReason, usageMetadata token counts,
+// and modelVersion. The streaming chunk parser (parseSSEResponse.handleChunk)
+// always understood these fields; the buffered-response parser dropped them —
+// empty AssistantReply, CompletionTokens 0, cost undercounted — until
+// parseJSONResponse learned the same shapes.
+func TestAnalyzeWirePayloads_GeminiNonStreamGenerateContent(t *testing.T) {
+	req := []byte(`{"contents":[{"parts":[{"text":"hi"}]}]}`)
+	resp := []byte(`{"candidates":[{"content":{"parts":[{"text":"hello from gemini"},{"text":"deep thought","thought":true}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":25,"candidatesTokenCount":7,"totalTokenCount":32},"modelVersion":"gemini-2.5-flash"}`)
+	a := AnalyzeWirePayloads(req, resp, false)
+	if a.AssistantReply != "hello from gemini" {
+		t.Fatalf("AssistantReply = %q, want %q", a.AssistantReply, "hello from gemini")
+	}
+	if a.Reasoning != "deep thought" {
+		t.Errorf("Reasoning = %q, want deep thought", a.Reasoning)
+	}
+	if a.PromptTokens != 25 || a.CompletionTokens != 7 {
+		t.Fatalf("tokens = (%d, %d), want (25, 7)", a.PromptTokens, a.CompletionTokens)
+	}
+	if a.TotalTokens != 32 {
+		t.Errorf("TotalTokens = %d, want 32", a.TotalTokens)
+	}
+	if a.FinishReason != "STOP" {
+		t.Errorf("FinishReason = %q, want STOP", a.FinishReason)
+	}
+	if a.WireModel != "gemini-2.5-flash" {
+		t.Errorf("WireModel = %q, want gemini-2.5-flash", a.WireModel)
+	}
+}
