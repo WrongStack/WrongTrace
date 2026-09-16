@@ -122,7 +122,7 @@ func (f *failingEngine) LockFileWithOptions(string, string, string, string, time
 func (f *failingEngine) TryLockFile(string, string, string, string, time.Duration, bool) (core.LockInfo, error) {
 	return core.LockInfo{}, nil
 }
-func (f *failingEngine) UnlockFile(string) {}
+func (f *failingEngine) UnlockFile(string, string) error { return nil }
 func (f *failingEngine) IsFileLocked(string) (bool, core.LockInfo) {
 	return false, core.LockInfo{}
 }

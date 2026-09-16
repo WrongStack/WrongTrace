@@ -416,6 +416,52 @@ func TestLockFileRejectsOverflowingTTL(t *testing.T) {
 // is a diagnostic fix, not a contract change. The exactly-at-cap row is the
 // off-by-one guard for the "+1" read: a body of exactly the cap is
 // legitimate data and must not be reported as too large.
+// Pins the HTTP unlock ownership contract (handlers.go UnlockFile): a
+// foreign owner unlock is refused with 403 and the lock survives; the
+// honest owner still unlocks. Pre-fix, the handler dropped the engine
+// error and answered 200 "unlocked" on a refused lock-steal — the HTTP
+// sibling of the round-61 IPC false-success defect.
+func TestUnlockFileSurfacesOwnershipRefusal(t *testing.T) {
+	eng := core.NewEngine(core.Config{RepoName: "unlock-proof"})
+	h := Handlers{Engine: eng}
+
+	unlock := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/guardrail/unlock", bytes.NewReader([]byte(body)))
+		rec := httptest.NewRecorder()
+		h.UnlockFile(rec, req)
+		return rec
+	}
+
+	if _, err := eng.TryLockFile("src/secret.go", "refactor in progress", "agent-a", "agent-a-secret-run", time.Hour, false); err != nil {
+		t.Fatalf("TryLockFile: %v", err)
+	}
+
+	// Foreign owner: 403 with the refusal text; the lock survives.
+	rec := unlock(`{"file_path":"src/secret.go","owner_run_id":"agent-b-secret-run"}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("foreign owner: HTTP %d, want 403 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var errBody map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&errBody); err != nil {
+		t.Fatalf("decode error envelope: %v (body: %s)", err, rec.Body.String())
+	}
+	if !strings.Contains(errBody["error"], "unlock denied") {
+		t.Fatalf("foreign owner error = %q, want unlock-denied text", errBody["error"])
+	}
+	if locked, _ := eng.IsFileLocked("src/secret.go"); !locked {
+		t.Fatal("refused unlock removed the lock anyway")
+	}
+
+	// Honest owner: 200 and the lock is gone.
+	rec = unlock(`{"file_path":"src/secret.go","owner_run_id":"agent-a-secret-run"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner unlock: HTTP %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if locked, _ := eng.IsFileLocked("src/secret.go"); locked {
+		t.Fatal("owner unlock left the lock in place")
+	}
+}
+
 func TestAddProject_RejectsOversizedBodyNamingTheLimit(t *testing.T) {
 	withIsolatedProjectsHome(t)
 	_, _, ts := newTestServer(t)

@@ -49,10 +49,10 @@ func (f *fakeSink) LockFile(path, reason string) ipc.LockInfo {
 	return ipc.LockInfo{Path: path, Reason: reason}
 }
 
-func (f *fakeSink) UnlockFile(path string) ipc.LockInfo {
+func (f *fakeSink) UnlockFile(path string, ownerRunID string) error {
 	f.isLocked = false
 	f.lockReason = ""
-	return ipc.LockInfo{}
+	return nil
 }
 
 func (f *fakeSink) ReportRunMCP(model, provider, taskID, intent string, promptTokens, completionTokens int64, cost float64) (string, error) {

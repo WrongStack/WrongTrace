@@ -278,6 +278,9 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		if err != nil {
 			return toolError(resp, "get_file_health_score failed: "+err.Error(), nil)
 		}
+		// lock_owner_run_id is the credential the unlock_file ownership check
+		// verifies; it must not reach the wire. The lock owner name stays.
+		h.LockOwnerRunID = ""
 		text := fmt.Sprintf("health_score=%d fragile=%v recent_thrashing_count=%d is_locked=%v warning=%q",
 			h.HealthScore, h.IsFragile, h.RecentThrashingCount, h.IsLocked, h.Warning)
 		resp.Result = map[string]interface{}{
@@ -429,12 +432,17 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		}
 	case "unlock_file":
 		path, _ := args["file_path"].(string)
+		ownerRunID, _ := args["owner_run_id"].(string)
 		if path == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
 			return resp
 		}
-		if locker, ok := sink.(interface{ UnlockFile(path string) }); ok {
-			locker.UnlockFile(path)
+		if locker, ok := sink.(interface {
+			UnlockFile(path string, ownerRunID string) error
+		}); ok {
+			if err := locker.UnlockFile(path, ownerRunID); err != nil {
+				return toolError(resp, "unlock_file failed: "+err.Error(), nil)
+			}
 		}
 		resp.Result = map[string]interface{}{
 			"content": []map[string]interface{}{
@@ -444,7 +452,16 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 	case "list_locks":
 		var locks interface{} = []interface{}{}
 		if locker, ok := sink.(interface{ ListLocks() []core.LockInfo }); ok {
-			locks = locker.ListLocks()
+			all := locker.ListLocks()
+			// owner_run_id is the credential the unlock_file ownership check
+			// verifies; broadcasting it would let any agent steal locks. The
+			// human-readable owner stays for diagnostics.
+			redacted := make([]core.LockInfo, len(all))
+			for i, info := range all {
+				info.OwnerRunID = ""
+				redacted[i] = info
+			}
+			locks = redacted
 		}
 		resp.Result = map[string]interface{}{
 			"content": []map[string]interface{}{
@@ -635,7 +652,8 @@ var mcpToolsList = sync.OnceValue(func() interface{} {
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"file_path": map[string]string{"type": "string"},
+						"file_path":    map[string]string{"type": "string"},
+						"owner_run_id": map[string]string{"type": "string"},
 					},
 					"required": []string{"file_path"},
 				},
@@ -645,9 +663,6 @@ var mcpToolsList = sync.OnceValue(func() interface{} {
 				"description": "List all active guardrail file locks and their TTL expiry times.",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"filter": map[string]string{"type": "string"},
-					},
 				},
 			},
 			{

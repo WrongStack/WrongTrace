@@ -91,3 +91,41 @@ func TestToolsList_AdvertisedRequiredMatchesHandlers(t *testing.T) {
 		}
 	}
 }
+
+// Pins the list_locks schema-honesty contract: the dispatch handler reads no
+// arguments, so the advertised inputSchema must not declare any. A
+// previously advertised "filter" property was never read by the handler —
+// schema-permitting input the server ignores is dishonest advertising.
+func TestCallTool_ListLocks_InputSchemaHonest(t *testing.T) {
+	resp := dispatch(&fakeSink{}, &jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      3,
+		Method:  "tools/list",
+	})
+	if resp.Error != nil {
+		t.Fatalf("tools/list failed: %v", resp.Error)
+	}
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("tools/list result has unexpected shape: %T", resp.Result)
+	}
+	tools, ok := result["tools"].([]map[string]interface{})
+	if !ok {
+		t.Fatalf("tools/list tools has unexpected shape: %T", result["tools"])
+	}
+	for _, tool := range tools {
+		if name, _ := tool["name"].(string); name != "list_locks" {
+			continue
+		}
+		schema, ok := tool["inputSchema"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("list_locks inputSchema has unexpected shape: %T", tool["inputSchema"])
+		}
+		props, _ := schema["properties"].(map[string]interface{})
+		if len(props) != 0 {
+			t.Fatalf("list_locks advertises %d input properties but the handler reads none (advertised-but-unenforced): %v", len(props), props)
+		}
+		return
+	}
+	t.Fatal("list_locks not found in tools/list")
+}

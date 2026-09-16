@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/wrongstack/wrongtrace/internal/core"
+	"github.com/wrongstack/wrongtrace/internal/ipc"
 )
 
 // Round-24 regression: callTool's lock capability assertions used result-less
@@ -120,5 +121,186 @@ func TestCallTool_UnlockFile_RealEngine(t *testing.T) {
 	}
 	if got := len(engine.ListLocks()); got != 0 {
 		t.Fatalf("engine holds %d locks after unlock, want 0", got)
+	}
+}
+
+// The lock-stealing credential leak: list_locks returned each lock
+// owner_run_id — the credential the unlock_file ownership check verifies —
+// letting any agent enumerate it and unlock a foreign lock. List output must
+// carry no owner_run_id; the human-readable owner stays for diagnostics.
+func TestCallTool_ListLocks_RedactsOwnerRunID(t *testing.T) {
+	engine := newLockTestEngine(t)
+	if _, err := engine.TryLockFile("src/secret.go", "refactor in progress", "agent-a", "agent-a-secret-run", time.Hour, false); err != nil {
+		t.Fatalf("TryLockFile: %v", err)
+	}
+
+	resp := dispatch(engine, toolCallReq(7, "list_locks", `{}`))
+	if resp.Error != nil {
+		t.Fatalf("unexpected rpc error: %+v", resp.Error)
+	}
+	res, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected result map, got %#v", resp.Result)
+	}
+	locks, ok := res["data"].([]core.LockInfo)
+	if !ok {
+		t.Fatalf("expected []core.LockInfo in data, got %#v", res["data"])
+	}
+	if len(locks) != 1 {
+		t.Fatalf("expected 1 lock in list, got %d", len(locks))
+	}
+	if locks[0].OwnerRunID != "" {
+		t.Fatalf("list_locks leaked the ownership credential owner_run_id %q", locks[0].OwnerRunID)
+	}
+	if locks[0].Owner != "agent-a" || locks[0].Path != "src/secret.go" {
+		t.Fatalf("redaction corrupted the lock entry: %+v", locks[0])
+	}
+}
+
+// Same credential-leak class as list_locks: get_file_health_score returned
+// the whole FileHealthReply including the lock owner_run_id — the credential
+// the unlock_file ownership check verifies. Health output must carry no
+// owner_run_id; the lock owner name stays.
+func TestCallTool_GetFileHealthScore_RedactsOwnerRunID(t *testing.T) {
+	sink := &fakeSink{health: ipc.FileHealthReply{
+		FilePath:       "src/secret.go",
+		HealthScore:    42,
+		IsLocked:       true,
+		LockReason:     "refactor in progress",
+		LockOwner:      "agent-a",
+		LockOwnerRunID: "agent-a-secret-run",
+	}}
+
+	resp := dispatch(sink, toolCallReq(8, "get_file_health_score", `{"file_path":"src/secret.go"}`))
+	if resp.Error != nil {
+		t.Fatalf("unexpected rpc error: %+v", resp.Error)
+	}
+	res, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected result map, got %#v", resp.Result)
+	}
+	h, ok := res["data"].(ipc.FileHealthReply)
+	if !ok {
+		t.Fatalf("expected FileHealthReply in data, got %#v", res["data"])
+	}
+	if h.LockOwnerRunID != "" {
+		t.Fatalf("get_file_health_score leaked the ownership credential owner_run_id %q", h.LockOwnerRunID)
+	}
+	if !h.IsLocked || h.LockOwner != "agent-a" {
+		t.Fatalf("redaction corrupted the health reply: %+v", h)
+	}
+}
+
+// Pins check_guardrail's IsFileLocked branch: with the real engine holding a
+// lock, the guardrail-block response reports the lock and carries no
+// owner_run_id credential. The branch-rec text ends "is locked." without the
+// reason parenthetical, so the assertion also proves which branch fired.
+func TestCallTool_CheckGuardrail_LockedPath_RealEngine(t *testing.T) {
+	engine := newLockTestEngine(t)
+	if _, err := engine.TryLockFile("src/secret.go", "refactor in progress", "agent-a", "agent-a-secret-run", time.Hour, false); err != nil {
+		t.Fatalf("TryLockFile: %v", err)
+	}
+
+	resp := dispatch(engine, toolCallReq(9, "check_guardrail", `{"file_path":"src/secret.go"}`))
+	if resp.Error != nil {
+		t.Fatalf("unexpected rpc error: %+v", resp.Error)
+	}
+	text := lockResultText(t, resp)
+	res, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected result map, got %#v", resp.Result)
+	}
+	data, ok := res["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected data map, got %#v", res["data"])
+	}
+	if data["is_locked"] != true {
+		t.Fatalf("expected is_locked=true, got %#v", data["is_locked"])
+	}
+	if _, leaked := data["owner_run_id"]; leaked {
+		t.Fatal("check_guardrail leaked owner_run_id")
+	}
+	if _, leaked := data["lock_owner_run_id"]; leaked {
+		t.Fatal("check_guardrail leaked lock_owner_run_id")
+	}
+	if data["lock_owner"] != "agent-a" || data["lock_reason"] != "refactor in progress" {
+		t.Fatalf("unexpected lock metadata: %#v", data)
+	}
+	if !strings.Contains(text, "GUARDRAIL BLOCKED") {
+		t.Fatalf("expected guardrail-block text, got %q", text)
+	}
+	if strings.Contains(text, "is locked (") {
+		t.Fatalf("expected the IsFileLocked branch text, got the fallback text: %q", text)
+	}
+}
+
+// healthFallbackSink hides the IsFileLocked capability so check_guardrail
+// takes its FileHealth fallback branch. FileHealth mirrors the engine reply
+// for the real engine lock — including a populated LockOwnerRunID, exactly
+// what a store-backed engine would produce — so the test pins that the
+// fallback response does not relay the credential even when the sink
+// supplies it.
+type healthFallbackSink struct {
+	*core.Engine
+}
+
+func (s healthFallbackSink) IsFileLocked(string) (bool, core.LockInfo) {
+	return false, core.LockInfo{}
+}
+
+func (s healthFallbackSink) FileHealth(path string) (ipc.FileHealthReply, error) {
+	locked, info := s.Engine.IsFileLocked(path)
+	if !locked {
+		return ipc.FileHealthReply{FilePath: path, HealthScore: 100}, nil
+	}
+	exp := info.ExpiresAt
+	return ipc.FileHealthReply{
+		FilePath:       path,
+		IsLocked:       true,
+		LockReason:     info.Reason,
+		LockOwner:      info.Owner,
+		LockOwnerRunID: info.OwnerRunID,
+		LockExpiresAt:  &exp,
+	}, nil
+}
+
+// Pins check_guardrail's FileHealth fallback branch: a sink without the
+// IsFileLocked capability still gets the guardrail-block response built from
+// the real engine lock data, with no owner_run_id credential. The branch-rec
+// text ends "is locked (...)" with the reason parenthetical, proving the
+// fallback branch fired.
+func TestCallTool_CheckGuardrail_LockedPath_HealthFallback(t *testing.T) {
+	engine := newLockTestEngine(t)
+	if _, err := engine.TryLockFile("src/secret.go", "refactor in progress", "agent-a", "agent-a-secret-run", time.Hour, false); err != nil {
+		t.Fatalf("TryLockFile: %v", err)
+	}
+
+	resp := dispatch(healthFallbackSink{Engine: engine}, toolCallReq(10, "check_guardrail", `{"file_path":"src/secret.go"}`))
+	if resp.Error != nil {
+		t.Fatalf("unexpected rpc error: %+v", resp.Error)
+	}
+	text := lockResultText(t, resp)
+	res, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected result map, got %#v", resp.Result)
+	}
+	data, ok := res["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected data map, got %#v", res["data"])
+	}
+	if data["is_locked"] != true {
+		t.Fatalf("expected is_locked=true, got %#v", data["is_locked"])
+	}
+	if _, leaked := data["owner_run_id"]; leaked {
+		t.Fatal("check_guardrail leaked owner_run_id")
+	}
+	if _, leaked := data["lock_owner_run_id"]; leaked {
+		t.Fatal("check_guardrail leaked lock_owner_run_id")
+	}
+	if data["lock_owner"] != "agent-a" || data["lock_reason"] != "refactor in progress" {
+		t.Fatalf("unexpected lock metadata: %#v", data)
+	}
+	if !strings.Contains(text, "is locked (") {
+		t.Fatalf("expected the FileHealth fallback branch text, got: %q", text)
 	}
 }

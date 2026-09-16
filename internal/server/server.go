@@ -47,7 +47,7 @@ type EngineAPI interface {
 	LockFile(path, reason string) core.LockInfo
 	LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) core.LockInfo
 	TryLockFile(path, reason, owner, ownerRunID string, ttl time.Duration, force bool) (core.LockInfo, error)
-	UnlockFile(path string)
+	UnlockFile(path, ownerRunID string) error
 	IsFileLocked(path string) (bool, core.LockInfo)
 	ListLocks() []core.LockInfo
 	ReportRun(p ipc.TelemetryReport) error

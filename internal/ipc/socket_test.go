@@ -28,6 +28,14 @@ type fakeSink struct {
 	lockErr         error
 	gotHistoryLimit int
 	historyCalls    int
+	// Capture: what dispatch actually forwarded for unlock_file, plus a
+	// failure injection so dispatch's refusal handling can be asserted.
+	unlockCalls      int
+	unlockPath       string
+	unlockOwnerRunID string
+	unlockErr        error
+	// ListLocks payload for the redaction test; nil keeps the empty list.
+	listLocks []LockInfo
 }
 
 func (f *fakeSink) ReportRun(r TelemetryReport) error {
@@ -60,10 +68,18 @@ func (f *fakeSink) TryLockFile(path, reason, owner, ownerRunID string, ttl time.
 	return info, nil
 }
 
-func (f *fakeSink) UnlockFile(path string) {}
+func (f *fakeSink) UnlockFile(path string, ownerRunID string) error {
+	f.unlockCalls++
+	f.unlockPath = path
+	f.unlockOwnerRunID = ownerRunID
+	return f.unlockErr
+}
 
 func (f *fakeSink) ListLocks() []LockInfo {
-	return []LockInfo{}
+	if f.listLocks == nil {
+		return []LockInfo{}
+	}
+	return f.listLocks
 }
 
 func (f *fakeSink) GetFileReadStats(filePath string) (db.FileReadStats, error) {

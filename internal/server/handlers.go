@@ -727,8 +727,10 @@ func (h *Handlers) ListLocks(w http.ResponseWriter, _ *http.Request) {
 // UnlockFile removes a lock on a file.
 func (h *Handlers) UnlockFile(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path     string `json:"path"`
-		FilePath string `json:"file_path"`
+		Path       string `json:"path"`
+		FilePath   string `json:"file_path"`
+		OwnerRunID string `json:"owner_run_id"`
+		RunID      string `json:"run_id"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -742,7 +744,16 @@ func (h *Handlers) UnlockFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "path or file_path is required in body")
 		return
 	}
-	h.Engine.UnlockFile(targetPath)
+	ownerRunID := req.OwnerRunID
+	if ownerRunID == "" {
+		ownerRunID = req.RunID
+	}
+	// Ownership refusal must reach the caller: answering 200 "unlocked" on a
+	// refused lock-steal is the HTTP sibling of the round-61 IPC defect.
+	if err := h.Engine.UnlockFile(targetPath, ownerRunID); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":     true,
 		"status": "unlocked",

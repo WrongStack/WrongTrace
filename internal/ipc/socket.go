@@ -51,7 +51,7 @@ type EngineSink interface {
 	// different owner already holds an unexpired lock; force=false always
 	// on this agent-facing surface.
 	TryLockFile(path, reason, owner, ownerRunID string, ttl time.Duration, force bool) (LockInfo, error)
-	UnlockFile(path string)
+	UnlockFile(path, ownerRunID string) error
 	ListLocks() []LockInfo
 	GetFileReadStats(filePath string) (db.FileReadStats, error)
 	GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error)
@@ -84,7 +84,9 @@ type Config struct {
 	MaxConns int
 	// IdleTimeout closes a connection that sends nothing for this long. It is
 	// re-armed before every read, so a persistent client that keeps talking
-	// is never cut off. Zero selects DefaultIdleTimeout.
+	// is never cut off. The same duration bounds each response write, so a
+	// client that stops reading cannot pin the handler goroutine. Zero
+	// selects DefaultIdleTimeout.
 	IdleTimeout time.Duration
 }
 
@@ -227,6 +229,13 @@ func (s *Server) acceptLoop(ctx context.Context) {
 			defer s.wg.Done()
 			defer func() { <-s.sem }()
 			defer s.track(c, false)
+			// A sink panic must take down the offending connection, not the
+			// daemon: recover last so the cleanup defers still run.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("ipc: recovered from panic in connection handler: %v", r)
+				}
+			}()
 			s.handleConn(ctx, c)
 		}(conn)
 	}
@@ -286,6 +295,7 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 		if mErr != nil {
 			return true
 		}
+		_ = c.SetWriteDeadline(time.Now().Add(s.cfg.IdleTimeout))
 		return writeJSONLine(writer, payload) == nil
 	}
 
@@ -371,6 +381,9 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 			// It is still dispatched (fire-and-forget telemetry) and recorded.
 			continue
 		}
+		// Bound the response write: a client that stops reading while a large
+		// reply is in flight must not pin this goroutine in the flush forever.
+		_ = c.SetWriteDeadline(time.Now().Add(s.cfg.IdleTimeout))
 		if err := writeJSONLine(writer, respPayload); err != nil {
 			if !isClientDisconnect(err) {
 				log.Printf("ipc: write error: %v", err)
@@ -515,6 +528,10 @@ func (s *Server) dispatch(req *Request) Response {
 			resp.Error = &RPCError{Code: -32011, Message: err.Error()}
 			return resp
 		}
+		// lock_owner_run_id is the credential the unlock_file ownership check
+		// verifies; broadcasting it would let any agent steal locks. The
+		// lock owner name stays for diagnostics.
+		h.LockOwnerRunID = ""
 		resp.Result = h
 
 	case "lock_file", "guardrail/lock", "telemetry/lock_file":
@@ -586,12 +603,26 @@ func (s *Server) dispatch(req *Request) Response {
 			resp.Error = &RPCError{Code: -32602, Message: "file_path or path is required"}
 			return resp
 		}
-		s.cfg.Engine.UnlockFile(filePath)
+		if err := s.cfg.Engine.UnlockFile(filePath, p.OwnerRunID); err != nil {
+			// Surface the refusal (e.g. ErrNotLockOwner for a foreign owner)
+			// instead of answering a lock-steal attempt with success; matches
+			// the lock_file handler's engine-error convention above.
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+			return resp
+		}
 		resp.Result = map[string]interface{}{"status": "unlocked", "file_path": filePath}
 
 	case "list_locks", "guardrail/locks", "telemetry/list_locks":
 		locks := s.cfg.Engine.ListLocks()
-		resp.Result = map[string]interface{}{"locks": locks, "count": len(locks)}
+		// owner_run_id is the credential the unlock_file ownership check
+		// verifies; broadcasting it would let any agent pass that check and
+		// steal locks. Callers identify themselves with their own run_id.
+		redacted := make([]LockInfo, len(locks))
+		for i, info := range locks {
+			info.OwnerRunID = ""
+			redacted[i] = info
+		}
+		resp.Result = map[string]interface{}{"locks": redacted, "count": len(redacted)}
 
 	case "atlas", "get_atlas", "telemetry/atlas":
 		var p AtlasRequest
