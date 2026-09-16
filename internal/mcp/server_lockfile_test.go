@@ -107,6 +107,46 @@ func TestCallTool_LockFile_SecondsAndDefaultTTL(t *testing.T) {
 	assertLockLifetime(t, engine2, "b.go", 15*time.Minute)
 }
 
+// TestCallTool_LockFileConflict_RedactsOwnerRunID pins the conflict branch of
+// lock_file: when TryLockFile refuses because another owner holds the lock,
+// the isError result's data carries the existing lock for diagnostics — but
+// owner_run_id is the credential the unlock_file ownership check verifies,
+// and the loser of a lock race must not receive it. The sibling surfaces
+// (list_locks, get_file_health_score, check_guardrail) already redact the
+// same field; the conflict payload was the one path that shipped it whole.
+func TestCallTool_LockFileConflict_RedactsOwnerRunID(t *testing.T) {
+	engine := newLockTestEngine(t)
+	if _, err := engine.TryLockFile("src/secret.go", "refactor in progress", "agent-a", "agent-a-secret-run", time.Hour, false); err != nil {
+		t.Fatalf("TryLockFile: %v", err)
+	}
+
+	resp := dispatch(engine, toolCallReq(1, "lock_file", `{"file_path":"src/secret.go","owner":"agent-b","reason":"mine now"}`))
+	flag, text := isErrorResult(t, resp)
+	if !flag || !strings.Contains(text, "agent-a") {
+		t.Fatalf("conflict = isError:%v %q, want isError naming agent-a", flag, text)
+	}
+
+	wire := wireResult(t, resp)
+	data, ok := wire["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("conflict data missing: %#v", wire["data"])
+	}
+	existing, ok := data["existing"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("conflict existing missing: %#v", data)
+	}
+	if got := existing["owner_run_id"]; got != nil && got != "" {
+		t.Fatalf("lock_file conflict leaked the ownership credential owner_run_id %q", got)
+	}
+	if existing["owner"] == "" || existing["path"] != "src/secret.go" {
+		t.Errorf("diagnostic fields lost from conflict data: %#v", existing)
+	}
+	locked, info := engine.IsFileLocked("src/secret.go")
+	if !locked || info.Owner != "agent-a" {
+		t.Fatalf("holder's lock did not survive the conflict: locked=%v info=%+v", locked, info)
+	}
+}
+
 func TestCallTool_UnlockFile_RealEngine(t *testing.T) {
 	engine := newLockTestEngine(t)
 

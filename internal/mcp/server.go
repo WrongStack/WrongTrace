@@ -410,9 +410,15 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			if _, err := locker.TryLockFile(path, reason, owner, ownerRunID, ttl, false); err != nil {
 				var conflict *core.LockConflictError
 				if errors.As(err, &conflict) {
+					// owner_run_id is the credential the unlock_file ownership
+					// check verifies; handing it to the loser of a lock race
+					// would let it unlock the foreign lock. The human-readable
+					// owner stays for diagnostics (see list_locks).
+					existing := conflict.Existing
+					existing.OwnerRunID = ""
 					return toolError(resp, fmt.Sprintf("GUARDRAIL CONFLICT: %s (reason=%q, expires_at=%s). The lock was not taken.",
-						conflict.Error(), conflict.Existing.Reason, conflict.Existing.ExpiresAt.Format(time.RFC3339)),
-						map[string]interface{}{"status": "conflict", "existing": conflict.Existing})
+						conflict.Error(), existing.Reason, existing.ExpiresAt.Format(time.RFC3339)),
+						map[string]interface{}{"status": "conflict", "existing": existing})
 				}
 				return toolError(resp, "lock_file failed: "+err.Error(), nil)
 			}
