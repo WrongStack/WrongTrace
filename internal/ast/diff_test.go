@@ -234,9 +234,7 @@ func TestDiffLongSharedPrefixDoesNotPanic(t *testing.T) {
 		next := &FileSnapshot{Path: "app.js", RawContent: longLineDecls(3, 25000, "var n = 2;\n")}
 
 		res := Diff("repo", prev, next)
-		if len(res.FileDiff) > maxDiffSnippetBytes {
-			t.Fatalf("FileDiff grew to %d bytes, cap is %d", len(res.FileDiff), maxDiffSnippetBytes)
-		}
+		assertSnippetsBounded(t, res)
 	})
 
 	t.Run("modified node", func(t *testing.T) {
@@ -316,7 +314,14 @@ func TestDiffRealParserLongLineFileStaysBounded(t *testing.T) {
 	}
 
 	res := Diff("repo", prev, after)
-	if len(res.FileDiff) > maxDiffSnippetBytes {
-		t.Fatalf("FileDiff grew to %d bytes, cap is %d", len(res.FileDiff), maxDiffSnippetBytes)
+	assertSnippetsBounded(t, res)
+}
+
+func assertSnippetsBounded(t *testing.T, res DiffResult) {
+	t.Helper()
+	for _, ev := range res.Events {
+		if len(ev.DiffSnippet) > maxDiffSnippetBytes {
+			t.Fatalf("%s DiffSnippet grew to %d bytes, cap is %d", ev.Signature, len(ev.DiffSnippet), maxDiffSnippetBytes)
+		}
 	}
 }

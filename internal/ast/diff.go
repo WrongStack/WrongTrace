@@ -89,12 +89,9 @@ type Event struct {
 // The order is stable: DELETED, MODIFIED, ADDED — which matches what
 // downstream consumers (DB writers, websocket hub) prefer for display.
 type DiffResult struct {
-	FilePath    string
-	Events      []Event
-	NewSnap     *FileSnapshot
-	FileDiff    string // Unified full-file diff snippet
-	FileAdded   int    // Total lines added in the whole file
-	FileDeleted int    // Total lines deleted in the whole file
+	FilePath string
+	Events   []Event
+	NewSnap  *FileSnapshot
 }
 
 // Diff computes the semantic delta between a previous snapshot (possibly nil)
@@ -109,31 +106,30 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	}
 
 	// Cheap identity check first: comparing the retained file hashes must not
-	// pay for inflating both sources. Cached snapshots hold their source
-	// DEFLATE-compressed, so the two Source() calls below each decompress the
-	// whole file — wasted work whenever the hash shortcut fires, which is the
-	// common case for no-op touches. nodeBody slices these strings; calling
-	// Source() per node would decompress the file once per declaration.
+	// pay for inflating both sources.
 	if prev != nil && next != nil {
 		if prev.Hash != "" && next.Hash != "" && prev.Hash == next.Hash {
 			res.NewSnap = next
 			return res
 		}
 	}
-	prevSrc := prev.Source()
-	nextSrc := next.Source()
+	// Cached snapshots hold their source DEFLATE-compressed, so Source()
+	// inflates the whole file. Resolve each side lazily, at most once, and only
+	// when an emitted event actually needs a node body: an edit that changes
+	// no declaration (comments, whitespace, imports) emits nothing and must
+	// not pay for inflating either file. nodeBody slices these strings;
+	// calling Source() per node would decompress the file once per declaration.
+	//
+	// There is deliberately no whole-file diff here. One used to be computed
+	// on every save (an LCS over the changed region plus a 64 KiB snippet) and
+	// nothing ever read it.
+	prevSrc := lazySource(prev)
+	nextSrc := lazySource(next)
 
 	if prev == nil {
-		if nextSrc != "" {
-			fileDiff, fileAdded, fileDeleted := formatAddedDiff(nextSrc)
-			res.FileDiff = fileDiff
-			res.FileAdded = fileAdded
-			res.FileDeleted = fileDeleted
-		}
-
 		for _, sig := range next.SortedSignatures() {
 			n := next.Nodes[sig]
-			diff, added, deleted := formatAddedDiff(nodeBody(nextSrc, n))
+			diff, added, deleted := formatAddedDiff(nodeBody(nextSrc(), n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -155,16 +151,9 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		return res
 	}
 	if next == nil {
-		if prevSrc != "" {
-			fileDiff, fileAdded, fileDeleted := formatDeletedDiff(prevSrc)
-			res.FileDiff = fileDiff
-			res.FileAdded = fileAdded
-			res.FileDeleted = fileDeleted
-		}
-
 		for _, sig := range prev.SortedSignatures() {
 			n := prev.Nodes[sig]
-			diff, added, deleted := formatDeletedDiff(nodeBody(prevSrc, n))
+			diff, added, deleted := formatDeletedDiff(nodeBody(prevSrc(), n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     prev.Path,
@@ -185,23 +174,14 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		return res
 	}
 
-	if prevSrc != "" || nextSrc != "" {
-		fileDiff, fileAdded, fileDeleted := generateLineDiff(prevSrc, nextSrc)
-		res.FileDiff = fileDiff
-		res.FileAdded = fileAdded
-		res.FileDeleted = fileDeleted
-	}
-
 	prevSigs := prev.SortedSignatures()
 	nextSigs := next.SortedSignatures()
 
 	// DELETED first — anything in prev but not in next.
-	prevSet := sigSet(prevSigs)
-	nextSet := sigSet(nextSigs)
 	for _, sig := range prevSigs {
-		if _, ok := nextSet[sig]; !ok {
+		if _, ok := next.Nodes[sig]; !ok {
 			n := prev.Nodes[sig]
-			diff, added, deleted := formatDeletedDiff(nodeBody(prevSrc, n))
+			diff, added, deleted := formatDeletedDiff(nodeBody(prevSrc(), n))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     prev.Path,
@@ -224,8 +204,8 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 	// ADDED — new signature.
 	for _, sig := range nextSigs {
 		newNode := next.Nodes[sig]
-		if _, existed := prevSet[sig]; !existed {
-			diff, added, deleted := formatAddedDiff(nodeBody(nextSrc, newNode))
+		if _, existed := prev.Nodes[sig]; !existed {
+			diff, added, deleted := formatAddedDiff(nodeBody(nextSrc(), newNode))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -245,7 +225,7 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		}
 		oldNode := prev.Nodes[sig]
 		if oldNode.Hash != newNode.Hash {
-			diff, added, deleted := generateLineDiff(nodeBody(prevSrc, oldNode), nodeBody(nextSrc, newNode))
+			diff, added, deleted := generateLineDiff(nodeBody(prevSrc(), oldNode), nodeBody(nextSrc(), newNode))
 			res.Events = append(res.Events, Event{
 				RepoName:     repoName,
 				FilePath:     next.Path,
@@ -284,6 +264,22 @@ func nodeBody(src string, n Node) string {
 	return n.Body
 }
 
+// lazySource returns a memoized accessor for snap's source. Safe on a nil
+// snapshot (Source is nil-safe).
+func lazySource(snap *FileSnapshot) func() string {
+	var (
+		src    string
+		loaded bool
+	)
+	return func() string {
+		if !loaded {
+			src = snap.Source()
+			loaded = true
+		}
+		return src
+	}
+}
+
 func actionRank(a Action) int {
 	switch a {
 	case ActionDeleted:
@@ -294,14 +290,6 @@ func actionRank(a Action) int {
 		return 2
 	}
 	return 99
-}
-
-func sigSet(sigs []string) map[string]struct{} {
-	out := make(map[string]struct{}, len(sigs))
-	for _, s := range sigs {
-		out[s] = struct{}{}
-	}
-	return out
 }
 
 func safePath(a, b *FileSnapshot) string {

@@ -162,6 +162,13 @@ func (e *Engine) parserFor(lang Language) *sitter.Parser {
 // and an error when the engine is closed. The parse itself is serialized so a
 // shared *sitter.Parser is never driven concurrently.
 func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
+	return e.ParseHashed(path, src, "")
+}
+
+// ParseHashed is Parse for callers that already computed HashBytes(src) --
+// typically for the unchanged-content fast path -- so the whole file is not
+// SHA-256 hashed a second time. An empty hash is computed here.
+func (e *Engine) ParseHashed(path string, src []byte, hash string) (*FileSnapshot, error) {
 	e.mu.RLock()
 	closed := e.closed
 	e.mu.RUnlock()
@@ -173,10 +180,13 @@ func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
 	if lang == LangUnknown {
 		return nil, nil
 	}
+	if hash == "" {
+		hash = hashBytes(src)
+	}
 	parser := e.parserFor(lang)
 	if parser == nil {
 		// Generic heuristic parser for languages without native tree-sitter C grammar
-		return parseGenericSource(path, src, lang), nil
+		return parseGenericSource(path, src, lang, hash), nil
 	}
 
 	e.parseMu.Lock()
@@ -192,7 +202,7 @@ func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
 	snap := &FileSnapshot{
 		Path:       path,
 		Nodes:      map[string]Node{},
-		Hash:       hashBytes(src),
+		Hash:       hash,
 		RawContent: raw,
 		LOC:        strings.Count(raw, "\n") + 1,
 	}
@@ -202,16 +212,34 @@ func (e *Engine) Parse(path string, src []byte) (*FileSnapshot, error) {
 }
 
 // parseGenericSource extracts declarations using robust pattern matching for languages without a compiled Tree-sitter grammar.
-func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
+func parseGenericSource(path string, src []byte, lang Language, hash ...string) *FileSnapshot {
+	h := ""
+	if len(hash) > 0 {
+		h = hash[0]
+	}
+	if h == "" {
+		h = hashBytes(src)
+	}
 	raw := string(src)
 	lines := strings.Split(raw, "\n")
 	base := filepath.Base(path)
 	snap := &FileSnapshot{
 		Path:       path,
 		Nodes:      map[string]Node{},
-		Hash:       hashBytes(src),
+		Hash:       h,
 		RawContent: raw,
 		LOC:        len(lines),
+	}
+
+	// lineStart[i] is the byte offset of lines[i] in raw. A node spanning lines
+	// [a, b) is raw[lineStart[a] : lineStart[b-1]+len(lines[b-1])] -- exactly
+	// the newline-joined lines[a:b] -- so nodes carry a byte range into the
+	// snapshot's (compressed, budgeted) source instead of their own uncompressed
+	// copy. Nested declarations used to duplicate their enclosing text again.
+	lineStart := make([]int, len(lines))
+	for i, off := 0, 0; i < len(lines); i++ {
+		lineStart[i] = off
+		off += len(lines[i]) + 1
 	}
 
 	for i, line := range lines {
@@ -293,8 +321,6 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 
 			startLine := i + 1
 			endLine := i + 1
-			var bodyLines []string
-			bodyLines = append(bodyLines, line)
 
 			if strings.Contains(line, "{") {
 				// The scanner carries string/comment state across lines, so a
@@ -304,20 +330,20 @@ func parseGenericSource(path string, src []byte, lang Language) *FileSnapshot {
 				braceCount := scanner.lineDelta(line)
 				j := i + 1
 				for ; j < len(lines) && braceCount > 0; j++ {
-					l := lines[j]
-					bodyLines = append(bodyLines, l)
-					braceCount += scanner.lineDelta(l)
+					braceCount += scanner.lineDelta(lines[j])
 				}
 				endLine = j
 			}
 
-			fullBody := strings.Join(bodyLines, "\n")
-			nodeHash := hashNormalizedBody(fullBody, lang)
+			startByte := lineStart[startLine-1]
+			endByte := lineStart[endLine-1] + len(lines[endLine-1])
+			nodeHash := hashNormalizedBodyBytes(src[startByte:endByte], lang)
 
 			snap.Nodes[sig] = Node{
 				Signature: sig,
 				Kind:      kind,
-				Body:      fullBody,
+				StartByte: uint32(startByte),
+				EndByte:   uint32(endByte),
 				StartLine: uint32(startLine),
 				EndLine:   uint32(endLine),
 				Hash:      nodeHash,
@@ -716,6 +742,27 @@ func (e *Engine) ForEachSnapshot(fn func(path string, snap *FileSnapshot) bool) 
 			break
 		}
 	}
+}
+
+// SnapshotEntry pairs a cached snapshot with its cache key.
+type SnapshotEntry struct {
+	Path string
+	Snap *FileSnapshot
+}
+
+// SnapshotList returns the cached snapshots as a slice, holding the read lock
+// only for the pointer copy. Snapshots are immutable once cached, so callers
+// doing heavy per-file work should use this instead of ForEachSnapshot: a long
+// walk under the read lock stalls SetSnapshot, and a waiting writer in turn
+// blocks every new reader.
+func (e *Engine) SnapshotList() []SnapshotEntry {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]SnapshotEntry, 0, len(e.snapshots))
+	for k, v := range e.snapshots {
+		out = append(out, SnapshotEntry{Path: k, Snap: v})
+	}
+	return out
 }
 
 // SnapshotCount returns the number of files currently cached in memory.
