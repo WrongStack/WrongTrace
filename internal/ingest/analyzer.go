@@ -28,7 +28,11 @@ var (
 	endLineKeys   = []string{"EndLine", "end_line", "endLine", "line_end", "lineEnd", "to_line", "toLine", "end"}
 	countLineKeys = []string{"lines", "line_count", "count", "num_lines", "limit"}
 
-	bTool          = []byte(`"tool`)
+	// Only the top-level "tool_calls" key is read below. The looser `"tool`
+	// prefix also matched "tool_result"/"tool_use_id"/"toolUseResult", so
+	// every tool-result line -- which embeds whole file contents -- paid a
+	// full generic JSON decode and yielded nothing.
+	bTool          = []byte(`"tool_calls"`)
 	bUserInput     = []byte(`"USER_INPUT"`)
 	bModelLower    = []byte(`"model"`)
 	bModelUpper    = []byte(`"Model"`)
@@ -252,8 +256,7 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 				continue
 			}
 
-			var row map[string]interface{}
-			if uErr := json.Unmarshal(trimmed, &row); uErr == nil {
+			if row, uErr := decodeJSONLRow(trimmed); uErr == nil {
 				// Dynamically extract model from deep json structures
 				if extracted := extractModelFromRow(row); extracted != "" && !models.IsJunkModel(extracted) {
 					currentModel = extracted
@@ -387,6 +390,13 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read cline task: %w", err)
 	}
+	// Events come only from messages[].say. Other agents' session files that
+	// share the tasks/sessions/conversations layout (Continue, Zed) never
+	// carry that key, yet are rewritten on every message; decoding each whole
+	// file into nested maps produced nothing.
+	if !bytes.Contains(data, []byte(`"say"`)) {
+		return nil, nil
+	}
 
 	var root map[string]interface{}
 	if err := json.Unmarshal(data, &root); err != nil {
@@ -485,6 +495,47 @@ var (
 	modelKeys       = []string{"model", "model_name", "modelName", "model_id", "modelId", "apiModelId", "selectedModel", "planner_model", "llm_model", "wire_model"}
 	modelNestedKeys = []string{"metadata", "params", "options", "config", "response", "system_info", "args"}
 )
+
+// jsonlRowKeys is every top-level key parseJSONLResumable and
+// extractModelFromRow read from a transcript line.
+var jsonlRowKeys = func() map[string]struct{} {
+	keys := map[string]struct{}{
+		"content": {}, "type": {}, "usage": {}, "tool_calls": {}, "created_at": {},
+	}
+	for _, k := range modelKeys {
+		keys[k] = struct{}{}
+	}
+	for _, k := range modelNestedKeys {
+		keys[k] = struct{}{}
+	}
+	return keys
+}()
+
+// decodeJSONLRow decodes one transcript line into the same map a plain
+// json.Unmarshal would produce, restricted to jsonlRowKeys. Claude Code lines
+// pass the pre-filter on "model" yet carry their payload under keys the parser
+// never reads ("message", "toolUseResult") -- often whole file contents.
+// Decoding those into nested maps was the tailer's dominant allocation; here
+// they stay raw bytes and are dropped. Key matching and duplicate-key handling
+// are those of map decoding, so the parser sees an identical row.
+func decodeJSONLRow(line []byte) (map[string]interface{}, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(line, &raw); err != nil {
+		return nil, err
+	}
+	row := make(map[string]interface{}, 4)
+	for k, v := range raw {
+		if _, ok := jsonlRowKeys[k]; !ok {
+			continue
+		}
+		var val interface{}
+		if err := json.Unmarshal(v, &val); err != nil {
+			return nil, err
+		}
+		row[k] = val
+	}
+	return row, nil
+}
 
 func extractModelFromRow(m map[string]interface{}) string {
 	for _, k := range modelKeys {
