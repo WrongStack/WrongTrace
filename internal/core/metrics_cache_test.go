@@ -55,7 +55,7 @@ func TestMetricsCacheCoalescesAndInvalidates(t *testing.T) {
 	if len(after.ActiveRuns) != 1 {
 		t.Errorf("ActiveRuns = %d, want 1", len(after.ActiveRuns))
 	}
-	if e.metricsCalls != nil && len(e.metricsCalls) != 0 {
+	if len(e.metricsCalls) != 0 {
 		t.Errorf("in-flight builds leaked: %d", len(e.metricsCalls))
 	}
 }
