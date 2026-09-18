@@ -162,14 +162,15 @@ func (e *Engine) PrimeDirectory(dir string) {
 		}
 
 		// Fast-path: if existing snapshot matches file hash, skip Tree-sitter AST parsing
-		if existing, ok := e.cfg.AST.Snapshot(path); ok && existing != nil && existing.Hash == ast.HashBytes(src) {
+		srcHash := ast.HashBytes(src)
+		if existing, ok := e.cfg.AST.Snapshot(path); ok && existing != nil && existing.Hash == srcHash {
 			unlock()
 			indexed++
 			pacer.step()
 			return nil
 		}
 
-		snap, perr := e.cfg.AST.Parse(path, src)
+		snap, perr := e.cfg.AST.ParseHashed(path, src, srcHash)
 		if perr != nil || snap == nil {
 			unlock()
 			failed++
@@ -320,14 +321,17 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	pkgMap := make(map[string]*AtlasPackage)
 
 	if e.cfg.AST != nil {
-		e.cfg.AST.ForEachSnapshot(func(path string, fileSnap *ast.FileSnapshot) bool {
+		// Copy the pointers and release the AST lock before the per-file build;
+		// snapshots are immutable once cached.
+		for _, entry := range e.cfg.AST.SnapshotList() {
+			path, fileSnap := entry.Path, entry.Snap
 			cleanPath := filepath.Clean(path)
 			// Same boundary as the probe above: exclude sibling directories
 			// sharing the project path's prefix, not just foreign trees.
 			// Without it the sibling's relPath (filepath.Rel yields "..")
 			// fell back to the absolute path and grouped into junk packages.
 			if hasActivePathMatch && !pathIsWithin(cleanPath, activePath) {
-				return true
+				continue
 			}
 
 			relPath := cleanPath
@@ -419,8 +423,7 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 			snap.TotalFiles++
 			snap.TotalLOC += af.TotalLOC
 			snap.TotalNodes += len(af.Symbols)
-			return true
-		})
+		}
 	}
 
 	// Sort packages and files deterministically

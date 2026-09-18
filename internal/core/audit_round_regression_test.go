@@ -289,8 +289,8 @@ func TestParseSizeLimitIsShared(t *testing.T) {
 		t.Fatalf("fixture too small: %d", info.Size())
 	}
 	e.PrimeDirectory(dir)
-	if e.parseEligible(path) {
-		t.Fatal("parseEligible accepts a file above maxParseFileBytes")
+	if _, ok := parser.Snapshot(path); ok {
+		t.Fatal("oversized file was primed")
 	}
 	if err := os.WriteFile(path, []byte(strings.Replace(auditThreeFuncs, "return 2", "return 22", 1)+pad), 0o644); err != nil {
 		t.Fatal(err)

@@ -78,6 +78,12 @@ func (e *Engine) SetWatcher(w WatcherAPI) {
 	if w == nil || e.webhooks == nil || e.samplerClosed {
 		return
 	}
+	// The occupancy value is only ever read when the watcher is capturing
+	// fsnotify events for debugging. Otherwise the sampler is a 5 Hz wakeup
+	// for the daemon's whole lifetime that nothing observes.
+	if c, ok := w.(interface{ CapturesFSEvents() bool }); ok && !c.CapturesFSEvents() {
+		return
+	}
 	stop := make(chan struct{})
 	e.samplerStop = stop
 	dispatcher := e.webhooks
@@ -1649,5 +1655,11 @@ func (e *Engine) ClearStale(days int) (int64, error) {
 	if st == nil {
 		return 0, nil
 	}
-	return st.ClearStale(days)
+	deleted, err := st.ClearStale(days)
+	if deleted > 0 {
+		// The metrics and atlas caches are invalidated by generation; a prune
+		// removes rows they were derived from.
+		e.BumpCacheGen()
+	}
+	return deleted, err
 }

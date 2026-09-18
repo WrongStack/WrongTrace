@@ -198,6 +198,12 @@ func (w *Watcher) Handler() http.Handler {
 	return w.httpHandler
 }
 
+// CapturesFSEvents reports whether fsnotify events are being recorded for
+// the debug stream, i.e. whether UpdateSemOccupied's value is ever read.
+func (w *Watcher) CapturesFSEvents() bool {
+	return w.evBuf != nil
+}
+
 // UpdateSemOccupied records the webhook dispatcher's in-flight count so that
 // captureEvent can embed it in the next captured fsnotify event. Called by the
 // engine after each dispatch completes. Zero cost when evBuf is nil.

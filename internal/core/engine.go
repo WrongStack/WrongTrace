@@ -108,6 +108,9 @@ type Engine struct {
 	atlasCache   map[string]cachedAtlas
 	metricsCache map[string]cachedMetrics
 	recentCache  map[string]cachedRecent
+	// metricsCalls coalesces concurrent snapshot builds per filter. Guarded
+	// by cacheMu.
+	metricsCalls map[string]*metricsCall
 }
 
 // BumpCacheGen increments the cache generation counter, invalidating in-memory Atlas, Metrics, and RecentEvents caches.
@@ -244,6 +247,11 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 	// independent time.AfterFunc goroutines, and read-snapshot -> parse ->
 	// store is not atomic. Two overlapping deliveries both diffed against the
 	// same previous snapshot and persisted duplicate events.
+	// Unsupported languages are never parsed, so they have no snapshot to
+	// diff or delete: bail out before any syscall.
+	if !e.parseEligible(path) {
+		return
+	}
 	unlock := e.pathLocks.lock(path)
 	defer unlock()
 
@@ -274,12 +282,13 @@ func (e *Engine) HandleFileChange(ctx context.Context, path string) {
 	}
 
 	// Fast-path: if file was touched without content changes, skip AST parse and Diff entirely
+	srcHash := ast.HashBytes(src)
 	prev, _ := e.cfg.AST.Snapshot(path)
-	if prev != nil && prev.Hash == ast.HashBytes(src) {
+	if prev != nil && prev.Hash == srcHash {
 		return
 	}
 
-	snap, err := e.cfg.AST.Parse(path, src)
+	snap, err := e.cfg.AST.ParseHashed(path, src, srcHash)
 	if err != nil || snap == nil {
 		return
 	}
@@ -351,11 +360,22 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 	// Every event in one diff result originates from the same file, so the
 	// store handle and repo attribution are resolved once instead of per event.
 	store := e.Store()
-	defaultRepo := e.repoName()
-	if p, ok := e.FindProjectForFile(res.Events[0].FilePath); ok && p.Name != "" {
-		defaultRepo = p.Name
-	}
+	// Diff stamps every event with the repo its caller resolved, so the
+	// project lookup (Abs/Clean/ToLower over every registered root) is only
+	// needed for events that arrive without one.
+	defaultRepo := ""
 	for _, ev := range res.Events {
+		if ev.RepoName == "" {
+			defaultRepo = e.repoName()
+			if p, ok := e.FindProjectForFile(res.Events[0].FilePath); ok && p.Name != "" {
+				defaultRepo = p.Name
+			}
+			break
+		}
+	}
+	events := make([]ast.Event, len(res.Events))
+	recs := make([]db.EventRecord, len(res.Events))
+	for i, ev := range res.Events {
 		if runID != "" && ev.RunID == "" {
 			ev.RunID = runID
 		}
@@ -363,7 +383,8 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 		if repo == "" {
 			repo = defaultRepo
 		}
-		rec := db.EventRecord{
+		events[i] = ev
+		recs[i] = db.EventRecord{
 			EventID:               newID(),
 			RunID:                 ev.RunID,
 			RepoName:              repo,
@@ -382,13 +403,28 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 			AttributionConfidence: attributionConfidence,
 			OccurredAt:            ev.OccurredAt,
 		}
-		if store != nil {
+	}
+	// One transaction per file transition. If the batch fails, retry row by
+	// row so one bad row cannot drop its siblings, and only broadcast what
+	// was actually persisted.
+	persisted := make([]bool, len(recs))
+	if store == nil || store.InsertEvents(recs) == nil {
+		for i := range persisted {
+			persisted[i] = true
+		}
+	} else {
+		for i, rec := range recs {
 			if err := store.InsertEvent(rec); err != nil {
 				log.Printf("engine: insert event %s: %v", rec.EventID, err)
 				continue
 			}
+			persisted[i] = true
 		}
-		e.hub.Broadcast(WSEvent{Type: "code_event", Payload: ev, EventID: rec.EventID})
+	}
+	for i, ev := range events {
+		if persisted[i] {
+			e.hub.Broadcast(WSEvent{Type: "code_event", Payload: ev, EventID: recs[i].EventID})
+		}
 	}
 	if len(res.Events) > 0 {
 		e.BumpCacheGen()
@@ -466,20 +502,16 @@ func ignoredPathSegment(path string) bool {
 	return false
 }
 
-// parseEligible reports whether a file should be parsed into the AST cache:
-// supported language and not a pathological bundle. Directory-ignore
+// parseEligible reports whether a file should be parsed into the AST cache by
+// language. The size ceiling (maxParseFileBytes) is enforced by each caller
+// from the file info it already holds; this used to os.Stat every file a
+// second time, once per file on every indexing pass. Directory-ignore
 // filtering is deliberately NOT part of this — PrimeDirectory's walk already
 // prunes ignored subtrees with filepath.SkipDir, and re-checking segments
 // here would false-positive on workspaces whose own root (or an ancestor)
 // happens to be named like an ignore entry (e.g. a workspace named "bin").
 func (e *Engine) parseEligible(path string) bool {
-	if ast.DetectLanguage(path) == ast.LangUnknown {
-		return false
-	}
-	if info, err := os.Stat(path); err == nil && info.Size() > maxParseFileBytes {
-		return false
-	}
-	return true
+	return ast.DetectLanguage(path) != ast.LangUnknown
 }
 
 // shouldSkip filters files we never want to watch: ignored directories,
@@ -513,12 +545,23 @@ func (e *Engine) shouldSkip(path string) bool {
 func (e *Engine) Run(ctx context.Context) {
 	runTicker := time.NewTicker(2 * time.Minute)
 	retentionTicker := time.NewTicker(24 * time.Hour)
+	// Planner statistics: first refresh once startup has settled, then a few
+	// times a day. Not at startup itself, which must stay fast.
+	optimizeTimer := time.NewTimer(10 * time.Minute)
 	defer runTicker.Stop()
 	defer retentionTicker.Stop()
+	defer optimizeTimer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-optimizeTimer.C:
+			if st := e.Store(); st != nil {
+				if err := st.Optimize(); err != nil {
+					log.Printf("db: optimize planner statistics: %v", err)
+				}
+			}
+			optimizeTimer.Reset(6 * time.Hour)
 		case <-runTicker.C:
 			e.pruneActiveRuns()
 			// Guardrail locks and pending file-operation hints carry their own
