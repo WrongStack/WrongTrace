@@ -11,6 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.15] - 2026-09-18
+
+### Security
+- **Any agent could release another agent's file lock, and read surfaces handed out the credential to do it (guardrails)** — `unlock_file` over IPC, MCP and HTTP removed a lock without checking who held it, and `owner_run_id` — the value an ownership check would verify — was published by `check_guardrail`, file health (including HTTP `/api/file/health`), `list_locks` and the HTTP/MCP `lock_file` conflict replies. `Engine.UnlockFile(path, ownerRunID) error` now returns `ErrNotLockOwner` when a live lock belongs to another run (IPC maps it to an error, HTTP to `403`; an empty `ownerRunID` keeps the legacy force path), and `owner_run_id` is withheld from every surface that reports on other agents' locks — the success reply of your own `lock_file` still returns it. Holder name, reason and expiry remain for diagnostics. Pinned by `internal/core/unlock_ownership_test.go`, `internal/ipc/unlock_ownership_test.go`, `internal/mcp/server_lockfile_test.go`, `internal/ipc/guardrail_credential_regression_test.go`, `internal/server/guardrail_credential_regression_test.go`, `TestCallTool_LockFileConflict_RedactsOwnerRunID`.
+
+### Fixed & Hardened
+- **Non-streaming Ollama and Gemini replies lost their text and token counts (AI Gateway proxy)** — the buffered-response analyzer recognized only OpenAI and Anthropic shapes, so `message.content`/`response`/`prompt_eval_count`/`eval_count` and `candidates[].content.parts`/`usageMetadata` were ignored and cost fell back to estimates. They are now extracted like their streaming twins. Pinned by `TestAnalyzeWirePayloads_OllamaNonStreamChat`, `TestAnalyzeWirePayloads_GeminiNonStreamGenerateContent`.
+- **Re-storing a cached key evicted an unrelated live entry (AI Gateway proxy)** — replacing a resident key does not grow the cache, yet room was made anyway; a burst of identical concurrent requests (all miss, all store) shed up to N−1 live responses. Pinned by `internal/proxy/cache_replacement_eviction_test.go`, `internal/proxy/cache_replacement_gateway_test.go`.
+- **`/api/health` advertised an IPC endpoint that was never bound (CLI)** — after a failed bind (`ipc: disabled`) the configured socket path was still reported; `socket_path` is now empty unless the daemon actually listens there. Pinned by `TestHealth_SocketPathOnlyWhenConfigured`.
+
+### Performance
+Measured on a 510-file workspace with an edit burst, dashboard, gateway (1.3 MB conversations) and transcript load: total daemon CPU −10–15% and final private memory −5 MB versus 0.3.14 plus the fixes above. The retention and storage changes matter most on long-running daemons with large databases, which that run did not model.
+- **AST / indexing** — every save computed a whole-file LCS diff (plus a 64 KiB snippet) that nothing read; it is gone. Cached sources are inflated only when an emitted event needs a node body. The generic parser (Rust, Java, C#, C/C++, Kotlin, Dart, PHP, Ruby) stores byte ranges instead of an uncompressed body copy per node, which nested declarations duplicated outside the source budget. Files are hashed once and no longer `stat`-ed twice per indexing pass.
+- **Engine** — concurrent dashboard metric fetches share one snapshot build (cache TTL 2s → 30s; invalidation stays generation-based and now includes retention pruning). Code Atlas is built without holding the AST lock, so edits no longer wait on it. A file's diff events are written in one transaction. The 5 Hz webhook-occupancy sampler runs only with `--debug-fs`, its sole reader.
+- **Storage** — `GetFileReadStats` makes one scan instead of four full scans; the friction query no longer sorts `diff_snippet` through its window. Two redundant prefix indexes are dropped and two indexes are replaced by covering `(run_id, repo_name)` / `(repo_name, run_id)` indexes (index count unchanged; applied on first start). SQLite planner statistics are refreshed 10 minutes after start and every 6 hours instead of only on shutdown.
+- **AI Gateway** — each request is decoded once with a typed decoder instead of two or three `map[string]any` decodes of the whole conversation (~2× faster, ~4× less memory in the benchmark). Stream captures and bodies are no longer copied in full to keep a 64 KiB record, Anthropic replies are decoded once, and the `sk-` secret pre-filter no longer fires on words like `task-`/`disk-`.
+- **Ingest** — transcript lines decode only the keys the parser reads (~1.8× faster, half the memory per Claude Code line), `tool_result` lines no longer pass the pre-filter, and JSON session files that never yield events (Continue, Zed) are skipped.
+
+### Changed
+- **Retained gateway traffic text is capped** — records kept in memory for `/api/proxy/traffic` now hold at most 16 KiB of `assistant_reply`, `reasoning` and `system_prompt` and 4 KiB per tool-call `arguments` (head and tail kept, the gap marked). Run correlation and file attribution still see the full values. Gateway file-read rows store a 200-character intent instead of the whole reply.
+
+### Testing & Tooling
+- Behavior-preserving rewrites are pinned against the previous implementation: `TestSummarizeWireRequestMatchesLegacyWalk`, `TestSanitizeBodyBytesMatchesStringPath`, `TestDecodeJSONLRowMatchesFullDecode`; `FuzzHasOpenAIKeyCandidateIsSound` checks the secret pre-filter never rejects a regex match. New: `TestMetricsCacheCoalescesAndInvalidates`, `TestGetFileReadStats_SinglePassBeyondRecentCap`, `TestModelFrictionMatrix_SnippetJoinedAfterLimit`, `TestMigrateConvergesIndexes`, `TestHandleConn_WriteDeadlineReapsWedgedClient`, and benchmarks `BenchmarkRequestAnalysis`, `BenchmarkJSONLRowDecode`.
+
+---
+
 ## [0.3.14] - 2026-09-15
 
 ### Security
