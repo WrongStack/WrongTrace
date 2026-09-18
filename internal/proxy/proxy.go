@@ -1786,7 +1786,10 @@ const (
 // only the retained bytes are copied; the output is identical to converting
 // the whole buffer and sanitizing that.
 func sanitizeBodyBytesForRecord(body []byte) string {
-	if len(body) <= maxRecordBodyLen*2 {
+	// Mask-first for credential-bearing oversized bodies (see
+	// sanitizeBodyForRecord): the seam cut would strand a partial credential
+	// at each cut. Marker-free bodies keep the no-copy fast path.
+	if len(body) <= maxRecordBodyLen*2 || bodyMayContainCredentials(body) {
 		return sanitizeBodyForRecord(string(body))
 	}
 	headLen := maxRecordBodyLen * 3 / 4
@@ -1807,8 +1810,13 @@ func sanitizeBodyForRecord(body string) string {
 	}
 
 	// Early head/tail truncation if the incoming body is massive (e.g. 500KB - 5MB SSE stream)
-	// to avoid unmarshaling and regex scanning megabytes of discarded lines
-	if len(body) > maxRecordBodyLen*2 {
+	// to avoid unmarshaling and regex scanning megabytes of discarded lines.
+	// The cut is only safe for bodies that cannot contain credentials: a cut
+	// seam strands a partial credential the complete-pattern regexes cannot
+	// match (18 of 20 chars of an AWS key reached the stored copy — proven by
+	// the seam regression test). Credential-bearing bodies take the
+	// mask-first path and let the post-mask cap below do the size limiting.
+	if len(body) > maxRecordBodyLen*2 && !bodyMayContainCredentials([]byte(body)) {
 		head := runeSafePrefix(body, maxRecordBodyLen*3/4)
 		tail := runeSafeSuffix(body, maxRecordBodyLen/4)
 		return sanitizeBodyForRecord(head) + "\n…[body truncated " + strconv.Itoa(len(body)-len(head)-len(tail)) + " chars]…\n" + sanitizeBodyForRecord(tail)
@@ -1835,6 +1843,22 @@ func sanitizeBodyForRecord(body string) string {
 		out = head + "\n…[body truncated " + strconv.Itoa(truncated) + " chars]…\n" + tail
 	}
 	return out
+}
+
+// bodyMayContainCredentials mirrors ScanAndRedactSecrets's pre-filter gate:
+// every credential regex match implies one of these markers fires on the
+// body, so a marker-free body cannot contain credential material anywhere.
+// Keep in sync with ScanAndRedactSecrets.
+func bodyMayContainCredentials(body []byte) bool {
+	if bytes.Contains(body, bPrivKey) || bytes.Contains(body, bAKIA) ||
+		bytes.Contains(body, bGhp) || bytes.Contains(body, bGithubPat) ||
+		bytes.Contains(body, bSkAnt) || hasOpenAIKeyCandidate(body) ||
+		bytes.Contains(body, bAIzaSy) || hasGenericSecret(body) {
+		return true
+	}
+	return bytes.Contains(body, bColonSlash) &&
+		(bytes.Contains(body, bPostgres) || bytes.Contains(body, bMysql) ||
+			bytes.Contains(body, bMongo) || bytes.Contains(body, bRedis))
 }
 
 // maskJSONValue walks a decoded JSON value, truncating long strings and
