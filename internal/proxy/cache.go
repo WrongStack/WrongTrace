@@ -192,7 +192,13 @@ func (c *ResponseCache) SetWithReplayHeader(key, provider, model string, statusC
 	}
 
 	now := time.Now()
-	if len(c.items) >= c.maxEntries {
+	// Storing a key that is already resident replaces its slot: the entry
+	// count does not grow, so no room has to be made. Making room anyway
+	// destroyed one unrelated live response per redundant store, and the
+	// gateway has no in-flight dedup — N concurrent identical requests all
+	// miss, all fetch upstream, then all store the same key, so a single
+	// duplicate burst shed live entries the cache exists to keep.
+	if _, exists := c.items[key]; !exists && len(c.items) >= c.maxEntries {
 		// First pass: purge expired entries
 		for k, v := range c.items {
 			if now.After(v.ExpiresAt) {
