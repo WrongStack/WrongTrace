@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"regexp"
 	"sort"
 	"strings"
@@ -33,6 +34,19 @@ type PayloadAnalysis struct {
 	TotalTokens      int64
 	CachedTokens     int64
 	ReasoningTokens  int64
+
+	// estPromptTokens is the request-side token estimate computed during the
+	// request decode, so the fallback never re-parses the body.
+	estPromptTokens int64
+}
+
+// EstimatedPromptTokens returns the prompt-token estimate for reqBody, reusing
+// the one computed by AnalyzeWirePayloads when available.
+func (pa *PayloadAnalysis) EstimatedPromptTokens(reqBody []byte) int64 {
+	if pa.estPromptTokens > 0 {
+		return pa.estPromptTokens
+	}
+	return EstimatePromptTokens(reqBody)
 }
 
 var (
@@ -44,39 +58,16 @@ var (
 func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysis {
 	var analysis PayloadAnalysis
 
-	// 1. Analyze Request
+	// 1. Analyze Request. One typed decode serves both the conversation stats
+	// and the prompt-token fallback estimate; bodies are the whole conversation
+	// (often megabytes), and decoding them into map[string]interface{} two or
+	// three times per exchange was the proxy's largest allocation source.
 	if len(reqBody) > 0 {
-		var reqMap map[string]interface{}
-		if err := json.Unmarshal(reqBody, &reqMap); err == nil {
-			if msgs, ok := reqMap["messages"].([]interface{}); ok {
-				analysis.MessageCount = len(msgs)
-				for _, m := range msgs {
-					if mMap, ok := m.(map[string]interface{}); ok {
-						role, _ := mMap["role"].(string)
-						if role == "system" && analysis.SystemPrompt == "" {
-							if sysContent, ok := mMap["content"].(string); ok {
-								analysis.SystemPrompt = runeSafeTruncate(sysContent, 120)
-							}
-						}
-						// Last user message wins; this used to be derived by a
-						// separate full decode on the request path.
-						if role == "user" {
-							if userContent, ok := mMap["content"].(string); ok {
-								analysis.UserIntent = runeSafePrefix(userContent, 80)
-								if len(userContent) > len(analysis.UserIntent) {
-									analysis.UserIntent += "…"
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Anthropic top-level system prompt
-			if sys, ok := reqMap["system"].(string); ok && analysis.SystemPrompt == "" {
-				analysis.SystemPrompt = runeSafeTruncate(sys, 120)
-			}
-		}
+		req := summarizeWireRequest(reqBody)
+		analysis.MessageCount = req.messageCount
+		analysis.SystemPrompt = req.systemPrompt
+		analysis.UserIntent = req.userIntent
+		analysis.estPromptTokens = req.estimatedTokens(len(reqBody))
 	}
 
 	// 2. Analyze Response
@@ -86,7 +77,7 @@ func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysi
 				analysis.AssistantReply = string(respBody)
 			}
 			if analysis.PromptTokens == 0 && len(reqBody) > 0 {
-				analysis.PromptTokens = EstimatePromptTokens(reqBody)
+				analysis.PromptTokens = analysis.estPromptTokens
 			}
 			if analysis.CompletionTokens == 0 && len(analysis.AssistantReply) > 0 {
 				analysis.CompletionTokens = int64(float64(len(analysis.AssistantReply)) / 3.7)
@@ -221,6 +212,13 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 	// extraction semantics. Bodies that took the OpenAI early return never
 	// reach this, and the generic usage map was already consumed above, so
 	// only the shapes it misses are handled here.
+	//
+	// The second decode is skipped when the body carries none of those fields
+	// -- every Anthropic Messages response -- so the common non-OpenAI reply
+	// is no longer decoded twice.
+	if !hasNativeChunkField(respMap) {
+		return true
+	}
 	var chunk sseStreamChunk
 	if err := json.Unmarshal(data, &chunk); err == nil {
 		if chunk.ModelVersion != "" {
@@ -273,6 +271,26 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 		}
 	}
 	return true
+}
+
+// nativeChunkFields are the top-level keys of Gemini and Ollama-native
+// bodies that parseJSONResponse's sseStreamChunk pass reads.
+var nativeChunkFields = []string{
+	"candidates", "usageMetadata", "modelVersion", "message", "response",
+	"done_reason", "prompt_eval_count", "eval_count",
+}
+
+// hasNativeChunkField reports whether m has any nativeChunkFields key.
+// encoding/json matches struct fields case-insensitively, so this does too.
+func hasNativeChunkField(m map[string]interface{}) bool {
+	for k := range m {
+		for _, f := range nativeChunkFields {
+			if strings.EqualFold(k, f) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type sseToolCallItem struct {
@@ -575,7 +593,7 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 
 	// If upstream stream did not emit usage metadata, compute accurate token estimate from request/reply
 	if pa.PromptTokens == 0 && len(reqBody) > 0 {
-		pa.PromptTokens = EstimatePromptTokens(reqBody)
+		pa.PromptTokens = pa.EstimatedPromptTokens(reqBody)
 	}
 	if pa.CompletionTokens == 0 {
 		outChars := len(pa.AssistantReply) + len(pa.Reasoning)
@@ -678,68 +696,150 @@ func EstimatePromptTokens(reqBody []byte) int64 {
 	if len(reqBody) == 0 {
 		return 0
 	}
-	var reqMap map[string]interface{}
-	if err := json.Unmarshal(reqBody, &reqMap); err != nil {
-		return int64(float64(len(reqBody)) / 3.7)
+	return summarizeWireRequest(reqBody).estimatedTokens(len(reqBody))
+}
+
+// wireRequest is the subset of an OpenAI/Anthropic-style request the proxy
+// reads. Content stays raw so large tool results and images are skipped by the
+// decoder instead of being materialized as nested maps.
+type wireRequest struct {
+	System   json.RawMessage `json:"system"`
+	Messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+	Tools []struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Function    *struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"function"`
+	} `json:"tools"`
+}
+
+type wireRequestSummary struct {
+	valid        bool // body was syntactically valid JSON
+	messageCount int
+	systemPrompt string
+	userIntent   string
+	charCount    int
+}
+
+// estimatedTokens converts the summary's character count into a token
+// estimate, falling back to the raw body size exactly as the map-based
+// estimator did.
+func (r wireRequestSummary) estimatedTokens(bodyLen int) int64 {
+	if !r.valid {
+		return int64(float64(bodyLen) / 3.7)
 	}
-
-	charCount := 0
-
-	// 1. System prompt
-	if sys, ok := reqMap["system"].(string); ok {
-		charCount += len(sys)
+	chars := r.charCount
+	if chars == 0 {
+		chars = bodyLen
 	}
-
-	// 2. Messages
-	if msgs, ok := reqMap["messages"].([]interface{}); ok {
-		for _, m := range msgs {
-			if mMap, ok := m.(map[string]interface{}); ok {
-				if contentStr, ok := mMap["content"].(string); ok {
-					charCount += len(contentStr)
-				} else if contentArr, ok := mMap["content"].([]interface{}); ok {
-					for _, block := range contentArr {
-						if bMap, ok := block.(map[string]interface{}); ok {
-							if text, ok := bMap["text"].(string); ok {
-								charCount += len(text)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// 3. Tools definitions
-	if tools, ok := reqMap["tools"].([]interface{}); ok {
-		for _, t := range tools {
-			if tMap, ok := t.(map[string]interface{}); ok {
-				if fn, ok := tMap["function"].(map[string]interface{}); ok {
-					if fnName, ok := fn["name"].(string); ok {
-						charCount += len(fnName)
-					}
-					if fnDesc, ok := fn["description"].(string); ok {
-						charCount += len(fnDesc)
-					}
-				}
-				if name, ok := tMap["name"].(string); ok {
-					charCount += len(name)
-				}
-				if desc, ok := tMap["description"].(string); ok {
-					charCount += len(desc)
-				}
-			}
-		}
-	}
-
-	if charCount == 0 {
-		charCount = len(reqBody)
-	}
-
-	tokens := int64(float64(charCount) / 3.7)
+	tokens := int64(float64(chars) / 3.7)
 	if tokens < 1 {
 		tokens = 1
 	}
 	return tokens
+}
+
+// decodeLenient unmarshals data into v, tolerating fields whose JSON type does
+// not match the target: encoding/json skips those and keeps filling the rest,
+// which mirrors the type-asserting map walk this replaced.
+func decodeLenient(data []byte, v any) bool {
+	err := json.Unmarshal(data, v)
+	if err == nil {
+		return true
+	}
+	var typeErr *json.UnmarshalTypeError
+	return errors.As(err, &typeErr)
+}
+
+// rawJSONString decodes raw when it is a JSON string.
+func rawJSONString(raw json.RawMessage) (string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// contentChars counts the text characters of a message content value: a
+// plain string, or an array of blocks whose "text" fields are summed.
+func contentChars(raw json.RawMessage) int {
+	if s, ok := rawJSONString(raw); ok {
+		return len(s)
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '[' {
+		return 0
+	}
+	var blocks []struct {
+		Text json.RawMessage `json:"text"`
+	}
+	if !decodeLenient(raw, &blocks) {
+		return 0
+	}
+	n := 0
+	for _, b := range blocks {
+		if s, ok := rawJSONString(b.Text); ok {
+			n += len(s)
+		}
+	}
+	return n
+}
+
+func summarizeWireRequest(body []byte) wireRequestSummary {
+	var sum wireRequestSummary
+	var req wireRequest
+	if !decodeLenient(body, &req) {
+		return sum
+	}
+	sum.valid = true
+	sum.messageCount = len(req.Messages)
+
+	if sys, ok := rawJSONString(req.System); ok {
+		sum.charCount += len(sys)
+	}
+	for _, m := range req.Messages {
+		content, isString := rawJSONString(m.Content)
+		if isString {
+			sum.charCount += len(content)
+		} else {
+			sum.charCount += contentChars(m.Content)
+		}
+		if !isString {
+			continue
+		}
+		if m.Role == "system" && sum.systemPrompt == "" {
+			sum.systemPrompt = runeSafeTruncate(content, 120)
+		}
+		// Last user message wins.
+		if m.Role == "user" {
+			sum.userIntent = runeSafePrefix(content, 80)
+			if len(content) > len(sum.userIntent) {
+				sum.userIntent += "…"
+			}
+		}
+	}
+	// Anthropic top-level system prompt.
+	if sum.systemPrompt == "" {
+		if sys, ok := rawJSONString(req.System); ok {
+			sum.systemPrompt = runeSafeTruncate(sys, 120)
+		}
+	}
+	for _, t := range req.Tools {
+		if t.Function != nil {
+			sum.charCount += len(t.Function.Name) + len(t.Function.Description)
+		}
+		sum.charCount += len(t.Name) + len(t.Description)
+	}
+	return sum
 }
 
 func extractFileFromArgsString(args string) string {

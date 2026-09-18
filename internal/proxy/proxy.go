@@ -91,6 +91,10 @@ type ProxyTrafficRecord struct {
 	// upstream EOF, or whose client stopped accepting bytes mid-stream. Its
 	// captured body and token counts are partial and it is never cached.
 	Truncated bool `json:"truncated,omitempty"`
+
+	// bodiesSanitized marks RequestBody/ResponseBody as already capped and
+	// masked by the finalize path, so recordTraffic does not redo it.
+	bodiesSanitized bool
 }
 
 // Config configures the transparent LLM gateway proxy.
@@ -355,9 +359,12 @@ func (p *GatewayProxy) Close() {
 // delayed the response bytes themselves.
 func (p *GatewayProxy) finalize(job finalizeJob) {
 	rec := job.rec
-	rec.RequestBody = string(job.reqBody)
-
-	rec.ResponseBody = string(job.respBytes)
+	// Sanitize straight from the wire bytes: converting a body of up to 32 MB
+	// to a string first copied all of it only for the record cap to keep
+	// 64 KB. recordTraffic skips its own pass for these records.
+	rec.RequestBody = sanitizeBodyBytesForRecord(job.reqBody)
+	rec.ResponseBody = sanitizeBodyBytesForRecord(job.respBytes)
+	rec.bodiesSanitized = true
 
 	if job.cacheHit {
 		// Cache-hit path: the record is already final ($0 cost, cache-savings
@@ -406,7 +413,7 @@ func (p *GatewayProxy) finalize(job finalizeJob) {
 		rec.ID = analysis.WireID
 	}
 	if promptTokens == 0 {
-		promptTokens = EstimatePromptTokens(job.reqBody)
+		promptTokens = analysis.EstimatedPromptTokens(job.reqBody)
 	}
 	if completionTokens == 0 && job.isStream {
 		completionTokens = 1
@@ -528,15 +535,25 @@ func (p *GatewayProxy) recordTraffic(rec ProxyTrafficRecord) {
 	// Single choke point: every stored/broadcast record is size-capped and
 	// partially masked here. Analysis paths upstream ran on the ORIGINAL
 	// payloads; only the persisted/broadcast copy is sanitized.
-	rec.RequestBody = sanitizeBodyForRecord(rec.RequestBody)
-	rec.ResponseBody = sanitizeBodyForRecord(rec.ResponseBody)
+	if !rec.bodiesSanitized {
+		rec.RequestBody = sanitizeBodyForRecord(rec.RequestBody)
+		rec.ResponseBody = sanitizeBodyForRecord(rec.ResponseBody)
+	}
+
+	// The ring retains maxTraffic records for the daemon's lifetime. The two
+	// bodies above are capped, but the analysis fields are not: a non-JSON
+	// reply lands whole in AssistantReply (up to the 32 MB read cap) and a
+	// write_file/edit tool call carries the entire file in its arguments.
+	// Retaining those uncapped pinned tens of MB. OnTraffic still receives
+	// the full values below — it parses tool arguments for line ranges.
+	stored := capRecordAnalysis(rec)
 
 	p.trafficMu.Lock()
 	if len(p.trafficLog) >= p.maxTraffic {
 		copy(p.trafficLog, p.trafficLog[1:])
-		p.trafficLog[len(p.trafficLog)-1] = rec
+		p.trafficLog[len(p.trafficLog)-1] = stored
 	} else {
-		p.trafficLog = append(p.trafficLog, rec)
+		p.trafficLog = append(p.trafficLog, stored)
 	}
 	p.trafficMu.Unlock()
 
@@ -548,6 +565,44 @@ func (p *GatewayProxy) recordTraffic(rec ProxyTrafficRecord) {
 	if p.cfg.OnTraffic != nil {
 		p.cfg.OnTraffic(rec)
 	}
+}
+
+// Retention caps for the analysis text kept in the in-memory traffic ring.
+const (
+	maxStoredReplyLen    = 16 * 1024
+	maxStoredToolArgsLen = 4 * 1024
+)
+
+// capRecordAnalysis returns rec with its free-text analysis fields head/tail
+// capped for retention. The ToolCalls slice is copied before any argument is
+// shortened so the caller's record is never mutated.
+func capRecordAnalysis(rec ProxyTrafficRecord) ProxyTrafficRecord {
+	rec.AssistantReply = capRecordText(rec.AssistantReply, maxStoredReplyLen)
+	rec.Reasoning = capRecordText(rec.Reasoning, maxStoredReplyLen)
+	rec.SystemPrompt = capRecordText(rec.SystemPrompt, maxStoredReplyLen)
+	for _, tc := range rec.ToolCalls {
+		if len(tc.Arguments) > maxStoredToolArgsLen {
+			calls := make([]ProxyToolCall, len(rec.ToolCalls))
+			copy(calls, rec.ToolCalls)
+			for i := range calls {
+				calls[i].Arguments = capRecordText(calls[i].Arguments, maxStoredToolArgsLen)
+			}
+			rec.ToolCalls = calls
+			break
+		}
+	}
+	return rec
+}
+
+// capRecordText keeps the first three quarters and last quarter of s within
+// max bytes, marking how much was dropped.
+func capRecordText(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	head := runeSafePrefix(s, max*3/4)
+	tail := runeSafeSuffix(s, max/4)
+	return head + "…[+" + strconv.Itoa(len(s)-len(head)-len(tail)) + " chars]…" + tail
 }
 
 // stripProxyMountLabel removes the "/proxy/<label>" addressing prefix from
@@ -1522,13 +1577,13 @@ func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Rea
 	fullSSE := streamAnalysisPayload(capturedHead.Bytes(), capturedTail.Bytes())
 
 	// Guarantee terminal marker: if upstream closed stream cleanly without [DONE], emit terminal marker
-	if opts.policyEnabled && cleanEOF && !writeFailed && expectsDoneMarker(rec) && strings.Contains(fullSSE, "data:") && !strings.Contains(fullSSE, "[DONE]") {
+	if opts.policyEnabled && cleanEOF && !writeFailed && expectsDoneMarker(rec) && bytes.Contains(fullSSE, []byte("data:")) && !bytes.Contains(fullSSE, []byte("[DONE]")) {
 		terminalMarker := []byte("data: [DONE]\n\n")
 		_, _ = w.Write(terminalMarker)
 		if isFlusher {
 			flusher.Flush()
 		}
-		fullSSE += string(terminalMarker)
+		fullSSE = append(fullSSE, terminalMarker...)
 	}
 
 	// Only a stream that ended with a clean upstream EOF and was delivered in
@@ -1539,7 +1594,7 @@ func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Rea
 	p.enqueueFinalize(finalizeJob{
 		rec:          rec,
 		reqBody:      opts.reqBody,
-		respBytes:    []byte(fullSSE),
+		respBytes:    fullSSE,
 		cacheKey:     opts.cacheKey,
 		cacheEnabled: opts.cacheEnabled && !rec.Truncated,
 		isStream:     true,
@@ -1644,16 +1699,22 @@ func (b *cappedTailBuffer) Bytes() []byte {
 	return out
 }
 
-func streamAnalysisPayload(head, tail []byte) string {
-	if len(tail) == 0 {
-		return string(head)
-	}
+// streamAnalysisPayload joins the captured head and tail into the single
+// buffer handed to finalize. It is built once as bytes, with spare room for a
+// terminal marker, instead of string concatenation followed by a []byte copy.
+func streamAnalysisPayload(head, tail []byte) []byte {
 	// The tail can start in the middle of an SSE record. Drop that fragment so
 	// the final usage/message_stop records remain independently parseable.
 	if idx := bytes.IndexByte(tail, '\n'); idx >= 0 && idx+1 < len(tail) {
 		tail = tail[idx+1:]
 	}
-	return string(head) + "\n" + string(tail)
+	out := make([]byte, 0, len(head)+1+len(tail)+len("data: [DONE]\n\n"))
+	out = append(out, head...)
+	if len(tail) > 0 {
+		out = append(out, '\n')
+		out = append(out, tail...)
+	}
+	return out
 }
 
 func expectsDoneMarker(rec ProxyTrafficRecord) bool {
@@ -1720,6 +1781,26 @@ const (
 // text) fall back to per-line masking plus the credential regex scrub.
 // Analysis paths always run on the ORIGINAL payload — only the stored copy
 // is sanitized.
+// sanitizeBodyBytesForRecord is sanitizeBodyForRecord for a wire buffer. An
+// oversized body is cut to its head and tail before any string conversion, so
+// only the retained bytes are copied; the output is identical to converting
+// the whole buffer and sanitizing that.
+func sanitizeBodyBytesForRecord(body []byte) string {
+	if len(body) <= maxRecordBodyLen*2 {
+		return sanitizeBodyForRecord(string(body))
+	}
+	headLen := maxRecordBodyLen * 3 / 4
+	for headLen > 0 && !utf8.RuneStart(body[headLen]) {
+		headLen--
+	}
+	tailStart := len(body) - maxRecordBodyLen/4
+	for tailStart < len(body) && !utf8.RuneStart(body[tailStart]) {
+		tailStart++
+	}
+	head, tail := string(body[:headLen]), string(body[tailStart:])
+	return sanitizeBodyForRecord(head) + "\n…[body truncated " + strconv.Itoa(len(body)-len(head)-len(tail)) + " chars]…\n" + sanitizeBodyForRecord(tail)
+}
+
 func sanitizeBodyForRecord(body string) string {
 	if body == "" {
 		return body

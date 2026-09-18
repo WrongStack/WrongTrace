@@ -997,7 +997,7 @@ func TestRequestCacheScope_IncludesQueryCredentialsWithoutLeakingThem(t *testing
 func TestStreamAnalysisPayload_RetainsFinalUsage(t *testing.T) {
 	head := []byte("data: " + strings.Repeat("x", 1024) + "\n\n")
 	tail := []byte("partial\nevent: message_delta\ndata: {\"usage\":{\"output_tokens\":77}}\n\n")
-	got := streamAnalysisPayload(head, tail)
+	got := string(streamAnalysisPayload(head, tail))
 	if !strings.Contains(got, `"output_tokens":77`) || strings.Contains(got, "partial") {
 		t.Fatalf("analysis payload did not preserve a clean final usage event: %q", got)
 	}

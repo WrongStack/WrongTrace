@@ -85,6 +85,42 @@ var (
 // genericSecretPlaceholder replaces a matched secret value in place.
 const genericSecretPlaceholder = "[REDACTED_SECRET]"
 
+// hasOpenAIKeyCandidate is the pre-filter for openAIKeyRe (\bsk-[a-zA-Z0-9_\-]{20,}\b).
+// A bare "sk-" substring test let ordinary prose and code through -- "task-",
+// "disk-", "risk-", "desk-" -- so enforce mode copied and regex-scanned nearly
+// every multi-megabyte coding prompt. This checks the two conditions any match
+// needs: a word boundary before "sk-" and at least 20 key characters after it.
+// It never rejects text the regex would match.
+func hasOpenAIKeyCandidate(body []byte) bool {
+	const minKeyChars = 20
+	for off := 0; ; {
+		i := bytes.Index(body[off:], bSk)
+		if i < 0 {
+			return false
+		}
+		i += off
+		off = i + len(bSk)
+		if i > 0 && isWordByte(body[i-1]) {
+			continue
+		}
+		n := 0
+		for j := off; j < len(body) && n < minKeyChars && isKeyByte(body[j]); j++ {
+			n++
+		}
+		if n >= minKeyChars {
+			return true
+		}
+	}
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func isKeyByte(c byte) bool {
+	return c == '-' || isWordByte(c)
+}
+
 // ScanAndRedactSecrets inspects request payloads for confidential secrets and masks them before sending to LLMs.
 // Uses fast-path substring checks so multi-megabyte payloads bypass expensive regex scans when no matching tokens exist.
 func ScanAndRedactSecrets(body []byte) ([]byte, int) {
@@ -96,7 +132,7 @@ func ScanAndRedactSecrets(body []byte) ([]byte, int) {
 	hasAWS := bytes.Contains(body, bAKIA)
 	hasGitHub := bytes.Contains(body, bGhp) || bytes.Contains(body, bGithubPat)
 	hasAnthropic := bytes.Contains(body, bSkAnt)
-	hasOpenAI := bytes.Contains(body, bSk)
+	hasOpenAI := hasOpenAIKeyCandidate(body)
 	hasGoogle := bytes.Contains(body, bAIzaSy)
 	hasDB := bytes.Contains(body, bColonSlash) && (bytes.Contains(body, bPostgres) || bytes.Contains(body, bMysql) || bytes.Contains(body, bMongo) || bytes.Contains(body, bRedis))
 	hasGeneric := hasGenericSecret(body)

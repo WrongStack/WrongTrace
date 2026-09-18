@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -511,6 +512,9 @@ func (s *Server) buildRouter() chi.Router {
 			Reporter: s.cfg.Engine,
 			OnTraffic: func(rec proxy.ProxyTrafficRecord) {
 				if s.cfg.Engine != nil {
+					// Every read row of this turn used to carry the whole
+					// assistant reply, duplicating it N times in SQLite.
+					readIntent := shortIntent(rec.AssistantReply)
 					for _, tc := range rec.ToolCalls {
 						if tc.TargetFile != "" && ingest.IsFileModifyingTool(tc.Name) {
 							s.cfg.Engine.RegisterFileOperation(tc.TargetFile, rec.RunID, rec.Timestamp)
@@ -535,7 +539,7 @@ func (s *Server) buildRouter() chi.Router {
 								PromptTokens:   rec.PromptTokens,
 								CachedTokens:   rec.CachedTokens,
 								CostUSD:        rec.CostUSD,
-								Intent:         rec.AssistantReply,
+								Intent:         readIntent,
 								ReadTime:       rec.Timestamp,
 							})
 						}
@@ -748,4 +752,19 @@ func requestLogger(next http.Handler) http.Handler {
 
 		log.Printf("[%s] %d %s %s (%v, %d bytes)", category, status, r.Method, path, duration.Round(time.Millisecond/10), ww.BytesWritten())
 	})
+}
+
+// maxReadIntentLen bounds the reply excerpt stored as a gateway read's intent.
+const maxReadIntentLen = 200
+
+// shortIntent returns a rune-safe prefix of reply suitable for an intent label.
+func shortIntent(reply string) string {
+	if len(reply) <= maxReadIntentLen {
+		return reply
+	}
+	cut := maxReadIntentLen
+	for cut > 0 && !utf8.RuneStart(reply[cut]) {
+		cut--
+	}
+	return reply[:cut] + "…"
 }
