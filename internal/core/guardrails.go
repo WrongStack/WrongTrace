@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -89,20 +90,36 @@ func (e *Engine) TryLockFile(path, reason, owner, ownerRunID string, ttl time.Du
 	return info, nil
 }
 
-// UnlockFile removes a lock on a file.
-func (e *Engine) UnlockFile(path string) {
+// ErrNotLockOwner is returned by UnlockFile when the caller does not own the lock.
+var ErrNotLockOwner = errors.New("unlock denied: caller does not own the lock")
+
+// UnlockFile removes a lock on a file. It returns ErrNotLockOwner when
+// ownerRunID is non-empty and does not match the lock's stored OwnerRunID,
+// preventing one agent from deleting another agent's lock. A call with an
+// empty ownerRunID (legacy / force-unlock) is still allowed so that an
+// agent can remove its own stale lock without needing to know its run ID.
+func (e *Engine) UnlockFile(path string, ownerRunID string) error {
 	e.lockMu.Lock()
 	defer e.lockMu.Unlock()
 	if e.lockedFiles == nil {
-		return
+		return nil
 	}
 	norm := normalizeLockPath(path)
+	// Check ownership before deleting, unless ownerRunID is empty (force/legacy).
+	if ownerRunID != "" {
+		if info, ok := e.lockedFiles[norm]; ok && !time.Now().UTC().After(info.ExpiresAt) {
+			if info.OwnerRunID != "" && info.OwnerRunID != ownerRunID {
+				return ErrNotLockOwner
+			}
+		}
+	}
 	delete(e.lockedFiles, norm)
 	for k := range e.lockedFiles {
 		if lockPathMatch(k, norm) {
 			delete(e.lockedFiles, k)
 		}
 	}
+	return nil
 }
 
 // lockPathMatch reports whether two normalized lock paths refer to the same
@@ -201,12 +218,17 @@ func (e *Engine) CheckGuardrail(path string) (GuardrailResult, error) {
 			expPtr = &exp
 		}
 		return GuardrailResult{
-			Allowed:        false,
-			IsLocked:       true,
-			LockReason:     lockInfo.Reason,
-			LockOwner:      lockInfo.Owner,
-			LockOwnerRunID: lockInfo.OwnerRunID,
-			LockExpiresAt:  expPtr,
+			Allowed:    false,
+			IsLocked:   true,
+			LockReason: lockInfo.Reason,
+			LockOwner:  lockInfo.Owner,
+			// LockOwnerRunID is deliberately NOT carried: it is the
+			// credential Engine.UnlockFile verifies, so publishing it
+			// from a READ surface lets any caller that merely checks
+			// safety harvest another agent's credential and present it
+			// back to unlock_file. The holder's name and reason stay for
+			// diagnostics; only the authorization material is withheld.
+			LockExpiresAt: expPtr,
 			Recommendation: "BLOCKED: File is locked against automated agent changes.",
 			CheckedAt:      time.Now().UTC(),
 		}, nil

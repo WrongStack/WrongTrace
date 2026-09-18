@@ -697,9 +697,17 @@ func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
 			"path":         existing.Path,
 			"reason":       existing.Reason,
 			"owner":        existing.Owner,
-			"owner_run_id": existing.OwnerRunID,
-			"locked_at":    existing.LockedAt,
-			"expires_at":   existing.ExpiresAt,
+			// existing.OwnerRunID is deliberately withheld. This is the
+			// HOLDER's credential, not the caller's, and owner_run_id is
+			// exactly what Engine.UnlockFile verifies, so echoing it here
+			// would hand the losing caller the authorization to unlock a
+			// lock they were just refused. The holder's name, reason and
+			// expiry stay so the conflict is still explainable. Mirrors the
+			// MCP lock_file conflict redaction; the success reply below may
+			// still return owner_run_id because that one is the caller's own
+			// credential, which they need in order to unlock later.
+			"locked_at":  existing.LockedAt,
+			"expires_at": existing.ExpiresAt,
 		})
 		return
 	}
@@ -721,7 +729,19 @@ func (h *Handlers) ListLocks(w http.ResponseWriter, _ *http.Request) {
 	if locks == nil {
 		locks = []core.LockInfo{}
 	}
-	writeJSON(w, http.StatusOK, locks)
+	// owner_run_id is the credential Engine.UnlockFile verifies, and this
+	// endpoint lists OTHER agents' locks. Handing those credentials out lets
+	// any caller present one back to unlock_file and steal a lock the
+	// ownership check exists to refuse, so the list is copied and the
+	// authorization material stripped while the holder's name, reason and
+	// expiry stay for diagnostics. Mirrors the redaction the IPC
+	// list_locks/check_guardrail and MCP list_locks surfaces already apply.
+	redacted := make([]core.LockInfo, len(locks))
+	for i, l := range locks {
+		l.OwnerRunID = ""
+		redacted[i] = l
+	}
+	writeJSON(w, http.StatusOK, redacted)
 }
 
 // UnlockFile removes a lock on a file.

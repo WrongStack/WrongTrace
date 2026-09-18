@@ -507,6 +507,15 @@ func (s *Server) dispatch(req *Request) Response {
 			resp.Error = &RPCError{Code: -32013, Message: err.Error()}
 			return resp
 		}
+		// lock_owner_run_id is the credential the unlock_file ownership check
+		// verifies, and unlike the other guardrail replies this one
+		// serializes the whole struct, so the field must be cleared on the
+		// local copy before it goes on the wire. Handing it out lets any agent
+		// enumerate a locked file's holder and present the credential to
+		// unlock_file, which is exactly the lock steal the ownership check
+		// exists to refuse. The lock owner NAME and reason stay for
+		// diagnostics.
+		gr.LockOwnerRunID = ""
 		resp.Result = gr
 
 	case "telemetry/file_health", "get_file_health_score", "file_health", "telemetry/get_file_health_score":

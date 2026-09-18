@@ -435,7 +435,7 @@ func TestFileLockingGuardrail_PathNormalization(t *testing.T) {
 	}
 
 	// Unlock and verify
-	e.UnlockFile("internal/core/engine.go")
+	e.UnlockFile("internal/core/engine.go", "")
 	for _, c := range cases {
 		locked, _ := e.IsFileLocked(c)
 		if locked {

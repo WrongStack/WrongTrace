@@ -738,7 +738,15 @@ func (e *Engine) FileHealth(path string) (IPCHealth, error) {
 		res.IsLocked = true
 		res.LockReason = lockInfo.Reason
 		res.LockOwner = lockInfo.Owner
-		res.LockOwnerRunID = lockInfo.OwnerRunID
+		// res.LockOwnerRunID is deliberately NOT stamped. It is the
+		// credential Engine.UnlockFile verifies, so a health reply — which any
+		// agent may request about any file — must not carry another agent's
+		// authorization material. The IPC and MCP file_health surfaces each
+		// blanked this field on their own copy while the HTTP /api/file/health
+		// handler serialized the engine reply verbatim, leaving the credential
+		// reachable there; withholding it at the single producer closes every
+		// surface at once instead of per egress. The holder's name, reason and
+		// expiry remain for diagnostics.
 		if !lockInfo.ExpiresAt.IsZero() {
 			exp := lockInfo.ExpiresAt
 			res.LockExpiresAt = &exp
