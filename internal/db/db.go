@@ -109,6 +109,32 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Optimize refreshes the query planner's statistics. SQLite only gathers them
+// through ANALYZE/optimize; Close alone ran it, so a daemon that stays up for
+// weeks planned every query against statistics from its previous shutdown --
+// or none at all. analysis_limit bounds the per-index sampling so the pass is
+// cheap even on a large database; 0x10002 checks every table, not only those
+// this connection happened to query.
+func (s *Store) Optimize() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "PRAGMA analysis_limit=1000"); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, "PRAGMA optimize=0x10002")
+	return err
+}
+
 // DB exposes the underlying *sql.DB for callers that need to run bespoke
 // read-only queries (e.g. analytics endpoints). Prefer the higher-level
 // methods on Store when available.
@@ -154,6 +180,20 @@ func (s *Store) Migrate() error {
 		"CREATE INDEX IF NOT EXISTS idx_node_time_repo_file ON code_node_events(event_time DESC, repo_name, file_path, node_signature)",
 		"CREATE INDEX IF NOT EXISTS idx_runs_created ON agent_runs(created_at DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_read_file_time ON file_read_events(file_path, read_time DESC)",
+		// Strict prefixes of idx_node_sig_time and idx_node_time_repo_file:
+		// the planner never needs them, yet every event insert maintained
+		// both B-trees.
+		"DROP INDEX IF EXISTS idx_node_sig",
+		"DROP INDEX IF EXISTS idx_node_time",
+		// Covering replacements for the repo-filtered run-id sets (Overview,
+		// ModelComparison): (run_id) and (repo_name) alone forced a table
+		// lookup per matching row, or a full scan of file_read_events. Each
+		// new index keeps its predecessor as a prefix, so the index count and
+		// per-insert maintenance are unchanged.
+		"CREATE INDEX IF NOT EXISTS idx_node_run_repo ON code_node_events(run_id, repo_name)",
+		"DROP INDEX IF EXISTS idx_node_run",
+		"CREATE INDEX IF NOT EXISTS idx_read_repo_run ON file_read_events(repo_name, run_id)",
+		"DROP INDEX IF EXISTS idx_read_repo",
 	} {
 		if _, err := s.db.ExecContext(context.Background(), idx); err != nil {
 			if msg := err.Error(); strings.Contains(msg, "already exists") {

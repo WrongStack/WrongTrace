@@ -36,9 +36,7 @@ CREATE TABLE IF NOT EXISTS code_node_events (
     event_time       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_node_sig   ON code_node_events(file_path, node_signature);
-CREATE INDEX IF NOT EXISTS idx_node_time  ON code_node_events(event_time);
-CREATE INDEX IF NOT EXISTS idx_node_run   ON code_node_events(run_id);
+CREATE INDEX IF NOT EXISTS idx_node_run_repo ON code_node_events(run_id, repo_name);
 CREATE INDEX IF NOT EXISTS idx_node_sig_time ON code_node_events(file_path, node_signature, event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_node_repo_time ON code_node_events(repo_name, event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_node_action_time ON code_node_events(action, event_time DESC);
@@ -91,5 +89,5 @@ CREATE TABLE IF NOT EXISTS file_read_events (
 CREATE INDEX IF NOT EXISTS idx_read_file_model ON file_read_events(file_path, model_name);
 CREATE INDEX IF NOT EXISTS idx_read_time       ON file_read_events(read_time);
 CREATE INDEX IF NOT EXISTS idx_read_file_time  ON file_read_events(file_path, read_time DESC);
-CREATE INDEX IF NOT EXISTS idx_read_repo       ON file_read_events(repo_name);
+CREATE INDEX IF NOT EXISTS idx_read_repo_run   ON file_read_events(repo_name, run_id);
 CREATE INDEX IF NOT EXISTS idx_read_lines      ON file_read_events(file_path, start_line, end_line);

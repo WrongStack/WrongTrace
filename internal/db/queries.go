@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -169,37 +170,65 @@ func (s *Store) UpsertRun(r RunRecord) error {
 // caller so it can pre-emit the event on the websocket stream and reconcile
 // DB-side failures with the client.
 func (s *Store) InsertEvent(e EventRecord) error {
+	return s.InsertEvents([]EventRecord{e})
+}
+
+const insertEventSQL = `
+	INSERT INTO code_node_events
+		(event_id, run_id, repo_name, file_path, node_signature, node_type, action,
+		 ast_content_hash, lines_of_code, start_line, end_line, diff_snippet,
+		 added_lines, deleted_lines, attribution_source, attribution_confidence, event_time)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+`
+
+// InsertEvents appends the rows of one file transition in a single
+// transaction. A file create/delete or a branch checkout yields one event per
+// declaration; committing each separately paid a WAL fsync and a writeMu
+// round-trip per row. All-or-nothing: on error no row is written.
+func (s *Store) InsertEvents(events []EventRecord) error {
+	if len(events) == 0 {
+		return nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
-	const q = `
-		INSERT INTO code_node_events
-			(event_id, run_id, repo_name, file_path, node_signature, node_type, action,
-			 ast_content_hash, lines_of_code, start_line, end_line, diff_snippet,
-			 added_lines, deleted_lines, attribution_source, attribution_confidence, event_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
-	`
-	var runID any
-	if e.RunID != "" {
-		runID = e.RunID
-	}
-	var bodyHash any
-	if e.BodyHash != "" {
-		bodyHash = e.BodyHash
-	}
-	if e.AttributionSource == "" {
-		e.AttributionSource = "unknown"
-	}
-	_, err := s.db.ExecContext(ctx, q,
-		e.EventID, runID, e.RepoName, e.FilePath, e.Signature, e.NodeType,
-		e.Action, bodyHash, e.LOC, e.StartLine, e.EndLine, e.DiffSnippet,
-		e.AddedLines, e.DeletedLines, e.AttributionSource, e.AttributionConfidence, fmtDBTime(e.OccurredAt),
-	)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("insert event %s: %w", e.EventID, err)
+		return fmt.Errorf("insert events: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx, insertEventSQL)
+	if err != nil {
+		return fmt.Errorf("insert events: prepare: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, e := range events {
+		var runID any
+		if e.RunID != "" {
+			runID = e.RunID
+		}
+		var bodyHash any
+		if e.BodyHash != "" {
+			bodyHash = e.BodyHash
+		}
+		if e.AttributionSource == "" {
+			e.AttributionSource = "unknown"
+		}
+		if _, err := stmt.ExecContext(ctx,
+			e.EventID, runID, e.RepoName, e.FilePath, e.Signature, e.NodeType,
+			e.Action, bodyHash, e.LOC, e.StartLine, e.EndLine, e.DiffSnippet,
+			e.AddedLines, e.DeletedLines, e.AttributionSource, e.AttributionConfidence, fmtDBTime(e.OccurredAt),
+		); err != nil {
+			return fmt.Errorf("insert event %s: %w", e.EventID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("insert events: commit: %w", err)
 	}
 	return nil
 }
@@ -1259,100 +1288,67 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 	// directory boundary, so stats for "main.go" absorbed "cmd/domain.go".
 	readPathArgs := []any{filePath, escapeLike(normPath), "%/" + escapeLike(normPath)}
 
-	// 1. Overall Aggregates
-	row := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*),
-		       COALESCE(SUM(lines_read_count), 0),
-		       COALESCE(SUM(cost_usd), 0.0),
-		       COALESCE(SUM(prompt_tokens), 0),
-		       COALESCE(SUM(cached_tokens), 0),
-		       COUNT(DISTINCT model_name)
-		FROM file_read_events
-		WHERE `+readPathClause, readPathArgs...)
-
-	if err := row.Scan(
-		&stats.TotalReads,
-		&stats.TotalLinesRead,
-		&stats.TotalCostUSD,
-		&stats.TotalPromptTokens,
-		&stats.TotalCachedTokens,
-		&stats.UniqueModels,
-	); err != nil {
-		return stats, fmt.Errorf("scan read stats: %w", err)
-	}
-
-	// 2 + 3. Model and provider breakdowns. Query, scan and iteration errors
-	// are returned: they used to be swallowed, handing callers a
-	// partially-empty breakdown that looked like real data.
-	breakdown := func(col string, into map[string]int) error {
-		rows, err := s.db.QueryContext(ctx, `
-			SELECT `+col+`, COUNT(*)
-			FROM file_read_events
-			WHERE `+readPathClause+`
-			GROUP BY `+col+`
-			ORDER BY COUNT(*) DESC
-		`, readPathArgs...)
-		if err != nil {
-			return fmt.Errorf("read stats %s breakdown: %w", col, err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var key string
-			var count int
-			if err := rows.Scan(&key, &count); err != nil {
-				return fmt.Errorf("scan read stats %s breakdown: %w", col, err)
-			}
-			if key != "" {
-				into[key] = count
-			}
-		}
-		return rows.Err()
-	}
-	if err := breakdown("model_name", stats.ModelBreakdown); err != nil {
-		return stats, err
-	}
-	if err := breakdown("provider", stats.ProviderBreakdown); err != nil {
-		return stats, err
-	}
-
-	// 4. Recent Reads. read_id breaks same-second read_time ties —
-	// read_time is written at SECOND granularity, so bare ordering made
-	// the per-file timeline insertion-order-dependent (see
-	// GetRecentFileReads).
-	rRows, err := s.db.QueryContext(ctx, `
+	// readPathClause's LIKE arms cannot use an index, so every statement
+	// filtered by it is a full scan of file_read_events -- usually the largest
+	// table. This used to run four of them (aggregates, two breakdowns, recent
+	// reads). One pass now streams the matching rows newest-first, folds the
+	// aggregates and breakdowns in Go, and keeps the first 20 as the recent
+	// timeline. read_id breaks same-second read_time ties: read_time is written
+	// at SECOND granularity (see GetRecentFileReads). Intent is only
+	// materialized for the rows that are kept.
+	const recentReads = 20
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT read_id, COALESCE(run_id, ''), COALESCE(session_id, ''), repo_name, file_path,
-		       agent_name, model_name, provider, tool_name, start_line, end_line,
-		       lines_read_count, prompt_tokens, cached_tokens, cost_usd, COALESCE(intent, ''),
+		       agent_name, model_name, provider, tool_name,
+		       COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(lines_read_count, 0),
+		       COALESCE(prompt_tokens, 0), COALESCE(cached_tokens, 0), COALESCE(cost_usd, 0.0),
+		       CASE WHEN ROW_NUMBER() OVER (ORDER BY read_time DESC, read_id DESC) <= `+strconv.Itoa(recentReads)+`
+		            THEN COALESCE(intent, '') ELSE '' END,
 		       COALESCE(read_time, CURRENT_TIMESTAMP)
 		FROM file_read_events
 		WHERE `+readPathClause+`
 		ORDER BY read_time DESC, read_id DESC
-		LIMIT 20
 	`, readPathArgs...)
 	if err != nil {
-		return stats, fmt.Errorf("read stats recent reads: %w", err)
+		return stats, fmt.Errorf("read stats query: %w", err)
 	}
-	defer rRows.Close()
-	for rRows.Next() {
+	defer rows.Close()
+	models := make(map[string]struct{})
+	for rows.Next() {
 		var (
 			rec FileReadRecord
 			ts  string
 		)
-		if err := rRows.Scan(
+		if err := rows.Scan(
 			&rec.ReadID, &rec.RunID, &rec.SessionID, &rec.RepoName, &rec.FilePath,
 			&rec.AgentName, &rec.ModelName, &rec.Provider, &rec.ToolName,
 			&rec.StartLine, &rec.EndLine, &rec.LinesReadCount,
 			&rec.PromptTokens, &rec.CachedTokens, &rec.CostUSD,
 			&rec.Intent, &ts,
 		); err != nil {
-			return stats, fmt.Errorf("scan read stats recent read: %w", err)
+			return stats, fmt.Errorf("scan read stats row: %w", err)
 		}
-		rec.ReadTime = parseDBTime(ts)
-		stats.RecentReads = append(stats.RecentReads, rec)
+		stats.TotalReads++
+		stats.TotalLinesRead += rec.LinesReadCount
+		stats.TotalCostUSD += rec.CostUSD
+		stats.TotalPromptTokens += rec.PromptTokens
+		stats.TotalCachedTokens += rec.CachedTokens
+		models[rec.ModelName] = struct{}{}
+		if rec.ModelName != "" {
+			stats.ModelBreakdown[rec.ModelName]++
+		}
+		if rec.Provider != "" {
+			stats.ProviderBreakdown[rec.Provider]++
+		}
+		if len(stats.RecentReads) < recentReads {
+			rec.ReadTime = parseDBTime(ts)
+			stats.RecentReads = append(stats.RecentReads, rec)
+		}
 	}
-	if err := rRows.Err(); err != nil {
-		return stats, fmt.Errorf("iterate read stats recent reads: %w", err)
+	if err := rows.Err(); err != nil {
+		return stats, fmt.Errorf("iterate read stats rows: %w", err)
 	}
+	stats.UniqueModels = len(models)
 
 	return stats, nil
 }
@@ -1818,7 +1814,6 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 				e.action,
 				COALESCE(e.added_lines, 0) AS added_lines,
 				COALESCE(e.deleted_lines, 0) AS deleted_lines,
-				COALESCE(e.diff_snippet, '') AS diff_snippet,
 				e.event_time,
 				COALESCE(r.model_name, 'unknown') AS overwriter_model,
 				COALESCE(r.run_id, '') AS overwriter_run_id,
@@ -1874,14 +1869,22 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 		edges = make([]ModelFrictionEdge, 0)
 	}
 
+	// diff_snippet (up to 64 KiB per row) is deliberately absent from the
+	// CTE: carrying it through the window sort over every attributed event
+	// made that sort's temp B-tree roughly the size of the table. It is joined
+	// back by primary key for only the rows that survive the LIMIT.
 	rows, err := s.db.QueryContext(ctx, collisionsCTE+`
 		SELECT
-			event_id, file_path, node_signature, action, added_lines, deleted_lines,
-			diff_snippet, event_time, overwriter_model, overwriter_run_id,
-			author_model, author_run_id, author_time
-		FROM Collisions
-		ORDER BY event_time DESC, event_id DESC
-		LIMIT ?
+			c.event_id, c.file_path, c.node_signature, c.action, c.added_lines, c.deleted_lines,
+			COALESCE(ev.diff_snippet, ''), c.event_time, c.overwriter_model, c.overwriter_run_id,
+			c.author_model, c.author_run_id, c.author_time
+		FROM (
+			SELECT * FROM Collisions
+			ORDER BY event_time DESC, event_id DESC
+			LIMIT ?
+		) c
+		JOIN code_node_events ev ON ev.event_id = c.event_id
+		ORDER BY c.event_time DESC, c.event_id DESC
 	`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query model friction: %w", err)
