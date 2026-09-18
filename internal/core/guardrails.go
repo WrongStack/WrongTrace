@@ -105,9 +105,19 @@ func (e *Engine) UnlockFile(path string, ownerRunID string) error {
 		return nil
 	}
 	norm := normalizeLockPath(path)
-	// Check ownership before deleting, unless ownerRunID is empty (force/legacy).
+	// Verify ownership of EVERY nesting match before deleting anything, using
+	// the same lockPathMatch resolution as the delete loop below. The guard
+	// used to look up only the exact key, so a caller spelling the file as a
+	// nesting alias ("main.go" for a lock held as "src/main.go") missed the
+	// guard yet still deleted the lock through the nesting loop. An empty
+	// ownerRunID stays a legacy/force unlock, and expired entries stay
+	// clearable by anyone.
 	if ownerRunID != "" {
-		if info, ok := e.lockedFiles[norm]; ok && !time.Now().UTC().After(info.ExpiresAt) {
+		now := time.Now().UTC()
+		for k, info := range e.lockedFiles {
+			if !lockPathMatch(k, norm) || now.After(info.ExpiresAt) {
+				continue
+			}
 			if info.OwnerRunID != "" && info.OwnerRunID != ownerRunID {
 				return ErrNotLockOwner
 			}
