@@ -1240,18 +1240,18 @@ func hashBytes(b []byte) string {
 
 // SortedSignatures returns the signatures of a snapshot in lexical order.
 // Useful for deterministic iteration during diffing and tests.
-func (s *FileSnapshot) SortedSignatures() []string {
-	if s == nil {
+func (f *FileSnapshot) SortedSignatures() []string {
+	if f == nil {
 		return nil
 	}
-	if s.sortedSigs != nil && len(s.sortedSigs) == len(s.Nodes) {
-		return s.sortedSigs
+	if f.sortedSigs != nil && len(f.sortedSigs) == len(f.Nodes) {
+		return f.sortedSigs
 	}
-	out := make([]string, 0, len(s.Nodes))
-	for k := range s.Nodes {
+	out := make([]string, 0, len(f.Nodes))
+	for k := range f.Nodes {
 		out = append(out, k)
 	}
 	sort.Strings(out)
-	s.sortedSigs = out
+	f.sortedSigs = out
 	return out
 }

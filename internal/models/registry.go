@@ -1,3 +1,5 @@
+// Package models holds the model/provider catalog and pricing used for cost
+// calculation.
 package models
 
 import (

@@ -934,10 +934,10 @@ func TestServer_Enhancements_WrongStackReport(t *testing.T) {
 	if confResp.StatusCode != http.StatusConflict {
 		t.Errorf("expected 409 Conflict when file locked by another owner, got %d", confResp.StatusCode)
 	}
-	var confJson map[string]interface{}
-	_ = json.NewDecoder(confResp.Body).Decode(&confJson)
-	if confJson["status"] != "conflict" || confJson["owner"] != "Agent1" {
-		t.Errorf("conflict payload unexpected: %+v", confJson)
+	var confJSON map[string]interface{}
+	_ = json.NewDecoder(confResp.Body).Decode(&confJSON)
+	if confJSON["status"] != "conflict" || confJSON["owner"] != "Agent1" {
+		t.Errorf("conflict payload unexpected: %+v", confJSON)
 	}
 
 	// 12. GET /api/nonexistent returns JSON 404

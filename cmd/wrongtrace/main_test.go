@@ -88,7 +88,7 @@ func TestReportCmd(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "report_test.db")
 	outMd := filepath.Join(tempDir, "report.md")
-	outHtml := filepath.Join(tempDir, "report.html")
+	outHTML := filepath.Join(tempDir, "report.html")
 
 	buf := new(bytes.Buffer)
 	rootCmd.SetOut(buf)
@@ -101,7 +101,7 @@ func TestReportCmd(t *testing.T) {
 	}
 
 	// Test HTML report
-	rootCmd.SetArgs([]string{"report", "--db", dbPath, "--format", "html", "--out", outHtml})
+	rootCmd.SetArgs([]string{"report", "--db", dbPath, "--format", "html", "--out", outHTML})
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("execute report html failed: %v", err)
 	}

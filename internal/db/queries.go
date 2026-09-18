@@ -1490,9 +1490,6 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 		cleanSig = strings.TrimSpace(cleanSig[:idx])
 	}
 	cleanSig = strings.TrimPrefix(cleanSig, "*")
-	if idx := strings.LastIndex(cleanSig, "."); idx != -1 {
-		// e.g. "Engine.LockFile" -> try matching "LockFile" or full
-	}
 
 	// All four variants order by e.event_time, which fmtDBTime stores at
 	// SECOND granularity, so same-second rows tie and SQLite returns them

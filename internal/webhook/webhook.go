@@ -1,3 +1,5 @@
+// Package webhook dispatches alerts to Slack, Discord, and generic HTTP
+// endpoints with HMAC-signed payloads.
 package webhook
 
 import (

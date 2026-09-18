@@ -1,3 +1,5 @@
+// Package lock guards single-instance daemon startup with OS-level file locks
+// and a health endpoint.
 package lock
 
 import (

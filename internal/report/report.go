@@ -1,3 +1,5 @@
+// Package report renders WrongTrace telemetry as Markdown, HTML, and JSON
+// export reports.
 package report
 
 import (

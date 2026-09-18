@@ -1,3 +1,5 @@
+// Package profiler ingests runtime execution traces and computes latency
+// hotspots and overviews.
 package profiler
 
 import (

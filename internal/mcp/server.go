@@ -387,7 +387,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			resp.Error = &rpcError{Code: -32602, Message: "ttl_minutes and ttl_seconds must be <= 1440 and 86400 respectively (24h maximum lock)"}
 			return resp
 		}
-		var ttl time.Duration = 15 * time.Minute
+		ttl := 15 * time.Minute
 		if mins > 0 {
 			ttl = time.Duration(mins) * time.Minute
 		} else if secs > 0 {

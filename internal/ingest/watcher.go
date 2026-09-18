@@ -1,3 +1,5 @@
+// Package ingest parses agent session transcripts (JSONL, whole-file JSON, and
+// Markdown histories) into tool-call and file-read telemetry.
 package ingest
 
 import (

@@ -1,3 +1,5 @@
+// Package proxy implements the LLM gateway: dynamic routes, body sanitization,
+// response caching, quota enforcement, and traffic recording.
 package proxy
 
 import (
