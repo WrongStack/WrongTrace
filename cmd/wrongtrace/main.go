@@ -284,10 +284,16 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		Engine:     engine,
 		Version:    version,
 	})
+	// reportedSocketPath feeds /api/health, whose socket_path contract is
+	// "the IPC endpoint the daemon BOUND, if any": advertising the configured
+	// path after a failed bind would point agents at an endpoint that does
+	// not exist. Empty means IPC is disabled.
+	reportedSocketPath := ""
 	if err := ipcServer.Start(); err != nil {
 		log.Printf("ipc: disabled (%v) — HTTP API and watching continue", err)
 		ipcServer = nil
 	} else {
+		reportedSocketPath = socketPath
 		defer ipcServer.Stop()
 	}
 
@@ -301,7 +307,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		Port:        port,
 		Host:        bindHost,
 		Engine:      engine,
-		SocketPath:  socketPath,
+		SocketPath:  reportedSocketPath,
 		BaseContext: ctx,
 	})
 

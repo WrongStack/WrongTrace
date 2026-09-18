@@ -169,6 +169,36 @@ func TestHealth_DiagnosticsOnlyForTrustedCallers(t *testing.T) {
 	}
 }
 
+// TestHealth_SocketPathOnlyWhenConfigured pins the report semantics the
+// daemon wiring relies on: server.Config.SocketPath carries the IPC endpoint
+// the daemon BOUND, if any (cmd/wrongtrace runStart leaves it empty when the
+// bind fails and logs "ipc: disabled"), so /api/health must report exactly
+// what it was given — an empty path must never be upgraded to a
+// platform-default guess, and a configured path must reach loopback
+// diagnostics.
+func TestHealth_SocketPathOnlyWhenConfigured(t *testing.T) {
+	t.Setenv("WRONGTRACE_TOKEN", "")
+
+	empty, _ := newGuardTestServer(t, Config{})
+	rec := serve(empty, http.MethodGet, "/api/health", "127.0.0.1:3444", nil)
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if sp := body["socket_path"]; sp != nil && sp != "" {
+		t.Fatalf("empty SocketPath config reported as %q; an unbound endpoint must not be advertised", sp)
+	}
+
+	configured, _ := newGuardTestServer(t, Config{SocketPath: `\\.\pipe\wt-test`})
+	rec = serve(configured, http.MethodGet, "/api/health", "127.0.0.1:3444", nil)
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if sp := body["socket_path"]; sp != `\\.\pipe\wt-test` {
+		t.Fatalf("configured SocketPath = %v, want the bound pipe path", sp)
+	}
+}
+
 // Requests must inherit the daemon lifetime context so SSE and WebSocket
 // handlers observe shutdown.
 func TestNewHTTPServer_UsesConfiguredBaseContext(t *testing.T) {
