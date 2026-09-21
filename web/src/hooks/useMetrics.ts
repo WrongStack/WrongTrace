@@ -153,11 +153,14 @@ export function useProjects() {
   });
 }
 
-export function useProxyTraffic(projectId?: string | null) {
-  const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+// Traffic is not project-scoped server-side: ListProxyTraffic reads only
+// limit/detail, and ProxyRoutingView scopes traffic client-side via its
+// projectScope state. The dead projectId parameter is gone (round-99
+// observation): the handler silently ignored it.
+export function useProxyTraffic() {
   return useQuery<import('../types').ProxyTrafficRecord[]>({
-    queryKey: ['proxy_traffic', projectId || 'active'],
-    queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic${q}${q ? '&' : '?'}detail=false&limit=100`, signal),
+    queryKey: ['proxy_traffic'],
+    queryFn: ({ signal }) => jget<import('../types').ProxyTrafficRecord[]>(`${base}/proxy/traffic?detail=false&limit=100`, signal),
     staleTime: 2_000,
   });
 }

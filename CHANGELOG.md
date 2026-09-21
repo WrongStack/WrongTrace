@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.16] - 2026-09-21
+
+### Security
+- **A credential fragment could survive oversized gateway-record sanitization (AI Gateway proxy)** — sanitizers cut bodies before masking, so a secret spanning a retained head/tail seam could be stored as an unrecognizable fragment. Bodies that may contain credential markers are now masked before truncation; marker-free traffic retains the existing no-copy fast path. Pinned by `TestSanitizeBodyRecordSeamDoesNotLeakCredentialFragments`.
+- **A nesting-equivalent lock path could bypass guardrail ownership checks (core)** — `unlock_file` checked the exact key but deleted nesting-matched locks, letting an alias spelling remove another agent's lock. Ownership is now checked for every matched lock before any deletion; force unlock and expired-lock cleanup remain supported. Pinned by `TestUnlockFileForeignOwnerViaAliasSpelling`.
+
+### Fixed
+- **Proxy-traffic requests no longer imply unsupported project scoping (dashboard)** — `useProxyTraffic` now uses the server's actual `limit`/`detail` contract and a single `['proxy_traffic']` cache key. `ProxyRoutingView` continues to scope the returned records client-side. Pinned by `proxy-traffic-no-project-param-regression.mjs`.
+
+### Tooling
+- Cleared the repository's complete staticcheck finding set (23 findings), including missing package documentation, naming consistency, and redundant dead code, without changing runtime behavior.
+
+---
+
 ## [0.3.15] - 2026-09-18
 
 ### Security
