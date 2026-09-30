@@ -273,6 +273,36 @@ func escapeLike(s string) string {
 	return strings.NewReplacer(likeEscape, likeEscape+likeEscape, `%`, likeEscape+`%`, `_`, likeEscape+`_`).Replace(s)
 }
 
+// callerLongerArm renders the LIKE arm that matches a caller path carrying MORE
+// leading components than the stored row -- the one direction the equality arms
+// and the stored-ends-with-caller arm cannot reach. normCol is the
+// slash-normalized file_path expression (already LOWER-wrapped by the caller
+// where the clause is case-insensitive).
+//
+// The pattern is anchored on '/', so the stored value must be reduced to the
+// component suffix it can share with the caller. Three root shapes reduce to
+// that:
+//   - "internal/x.go"       relative        -> unchanged
+//   - "/repo/internal/x.go" POSIX absolute  -> leading '/' trimmed
+//   - "D:/repo/x.go"        Windows drive   -> "D:" stripped, then leading '/'
+//
+// Rounds 87 and 88 added the leading-slash trim. A drive root is a DIFFERENT
+// root marker that trim does not touch, so the pattern became "%/D:/repo/..." and
+// no caller could match it: the caller's own drive letter also sits at position
+// 0, never after a separator. On Windows, where the watcher records every stored
+// path drive-rooted, that left this direction dead for the platform's normal
+// spelling (round 89).
+//
+// The '/' anchor is deliberately kept -- the pattern supplies the boundary
+// itself, which is what stops "myfile_read.go" answering a query for
+// "file_read.go". The stored value is the PATTERN side, so its metacharacters
+// are quoted in SQL (ESCAPE processing touches only the pattern); the caller is
+// the LIKE SUBJECT, stays raw, and is bound by the caller's own placeholder.
+func callerLongerArm(normCol string) string {
+	return ` OR ? LIKE '%/' || REPLACE(REPLACE(LTRIM(CASE WHEN SUBSTR(` + normCol +
+		`, 2, 1) = ':' THEN SUBSTR(` + normCol + `, 3) ELSE ` + normCol + ` END, '/'), '%', '\%'), '_', '\_') ESCAPE '\'`
+}
+
 // pathMatchClause is the shared per-file filter used by RecentEventsFiltered,
 // SymbolHistory and FileModelActivity (col is the file_path column, possibly
 // alias-qualified). Bind pathMatchArgs in the same order.
@@ -281,7 +311,7 @@ func escapeLike(s string) string {
 //  2. norm(col) = ?                    slash-normalized caller path (exact)
 //  3. LOWER(norm(col)) LIKE LOWER(?)   case-insensitive exact, no wildcard
 //  4. norm(col) LIKE '%/' || ?         stored path ends with "/<caller>"
-//  5. ? LIKE '%/' || quoted(norm(col)) caller path ends with "/<stored>"
+//  5. callerLongerArm(norm(col))       caller path ends with "/<stored>"
 //  6. LOWER(norm(col)) LIKE '%/' || LOWER(?)  case-insensitive arm 4
 //
 // Every suffix arm is anchored on '/'. The unanchored '%' || x form this
@@ -297,14 +327,16 @@ func escapeLike(s string) string {
 // processing touches only the pattern, so a backslash escapeLike injected there
 // would be a literal character and a '_'/'%'-bearing absolute caller path could
 // never match its stored relative row (the round-90 defect) -- it stays raw,
-// while the stored path, now pattern-side, is quoted in SQL.
+// while the stored path, now pattern-side, is quoted in SQL. Arm 5 is
+// callerLongerArm, which also reduces the stored root so the anchor is never
+// doubled and is never missing before a drive letter.
 func pathMatchClause(col string) string {
 	n := "REPLACE(" + col + `, '\', '/')`
 	return "(" + col + " = ?" +
 		" OR " + n + " = ?" +
 		" OR LOWER(" + n + `) LIKE LOWER(?) ESCAPE '\'` +
 		" OR " + n + ` LIKE '%/' || ? ESCAPE '\'` +
-		` OR ? LIKE '%/' || REPLACE(REPLACE(` + n + `, '%', '\%'), '_', '\_') ESCAPE '\'` +
+		callerLongerArm(n) +
 		" OR LOWER(" + n + `) LIKE '%/' || LOWER(?) ESCAPE '\'` +
 		")"
 }
@@ -696,6 +728,16 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 
 	var edits, sigs int
 	normSlash := strings.ReplaceAll(filePath, "\\", "/")
+	// The sibling per-file clauses (pathMatchClause's callers, SymbolHistory,
+	// FileModelActivity, and GetFileReadStats) all trim a leading "./" before
+	// matching. FileHealth did not, and its caller path is the most
+	// agent-supplied of them all -- guardrails.go, mcp/server.go, ipc/socket.go
+	// and the HTTP handler all pass a path the AGENT chose, and agents write
+	// "./pkg/x.go" as readily as "pkg/x.go". Those are one file, and without the
+	// trim the agent's own spelling matched nothing, so the guardrail reported
+	// RecentThrashingCount=0 / HealthScore=100 ("safe to modify") for a file
+	// that had churned inside the window.
+	normSlash = strings.TrimPrefix(normSlash, "./")
 	// Guardrail queries arrive with agent-supplied casing (MCP/IPC/HTTP) while
 	// stored event paths carry FS-native casing, so the normalized comparison
 	// must be case-insensitive — mirroring RecentEventsFiltered's LOWER arms.
@@ -710,6 +752,15 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 	// path — and arms 4/5 cannot rescue an exact query because they require
 	// the stored path to end with '/'+caller. Bind lowerNorm; arms 4/5 keep
 	// escapeLike (their placeholders are pattern-side).
+	// Arm 6 is the caller-LONGER direction. The other five arms all require the
+	// caller to be no longer than the stored row, so an absolute caller against
+	// a relative stored row matched nothing -- and FileHealth is reached with a
+	// path the agent chose, so that is an ordinary shape, not an exotic one.
+	// It is the shared callerLongerArm, not a hand-copy, so the boundary rule
+	// (the '/' anchor, the leading-slash trim, the drive-root strip) cannot drift
+	// from pathMatchClause and readPathClause. This clause is case-insensitive,
+	// so the stored value is LOWER-wrapped; the caller is the LIKE SUBJECT, so it
+	// stays raw (no escapeLike) and is bound lowercased below.
 	row := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*), COUNT(DISTINCT node_signature)
 		FROM code_node_events
@@ -717,9 +768,11 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 			OR REPLACE(file_path, '\', '/') = ?
 			OR LOWER(REPLACE(file_path, '\', '/')) = ?
 			OR REPLACE(file_path, '\', '/') LIKE '%/' || ? ESCAPE '\'
-			OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%/' || LOWER(?) ESCAPE '\')
+			OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%/' || LOWER(?) ESCAPE '\'`+
+		callerLongerArm(`LOWER(REPLACE(file_path, '\', '/'))`)+`
+		)
 		  AND event_time >= datetime('now', '-1 day')
-	`, filePath, normSlash, lowerNorm, escapeLike(lowerNorm), escapeLike(lowerNorm))
+	`, filePath, normSlash, lowerNorm, escapeLike(lowerNorm), escapeLike(lowerNorm), lowerNorm)
 	if err := row.Scan(&edits, &sigs); err != nil {
 		return out, fmt.Errorf("file health scan: %w", err)
 	}
@@ -1286,7 +1339,7 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 	// (slash-normalized, ASCII case-insensitive exact match) and a suffix arm
 	// anchored on '/'. The suffix arm used to be '%' || path with no
 	// directory boundary, so stats for "main.go" absorbed "cmd/domain.go".
-	readPathArgs := []any{filePath, escapeLike(normPath), "%/" + escapeLike(normPath)}
+	readPathArgs := []any{filePath, escapeLike(normPath), "%/" + escapeLike(normPath), normPath}
 
 	// readPathClause's LIKE arms cannot use an index, so every statement
 	// filtered by it is a full scan of file_read_events -- usually the largest
@@ -1333,8 +1386,8 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		stats.TotalCostUSD += rec.CostUSD
 		stats.TotalPromptTokens += rec.PromptTokens
 		stats.TotalCachedTokens += rec.CachedTokens
-		models[rec.ModelName] = struct{}{}
 		if rec.ModelName != "" {
+			models[rec.ModelName] = struct{}{}
 			stats.ModelBreakdown[rec.ModelName]++
 		}
 		if rec.Provider != "" {
@@ -1355,8 +1408,25 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 
 // readPathClause is the per-file filter of GetFileReadStats and
 // GetFileReadHeatmap over file_read_events; bind [raw path,
-// escapeLike(normalized path), "%/"+escapeLike(normalized path)].
-const readPathClause = `(file_path = ? OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\')`
+// escapeLike(normalized path), "%/"+escapeLike(normalized path),
+// normalized path].
+//
+// This clause previously had three arms and so resolved only a caller path
+// with NO MORE components than the stored row. The stored read-event path comes
+// from the agent transcript's own tool-call argument and is normally
+// workspace-relative, while the caller reaches these functions with
+// code_node_events' file_path, which the watcher records ABSOLUTE -- so the
+// absolute form matched nothing and a file's read telemetry rendered as none.
+// The fourth arm is callerLongerArm, the same helper pathMatchClause uses. It
+// was hand-mirrored twice before (rounds 85 and 87) and both mirrors copied a
+// latent flaw: round 85 copied the arm before the leading-slash trim existed,
+// round 87 copied the trim before the drive-root strip did. Sharing the helper
+// removes the drift rather than documenting it -- a fix to the boundary rule now
+// lands in every family at once, and the family-specific notes below are limited
+// to what genuinely differs (this clause's arms 1-3 are wildcard-free, and the
+// caller is the LIKE SUBJECT, so it stays raw).
+var readPathClause = `(file_path = ? OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\' OR REPLACE(file_path, '\', '/') LIKE ? ESCAPE '\'` +
+	callerLongerArm(`REPLACE(file_path, '\', '/')`) + `)`
 
 // GetFileReadHeatmap computes line-range frequencies for inspecting hot read regions.
 func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
@@ -1372,7 +1442,7 @@ func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
 		GROUP BY start_line, end_line
 		ORDER BY COUNT(*) DESC
 		LIMIT 50
-	`, filePath, escapeLike(normPath), "%/"+escapeLike(normPath))
+	`, filePath, escapeLike(normPath), "%/"+escapeLike(normPath), normPath)
 	if err != nil {
 		return nil, fmt.Errorf("read heatmap query: %w", err)
 	}

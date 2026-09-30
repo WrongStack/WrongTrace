@@ -3,6 +3,7 @@ package db
 import (
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -455,6 +456,618 @@ func TestFileModelActivity_AbsoluteCallerSubjectStaysRaw(t *testing.T) {
 	if len(acts) != 3 {
 		t.Errorf("exact caller rows = %d, want 3 (model-a + model-w + 'unknown')", len(acts))
 	}
+}
+
+// TestGetFileReadStats_AbsoluteCallerResolvesRelativeStoredPath pins the
+// read-side counterpart to the round-90/91/92 subject-stays-raw family.
+// readPathClause (GetFileReadStats + GetFileReadHeatmap) had only three arms —
+// raw equality, normalized equality, and "stored ends with /caller" — so it
+// resolved a caller path with NO MORE components than the stored row and
+// nothing else. The stored read-event path is the agent transcript's own
+// tool-call argument and is normally workspace-RELATIVE, while the caller
+// arrives with code_node_events' file_path, which the watcher records
+// ABSOLUTE. That combination matched nothing, so FileReadDetails rendered a
+// file with real read telemetry as having none.
+//
+// The new fourth arm binds the caller path as the LIKE SUBJECT, so it must stay
+// RAW, while the stored path moves to the pattern side and is quoted in SQL —
+// the same shape pathMatchClause has carried since round 90.
+func TestGetFileReadStats_AbsoluteCallerResolvesRelativeStoredPath(t *testing.T) {
+	st := openMetaStore(t)
+	// Relative stored rows, exactly as a transcript records them, plus the
+	// '_'/'-' sibling that must not merge in.
+	seedRead(t, st, "rp1", underscorePath, "model-mine", 0.50)
+	seedRead(t, st, "rp2", dashPath, "model-theirs", 9.00)
+
+	for _, caller := range []string{
+		"/repo/root/" + underscorePath,
+		`D:\Codebox\PROJECTS\WrongTrace\internal\svc\file_read.go`,
+	} {
+		stats, err := st.GetFileReadStats(caller)
+		if err != nil {
+			t.Fatalf("GetFileReadStats(%q): %v", caller, err)
+		}
+		if stats.TotalReads != 1 || stats.TotalCostUSD != 0.50 {
+			t.Errorf("GetFileReadStats(%q) = %d reads, cost %v; want 1/0.5 — "+
+				"an absolute caller must resolve the relative stored row (arm-4 subject stays raw)",
+				caller, stats.TotalReads, stats.TotalCostUSD)
+		}
+		if got := stats.ModelBreakdown["model-mine"]; got != 1 {
+			t.Errorf("GetFileReadStats(%q) ModelBreakdown = %v, want model-mine=1 only",
+				caller, stats.ModelBreakdown)
+		}
+
+		heat, err := st.GetFileReadHeatmap(caller)
+		if err != nil {
+			t.Fatalf("GetFileReadHeatmap(%q): %v", caller, err)
+		}
+		if len(heat) != 1 || heat[0].ReadCount != 1 {
+			t.Errorf("GetFileReadHeatmap(%q) = %d slices, want 1 (same clause, same divergence)",
+				caller, len(heat))
+		}
+	}
+
+	// Isolation on the new arm: the dash sibling must not answer the
+	// underscore query, in either direction. The pattern side is quoted in SQL,
+	// so a raw subject must not turn '_' into a wildcard here either.
+	for _, caller := range []string{"/repo/root/" + dashPath, dashPath} {
+		stats, err := st.GetFileReadStats(caller)
+		if err != nil {
+			t.Fatalf("GetFileReadStats(%q): %v", caller, err)
+		}
+		if stats.TotalReads != 1 || stats.TotalCostUSD != 9.00 {
+			t.Errorf("dash sibling query %q = %d reads, cost %v; want exactly its own 1/9.0",
+				caller, stats.TotalReads, stats.TotalCostUSD)
+		}
+	}
+
+	// Opposite direction must not regress: a relative caller against a stored
+	// ABSOLUTE row still resolves through the pre-existing third arm.
+	seedRead(t, st, "rp3", "/srv/work/internal/svc/other.go", "model-abs", 0.25)
+	stats, err := st.GetFileReadStats("internal/svc/other.go")
+	if err != nil {
+		t.Fatalf("GetFileReadStats: %v", err)
+	}
+	if stats.TotalReads != 1 || stats.TotalCostUSD != 0.25 {
+		t.Errorf("relative caller vs stored absolute = %d reads, cost %v; want 1/0.25",
+			stats.TotalReads, stats.TotalCostUSD)
+	}
+}
+
+// TestPerFileClauses_CallerLongerResolvesAbsoluteStoredPath pins the round-87
+// fix. The caller-longer LIKE arm builds its pattern as "'%/' || <stored>".
+// Watcher-recorded file_path values are ABSOLUTE, so for an absolute stored row
+// that concatenation doubled the separator ("%//repo/root/...") and a caller
+// carrying merely more leading components could never satisfy it: the whole
+// caller-longer direction was dead for the stored spelling the daemon produces
+// most often, in BOTH clause families. Both now LTRIM the stored path's own
+// leading '/' after metacharacter quoting.
+//
+// The trim must not dissolve the '/' boundary anchor -- that anchor is what
+// stops "myfile_read.go" from answering a query for "file_read.go" -- and it
+// must not over-trim into a false negative either, so both directions are
+// asserted, not just the happy one.
+func TestPerFileClauses_CallerLongerResolvesAbsoluteStoredPath(t *testing.T) {
+	const abs = "/repo/root/internal/svc/file_read.go"
+	const rel = "internal/svc/file_read.go"
+	const longer = "/other/prefix" + abs
+
+	// seed builds a store holding exactly one event + one read row at path,
+	// with the event attributed to a run so FileModelActivity's write side
+	// resolves it as its own model rather than the 'unknown' sentinel.
+	seed := func(t *testing.T, path string) *Store {
+		t.Helper()
+		st := openMetaStore(t)
+		if err := st.UpsertRun(RunRecord{
+			RunID: "a87", TaskID: "t", AgentName: "agent", ModelName: "model-write", Provider: "prov",
+		}); err != nil {
+			t.Fatalf("UpsertRun: %v", err)
+		}
+		if err := st.InsertEvent(EventRecord{
+			EventID: "a87e", RunID: "a87", RepoName: "meta", FilePath: path,
+			Signature: "function:file_read.go::Fn", NodeType: "function",
+			Action: "MODIFIED", BodyHash: "hash", LOC: 5,
+			OccurredAt: time.Now().UTC().Add(-time.Minute),
+		}); err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+		seedRead(t, st, "a87r", path, "model-read", 0.5)
+		return st
+	}
+
+	// Every per-file reader, on both clause families, must resolve the
+	// absolute-stored row from a longer caller.
+	for _, tc := range []struct {
+		name string
+		call func(*Store) (int, string)
+	}{
+		{"RecentFileEvents", func(s *Store) (int, string) {
+			r, err := s.RecentFileEvents(longer, 50)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return len(r), "rows"
+		}},
+		{"SymbolHistory", func(s *Store) (int, string) {
+			r, err := s.SymbolHistory(longer, "", 50)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return len(r), "rows"
+		}},
+		{"FileModelActivity", func(s *Store) (int, string) {
+			r, err := s.FileModelActivity(longer)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return len(r), "summaries"
+		}},
+		{"GetFileReadStats", func(s *Store) (int, string) {
+			r, err := s.GetFileReadStats(longer)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return r.TotalReads, "reads"
+		}},
+		{"GetFileReadHeatmap", func(s *Store) (int, string) {
+			r, err := s.GetFileReadHeatmap(longer)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return len(r), "slices"
+		}},
+	} {
+		t.Run("absolute-stored/"+tc.name, func(t *testing.T) {
+			st := seed(t, abs)
+			// FileModelActivity reports one summary per model: the read-side
+			// model and the attributed write-side model.
+			want := 1
+			if tc.name == "FileModelActivity" {
+				want = 2
+			}
+			got, unit := tc.call(st)
+			if got != want {
+				t.Errorf("%s(caller=%q) = %d %s, want %d — the '/'-anchored arm "+
+					"doubles the separator when the stored path is absolute, so the "+
+					"caller-longer direction matches nothing", tc.name, longer, got, unit, want)
+			}
+		})
+	}
+
+	// The relative-stored case was already working and must not regress: the
+	// LTRIM is a no-op there, so the pattern must be byte-identical to before.
+	t.Run("relative-stored-unchanged", func(t *testing.T) {
+		st := seed(t, rel)
+		if r, err := st.RecentFileEvents("/repo/root/"+rel, 50); err != nil || len(r) != 1 {
+			t.Errorf("RecentFileEvents = %d rows err=%v, want 1 (relative stored + longer caller)", len(r), err)
+		}
+		s, err := st.GetFileReadStats("/repo/root/" + rel)
+		if err != nil || s.TotalReads != 1 {
+			t.Errorf("GetFileReadStats = %d reads err=%v, want 1 (relative stored + longer caller)", s.TotalReads, err)
+		}
+	})
+
+	// Anchor survives: a tail glued directly onto the preceding text with no
+	// separator is a DIFFERENT file. A naive "'%' || stored" fix would absorb
+	// it, silently merging another file's history.
+	t.Run("anchor-rejects-unseparated-tail", func(t *testing.T) {
+		st := seed(t, abs)
+		for _, bad := range []string{
+			"/other/prefixmy" + abs[1:],                         // "myrepo", no '/' before the tail
+			"/other/prefix/repo/root/internal/svc/file-read.go", // the '_' -> '-' sibling
+		} {
+			r, err := st.RecentFileEvents(bad, 50)
+			if err != nil {
+				t.Fatalf("RecentFileEvents(%q): %v", bad, err)
+			}
+			if len(r) != 0 {
+				t.Errorf("caller %q matched %d row(s), want 0 — the '/' boundary "+
+					"anchor was lost, so an unrelated path is absorbed", bad, len(r))
+			}
+		}
+	})
+
+	// No over-trim: a caller that really does end with the stored tail at a '/'
+	// boundary is a legitimate suffix match and must still resolve.
+	t.Run("genuine-boundary-suffix-resolves", func(t *testing.T) {
+		st := seed(t, abs)
+		genuine := "/other/prefixmy" + abs // ".../prefixmy/repo/root/..."
+		r, err := st.RecentFileEvents(genuine, 50)
+		if err != nil {
+			t.Fatalf("RecentFileEvents: %v", err)
+		}
+		if len(r) != 1 {
+			t.Errorf("caller %q = %d rows, want 1 — LTRIM must not over-trim into "+
+				"a false negative", genuine, len(r))
+		}
+	})
+
+	// '_' stays literal on the newly enabled direction, and the shorter-caller
+	// arm is untouched by the change.
+	t.Run("metacharacter-and-shorter-caller-intact", func(t *testing.T) {
+		st := seed(t, "/repo/root/internal/svc/file-read.go")
+		r, err := st.RecentFileEvents("/other/prefix/repo/root/internal/svc/file-read.go", 50)
+		if err != nil {
+			t.Fatalf("RecentFileEvents: %v", err)
+		}
+		if len(r) != 1 || r[0].FilePath != "/repo/root/internal/svc/file-read.go" {
+			t.Errorf("underscore isolation on the longer-caller arm: %d rows %v, want exactly its own row",
+				len(r), eventFilePaths(r))
+		}
+	})
+
+	t.Run("shorter-caller-unchanged", func(t *testing.T) {
+		st := seed(t, abs)
+		r, err := st.RecentFileEvents("file_read.go", 50)
+		if err != nil || len(r) != 1 {
+			t.Errorf("shorter caller vs absolute stored = %d rows err=%v, want 1", len(r), err)
+		}
+	})
+}
+
+// TestFileHealth_ResolvesAgentSuppliedPathSpellings pins the round-88 fix.
+// FileHealth's caller path is the most agent-supplied of the per-file queries --
+// guardrails.go, mcp/server.go, ipc/socket.go and the HTTP handler all pass a
+// path the AGENT chose -- and it was missing two things every sibling clause
+// already had:
+//
+//   - TrimPrefix("./"), so an agent writing "./pkg/x.go" for the stored
+//     "pkg/x.go" matched nothing;
+//   - any caller-LONGER arm at all, so an absolute caller against a relative
+//     stored row matched nothing.
+//
+// Both failures are silent and share one shape: the guardrail reported
+// RecentThrashingCount=0 and HealthScore=100, i.e. "safe to modify", for a file
+// that had churned inside the window. Rounds 41 and 91 fixed FileHealth's
+// CASING; neither touched arm coverage, so this is a distinct root cause.
+func TestFileHealth_ResolvesAgentSuppliedPathSpellings(t *testing.T) {
+	const rel = "internal/svc/file_read.go"
+	const relDash = "internal/svc/file-read.go"
+	const abs = "/repo/root/internal/svc/file_read.go"
+	const absDash = "/repo/root/internal/svc/file-read.go"
+
+	// oneEdit asserts the caller resolved the single stored row: churn counted
+	// and the score penalized (100 - 8 for a single edit).
+	oneEdit := func(t *testing.T, st *Store, caller string) (int, int) {
+		t.Helper()
+		h, err := st.FileHealth(caller)
+		if err != nil {
+			t.Fatalf("FileHealth(%q): %v", caller, err)
+		}
+		return h.RecentThrashingCount, h.HealthScore
+	}
+
+	// The "./"-prefixed relative path is what an agent actually sends, and it
+	// must resolve against either stored spelling.
+	t.Run("dot-slash-agent-caller", func(t *testing.T) {
+		for _, stored := range []string{rel, abs} {
+			st := openMetaStore(t)
+			seedMetaEvent(t, st, "d1", stored, "function:file_read.go::Fn")
+			calls, score := oneEdit(t, st, "./"+rel)
+			if calls != 1 || score != 92 {
+				t.Errorf("caller %q against stored %q = %d churn / health %d, want 1/92 — "+
+					"FileHealth never trimmed the './' prefix its siblings trim, so the "+
+					"agent's own spelling of the file read as a healthy 100",
+					"./"+rel, stored, calls, score)
+			}
+		}
+	})
+
+	// The caller-longer direction, for both the '_' and '-' spellings.
+	t.Run("caller-longer", func(t *testing.T) {
+		for _, tc := range []struct{ stored, caller string }{
+			{rel, "/other/prefix" + abs},
+			{relDash, "/other/prefix" + absDash},
+		} {
+			st := openMetaStore(t)
+			seedMetaEvent(t, st, "d2", tc.stored, "function:file_read.go::Fn")
+			calls, score := oneEdit(t, st, tc.caller)
+			if calls != 1 || score != 92 {
+				t.Errorf("caller %q against stored %q = %d churn / health %d, want 1/92 — "+
+					"every FileHealth arm required the caller to be no longer than the "+
+					"stored row, so this direction was missing entirely",
+					tc.caller, tc.stored, calls, score)
+			}
+		}
+	})
+
+	// Controls that must keep passing.
+	t.Run("control-exact-caller", func(t *testing.T) {
+		for _, stored := range []string{rel, abs} {
+			st := openMetaStore(t)
+			seedMetaEvent(t, st, "c1", stored, "function:file_read.go::Fn")
+			if calls, score := oneEdit(t, st, stored); calls != 1 || score != 92 {
+				t.Errorf("exact caller %q = %d/%d, want 1/92", stored, calls, score)
+			}
+		}
+	})
+
+	// Agent-supplied CASING divergence -- the case the LOWER arms exist for.
+	// Must be a casing variant of the SAME path, or the control proves nothing.
+	t.Run("control-casing-divergence", func(t *testing.T) {
+		st := openMetaStore(t)
+		seedMetaEvent(t, st, "c2", abs, "function:file_read.go::Fn")
+		upper := strings.ToUpper(abs)
+		if calls, _ := oneEdit(t, st, upper); calls != 1 {
+			t.Errorf("case variant %q = %d churn, want 1", upper, calls)
+		}
+	})
+
+	t.Run("control-shorter-caller", func(t *testing.T) {
+		st := openMetaStore(t)
+		seedMetaEvent(t, st, "c3", abs, "function:file_read.go::Fn")
+		if calls, _ := oneEdit(t, st, "file_read.go"); calls != 1 {
+			t.Errorf("shorter caller = %d churn, want 1", calls)
+		}
+	})
+
+	// '_' must stay literal: no sibling may answer across the new arm.
+	t.Run("control-metacharacter-isolation", func(t *testing.T) {
+		for _, tc := range []struct{ stored, caller string }{
+			{relDash, "./" + rel},            // './' caller must not see the dash row
+			{rel, "./" + relDash},            // dash caller must not see the underscore row
+			{absDash, "/other/prefix" + abs}, // longer caller must not see the dash row
+		} {
+			st := openMetaStore(t)
+			seedMetaEvent(t, st, "c4", tc.stored, "function:file_read.go::Fn")
+			if calls, _ := oneEdit(t, st, tc.caller); calls != 0 {
+				t.Errorf("caller %q matched the stored %q row (%d churn, want 0) — "+
+					"'_' is being treated as a wildcard", tc.caller, tc.stored, calls)
+			}
+		}
+	})
+
+	// The '/' boundary anchor must survive: a tail glued on with no separator is
+	// a DIFFERENT file, and a naive unanchored fix would merge its churn into
+	// this file's health score.
+	t.Run("control-anchor-rejects-unseparated-tail", func(t *testing.T) {
+		st := openMetaStore(t)
+		seedMetaEvent(t, st, "c5", rel, "function:file_read.go::Fn")
+		glued := "/other/prefixmy" + rel // "prefixmyinternal", no '/' before the tail
+		if calls, _ := oneEdit(t, st, glued); calls != 0 {
+			t.Errorf("caller %q = %d churn, want 0 — the '/' boundary anchor was lost", glued, calls)
+		}
+	})
+
+	// No over-trim: a caller genuinely ending at a '/' boundary is a legitimate
+	// suffix and must still resolve. Note the explicit separator -- it is what
+	// makes this the opposite of the glued case above.
+	t.Run("control-genuine-boundary-suffix-resolves", func(t *testing.T) {
+		st := openMetaStore(t)
+		seedMetaEvent(t, st, "c6", rel, "function:file_read.go::Fn")
+		genuine := "/other/prefixmy/" + rel
+		if calls, _ := oneEdit(t, st, genuine); calls != 1 {
+			t.Errorf("caller %q = %d churn, want 1 — LTRIM over-trimmed into a miss", genuine, calls)
+		}
+	})
+
+	// The clause's own 24h window must still exclude stale churn.
+	t.Run("control-24h-window", func(t *testing.T) {
+		st := openMetaStore(t)
+		if err := st.InsertEvent(EventRecord{
+			EventID: "c7", RepoName: "meta", FilePath: rel,
+			Signature: "function:file_read.go::Fn", NodeType: "function",
+			Action: "MODIFIED", BodyHash: "hash", LOC: 5,
+			OccurredAt: time.Now().UTC().Add(-48 * time.Hour),
+		}); err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+		if calls, score := oneEdit(t, st, rel); calls != 0 || score != 100 {
+			t.Errorf("stale churn = %d/%d, want 0/100 — the 24h window must survive the new arm",
+				calls, score)
+		}
+	})
+}
+
+// TestPerFileClauses_DriveRootedStoredResolvesLongerCaller pins the round-89
+// fix. A Windows drive root ("D:/...") is a root marker the leading-slash trim
+// added in rounds 87/88 does not touch, so the caller-longer arm built the
+// pattern "%/D:/repo/...". No caller could satisfy it, because the caller's own
+// drive letter also sits at position 0 rather than after a separator. On Windows
+// -- where the watcher records every stored path drive-rooted -- that left the
+// caller-longer direction dead for the platform's normal spelling, in all three
+// clause families.
+//
+// The stored value now reduces through the same CASE that strips the drive, so a
+// drive-rooted row reaches the component-suffix form every other stored path
+// already has. All three families now build this arm from one helper,
+// callerLongerArm, precisely so the boundary rule cannot drift between them
+// again (rounds 85 and 87 each hand-mirrored it and inherited the other's flaw).
+func TestPerFileClauses_DriveRootedStoredResolvesLongerCaller(t *testing.T) {
+	// Exactly what the Windows watcher records.
+	const win = `D:\repo\root\internal\svc\file_read.go`
+	const winSlash = "D:/repo/root/internal/svc/file_read.go"
+	const winDash = `D:\repo\root\internal\svc\file-read.go`
+	const deeper = "D:/other/prefix/repo/root/internal/svc/file_read.go"
+	const rel = "internal/svc/file_read.go"
+	const absPosix = "/repo/root/internal/svc/file_read.go"
+
+	// seed builds a store with exactly one event + one read row at path, the
+	// event attributed to a run so FileModelActivity's write side resolves it as
+	// its own model rather than the 'unknown' sentinel.
+	seed := func(t *testing.T, path string) *Store {
+		t.Helper()
+		st := openMetaStore(t)
+		if err := st.UpsertRun(RunRecord{
+			RunID: "a89", TaskID: "t", AgentName: "agent", ModelName: "model-write", Provider: "prov",
+		}); err != nil {
+			t.Fatalf("UpsertRun: %v", err)
+		}
+		if err := st.InsertEvent(EventRecord{
+			EventID: "a89e", RunID: "a89", RepoName: "meta", FilePath: path,
+			Signature: "function:file_read.go::Fn", NodeType: "function",
+			Action: "MODIFIED", BodyHash: "hash", LOC: 5,
+			OccurredAt: time.Now().UTC().Add(-time.Minute),
+		}); err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+		seedRead(t, st, "a89r", path, "model-read", 0.5)
+		return st
+	}
+
+	// Every per-file reader, in all three clause families, must resolve the
+	// drive-rooted row from a deeper caller on the same drive.
+	for _, tc := range []struct {
+		name string
+		call func(*Store) (int, string)
+	}{
+		{"RecentFileEvents", func(s *Store) (int, string) {
+			r, err := s.RecentFileEvents(deeper, 50)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return len(r), "rows"
+		}},
+		{"SymbolHistory", func(s *Store) (int, string) {
+			r, err := s.SymbolHistory(deeper, "", 50)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return len(r), "rows"
+		}},
+		{"FileModelActivity", func(s *Store) (int, string) {
+			r, err := s.FileModelActivity(deeper)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return len(r), "summaries"
+		}},
+		{"GetFileReadStats", func(s *Store) (int, string) {
+			r, err := s.GetFileReadStats(deeper)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return r.TotalReads, "reads"
+		}},
+		{"GetFileReadHeatmap", func(s *Store) (int, string) {
+			r, err := s.GetFileReadHeatmap(deeper)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return len(r), "slices"
+		}},
+		{"FileHealth", func(s *Store) (int, string) {
+			r, err := s.FileHealth(deeper)
+			if err != nil {
+				return -1, err.Error()
+			}
+			return r.HealthScore, "health"
+		}},
+	} {
+		t.Run("drive-stored/"+tc.name, func(t *testing.T) {
+			st := seed(t, win)
+			want := 1
+			if tc.name == "FileModelActivity" {
+				want = 2 // read-side model + attributed write-side model
+			}
+			if tc.name == "FileHealth" {
+				want = 92 // one edit: 100 - 8, the score the guardrail consumes
+			}
+			got, unit := tc.call(st)
+			if got != want {
+				t.Errorf("%s: drive-rooted stored %q + deeper caller %q = %d %s, want %d — "+
+					"the arm trimmed only leading slashes, so the pattern became "+
+					"\"%%/D:/repo/...\" and a caller whose drive letter also sits at "+
+					"position 0 could never match it", tc.name, win, deeper, got, unit, want)
+			}
+		})
+	}
+
+	// The fix must not be tied to one stored shape or one file name.
+	t.Run("variants", func(t *testing.T) {
+		for _, tc := range []struct{ stored, caller string }{
+			{winSlash, deeper},
+			{winDash, "D:/other/prefix/repo/root/internal/svc/file-read.go"},
+		} {
+			st := seed(t, tc.stored)
+			r, err := st.RecentFileEvents(tc.caller, 50)
+			if err != nil {
+				t.Fatalf("RecentFileEvents: %v", err)
+			}
+			if len(r) != 1 {
+				t.Errorf("stored %q + caller %q = %d rows, want 1", tc.stored, tc.caller, len(r))
+			}
+		}
+	})
+
+	// Controls.
+	t.Run("control-non-drive-stored-unaffected", func(t *testing.T) {
+		// The drive strip must be a no-op here. Note the explicit '/': without
+		// it the caller GLUES onto the tail and matches nothing.
+		for _, tc := range []struct{ stored, caller string }{
+			{rel, "/other/prefix/" + rel},
+			{absPosix, "/other/prefix" + absPosix}, // supplies its own leading '/'
+		} {
+			st := seed(t, tc.stored)
+			if r, err := st.RecentFileEvents(tc.caller, 50); err != nil || len(r) != 1 {
+				t.Errorf("non-drive stored %q = %d rows err=%v, want 1", tc.stored, len(r), err)
+			}
+			if s, err := st.GetFileReadStats(tc.caller); err != nil || s.TotalReads != 1 {
+				t.Errorf("read stats for non-drive stored %q = %d reads err=%v, want 1",
+					tc.stored, s.TotalReads, err)
+			}
+		}
+	})
+
+	t.Run("control-exact-and-shorter-caller", func(t *testing.T) {
+		st := seed(t, win)
+		for _, caller := range []string{win, "file_read.go"} {
+			r, err := st.RecentFileEvents(caller, 50)
+			if err != nil || len(r) != 1 {
+				t.Errorf("caller %q = %d rows err=%v, want 1", caller, len(r), err)
+			}
+		}
+		if h, err := st.FileHealth("file_read.go"); err != nil || h.HealthScore != 92 {
+			t.Errorf("FileHealth shorter caller = %d err=%v, want 92", h.HealthScore, err)
+		}
+	})
+
+	t.Run("control-anchor-rejects-unseparated-tail", func(t *testing.T) {
+		st := seed(t, win)
+		// No '/' before "repo" -- a different file. A naive unanchored fix
+		// would merge another file's telemetry into this one.
+		glued := "D:/other/prefixmyrepo/root/internal/svc/file_read.go"
+		r, err := st.RecentFileEvents(glued, 50)
+		if err != nil {
+			t.Fatalf("RecentFileEvents: %v", err)
+		}
+		if len(r) != 0 {
+			t.Errorf("caller %q = %d rows, want 0 — the '/' boundary anchor was lost", glued, len(r))
+		}
+	})
+
+	t.Run("control-metacharacter-isolation", func(t *testing.T) {
+		st := seed(t, winDash)
+		// '_' must stay literal on the newly-enabled direction.
+		caller := "D:/other/prefix/repo/root/internal/svc/file_read.go"
+		r, err := st.RecentFileEvents(caller, 50)
+		if err != nil {
+			t.Fatalf("RecentFileEvents: %v", err)
+		}
+		if len(r) != 0 {
+			t.Errorf("underscore caller %q matched the stored dash row (%d rows, want 0) — "+
+				"'_' is a wildcard on the pattern side", caller, len(r))
+		}
+	})
+
+	t.Run("control-cross-drive-suffix-matches", func(t *testing.T) {
+		// Pin the consequence explicitly rather than leaving it implicit.
+		// Stripping the drive root means a DIFFERENT drive carrying the same
+		// component suffix now matches. That is the per-file readers' existing
+		// policy made uniform — a stored "internal/x.go" already answers an
+		// unrelated "/elsewhere/internal/x.go", because these clauses match on
+		// path-COMPONENT suffix and have never compared roots.
+		st := seed(t, win)
+		other := "E:/other/repo/root/internal/svc/file_read.go"
+		r, err := st.RecentFileEvents(other, 50)
+		if err != nil {
+			t.Fatalf("RecentFileEvents: %v", err)
+		}
+		if len(r) != 1 {
+			t.Errorf("cross-drive caller %q = %d rows, want 1 — these readers match on "+
+				"component suffix and never compare roots", other, len(r))
+		}
+	})
 }
 
 // TestRecentEventsFiltered_SameSecondTiesAreDeterministic pins the round-93
