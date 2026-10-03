@@ -13,7 +13,7 @@
   "dependencies": {
     "@tanstack/react-query": "^5.103.2",
     "@xyflow/react": "^12.11.3",
-    "lucide-react": "^1.47.0",
+    "lucide-react": "^1.49.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "recharts": "^3.10.1"
