@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make CLI doctor, init and trace summaries reflect failed checks, incomplete setup and uncaptured traces.
 
 ### Testing & Tooling
-- Add backend and dashboard regression coverage for the fixes above; discover only actual `*-regression.mjs` guards.
+- Add backend and dashboard regression coverage for the fixes above; discover only actual `*-regression.mjs` guards and initialize portable scratch directories and dependency links on fresh checkouts.
 - Include the dependency and per-file path-matching updates committed since 0.3.16. Align the private dashboard package version with the release.
 
 ---

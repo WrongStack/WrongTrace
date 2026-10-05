@@ -28,7 +28,6 @@
 // repo's own vite and reads the plain-text KPI totals.
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -39,6 +38,7 @@ const webDir = path.join(root, 'web');
 const webRequire = createRequire(pathToFileURL(path.join(webDir, 'package.json')));
 const vite = webRequire('vite');
 
+fs.mkdirSync(path.join(root, '.temp_files'), { recursive: true });
 const work = fs.mkdtempSync(path.join(root, '.temp_files', 'wt-churn-'));
 const cleanup = () => { try { fs.rmSync(work, { recursive: true, force: true }); } catch {} };
 process.on('exit', cleanup);
@@ -48,7 +48,7 @@ const failures = [];
 const check = (cond, msg) => { if (!cond) failures.push(msg); };
 
 try {
-  spawnSync('cmd', ['/c', 'mklink', '/J', path.join(work, 'node_modules'), path.join(webDir, 'node_modules')]);
+  fs.symlinkSync(path.join(webDir, 'node_modules'), path.join(work, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
   if (!fs.existsSync(path.join(work, 'node_modules'))) blocked('could not link web/node_modules');
 
   const compSrc = fs.readFileSync(path.join(webDir, 'src', 'components', 'CodeChurnTimeline.tsx'), 'utf8');

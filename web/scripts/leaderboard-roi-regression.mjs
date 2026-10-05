@@ -26,7 +26,6 @@
 // with the repo's own vite, so this exercises production code, not a copy.
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -39,6 +38,7 @@ const vite = webRequire('vite');
 
 // Render into a temp dir that can resolve react/recharts/lucide-react, and
 // clean it up afterwards so the guard leaves nothing behind.
+fs.mkdirSync(path.join(root, '.temp_files'), { recursive: true });
 const work = fs.mkdtempSync(path.join(root, '.temp_files', 'wt-leaderboard-roi-'));
 const failures = [];
 const cleanup = () => { try { fs.rmSync(work, { recursive: true, force: true }); } catch {} };
@@ -47,7 +47,7 @@ process.on('exit', cleanup);
 const blocked = (why) => { console.log('BLOCKED: ' + why); cleanup(); process.exit(2); };
 
 try {
-  spawnSync('cmd', ['/c', 'mklink', '/J', path.join(work, 'node_modules'), path.join(webDir, 'node_modules')]);
+  fs.symlinkSync(path.join(webDir, 'node_modules'), path.join(work, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
   if (!fs.existsSync(path.join(work, 'node_modules'))) blocked('could not link web/node_modules');
 
   const transpile = async (rel, out) => {
