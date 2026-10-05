@@ -158,13 +158,13 @@ export function SymbolHistoryTimeline({ filePath = '', signature }: SymbolHistor
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[11px] font-mono">
                     <div className="panel-raised p-1.5">
                       <div className="text-slate-500 text-[10px]">LOC</div>
-                      <div className="text-slate-200 font-semibold">{rev.lines_of_code || 0} lines</div>
+                      <div className="text-slate-200 font-semibold">{rev.lines_of_code} lines</div>
                     </div>
                     <div className="panel-raised p-1.5">
                       <div className="text-slate-500 text-[10px]">Delta</div>
                       <div className="flex items-center gap-1.5">
-                        <span className="text-emerald-400">+{rev.added_lines || 0}</span>
-                        <span className="text-rose-400">-{rev.deleted_lines || 0}</span>
+                        <span className="text-emerald-400">+{rev.added_lines}</span>
+                        <span className="text-rose-400">-{rev.deleted_lines}</span>
                       </div>
                     </div>
                     <div className="panel-raised p-1.5">

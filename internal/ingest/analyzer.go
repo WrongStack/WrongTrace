@@ -3,12 +3,15 @@ package ingest
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -90,7 +93,11 @@ func ExtractLineRange(args map[string]interface{}) (int, int, int) {
 		linesCount = endLine - startLine + 1
 	}
 	if endLine == 0 && linesCount > 0 {
-		endLine = startLine + linesCount - 1
+		remaining := int(^uint(0)>>1) - startLine + 1
+		if linesCount > remaining {
+			linesCount = remaining
+		}
+		endLine = startLine + (linesCount - 1)
 	}
 
 	return startLine, endLine, linesCount
@@ -104,6 +111,10 @@ func extractInt(v interface{}) int {
 		return int(n)
 	case float64:
 		return int(n)
+	case json.Number:
+		if parsed, ok := jsonNumberInt64(n); ok && int64(int(parsed)) == parsed {
+			return int(parsed)
+		}
 	case string:
 		if parsed, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
 			return parsed
@@ -124,8 +135,12 @@ func ParseJSONLTranscriptFull(filePath string) ([]ToolCallEvent, []FileReadEvent
 	return modEvents, readEvents, err
 }
 
-// ParseJSONLTranscriptFromOffset streams a JSONL file line-by-line starting from startOffset without loading the entire file into memory.
+// ParseJSONLTranscriptFromOffset streams new records from startOffset and
+// recovers preceding model/intent without materializing historical events.
 func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolCallEvent, []FileReadEvent, int64, error) {
+	if startOffset < 0 {
+		return nil, nil, startOffset, fmt.Errorf("invalid transcript offset: %d", startOffset)
+	}
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, nil, startOffset, fmt.Errorf("open transcript: %w", err)
@@ -135,11 +150,17 @@ func ParseJSONLTranscriptFromOffset(filePath string, startOffset int64) ([]ToolC
 }
 
 // jsonlCursor is the resumable position in a JSONL transcript: the committed
-// offset plus a fingerprint of the bytes just before it.
+// offset, its preceding-byte fingerprint and inherited model/intent.
 type jsonlCursor struct {
 	offset         int64
 	fingerprint    uint64
 	hasFingerprint bool
+	context        jsonlContext
+}
+
+type jsonlContext struct {
+	ModelName string `json:"model"`
+	Intent    string `json:"intent,omitempty"`
 }
 
 // fingerprintBytes is how much of the committed prefix identifies the file.
@@ -185,8 +206,12 @@ func parseJSONLResumable(filePath string, cur jsonlCursor) ([]ToolCallEvent, []F
 			start = 0
 		}
 	}
-	mods, reads, committed, err := parseJSONLFile(f, filePath, start)
-	next := jsonlCursor{offset: committed}
+	context := cur.context
+	if start == 0 {
+		context = jsonlContext{}
+	}
+	mods, reads, committed, err := parseJSONLFile(f, filePath, start, &context)
+	next := jsonlCursor{offset: committed, context: context}
 	if err == nil {
 		next.fingerprint, next.hasFingerprint = tailFingerprint(f, committed)
 	}
@@ -195,7 +220,7 @@ func parseJSONLResumable(filePath string, cur jsonlCursor) ([]ToolCallEvent, []F
 
 var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 
-func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallEvent, []FileReadEvent, int64, error) {
+func parseJSONLFile(f *os.File, filePath string, startOffset int64, inherited ...*jsonlContext) ([]ToolCallEvent, []FileReadEvent, int64, error) {
 	if startOffset > 0 {
 		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
 			return nil, nil, startOffset, fmt.Errorf("seek transcript: %w", err)
@@ -207,8 +232,23 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 	var readEvents []FileReadEvent
 	sessionID := sessionIDForPath(filePath)
 	agentName := detectAgentFromPath(filePath)
-	currentModel := detectAgentDefaultModel(agentName)
-	currentIntent := ""
+	context := jsonlContext{ModelName: detectAgentDefaultModel(agentName)}
+	if startOffset > 0 {
+		if len(inherited) > 0 && inherited[0] != nil && inherited[0].ModelName != "" {
+			context = *inherited[0]
+		} else {
+			var err error
+			context, err = readJSONLContext(f, startOffset, context)
+			if err != nil {
+				return nil, nil, startOffset, fmt.Errorf("read transcript context: %w", err)
+			}
+		}
+	}
+	defer func() {
+		if len(inherited) > 0 && inherited[0] != nil {
+			*inherited[0] = context
+		}
+	}()
 	currentOffset := startOffset
 	committed := startOffset // offset through the last '\n'-terminated line
 
@@ -243,13 +283,7 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 		}
 		if len(trimmed) > 0 {
 			// Fast pre-filter: skip JSON unmarshaling for lines that cannot contain tool calls, user input, model info, or usage
-			if !bytes.Contains(trimmed, bTool) &&
-				!bytes.Contains(trimmed, bUserInput) &&
-				!bytes.Contains(trimmed, bModelLower) &&
-				!bytes.Contains(trimmed, bModelUpper) &&
-				!bytes.Contains(trimmed, bUsage) &&
-				!bytes.Contains(trimmed, bSelectedModel) &&
-				!bytes.Contains(trimmed, bPlannerModel) {
+			if !jsonlRowHasSignals(trimmed) {
 				if !complete {
 					break
 				}
@@ -257,14 +291,7 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 			}
 
 			if row, uErr := decodeJSONLRow(trimmed); uErr == nil {
-				// Dynamically extract model from deep json structures
-				if extracted := extractModelFromRow(row); extracted != "" && !models.IsJunkModel(extracted) {
-					currentModel = extracted
-				}
-
-				if intent, ok := row["content"].(string); ok && row["type"] == "USER_INPUT" {
-					currentIntent = runeSafeTruncate(intent, 80)
-				}
+				updateJSONLContext(&context, row)
 
 				// Extract usage tokens if present
 				var promptTokens, completionTokens int64
@@ -275,6 +302,7 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 
 				// Extract tool calls
 				if toolCalls, ok := row["tool_calls"].([]interface{}); ok {
+					readIndex := 0
 					for _, tc := range toolCalls {
 						tcMap, ok := tc.(map[string]interface{})
 						if !ok {
@@ -293,7 +321,7 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 						}
 
 						// Check if tool call has its own specific model override
-						tcModel := currentModel
+						tcModel := context.ModelName
 						if m := extractModelFromRow(tcMap); m != "" {
 							tcModel = m
 						}
@@ -326,7 +354,7 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 								PromptTokens:     promptTokens,
 								CompletionTokens: completionTokens,
 								CostUSD:          cost,
-								Intent:           currentIntent,
+								Intent:           context.Intent,
 								OccurredAt:       occurredAt,
 							}
 							modEvents = append(modEvents, ev)
@@ -334,13 +362,19 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 
 						if isRead && targetFile != "" {
 							sLine, eLine, lCount := ExtractLineRange(args)
+							readID := fmt.Sprintf("read-%s-%d", sessionID, lineStart)
+							if readIndex > 0 {
+								readID += fmt.Sprintf("-%d", readIndex)
+							}
+							readIndex++
 							rEv := FileReadEvent{
 								// Keyed by the line's byte offset so the ID is
 								// stable across re-reads (dedup on the PK) and
 								// unique per session file. A per-batch counter
 								// collided across polls, silently discarding
 								// every batch after the first.
-								ReadID:         fmt.Sprintf("read-%s-%d", sessionID, lineStart),
+								// Additional reads in the same row need distinct IDs too.
+								ReadID:         readID,
 								SessionID:      sessionID,
 								FilePath:       targetFile,
 								AgentName:      agentName,
@@ -351,7 +385,7 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 								LinesReadCount: lCount,
 								PromptTokens:   promptTokens,
 								CostUSD:        cost,
-								Intent:         currentIntent,
+								Intent:         context.Intent,
 								OccurredAt:     occurredAt,
 							}
 							readEvents = append(readEvents, rEv)
@@ -369,19 +403,72 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64) ([]ToolCallE
 	return modEvents, readEvents, committed, nil
 }
 
+func jsonlRowHasSignals(line []byte) bool {
+	return bytes.Contains(line, bTool) || bytes.Contains(line, bUserInput) ||
+		bytes.Contains(line, bModelLower) || bytes.Contains(line, bModelUpper) ||
+		bytes.Contains(line, bUsage) || bytes.Contains(line, bSelectedModel) ||
+		bytes.Contains(line, bPlannerModel) || bytes.Contains(line, []byte(`\u`))
+}
+
+func updateJSONLContext(context *jsonlContext, row map[string]interface{}) {
+	if model := extractModelFromRow(row); model != "" && !models.IsJunkModel(model) {
+		context.ModelName = model
+	}
+	if intent, ok := row["content"].(string); ok && row["type"] == "USER_INPUT" {
+		context.Intent = runeSafeTruncate(intent, 80)
+	}
+}
+
+// Recover metadata for legacy cursors and stateless offset callers without
+// constructing or replaying historical tool/read events. ReadAt leaves the
+// main parser's file position unchanged.
+func readJSONLContext(f *os.File, end int64, context jsonlContext) (jsonlContext, error) {
+	reader := bufio.NewReaderSize(io.NewSectionReader(f, 0, end), 64*1024)
+	first := true
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			return context, err
+		}
+		if first {
+			line = bytes.TrimPrefix(line, utf8BOM)
+			first = false
+		}
+		if trimmed := bytes.TrimSpace(line); jsonlRowHasSignals(trimmed) {
+			if row, decodeErr := decodeJSONLRow(trimmed); decodeErr == nil {
+				updateJSONLContext(&context, row)
+			}
+		}
+		if err == io.EOF {
+			return context, nil
+		}
+	}
+}
+
 // sessionIDForPath derives a stable, collision-free session identifier from
 // the transcript path. Every agent session directory stores its transcript
 // under the same file name (transcript.jsonl), so using only the base name
 // collapses all sessions into one session id — and via ReportRun into a
 // single agent_runs row. Including the parent directory (the session UUID or
-// date folder) keeps sessions distinct while staying human-readable.
+// date folder) supplies a readable prefix; the full path fingerprint separates
+// identical directory/file names belonging to different transcript owners.
 func sessionIDForPath(filePath string) string {
-	base := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
-	parent := filepath.Base(filepath.Dir(filePath))
-	if parent == "" || parent == "." || parent == string(filepath.Separator) || parent == "/" {
-		return base
+	path, err := filepath.Abs(filePath)
+	if err != nil {
+		path = filepath.Clean(filePath)
 	}
-	return parent + "-" + base
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	parent := filepath.Base(filepath.Dir(path))
+	prefix := base
+	if parent == "" || parent == "." || parent == string(filepath.Separator) || parent == "/" {
+		prefix = base
+	} else {
+		prefix = parent + "-" + base
+	}
+	return fmt.Sprintf("%s-%x", prefix, sha256.Sum256([]byte(path)))
 }
 
 // ParseClineTask parses a Cline / Roo Code task JSON structure.
@@ -399,11 +486,16 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 	}
 
 	var root map[string]interface{}
-	if err := json.Unmarshal(data, &root); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&root); err != nil {
 		return nil, fmt.Errorf("unmarshal cline task: %w", err)
 	}
+	if len(bytes.TrimSpace(data[decoder.InputOffset():])) != 0 {
+		return nil, fmt.Errorf("unmarshal cline task: trailing data")
+	}
 
-	sessionID := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+	sessionID := sessionIDForPath(filePath)
 	modelName := "unknown-model"
 	if m := extractModelFromRow(root); m != "" {
 		modelName = m
@@ -425,8 +517,8 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 				text, _ := mMap["text"].(string)
 				// Cline/Roo stamp every message (`ts`, epoch milliseconds).
 				occurredAt := time.Now().UTC()
-				if ts, ok := mMap["ts"].(float64); ok && ts > 0 {
-					occurredAt = time.UnixMilli(int64(ts)).UTC()
+				if ts := extractInt64(mMap, "ts"); ts > 0 {
+					occurredAt = time.UnixMilli(ts).UTC()
 				}
 				events = append(events, ToolCallEvent{
 					SessionID:        sessionID,
@@ -529,7 +621,9 @@ func decodeJSONLRow(line []byte) (map[string]interface{}, error) {
 			continue
 		}
 		var val interface{}
-		if err := json.Unmarshal(v, &val); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(v))
+		decoder.UseNumber()
+		if err := decoder.Decode(&val); err != nil {
 			return nil, err
 		}
 		row[k] = val
@@ -616,25 +710,27 @@ func normalizeModelName(raw string) string {
 
 	// Canonical mapping for common display names
 	switch {
-	case strings.Contains(lower, "gemini 3.7 flash"):
+	case lower == "gemini 3.7 flash":
 		return "gemini-3.7-flash"
-	case strings.Contains(lower, "gemini 2.5 pro"):
+	case lower == "gemini 2.5 pro":
 		return "gemini-2.5-pro"
-	case strings.Contains(lower, "gemini 2.0 flash"):
+	case lower == "gemini 2.0 flash":
 		return "gemini-2.0-flash"
-	case strings.Contains(lower, "gemini 1.5 pro"):
+	case lower == "gemini 1.5 pro":
 		return "gemini-1.5-pro"
-	case strings.Contains(lower, "claude 3.7 sonnet") || strings.Contains(lower, "claude-3-7-sonnet"):
+	case lower == "claude 3.7 sonnet" || lower == "claude-3-7-sonnet":
 		return "claude-3-7-sonnet"
-	case strings.Contains(lower, "claude 3.5 sonnet") || strings.Contains(lower, "claude-3-5-sonnet"):
+	case lower == "claude 3.5 sonnet" || lower == "claude-3-5-sonnet":
 		return "claude-3-5-sonnet"
-	case strings.Contains(lower, "deepseek v3") || strings.Contains(lower, "deepseek-v3"):
+	case lower == "deepseek v3" || lower == "deepseek-v3":
 		return "deepseek-v3"
-	case strings.Contains(lower, "deepseek r1") || strings.Contains(lower, "deepseek-r1"):
+	case lower == "deepseek r1" || lower == "deepseek-r1":
 		return "deepseek-r1"
-	case strings.Contains(lower, "gpt-4o"):
+	case lower == "gpt-4o-mini" || lower == "gpt-4o mini":
+		return "gpt-4o-mini"
+	case lower == "gpt-4o":
 		return "gpt-4o"
-	case strings.Contains(lower, "o3-mini"):
+	case lower == "o3-mini":
 		return "o3-mini"
 	default:
 		// Slugify human readable string: "Gemini Pro" -> "gemini-pro"
@@ -650,6 +746,10 @@ func extractInt64(m map[string]interface{}, keys ...string) int64 {
 	for _, k := range keys {
 		if val, ok := m[k]; ok {
 			switch v := val.(type) {
+			case json.Number:
+				if parsed, ok := jsonNumberInt64(v); ok {
+					return parsed
+				}
 			case float64:
 				return int64(v)
 			case int64:
@@ -660,6 +760,19 @@ func extractInt64(m map[string]interface{}, keys ...string) int64 {
 		}
 	}
 	return 0
+}
+
+func jsonNumberInt64(n json.Number) (int64, bool) {
+	if parsed, err := n.Int64(); err == nil {
+		return parsed, true
+	}
+	// Preserve decimal/exponent coercion without rounding through float64.
+	parsed, _, err := big.ParseFloat(n.String(), 10, 64, big.ToZero)
+	if err == nil && parsed.Cmp(big.NewFloat(-0x1p63)) >= 0 && parsed.Cmp(big.NewFloat(0x1p63)) < 0 {
+		integer, _ := parsed.Int64()
+		return integer, true
+	}
+	return 0, false
 }
 
 // containsAgentToken reports whether an agent key occurs in the lowered path as a

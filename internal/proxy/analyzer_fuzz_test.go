@@ -19,6 +19,10 @@ func FuzzAnalyzeWirePayloads(f *testing.F) {
 	}{
 		{`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
 			`{"choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":5,"completion_tokens":3}}`, false},
+		{`{"instructions":"Be brief","input":"hi"}`,
+			`{"object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":5,"output_tokens":3}}`, false},
+		{`{"input":[{"role":"user","content":"hi"}]}`,
+			"data: {\"type\":\"response.output_text.delta\",\"output_index\":1000000000,\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_seed\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n", true},
 		{`{"model":"claude-3","max_tokens":100}`,
 			"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\ndata: [DONE]\n", true},
 		{`{"messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}`,

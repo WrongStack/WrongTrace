@@ -131,21 +131,13 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
       }
 
       const b = buckets.get(timeKey)!;
-      const added =
-        typeof e.added_lines === 'number' && e.added_lines > 0
-          ? e.added_lines
-          : e.action === 'ADDED'
-          ? e.lines_of_code || 10
-          : e.action === 'MODIFIED'
-          ? Math.max(1, Math.round((e.lines_of_code || 6) * 0.3))
-          : 0;
-
-      const deleted =
-        typeof e.deleted_lines === 'number' && e.deleted_lines > 0
-          ? e.deleted_lines
-          : e.action === 'DELETED'
-          ? e.lines_of_code || 10
-          : 0;
+      // added_lines/deleted_lines are always real numbers (db.ModelComparison's
+      // EventRecord has no omitempty and the query COALESCEs to 0). A 0 is a
+      // genuine measurement -- formatAddedDiff returns 0 for an empty node body,
+      // and a deletion-only edit legitimately adds nothing -- so it must be
+      // summed as-is, never replaced by a lines_of_code estimate.
+      const added = e.added_lines;
+      const deleted = e.deleted_lines;
 
       b.addedLines += added;
       b.deletedLines += deleted;
@@ -170,21 +162,10 @@ export function CodeChurnTimeline({ events = [], loading = false }: CodeChurnTim
     let delEv = 0;
 
     filteredEvents.forEach((e) => {
-      const add =
-        typeof e.added_lines === 'number' && e.added_lines > 0
-          ? e.added_lines
-          : e.action === 'ADDED'
-          ? e.lines_of_code || 10
-          : e.action === 'MODIFIED'
-          ? Math.max(1, Math.round((e.lines_of_code || 6) * 0.3))
-          : 0;
-
-      const del =
-        typeof e.deleted_lines === 'number' && e.deleted_lines > 0
-          ? e.deleted_lines
-          : e.action === 'DELETED'
-          ? e.lines_of_code || 10
-          : 0;
+      // Same rule as the bucketing above: sum the real fields; 0 is a real
+      // value, not a reason to invent a magnitude from lines_of_code.
+      const add = e.added_lines;
+      const del = e.deleted_lines;
 
       added += add;
       deleted += del;

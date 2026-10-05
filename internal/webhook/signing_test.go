@@ -57,3 +57,90 @@ func TestGenericDeliveryUnsignedWithoutSecret(t *testing.T) {
 		t.Errorf("unexpected X-WrongTrace-Signature %q when no secret configured", sig)
 	}
 }
+
+type signingMarshalGate struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g signingMarshalGate) MarshalJSON() ([]byte, error) {
+	close(g.entered)
+	<-g.release
+	return []byte(`"gated"`), nil
+}
+
+func TestDispatchKeepsSigningSecretWithDestination(t *testing.T) {
+	const oldSecret = "old-test-key"
+	const newSecret = "new-test-key"
+	type delivery struct {
+		body      []byte
+		signature string
+	}
+	oldDeliveries := make(chan delivery, 2)
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		oldDeliveries <- delivery{body, r.Header.Get("X-WrongTrace-Signature")}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer old.Close()
+	newDeliveries := make(chan delivery, 1)
+	newer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		newDeliveries <- delivery{body, r.Header.Get("X-WrongTrace-Signature")}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer newer.Close()
+
+	awaitDelivery := func() delivery {
+		t.Helper()
+		select {
+		case got := <-oldDeliveries:
+			return got
+		case <-time.After(3 * time.Second):
+			t.Fatal("old destination did not receive delivery")
+			return delivery{}
+		}
+	}
+	checkSignature := func(got delivery) {
+		t.Helper()
+		mac := hmac.New(sha256.New, []byte(oldSecret))
+		mac.Write(got.body)
+		want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		if got.signature != want {
+			t.Errorf("old destination signature = %q, want signature using its original key %q", got.signature, want)
+		}
+	}
+
+	d := NewDispatcher(Config{GenericURL: old.URL, SigningSecret: oldSecret, Timeout: 2 * time.Second})
+	d.Dispatch(Payload{EventType: EventGuardrailBlock, Message: "control"})
+	checkSignature(awaitDelivery())
+
+	gate := signingMarshalGate{make(chan struct{}), make(chan struct{})}
+	d.Dispatch(Payload{EventType: EventGuardrailBlock, Message: "gated", Details: map[string]interface{}{"barrier": gate}})
+	select {
+	case <-gate.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("JSON encoder did not reach the gate")
+	}
+	d.UpdateConfig(Config{GenericURL: newer.URL, SigningSecret: newSecret, Timeout: 2 * time.Second})
+	close(gate.release)
+	checkSignature(awaitDelivery())
+	select {
+	case <-newDeliveries:
+		t.Error("in-flight delivery switched destination")
+	default:
+	}
+
+	d.Dispatch(Payload{EventType: EventGuardrailBlock, Message: "after update"})
+	select {
+	case got := <-newDeliveries:
+		mac := hmac.New(sha256.New, []byte(newSecret))
+		mac.Write(got.body)
+		want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		if got.signature != want {
+			t.Errorf("new destination signature = %q, want updated key signature %q", got.signature, want)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("new destination did not receive delivery after update")
+	}
+}

@@ -108,6 +108,7 @@ func (h *Handlers) getProjectFilter(r *http.Request) string {
 		if p, err := h.Engine.GetProject(pid); err == nil && p.Name != "" {
 			return p.Name
 		}
+		return pid
 	}
 	return ""
 }
@@ -452,9 +453,9 @@ func (h *Handlers) Atlas(w http.ResponseWriter, r *http.Request) {
 			if offset >= len(atlas.Packages) {
 				atlas.Packages = []core.AtlasPackage{}
 			} else {
-				end := offset + limit
-				if end > len(atlas.Packages) {
-					end = len(atlas.Packages)
+				end := len(atlas.Packages)
+				if limit < end-offset {
+					end = offset + limit
 				}
 				atlas.Packages = atlas.Packages[offset:end]
 			}
@@ -528,7 +529,7 @@ func (h *Handlers) UpsertModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if req.ID == "" {
+	if strings.TrimSpace(req.ID) == "" {
 		writeError(w, http.StatusBadRequest, "id is required")
 		return
 	}
@@ -1125,7 +1126,11 @@ func (h *Handlers) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	updated := h.Engine.UpdateSettings(s)
+	updated, err := h.Engine.UpdateSettings(s)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save settings")
+		return
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 

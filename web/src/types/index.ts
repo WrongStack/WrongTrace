@@ -35,8 +35,14 @@ export function isJunkModel(name?: string | null): boolean {
   if (!name) return true;
   const s = name.trim().toLowerCase();
   if (s.length < 2 || s.length > 80) return true;
+  // Bare 'unknown' is deliberately NOT junk here. This predicate mirrors the Go
+  // models.IsJunkModel (internal/models/registry.go), which does not list it:
+  // the Go queries GENERATE that attribution bucket
+  // (`COALESCE(r.model_name, 'unknown')`, internal/db/queries.go) and the
+  // exported report filters with that same Go predicate. Listing it here made
+  // the dashboard filter out a model row the API and the report both include.
   const junkSet = new Set([
-    'unknown', 'unknown-model', 'unknown_model', 'unknown-model-detected', 'unknown-provider',
+    'unknown-model', 'unknown_model', 'unknown-model-detected', 'unknown-provider',
     'omit', 'inherit', 'none', 'null', 'undefined', 'default', 'custom', 'agent', 'model',
     'string', 'boolean', 'number', 'integer', 'object', 'array', 'any', 'void', 'function',
     'this.meta.model', 'this.model', 'self.model', 'meta.model', 'process.env.model',
@@ -86,8 +92,8 @@ export interface EventRecord {
   start_line?: number;
   end_line?: number;
   diff_snippet?: string;
-  added_lines?: number;
-  deleted_lines?: number;
+  added_lines: number;
+  deleted_lines: number;
   attribution_source?: 'tool_path' | 'single_active_run' | 'unknown';
   attribution_confidence?: number;
   author_model?: string;

@@ -189,7 +189,7 @@ func TestUpdateConfigTimeoutHonoredBySender(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := disp.sendGeneric(ctx, srv.URL, Payload{EventType: EventSpendAlert, Message: "timeout update"})
+	err := disp.sendGeneric(ctx, srv.URL, Payload{EventType: EventSpendAlert, Message: "timeout update"}, "")
 	elapsed := time.Since(start)
 
 	if err == nil {

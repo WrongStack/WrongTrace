@@ -24,6 +24,9 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
   const [selectedFile, setSelectedFile] = useState<string>('ALL');
 
   // Unique files for dropdown filter
+  // Option list for the file dropdown. Deliberately over the UNFILTERED events:
+  // it is a control, not a card, so it must keep offering every file or a
+  // selected file could never be changed back.
   const uniqueFiles = useMemo(() => {
     const set = new Set<string>();
     events.forEach((e) => {
@@ -48,6 +51,18 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
       return true;
     });
   }, [events, search, selectedAction, selectedFile, currentProject]);
+
+  // The four KPI cards describe ONE set of rows. Reading uniqueFiles.length in
+  // the strip left "UNIQUE FILES CHURNED" describing the whole history while its
+  // three siblings reduced over filteredEvents, so any filter left the four
+  // cards disagreeing about what they were counting.
+  const filteredUniqueFiles = useMemo(() => {
+    const set = new Set<string>();
+    filteredEvents.forEach((e) => {
+      if (e.file_path) set.add(e.file_path);
+    });
+    return set.size;
+  }, [filteredEvents]);
 
   // Selected event for detail pane
   const currentEvent = useMemo(() => {
@@ -146,19 +161,19 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
           <div className="panel-raised p-2.5 font-mono text-xs">
             <div className="text-[10px] text-slate-400">TOTAL INSERTIONS</div>
             <div className="text-emerald-400 font-bold text-sm mt-0.5">
-              +{filteredEvents.reduce((acc, e) => acc + (e.added_lines ?? (e.action === 'ADDED' ? e.lines_of_code || 10 : 0)), 0).toLocaleString()} lines
+              +{filteredEvents.reduce((acc, e) => acc + e.added_lines, 0).toLocaleString()} lines
             </div>
           </div>
           <div className="panel-raised p-2.5 font-mono text-xs">
             <div className="text-[10px] text-slate-400">TOTAL DELETIONS</div>
             <div className="text-rose-400 font-bold text-sm mt-0.5">
-              -{filteredEvents.reduce((acc, e) => acc + (e.deleted_lines ?? (e.action === 'DELETED' ? e.lines_of_code || 10 : 0)), 0).toLocaleString()} lines
+              -{filteredEvents.reduce((acc, e) => acc + e.deleted_lines, 0).toLocaleString()} lines
             </div>
           </div>
           <div className="panel-raised p-2.5 font-mono text-xs">
             <div className="text-[10px] text-slate-400">UNIQUE FILES CHURNED</div>
             <div className="text-cyan-300 font-bold text-sm mt-0.5">
-              {uniqueFiles.length} files
+              {filteredUniqueFiles} files
             </div>
           </div>
           <div className="panel-raised p-2.5 font-mono text-xs">
@@ -190,8 +205,8 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
 
             {filteredEvents.map((e) => {
               const isSelected = currentEvent?.event_id === e.event_id;
-              const added = e.added_lines ?? 0;
-              const deleted = e.deleted_lines ?? 0;
+              const added = e.added_lines;
+              const deleted = e.deleted_lines;
               const start = e.start_line ?? 0;
               const end = e.end_line ?? 0;
 

@@ -22,12 +22,18 @@ func TestUpdateSettingsCanClearIgnorePatterns(t *testing.T) {
 
 	engine := NewEngine(Config{RepoName: "settings-clear-regression"})
 
-	cleared := engine.UpdateSettings(AppSettings{IgnorePatterns: []string{}})
+	cleared, err := engine.UpdateSettings(AppSettings{IgnorePatterns: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cleared.IgnorePatterns) != 0 {
 		t.Fatalf("explicit empty ignore_patterns was ignored: got %#v, want []", cleared.IgnorePatterns)
 	}
 
-	preserved := engine.UpdateSettings(AppSettings{DebounceMs: 333})
+	preserved, err := engine.UpdateSettings(AppSettings{DebounceMs: 333})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !reflect.DeepEqual(preserved.IgnorePatterns, []string{}) {
 		t.Fatalf("omitted ignore_patterns should preserve the current list: got %#v, want []", preserved.IgnorePatterns)
 	}
@@ -51,10 +57,13 @@ func TestUpdateSettingsCanSetRuntimePaths(t *testing.T) {
 
 	engine := NewEngine(Config{RepoName: "settings-path-regression"})
 
-	updated := engine.UpdateSettings(AppSettings{
+	updated, err := engine.UpdateSettings(AppSettings{
 		DBPath:     "/tmp/custom-wrongtrace.db",
 		SocketPath: "/tmp/custom-wrongtrace.sock",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if updated.DBPath != "/tmp/custom-wrongtrace.db" {
 		t.Fatalf("DBPath = %q, want custom path from settings update", updated.DBPath)
 	}

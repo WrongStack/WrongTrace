@@ -40,7 +40,7 @@ func (e *Engine) ActiveRuns() []ActiveRun {
 			if m.ProjectID != "" && m.ProjectID != activeProj.ID {
 				continue
 			}
-			if m.ProjectSlug != "" && !strings.EqualFold(m.ProjectSlug, activeProj.Name) && !strings.EqualFold(m.ProjectSlug, activeProj.ID) {
+			if m.ProjectID == "" && m.ProjectSlug != "" && !strings.EqualFold(m.ProjectSlug, activeProj.Name) && !strings.EqualFold(m.ProjectSlug, activeProj.ID) {
 				continue
 			}
 		}

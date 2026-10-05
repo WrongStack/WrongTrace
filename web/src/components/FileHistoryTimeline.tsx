@@ -57,8 +57,8 @@ function groupIntoRevisions(events: EventRecord[]): FileRevision[] {
     if (last && Number.isFinite(t) && Number.isFinite(lastT) && t - lastT <= REVISION_BURST_MS) {
       last.events.push(ev);
       last.endTime = ev.event_time;
-      last.added += ev.added_lines || 0;
-      last.deleted += ev.deleted_lines || 0;
+      last.added += ev.added_lines;
+      last.deleted += ev.deleted_lines;
       if (ev.author_model && !last.models.includes(ev.author_model)) last.models.push(ev.author_model);
       if (ev.action === 'ADDED') last.hasAdded = true;
       else if (ev.action === 'DELETED') last.hasDeleted = true;
@@ -70,8 +70,8 @@ function groupIntoRevisions(events: EventRecord[]): FileRevision[] {
         key: ev.event_id,
         startTime: ev.event_time,
         endTime: ev.event_time,
-        added: ev.added_lines || 0,
-        deleted: ev.deleted_lines || 0,
+        added: ev.added_lines,
+        deleted: ev.deleted_lines,
         events: [ev],
         models: ev.author_model ? [ev.author_model] : [],
         hasAdded: ev.action === 'ADDED',

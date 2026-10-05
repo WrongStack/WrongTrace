@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -44,7 +45,9 @@ func TestDecodeJSONLRowMatchesFullDecode(t *testing.T) {
 	}
 	for _, l := range lines {
 		var full map[string]interface{}
-		fullErr := json.Unmarshal([]byte(l), &full)
+		decoder := json.NewDecoder(bytes.NewReader([]byte(l)))
+		decoder.UseNumber()
+		fullErr := decoder.Decode(&full)
 		got, err := decodeJSONLRow([]byte(l))
 		if (err == nil) != (fullErr == nil) {
 			t.Fatalf("%s: error mismatch: %v vs %v", l, err, fullErr)

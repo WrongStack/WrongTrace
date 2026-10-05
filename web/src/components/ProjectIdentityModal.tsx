@@ -175,7 +175,7 @@ export function ProjectIdentityModal({
             <div className="p-2.5 rounded-lg bg-cyan-950/20 border border-cyan-500/30 space-y-1">
               <div className="text-[11px] text-cyan-400 font-semibold">⚡ WrongStack</div>
               <div className="text-base font-bold text-cyan-300 font-mono">
-                {sessions.wrongstack || 1} <span className="text-[10px] font-normal text-slate-500">sessions</span>
+                {sessions.wrongstack || 0} <span className="text-[10px] font-normal text-slate-500">sessions</span>
               </div>
             </div>
 

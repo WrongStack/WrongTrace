@@ -241,6 +241,31 @@ func TestHandleFileChange_RecentlyCreatedFileEmitsAdded(t *testing.T) {
 	}
 }
 
+func TestHandleFileChange_FutureBirthTimeBaselines(t *testing.T) {
+	e, store, parser := newAtlasTestEngine(t)
+	// A clock rollback or skewed filesystem can report a birth time ahead of
+	// the observer. Negative age is not evidence of a recent creation.
+	withBirthTime(t, func(string, os.FileInfo) (time.Time, bool) {
+		return time.Now().Add(24 * time.Hour), true
+	})
+	path := writeFixture(t, t.TempDir(), "x/skewed.go", auditThreeFuncs)
+	e.HandleFileChange(context.Background(), path)
+	if got := actionCounts(t, store); len(got) != 0 {
+		t.Fatalf("future birth time emitted false ADDED events: %v", got)
+	}
+	if _, ok := parser.Snapshot(path); !ok {
+		t.Fatal("future birth time did not establish a silent baseline")
+	}
+
+	if err := os.WriteFile(path, []byte(strings.Replace(auditThreeFuncs, "return 1", "return 11", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.HandleFileChange(context.Background(), path)
+	if got := actionCounts(t, store); len(got) != 1 || got["MODIFIED"] != 1 {
+		t.Fatalf("subsequent edit events = %v, want one MODIFIED and no ADDED", got)
+	}
+}
+
 func TestHandleFileChange_UnknownBirthTimeBaselines(t *testing.T) {
 	e, store, _ := newAtlasTestEngine(t)
 	withBirthTime(t, func(string, os.FileInfo) (time.Time, bool) { return time.Time{}, false })
@@ -272,6 +297,53 @@ func TestHandleFileChange_RecreateAfterDeleteEmitsAdded(t *testing.T) {
 	}
 	if n := len(e.tombstones); n != 0 {
 		t.Fatalf("tombstone not consumed: %d left", n)
+	}
+}
+
+// Two files whose names differ only in case have separate identities on a
+// case-sensitive filesystem; deleting one must not mark the other as created.
+func TestHandleFileChange_CaseDistinctTombstoneDoesNotCrossFiles(t *testing.T) {
+	e, store, parser := newAtlasTestEngine(t)
+	withBirthTime(t, birthAgo(24*time.Hour))
+	dir := t.TempDir()
+	upper := writeFixture(t, dir, "x/Foo.go", auditThreeFuncs)
+	e.PrimeDirectory(dir)
+	lower := writeFixture(t, dir, "x/foo.go", auditThreeFuncs)
+	upperInfo, err := os.Stat(upper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowerInfo, err := os.Stat(lower)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(upperInfo, lowerInfo) {
+		t.Skip("requires a case-sensitive filesystem with distinct Foo.go and foo.go")
+	}
+	if _, ok := parser.Snapshot(lower); ok {
+		t.Fatal("lowercase file unexpectedly has a cached snapshot")
+	}
+
+	ctx := context.Background()
+	if err := os.Remove(upper); err != nil {
+		t.Fatal(err)
+	}
+	e.HandleFileChange(ctx, upper)
+	if got := actionCounts(t, store); len(got) != 1 || got["DELETED"] != 3 {
+		t.Fatalf("deleted uppercase file events = %v, want 3 DELETED", got)
+	}
+	e.HandleFileChange(ctx, lower)
+	if got := actionCounts(t, store); len(got) != 1 || got["DELETED"] != 3 {
+		t.Fatalf("unseen lowercase file consumed another path's tombstone: %v, want only 3 DELETED", got)
+	}
+	if _, ok := parser.Snapshot(lower); !ok {
+		t.Fatal("unseen lowercase file did not establish a baseline")
+	}
+
+	writeFixture(t, dir, "x/Foo.go", auditThreeFuncs)
+	e.HandleFileChange(ctx, upper)
+	if got := actionCounts(t, store); len(got) != 2 || got["DELETED"] != 3 || got["ADDED"] != 3 {
+		t.Fatalf("recreated uppercase file events = %v, want 3 DELETED and 3 ADDED", got)
 	}
 }
 

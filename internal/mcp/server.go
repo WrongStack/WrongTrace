@@ -48,6 +48,26 @@ type jsonRPCRequest struct {
 	Method  string                 `json:"method"`
 	Params  map[string]interface{} `json:"params,omitempty"`
 	ID      interface{}            `json:"id,omitempty"`
+
+	// idPresent distinguishes an omitted JSON member from an explicit null.
+	// JSON-RPC treats only the former as a notification; both decode ID to nil
+	// when the field is interface{} without this presence bit.
+	idPresent bool
+}
+
+func (r *jsonRPCRequest) UnmarshalJSON(data []byte) error {
+	type requestAlias jsonRPCRequest
+	var wire requestAlias
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*r = jsonRPCRequest(wire)
+	_, r.idPresent = members["id"]
+	return nil
 }
 
 type jsonRPCResponse struct {
@@ -100,8 +120,9 @@ func ServeStdio(sink EngineSink) error {
 			})
 			continue
 		}
-		// Notifications carry no id: handle state changes, write no response.
-		if req.ID == nil {
+		// Notifications omit the id member; an explicit JSON null is still a
+		// request and must receive a response with id null.
+		if !req.idPresent {
 			continue
 		}
 		resp := dispatch(sink, &req)

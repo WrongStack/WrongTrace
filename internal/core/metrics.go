@@ -22,6 +22,11 @@ type MetricsSnapshot struct {
 type cachedMetrics struct {
 	gen      uint64
 	cachedAt time.Time
+	// readGen and readAt track the read-derived pair (Overview, Models)
+	// separately from the generation-keyed whole snapshot, because those two
+	// fields are not a function of cacheGen. See refreshReadDerived.
+	readGen  uint64
+	readAt   time.Time
 	snapshot MetricsSnapshot
 }
 
@@ -44,6 +49,80 @@ func (e *Engine) metricsFilter(repoFilter ...string) string {
 // drift of the time-windowed aggregates. At 2s it expired between the
 // dashboard's parallel fetches and re-ran the heavy scans for each of them.
 const metricsCacheTTL = 30 * time.Second
+
+// readDerivedTTL bounds how long the read-derived pair of a cached snapshot may
+// lag a file_read_events write.
+//
+// Overview and ModelComparison are NOT derived from code events and runs alone:
+// both build their repo-scoped run set from code_node_events UNION
+// file_read_events (internal/db/db.go:243 and internal/db/queries.go:654), so
+// Engine.RecordReadEvent can change either without bumping cacheGen. Thrashing
+// and RecentEvents come from code_node_events only and are unaffected.
+//
+// RecordReadEvent is the highest-frequency write in the system — dozens per
+// agent turn — so bumping the main generation on every read would make
+// metricsCacheTTL useless during exactly the sessions the TTL exists to serve.
+// Instead the read-derived pair carries its own clock: these two queries
+// re-run, while the other two keep the full 30s. That is still strictly fewer
+// queries per dashboard poll than the pre-split 2s TTL performed, which is what
+// motivated raising it in the first place.
+const readDerivedTTL = 2 * time.Second
+
+// refreshReadDerived re-runs ONLY the read-derived queries when the cached copy
+// has aged past readDerivedTTL, and writes the result back under the same
+// generation. Thrashing and RecentEvents are reused untouched.
+//
+// The snapshot is passed and returned by value, so replacing Overview/Models
+// never mutates slices a concurrent reader is holding, and the write-back is
+// guarded on cacheGen so a bump racing the refresh discards it instead of
+// resurrecting an entry the bump already invalidated.
+//
+// Concurrent callers may both refresh. The result is identical and the cache
+// stays consistent, which is cheaper than a second single-flight map and still
+// below the pre-split query count.
+func (e *Engine) refreshReadDerived(filter string, snap MetricsSnapshot) (MetricsSnapshot, error) {
+	e.cacheMu.RLock()
+	cached, ok := e.metricsCache[filter]
+	// Two independent reasons to re-run the read-derived pair:
+	//  1. a read event has landed since the pair was built (readGen), which is
+	//     the in-process case RecordReadEvent drives; and
+	//  2. the pair has simply aged past readDerivedTTL, which covers writes made
+	//     straight to the database by another process and the drift of the
+	//     time-windowed aggregates.
+	stale := ok && cached.gen == e.cacheGen &&
+		(cached.readGen != e.readGen || time.Since(cached.readAt) >= readDerivedTTL)
+	e.cacheMu.RUnlock()
+	if !stale {
+		return snap, nil
+	}
+	store := e.Store()
+	if store == nil {
+		return snap, nil
+	}
+
+	overview, err := store.Overview(filter)
+	if err != nil {
+		return MetricsSnapshot{}, err
+	}
+	models, err := store.ModelComparison(filter)
+	if err != nil {
+		return MetricsSnapshot{}, err
+	}
+
+	snap.Overview = overview
+	snap.Models = models
+
+	e.cacheMu.Lock()
+	if cur, ok := e.metricsCache[filter]; ok && cur.gen == e.cacheGen {
+		cur.snapshot.Overview = overview
+		cur.snapshot.Models = models
+		cur.readGen = e.readGen
+		cur.readAt = time.Now()
+		e.metricsCache[filter] = cur
+	}
+	e.cacheMu.Unlock()
+	return snap, nil
+}
 
 // metricsCall is one in-flight snapshot build that concurrent callers share.
 type metricsCall struct {
@@ -77,7 +156,7 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 	filter := e.metricsFilter(repoFilter...)
 
 	if cached, ok := e.metricsCacheFresh(filter); ok {
-		return cached, nil
+		return e.refreshReadDerived(filter, cached)
 	}
 
 	e.cacheMu.Lock()
@@ -152,9 +231,12 @@ func (e *Engine) buildMetrics(filter string, gen uint64) (MetricsSnapshot, error
 	if e.metricsCache == nil {
 		e.metricsCache = make(map[string]cachedMetrics)
 	}
+	now := time.Now()
 	e.metricsCache[filter] = cachedMetrics{
 		gen:      gen,
-		cachedAt: time.Now(),
+		cachedAt: now,
+		readGen:  e.readGen,
+		readAt:   now,
 		snapshot: res,
 	}
 	e.cacheMu.Unlock()
@@ -199,7 +281,11 @@ func (e *Engine) ThrashingRows(repoFilter ...string) ([]db.ThrashingRow, error) 
 func (e *Engine) ModelRows(repoFilter ...string) ([]db.ModelRow, error) {
 	filter := e.metricsFilter(repoFilter...)
 	if cached, ok := e.metricsCacheFresh(filter); ok {
-		return cached.Models, nil
+		refreshed, err := e.refreshReadDerived(filter, cached)
+		if err != nil {
+			return nil, err
+		}
+		return refreshed.Models, nil
 	}
 	if snap, ok := e.metricsInFlight(filter); ok {
 		return snap.Models, nil

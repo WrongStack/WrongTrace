@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -645,12 +646,12 @@ func TestParseAiderHistory_SessionIDFollowsPath(t *testing.T) {
 	}
 
 	// Same convention as JSONL transcripts (sessionIDForPath): parent
-	// directory + "-" + base name without extension.
-	if alpha[0].SessionID != "ws-alpha-.aider.chat.history" {
-		t.Errorf("ws-alpha session id = %q, want ws-alpha-.aider.chat.history", alpha[0].SessionID)
+	// directory + "-" + base name without extension, plus path fingerprint.
+	if !strings.HasPrefix(alpha[0].SessionID, "ws-alpha-.aider.chat.history-") {
+		t.Errorf("ws-alpha session id lacks its readable prefix: %q", alpha[0].SessionID)
 	}
-	if beta[0].SessionID != "ws-beta-.aider.chat.history" {
-		t.Errorf("ws-beta session id = %q, want ws-beta-.aider.chat.history", beta[0].SessionID)
+	if !strings.HasPrefix(beta[0].SessionID, "ws-beta-.aider.chat.history-") {
+		t.Errorf("ws-beta session id lacks its readable prefix: %q", beta[0].SessionID)
 	}
 
 	// Stable across re-reads of the same file: the id keys dedup and the

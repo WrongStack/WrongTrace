@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -50,6 +51,9 @@ func NewCollector(cfg Config) *Collector {
 
 // IngestReport stores a single structured profiler or test runner record.
 func (c *Collector) IngestReport(p ProfilerReportPayload) (TraceEvent, error) {
+	if math.IsNaN(p.DurationMs) || math.IsInf(p.DurationMs, 0) || math.IsNaN(p.CPUUsagePct) || math.IsInf(p.CPUUsagePct, 0) {
+		return TraceEvent{}, fmt.Errorf("profiler duration_ms and cpu_usage_pct must be finite")
+	}
 	if p.ServiceName == "" {
 		p.ServiceName = "app"
 	}
@@ -64,7 +68,10 @@ func (c *Collector) IngestReport(p ProfilerReportPayload) (TraceEvent, error) {
 		}
 	}
 
-	metaJSON, _ := json.Marshal(p.Metadata)
+	metaJSON, err := json.Marshal(p.Metadata)
+	if err != nil {
+		return TraceEvent{}, fmt.Errorf("marshal profiler metadata: %w", err)
+	}
 
 	ev := TraceEvent{
 		TraceID:       randomID("tr"),
@@ -158,7 +165,7 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 						if attr.Value.IntValue > 0 {
 							statusCode = int(attr.Value.IntValue)
 						} else if attr.Value.StringValue != "" {
-							if code, err := strconv.Atoi(attr.Value.StringValue); err == nil {
+							if code, err := strconv.Atoi(attr.Value.StringValue); err == nil && code > 0 {
 								statusCode = code
 							}
 						}
@@ -189,8 +196,8 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 				}
 
 				var durationMs float64
-				startNano, _ := strconv.ParseUint(span.StartTimeUnixNano, 10, 64)
-				endNano, _ := strconv.ParseUint(span.EndTimeUnixNano, 10, 64)
+				startNano, _ := strconv.ParseUint(string(span.StartTimeUnixNano), 10, 64)
+				endNano, _ := strconv.ParseUint(string(span.EndTimeUnixNano), 10, 64)
 				if endNano > startNano && startNano > 0 {
 					durationMs = float64(endNano-startNano) / 1e6
 				}
@@ -364,6 +371,7 @@ func (c *Collector) Recent(limit int) ([]TraceEvent, error) {
 	out := make([]TraceEvent, limit)
 	for i := 0; i < limit; i++ {
 		out[i] = c.recent[len(c.recent)-1-i]
+		out[i].Metadata = cloneTraceMetadata(out[i].Metadata)
 	}
 	return out, nil
 }
@@ -376,7 +384,39 @@ func (c *Collector) Overview() (db.ProfilerOverviewRow, error) {
 	return db.ProfilerOverviewRow{}, nil
 }
 
+// cloneTraceMetadata copies the mutable JSON/OTLP containers while preserving
+// scalar types (including int64) and nil versus empty container shapes.
+func cloneTraceMetadata(metadata map[string]interface{}) map[string]interface{} {
+	if metadata == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(metadata))
+	for key, value := range metadata {
+		out[key] = cloneTraceValue(value)
+	}
+	return out
+}
+
+func cloneTraceValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		return cloneTraceMetadata(v)
+	case []interface{}:
+		if v == nil {
+			return v
+		}
+		out := make([]interface{}, len(v))
+		for i, item := range v {
+			out[i] = cloneTraceValue(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
 func (c *Collector) recordRecent(ev TraceEvent) {
+	ev.Metadata = cloneTraceMetadata(ev.Metadata)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.recent) >= c.maxRecent {

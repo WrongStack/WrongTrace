@@ -6,7 +6,7 @@
 
 Watches your code with Tree-sitter, correlates AST-level edits with path-scoped agent tool operations, ingests OpenTelemetry/profiler runtime traces, tracks inter-agent code collisions ("Who Broke Whose Code?"), provides an interactive Code Atlas with full-screen graph visualization, serves an embedded React dashboard, and operates an AI Gateway observer — all from a single, high-performance Go binary.
 
-[![Version](https://img.shields.io/badge/Version-0.3.16-blue.svg?style=flat)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-0.3.17-blue.svg?style=flat)](CHANGELOG.md)
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-purple.svg)](LICENSE)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat&logo=react)](https://react.dev)
@@ -194,6 +194,12 @@ export GEMINI_API_BASE="http://localhost:3444/proxy/generativelanguage.googleapi
 Response caching is disabled unless a request explicitly sends
 `X-WrongTrace-Cache: allow`. Cache keys are isolated by credential, project,
 agent, and session scope; authorization material itself is never stored.
+
+OpenAI `/v1/responses` telemetry supports JSON and SSE responses, including
+input/output usage, cached input, reasoning tokens, text, and function/custom
+tool calls. Completed snapshots provide authoritative usage; cached input is
+already part of the input total. Stream deltas and final snapshots are combined
+without counting the same tool call or output twice.
 
 Wire analysis, run correlation, traffic persistence, quota accounting, and
 response-cache fill all run on a background finalize pipeline **after** the

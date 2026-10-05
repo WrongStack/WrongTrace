@@ -19,6 +19,7 @@ import {
 import type { ModelRow, EventRecord, FileReadRecord } from '../types';
 import { isJunkModel } from '../types';
 import { useRecentReads } from '../hooks/useMetrics';
+import { getGradeBadge } from '../lib/grade';
 
 interface ModelIntelligenceMatrixProps {
   models: ModelRow[];
@@ -30,19 +31,6 @@ interface ModelIntelligenceMatrixProps {
 function fmtUSD(n: number): string {
   if (!n || n <= 0) return '$0.0000';
   return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
-}
-
-function getGradeBadge(survivalRate: number, costPerNode: number, blendedCost: number) {
-  if (survivalRate >= 85 && (costPerNode <= blendedCost || costPerNode === 0)) {
-    return { label: 'S-TIER', color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-emerald-500/10' };
-  }
-  if (survivalRate >= 70) {
-    return { label: 'A-TIER', color: 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40 shadow-cyan-500/10' };
-  }
-  if (survivalRate >= 50) {
-    return { label: 'B-TIER', color: 'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-amber-500/10' };
-  }
-  return { label: 'C-TIER', color: 'bg-rose-500/20 text-rose-300 border-rose-500/40 shadow-rose-500/10' };
 }
 
 export function ModelIntelligenceMatrix({
@@ -90,7 +78,7 @@ export function ModelIntelligenceMatrix({
           : 0;
 
       const productiveSpend = Math.max(0, m.total_cost_usd - wasteSpend);
-      const grade = getGradeBadge(m.survival_rate_pct, m.cost_per_surviving_node, blendedCost);
+      const grade = getGradeBadge(m.survival_rate_pct, m.cost_per_surviving_node, blendedCost, m.total_survived_nodes > 0);
 
       return {
         ...m,

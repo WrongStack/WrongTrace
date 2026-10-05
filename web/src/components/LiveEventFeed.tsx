@@ -177,8 +177,8 @@ export function LiveEventFeed({ events, loading }: LiveEventFeedProps) {
           const hasDiff = !!e.diff_snippet;
           const startLine = e.start_line ?? 0;
           const endLine = e.end_line ?? 0;
-          const added = e.added_lines ?? 0;
-          const deleted = e.deleted_lines ?? 0;
+          const added = e.added_lines;
+          const deleted = e.deleted_lines;
 
           return (
             <li

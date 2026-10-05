@@ -97,6 +97,18 @@ export function ModelFrictionMatrix() {
     });
   }, [rawCollisions, filterMode, selectedPair, searchQuery]);
 
+  // The Go producer leaves top_friction_pair EMPTY when no edge qualifies as
+  // friction (queries.go frictionPair(): self-thrash and the "unknown"
+  // missing-attribution sentinel are both skipped), while TotalCollisions
+  // still counts every edge. An empty pair therefore means "no INTER-MODEL
+  // friction", never "no collisions" — rendering it as "No collisions yet"
+  // contradicted the Total Overwrites card sitting beside it.
+  const topFrictionLabel =
+    frictionReport?.top_friction_pair ||
+    (frictionReport && frictionReport.total_collisions > 0
+      ? 'No inter-model friction'
+      : 'No collisions yet');
+
   return (
     <div className="panel space-y-5 bg-gradient-to-b from-slate-900/95 via-slate-950/90 to-slate-900/95 border border-rose-500/20 shadow-2xl rounded-2xl p-5">
       {/* Header */}
@@ -215,8 +227,8 @@ export function ModelFrictionMatrix() {
             <span>Top Friction Vector</span>
             <Flame className="h-3.5 w-3.5 text-cyan-400" />
           </div>
-          <div className="font-mono text-xs font-bold text-cyan-300 mt-1 truncate" title={frictionReport?.top_friction_pair || 'None'}>
-            {frictionReport?.top_friction_pair || 'No collisions yet'}
+          <div className="font-mono text-xs font-bold text-cyan-300 mt-1 truncate" title={topFrictionLabel}>
+            {topFrictionLabel}
           </div>
           <div className="text-[10px] text-slate-500 font-mono">Highest friction pair</div>
         </div>

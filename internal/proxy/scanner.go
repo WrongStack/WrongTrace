@@ -121,10 +121,28 @@ func isKeyByte(c byte) bool {
 	return c == '-' || isWordByte(c)
 }
 
+// minScanBytes is the shortest byte sequence ANY credential pattern above can
+// match, so nothing shorter can hide a credential and may skip the scan:
+//
+//	dbURLRe:         "redis://" + user(>=1) + ":" + pw(>=1) + "@" = 12
+//	genericSecretRe: "passwd" + "=" + value(>=8)                  = 15
+//
+// The previous threshold of 16 sat ABOVE that floor, so every input of 12-15
+// bytes skipped redaction even when it was a complete, matchable credential
+// (the 15-byte "passwd=abcd1234" assignment, or the 12-byte shortest
+// redis-style URL with its password) — its own pre-filter markers ("passwd",
+// "://"+"redis") pass for those inputs, so only this guard stood between the
+// secret and the caller. That matters because the redactor is invoked per
+// SUBSTRING, not only on whole bodies: maskJSONValue scans each JSON string
+// value and maskNonJSONBody scans each line, and short values are exactly the
+// ones below the old floor. Keep this derived from the patterns: a threshold
+// above the true minimum silently disables redaction.
+const minScanBytes = 12
+
 // ScanAndRedactSecrets inspects request payloads for confidential secrets and masks them before sending to LLMs.
 // Uses fast-path substring checks so multi-megabyte payloads bypass expensive regex scans when no matching tokens exist.
 func ScanAndRedactSecrets(body []byte) ([]byte, int) {
-	if len(body) < 16 {
+	if len(body) < minScanBytes {
 		return body, 0
 	}
 

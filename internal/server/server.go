@@ -68,7 +68,7 @@ type EngineAPI interface {
 	RescanAllProjects() []core.ProjectProfile
 	RemoveProject(id string) error
 	GetSettings() core.AppSettings
-	UpdateSettings(s core.AppSettings) core.AppSettings
+	UpdateSettings(s core.AppSettings) (core.AppSettings, error)
 	VacuumDB() error
 	ClearStale(days int) (int64, error)
 	GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error)

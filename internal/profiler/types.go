@@ -27,14 +27,14 @@ type TraceEvent struct {
 
 // OTLPSpan represents a single OpenTelemetry span structure.
 type OTLPSpan struct {
-	TraceID           string          `json:"traceId"`
-	SpanID            string          `json:"spanId"`
-	Name              string          `json:"name"`
-	Kind              otlpEnumName    `json:"kind"`
-	StartTimeUnixNano string          `json:"startTimeUnixNano"`
-	EndTimeUnixNano   string          `json:"endTimeUnixNano"`
-	Attributes        []OTLPAttribute `json:"attributes"`
-	Status            *OTLPStatus     `json:"status,omitempty"`
+	TraceID           string           `json:"traceId"`
+	SpanID            string           `json:"spanId"`
+	Name              string           `json:"name"`
+	Kind              otlpEnumName     `json:"kind"`
+	StartTimeUnixNano otlpUint64String `json:"startTimeUnixNano"`
+	EndTimeUnixNano   otlpUint64String `json:"endTimeUnixNano"`
+	Attributes        []OTLPAttribute  `json:"attributes"`
+	Status            *OTLPStatus      `json:"status,omitempty"`
 }
 
 // otlpEnumName is an OTLP enum field kept in the canonical textual form
@@ -112,6 +112,28 @@ func (n *otlpInt64) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("invalid otlp intValue %s: %w", string(b), err)
 	}
 	*n = otlpInt64(parsed)
+	return nil
+}
+
+// otlpUint64String preserves an OTLP fixed64/uint64 wire value exactly while
+// accepting both decimal-string and bare-number spellings. Keeping the raw
+// validated digits avoids float64 precision loss for nanosecond timestamps.
+// Absent and null values retain protobuf's zero value; empty, negative, and
+// overflowing text remain errors rather than silently becoming zero.
+type otlpUint64String string
+
+// UnmarshalJSON accepts both spec-permitted fixed64/uint64 spellings without
+// passing through float64, so MaxUint64 and full nanosecond precision survive.
+func (n *otlpUint64String) UnmarshalJSON(b []byte) error {
+	text, ok := otlpEnumText(b)
+	if !ok {
+		*n = ""
+		return nil
+	}
+	if _, err := strconv.ParseUint(text, 10, 64); err != nil {
+		return fmt.Errorf("invalid otlp fixed64/uint64 %s: %w", string(b), err)
+	}
+	*n = otlpUint64String(text)
 	return nil
 }
 

@@ -41,9 +41,11 @@ type SessionWatcher struct {
 
 	// seenEmitted counts events already delivered per whole-file transcript
 	// (Cline/Roo JSON, Aider history); seenFingerprints hashes the bytes just
-	// before each JSONL offset. Both persist with the offsets (cursor.go).
+	// before each JSONL offset. seenContexts carries model/intent; all three
+	// persist with the offsets (cursor.go).
 	seenEmitted      map[string]int
 	seenFingerprints map[string]uint64
+	seenContexts     map[string]jsonlContext
 
 	// dirCache remembers what each directory looked like on the previous poll
 	// so dormant ones can be skipped. It has its own mutex because directory
@@ -65,6 +67,7 @@ func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 		seenOffsets:      make(map[string]int64),
 		seenEmitted:      make(map[string]int),
 		seenFingerprints: make(map[string]uint64),
+		seenContexts:     make(map[string]jsonlContext),
 		onToolCall:       onToolCall,
 		scanDepth:        maxScanDepthFromEnv(),
 	}
@@ -248,6 +251,7 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 	}
 	emitted, countKnown := sw.seenEmitted[path]
 	fingerprint, hasFingerprint := sw.seenFingerprints[path]
+	context := sw.seenContexts[path]
 
 	// A whole-file transcript the cursor already knows but has no delivered
 	// count for — baselined on a fresh install, or restored from a checkpoint
@@ -255,12 +259,10 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 	// Emitting there would replay its entire history as new events.
 	recount := wholeFile && seen && !countKnown
 
-	// Exact equality only: a file that SHRANK below its persisted offset was
-	// truncated or rewritten and must fall through to the truncation rule
-	// (re-ingest from byte 0), never be skipped. The mtime arm cannot save it
-	// on the checkpoint-restore path — there st.modTime is the file's current
-	// mtime, so the arm is always true.
-	if seen && !recount && currentSize == st.offset && !modTime.After(st.modTime) {
+	// Only equal size and mtime can skip parsing: a smaller file was truncated,
+	// while an older mtime can mean a same-size transcript was restored from
+	// a backup. The JSONL fingerprint detects changed content in that case.
+	if seen && !recount && currentSize == st.offset && modTime.Equal(st.modTime) {
 		sw.mu.Unlock()
 		return
 	}
@@ -284,6 +286,7 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 			offset:         lastOffset,
 			fingerprint:    fingerprint,
 			hasFingerprint: hasFingerprint,
+			context:        context,
 		})
 		newOffset = cursor.offset
 	case kindJSON:
@@ -324,6 +327,7 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 		sw.seenEmitted[path] = total
 	}
 	if kind == kindJSONL {
+		sw.seenContexts[path] = cursor.context
 		if cursor.hasFingerprint {
 			sw.seenFingerprints[path] = cursor.fingerprint
 		} else {
@@ -397,6 +401,7 @@ func (sw *SessionWatcher) pruneMissingFiles(now time.Time) {
 			delete(sw.seenOffsets, path)
 			delete(sw.seenEmitted, path)
 			delete(sw.seenFingerprints, path)
+			delete(sw.seenContexts, path)
 			sw.cursorDirty = true
 			sw.cursorVersion++
 		}

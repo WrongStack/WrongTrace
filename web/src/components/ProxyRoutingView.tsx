@@ -113,9 +113,9 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
       if (statusFilter === 'reasoning' && !t.reasoning && !(t.reasoning_tokens && t.reasoning_tokens > 0)) return false;
       if (projectScope === 'current' && currentProject) {
         const matchesProj =
-          (t.project_id && t.project_id === currentProject.id) ||
-          (t.project_slug && t.project_slug.toLowerCase() === currentProject.name.toLowerCase()) ||
-          (!t.project_id && !t.project_slug);
+          t.project_id
+            ? t.project_id === currentProject.id
+            : !t.project_slug || t.project_slug.toLowerCase() === currentProject.name.toLowerCase();
         if (!matchesProj) return false;
       }
       if (!trafficFilter) return true;
@@ -340,14 +340,13 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
   }, [traffic]);
 
   useEffect(() => {
-    if (!selectedTraffic && filteredTraffic.length > 0) {
-      setSelectedTraffic(filteredTraffic[0]);
-    }
+    if (selectedTraffic && filteredTraffic.some((t) => t.id === selectedTraffic.id)) return;
+    setSelectedTraffic(filteredTraffic[0] ?? null);
   }, [filteredTraffic, selectedTraffic]);
 
-  const selectedTrafficSummary = selectedTraffic;
+  const selectedTrafficSummary = filteredTraffic.find((t) => t.id === selectedTraffic?.id) ?? null;
   const selectedTrafficDetail = useProxyTrafficDetail(selectedTrafficSummary?.id);
-  const activeSelectedTraffic = selectedTrafficDetail.data ?? selectedTrafficSummary;
+  const activeSelectedTraffic = selectedTrafficSummary ? (selectedTrafficDetail.data ?? selectedTrafficSummary) : null;
 
   const handleCopy = async (id: string, text: string) => {
     if (await copyToClipboard(text)) {

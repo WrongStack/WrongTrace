@@ -276,7 +276,7 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 		})
 		res := candidates[0].model
 		for _, c := range candidates {
-			if c.model.IsCanonical {
+			if c.model.IsCanonical && len(c.model.ModelID) == len(res.ModelID) {
 				res = c.model
 				break
 			}
@@ -664,9 +664,9 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 				ProviderID:         provSlug,
 				ProviderAPI:        provAPI,
 				NpmPackage:         provNPM,
-				InputPricePerM:     m.Cost.Input,
-				OutputPricePerM:    m.Cost.Output,
-				CacheReadPricePerM: m.Cost.CacheRead,
+				InputPricePerM:     sanitizePrice(m.Cost.Input),
+				OutputPricePerM:    sanitizePrice(m.Cost.Output),
+				CacheReadPricePerM: sanitizePrice(m.Cost.CacheRead),
 				ContextWindow:      m.Limit.Context,
 				Description:        m.Description,
 				IsCanonical:        isCanonical,
@@ -709,6 +709,22 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 	for k, v := range r.models {
 		if v.IsCustom {
 			nextModels[k] = v
+			// A preserved override owns its ID in every catalog index.
+			for pid, provider := range nextProviders {
+				for i, imported := range provider.Models {
+					if imported.ID != k {
+						continue
+					}
+					provider.Models = append(provider.Models[:i], provider.Models[i+1:]...)
+					provider.ModelCount = len(provider.Models)
+					if provider.ModelCount == 0 {
+						delete(nextProviders, pid)
+					} else {
+						nextProviders[pid] = provider
+					}
+					break
+				}
+			}
 			if v.ModelID != "" {
 				nextCanonicals[v.ModelID] = k
 			}

@@ -73,12 +73,22 @@ func compactIPCValue(value interface{}) interface{} {
 		}
 		sort.Strings(keys)
 		kept := 0
+		encodedSummary, _ := json.Marshal(summary)
+		usedBytes := len(encodedSummary)
 		for _, key := range keys {
 			if kept >= maxIPCSummaryScalars {
 				break
 			}
 			if scalar, ok := compactIPCScalar(object[key]); ok {
+				encodedKey, _ := json.Marshal(key)
+				encodedScalar, err := json.Marshal(scalar)
+				// Include JSON escaping, the colon and the new member's comma.
+				memberBytes := len(encodedKey) + len(encodedScalar) + 2
+				if err != nil || memberBytes > maxStoredIPCValueBytes-usedBytes {
+					continue
+				}
 				summary[key] = scalar
+				usedBytes += memberBytes
 				kept++
 			}
 		}

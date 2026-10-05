@@ -155,7 +155,10 @@ func (s *Server) Start() error {
 	s.wg.Add(1)
 	go s.acceptLoop(ctx)
 
-	log.Printf("ipc: listening on %s (%s)", s.cfg.SocketPath, runtime.GOOS)
+	// Log the path actually bound: on POSIX the configured path may have been
+	// replaced by the sun_path fallback, and the operator needs the endpoint
+	// agents can really reach.
+	log.Printf("ipc: listening on %s (%s)", bound, runtime.GOOS)
 	return nil
 }
 
@@ -197,6 +200,15 @@ func (s *Server) Stop() {
 
 // ConnectedCount reports the current number of live agent connections.
 func (s *Server) ConnectedCount() int { return int(s.connected.Load()) }
+
+// BoundPath reports the socket file this server actually BOUND. It differs from
+// Config.SocketPath after bindSocketPaths' POSIX sun_path fallback (the
+// configured path overflows sockaddr_un.sun_path, so the listener binds
+// $TMPDIR/wrongtrace.sock instead). Callers that ADVERTISE the endpoint — the
+// daemon's /api/health socket_path, whose contract is "the IPC endpoint the
+// daemon BOUND, if any" — must report this value: advertising the configured
+// path after a fallback points agents at a socket that does not exist.
+func (s *Server) BoundPath() string { return s.boundPath }
 
 // acceptLoop pumps accepted connections through the per-conn handler.
 func (s *Server) acceptLoop(ctx context.Context) {
@@ -277,7 +289,7 @@ func isClientDisconnect(err error) bool {
 // explicit "id": null, which still gets a response.
 type wireRequest struct {
 	JSONRPC string                 `json:"jsonrpc"`
-	Method  string                 `json:"method"`
+	Method  *string                `json:"method"`
 	Params  map[string]interface{} `json:"params,omitempty"`
 	ID      json.RawMessage        `json:"id,omitempty"`
 }
@@ -330,18 +342,45 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue // blank separator lines are not requests
 		}
-		var wire wireRequest
+		var wire *wireRequest
 		if err := json.Unmarshal(line, &wire); err != nil {
-			if !writeErrorLine(-32700, "parse error: "+err.Error()) {
+			code, prefix := -32700, "parse error: "
+			var typeErr *json.UnmarshalTypeError
+			if errors.As(err, &typeErr) && typeErr.Field != "params" {
+				code, prefix = -32600, "invalid request: "
+			}
+			if !writeErrorLine(code, prefix+err.Error()) {
+				return
+			}
+			continue
+		}
+		if wire == nil {
+			if !writeErrorLine(-32600, "invalid request: request must be an object") {
+				return
+			}
+			continue
+		}
+		if wire.Method == nil {
+			if !writeErrorLine(-32600, "invalid request: method must be a string") {
 				return
 			}
 			continue
 		}
 		isNotification := wire.ID == nil
-		req := Request{JSONRPC: wire.JSONRPC, Method: wire.Method, Params: wire.Params}
+		req := Request{JSONRPC: wire.JSONRPC, Method: *wire.Method, Params: wire.Params}
 		if !isNotification {
-			if err := json.Unmarshal(wire.ID, &req.ID); err != nil {
+			decoder := json.NewDecoder(bytes.NewReader(wire.ID))
+			decoder.UseNumber()
+			if err := decoder.Decode(&req.ID); err != nil {
 				req.ID = nil
+			}
+			switch req.ID.(type) {
+			case nil, string, json.Number:
+			default:
+				if !writeErrorLine(-32600, "invalid request: id must be a string, number, or null") {
+					return
+				}
+				continue
 			}
 		}
 		start := time.Now()
@@ -587,9 +626,11 @@ func (s *Server) dispatch(req *Request) Response {
 		if err != nil {
 			var conflict *LockConflictError
 			if errors.As(err, &conflict) {
+				existing := conflict.Existing
+				existing.OwnerRunID = ""
 				resp.Error = &RPCError{Code: -32602, Message: conflict.Error(), Data: map[string]interface{}{
 					"status":   "conflict",
-					"existing": conflict.Existing,
+					"existing": existing,
 				}}
 				return resp
 			}

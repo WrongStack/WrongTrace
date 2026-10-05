@@ -116,6 +116,7 @@ func (d *Dispatcher) Dispatch(p Payload) {
 	slackURL := d.cfg.SlackURL
 	discordURL := d.cfg.DiscordURL
 	genericURL := d.cfg.GenericURL
+	signingSecret := d.cfg.SigningSecret
 	d.mu.RUnlock()
 
 	if slackURL == "" && discordURL == "" && genericURL == "" {
@@ -136,7 +137,9 @@ func (d *Dispatcher) Dispatch(p Payload) {
 		// silently truncated any Timeout above it, and because the sends run
 		// sequentially the first slow endpoint ate the budget the rest needed.
 		timeout := d.deliveryTimeout()
-		d.deliver(d.sendGeneric, genericURL, p, timeout)
+		d.deliver(func(ctx context.Context, url string, p Payload) error {
+			return d.sendGeneric(ctx, url, p, signingSecret)
+		}, genericURL, p, timeout)
 		d.deliver(d.sendSlack, slackURL, p, timeout)
 		d.deliver(d.sendDiscord, discordURL, p, timeout)
 	}()
@@ -164,7 +167,7 @@ func (d *Dispatcher) deliver(send func(context.Context, string, Payload) error, 
 	_ = send(ctx, url, p)
 }
 
-func (d *Dispatcher) sendGeneric(ctx context.Context, url string, p Payload) error {
+func (d *Dispatcher) sendGeneric(ctx context.Context, url string, p Payload, secret string) error {
 	b, err := json.Marshal(p)
 	if err != nil {
 		return err
@@ -174,9 +177,6 @@ func (d *Dispatcher) sendGeneric(ctx context.Context, url string, p Payload) err
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	d.mu.RLock()
-	secret := d.cfg.SigningSecret
-	d.mu.RUnlock()
 	if secret != "" {
 		mac := hmac.New(sha256.New, []byte(secret))
 		mac.Write(b)

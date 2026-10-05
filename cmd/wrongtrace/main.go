@@ -293,7 +293,12 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		log.Printf("ipc: disabled (%v) — HTTP API and watching continue", err)
 		ipcServer = nil
 	} else {
-		reportedSocketPath = socketPath
+		// Report the endpoint actually BOUND, not the configured one.
+		// bindSocketPaths silently falls back to $TMPDIR when the configured
+		// path overflows sockaddr_un.sun_path and still returns nil from
+		// Start, so the configured value can name a socket that does not
+		// exist — which is exactly what the socket_path contract forbids.
+		reportedSocketPath = ipcServer.BoundPath()
 		defer ipcServer.Stop()
 	}
 
@@ -503,6 +508,11 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	socketPath, _ := cmd.Flags().GetString("socket")
 	watchDir, _ := cmd.Flags().GetString("watch")
 	absWatch, _ := filepath.Abs(watchDir)
+	// Summary must reflect the checks, not a hard-coded verdict. Round 46 made
+	// each section report FAIL honestly but left the closing line unconditional,
+	// so a broken database produced "FAIL (…)" immediately followed by
+	// "✓ … operational" and exit 0 — a diagnostic contradicting itself.
+	unhealthy := false
 
 	fmt.Printf("=== WrongTrace Diagnostics (%s) ===\n", version)
 	fmt.Printf("OS / Arch      : %s / %s (CPUs: %d)\n", runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
@@ -513,16 +523,20 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	store, err := db.Open(dbPath)
 	if err != nil {
 		fmt.Printf("FAIL (%v)\n", err)
+		unhealthy = true
 	} else {
 		defer store.Close()
 		if err := store.Migrate(); err != nil {
 			fmt.Printf("FAIL MIGRATION (%v)\n", err)
+			unhealthy = true
 		} else {
 			overview, overviewErr := store.Overview()
 			if overviewErr != nil {
 				fmt.Printf("FAIL (overview: %v)\n", overviewErr)
+				unhealthy = true
 			} else if profOverview, profErr := store.ProfilerOverview(); profErr != nil {
 				fmt.Printf("FAIL (profiler overview: %v)\n", profErr)
+				unhealthy = true
 			} else {
 				fmt.Printf("OK (Runs: %d, Events: %d, Traces: %d)\n",
 					overview.TotalRuns, overview.TotalEvents, profOverview.TotalTraces)
@@ -535,6 +549,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	astEng, err := ast.NewEngine()
 	if err != nil {
 		fmt.Printf("FAIL (%v)\n", err)
+		unhealthy = true
 	} else {
 		defer astEng.Close()
 		testSnap, err := astEng.Parse("doctor_test.go", []byte("package main\nfunc Test() {}"))
@@ -608,6 +623,15 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	// The summary must agree with the sections above it. It used to be an
+	// unconditional "✓ … operational" + nil return, so a failing storage or AST
+	// check still ended in a green verdict. Keep the exit code at 0 (doctor is
+	// a report, matching the per-section FAIL convention and runInit's
+	// best-effort nil return), but never claim health that was not observed.
+	if unhealthy {
+		fmt.Println("\n✗ Diagnostics complete. One or more checks FAILED — see above; WrongTrace is NOT fully operational.")
+		return nil
+	}
 	fmt.Println("\n✓ Diagnostics complete. WrongTrace is operational.")
 	return nil
 }
@@ -674,16 +698,20 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	}
 
 	// 2. If daemon is offline, persist directly to local SQLite database
+	captured := sentToDaemon
 	if !sentToDaemon {
 		store, err := db.Open(dbPath)
 		if err != nil {
 			log.Printf("trace: open %s: %v (trace not persisted)", dbPath, err)
 		} else {
 			defer store.Close()
+			// A failed Migrate means the schema was never created, so an INSERT
+			// can only fail too. The old code logged and fell through into
+			// InsertTrace anyway, turning one clear diagnosis into a second
+			// confusing "no such table" error.
 			if err := store.Migrate(); err != nil {
-				log.Printf("trace: migrate %s: %v", dbPath, err)
-			}
-			if iErr := store.InsertTrace(db.RuntimeTraceRecord{
+				log.Printf("trace: migrate %s: %v (trace not persisted)", dbPath, err)
+			} else if iErr := store.InsertTrace(db.RuntimeTraceRecord{
 				TraceID:       fmt.Sprintf("tr-exec-%d", time.Now().UnixNano()),
 				ServiceName:   service,
 				NodeSignature: nodeSig,
@@ -695,12 +723,26 @@ func runTrace(cmd *cobra.Command, args []string) error {
 				Timestamp:     startTime.UTC(),
 			}); iErr != nil {
 				log.Printf("trace: insert: %v (trace not persisted)", iErr)
+			} else {
+				captured = true
 			}
 		}
 	}
 
-	fmt.Fprintf(banner, "\n📊 [WrongTrace] Captured Execution Trace: duration=%.2fms status=%d node=%s\n",
-		durationMs, statusCode, nodeSig)
+	// The banner must reflect what actually happened. It was an unconditional
+	// "Captured Execution Trace", so with the daemon down AND local persistence
+	// failing (both of which the code above already logs as "trace not
+	// persisted") the user was still told the trace was captured while it was
+	// stored nowhere — the same self-contradiction fixed for runDoctor in the
+	// same class. Exit code deliberately stays the child's: telemetry is
+	// best-effort and must never fail a passing test run.
+	if captured {
+		fmt.Fprintf(banner, "\n📊 [WrongTrace] Captured Execution Trace: duration=%.2fms status=%d node=%s\n",
+			durationMs, statusCode, nodeSig)
+	} else {
+		fmt.Fprintf(banner, "\n⚠️  [WrongTrace] Execution trace NOT captured (daemon offline, local store unavailable): duration=%.2fms status=%d node=%s\n",
+			durationMs, statusCode, nodeSig)
+	}
 
 	return runErr
 }
@@ -846,6 +888,13 @@ func runInit(cmd *cobra.Command, _ []string) error {
 		dir = "."
 	}
 
+	// Count config files we were asked to create and could not. The per-file
+	// lines already report each failure honestly, but the closing verdict was
+	// an unconditional "Setup complete!", so a read-only project directory
+	// produced four "✗ Could not create" lines and then a success banner at
+	// exit 0 — the same self-contradiction fixed for runDoctor and runTrace.
+	writeFailures := 0
+
 	fmt.Printf("🚀 Initializing WrongTrace AI Observability in %s\n\n", dir)
 
 	// 1. Generate .mcp.json
@@ -862,6 +911,7 @@ func runInit(cmd *cobra.Command, _ []string) error {
 	if !fileExists(mcpPath) {
 		if wErr := os.WriteFile(mcpPath, []byte(mcpJSON), 0644); wErr != nil {
 			fmt.Printf("  ✗ Could not create %s: %v\n", filepath.Base(mcpPath), wErr)
+			writeFailures++
 		} else {
 			fmt.Printf("  ✓ Created %s (MCP server registration for Claude Code, Cursor, Windsurf)\n", filepath.Base(mcpPath))
 		}
@@ -881,6 +931,7 @@ When working in this repository:
 	if !fileExists(claudePath) {
 		if wErr := os.WriteFile(claudePath, []byte(claudeMD), 0644); wErr != nil {
 			fmt.Printf("  ✗ Could not create %s: %v\n", filepath.Base(claudePath), wErr)
+			writeFailures++
 		} else {
 			fmt.Printf("  ✓ Created %s (Claude Code agent instructions)\n", filepath.Base(claudePath))
 		}
@@ -903,6 +954,7 @@ This repository is monitored by **WrongTrace AI Observability**.
 	if !fileExists(agentsPath) {
 		if wErr := os.WriteFile(agentsPath, []byte(agentsMD), 0644); wErr != nil {
 			fmt.Printf("  ✗ Could not create %s: %v\n", filepath.Base(agentsPath), wErr)
+			writeFailures++
 		} else {
 			fmt.Printf("  ✓ Created %s (Universal instructions for all coding agents)\n", filepath.Base(agentsPath))
 		}
@@ -920,6 +972,7 @@ This repository is monitored by **WrongTrace AI Observability**.
 	if !fileExists(cursorRulesPath) {
 		if wErr := os.WriteFile(cursorRulesPath, []byte(cursorRules), 0644); wErr != nil {
 			fmt.Printf("  ✗ Could not create %s: %v\n", filepath.Base(cursorRulesPath), wErr)
+			writeFailures++
 		} else {
 			fmt.Printf("  ✓ Created %s (Cursor IDE rules)\n", filepath.Base(cursorRulesPath))
 		}
@@ -934,6 +987,17 @@ This repository is monitored by **WrongTrace AI Observability**.
 		fmt.Printf("  - Git hook not configured: %v\n", err)
 	}
 
+	// The closing verdict must agree with the per-file lines above it. It used to
+	// be an unconditional "Setup complete!", so a read-only project directory
+	// printed several "✗ Could not create" failures and then declared success at
+	// exit 0 — the same self-contradiction fixed for runDoctor and runTrace.
+	// A pre-existing file ("- already exists") and a non-git directory are not
+	// failures, so only actual write failures are counted here.
+	if writeFailures > 0 {
+		fmt.Printf("\n⚠️  Setup incomplete: %d config file(s) could not be written (see above). "+
+			"WrongTrace is NOT fully set up for this project.\n", writeFailures)
+		return nil
+	}
 	fmt.Println("\n✨ Setup complete! WrongTrace is now ready to observe and guide all coding agents.")
 	return nil
 }

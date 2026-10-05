@@ -443,7 +443,15 @@ export function AgentSessionsView({
 
                 <div className="text-[11px] text-slate-400 flex items-center justify-between border-t border-white/5 pt-2 font-mono">
                   <span>{m.total_survived_nodes} / {m.total_nodes} nodes alive</span>
-                  <span className="text-accent">${m.cost_per_surviving_node.toFixed(4)} / node</span>
+                  {/* db.ModelComparison computes cost_per_surviving_node only when
+                      total_survived_nodes > 0, so a 0 there means "never computed",
+                      not "free". Printing it as a price put a fabricated "$0.0000 /
+                      node" on the same line that reads "0 / 120 nodes alive". */}
+                  <span className="text-accent">
+                    {m.total_survived_nodes > 0
+                      ? `$${m.cost_per_surviving_node.toFixed(4)} / node`
+                      : '— / node'}
+                  </span>
                 </div>
               </div>
             ))}

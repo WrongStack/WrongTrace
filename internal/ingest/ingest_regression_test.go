@@ -283,3 +283,44 @@ func TestParseJSONL_UTF8BOMKeepsFirstRecord(t *testing.T) {
 		t.Fatalf("events=%+v err=%v, want 2 starting with a.go", ev, err)
 	}
 }
+
+func TestPollOnce_SameSizeOlderTimestampReplacement(t *testing.T) {
+	isolateHome(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sessions", "x.jsonl")
+	first, replacement := toolLine("a.go")+"\n", toolLine("b.go")+"\n"
+	if len(first) != len(replacement) {
+		t.Fatal("replacement fixture must preserve transcript size")
+	}
+	newer := time.Now().Add(-time.Hour)
+	older := newer.Add(-time.Hour)
+	writeFile(t, p, first)
+	if err := os.Chtimes(p, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &eventSink{}
+	sw := NewSessionWatcher(sink.add)
+	sw.AddWatchDir(dir)
+	sw.PollOnce()
+	if got := sink.snapshot(); !equalStrings(got, []string{"a.go"}) {
+		t.Fatalf("initial poll = %v, want [a.go]", got)
+	}
+	sw.PollOnce()
+	if got := sink.snapshot(); !equalStrings(got, []string{"a.go"}) {
+		t.Fatalf("unchanged poll = %v, want [a.go]", got)
+	}
+
+	writeFile(t, p, replacement)
+	if err := os.Chtimes(p, older, older); err != nil {
+		t.Fatal(err)
+	}
+	sw.PollOnce()
+	if got := sink.snapshot(); !equalStrings(got, []string{"a.go", "b.go"}) {
+		t.Fatalf("same-size replacement with older mtime = %v, want [a.go b.go]", got)
+	}
+	sw.PollOnce()
+	if got := sink.snapshot(); !equalStrings(got, []string{"a.go", "b.go"}) {
+		t.Fatalf("unchanged replacement replayed events: %v", got)
+	}
+}

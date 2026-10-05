@@ -31,10 +31,14 @@ export function ModelLeaderboard({ models, loading }: ModelLeaderboardProps) {
     fullModel: m.model,
     survival: Number(m.survival_rate_pct.toFixed(1)),
     runs: m.run_count,
+    // The Go producer (db.ModelComparison) only computes cost_per_surviving_node
+    // when total_survived_nodes > 0, so a 0 there means "never computed", not
+    // "free". Plot it as a gap instead of 0: this axis is lower-is-better, so 0
+    // would make a model with no proven ROI look like the cheapest of them all.
     costPerSurvived:
-      Number.isFinite(m.cost_per_surviving_node) && m.cost_per_surviving_node < 1000
+      m.total_survived_nodes > 0 && Number.isFinite(m.cost_per_surviving_node) && m.cost_per_surviving_node < 1000
         ? Number(m.cost_per_surviving_node.toFixed(4))
-        : 0,
+        : null,
     totalCost: Number(m.total_cost_usd.toFixed(3)),
     activeNodes: m.active_nodes,
     survivedNodes: m.total_survived_nodes,
@@ -215,7 +219,13 @@ export function ModelLeaderboard({ models, loading }: ModelLeaderboardProps) {
                 </td>
                 <td className="py-2 text-right text-slate-300">{m.run_count}</td>
                 <td className="py-2 text-right text-accent font-medium">
-                  ${m.cost_per_surviving_node.toFixed(4)}
+                  {/* Same sentinel rule as the chart above, and the same em-dash
+                      convention ROIAnalysis.tsx already uses for this field. */}
+                  {m.total_survived_nodes === 0 ? (
+                    <span className="text-slate-500">—</span>
+                  ) : (
+                    <>${m.cost_per_surviving_node.toFixed(4)}</>
+                  )}
                 </td>
                 <td className="py-2 text-right text-slate-400">
                   ${m.total_cost_usd.toFixed(2)}

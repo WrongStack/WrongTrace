@@ -15,8 +15,8 @@ const (
 	maxOffsetCheckpointBytes = 16 * 1024 * 1024
 )
 
-// offsetCheckpoint is the on-disk cursor state. Emitted and Fingerprints were
-// added without a version bump: both are optional, so checkpoints written
+// offsetCheckpoint is the on-disk cursor state. Emitted, Fingerprints and Contexts were
+// added without a version bump: all are optional, so checkpoints written
 // before them load unchanged (their files are treated as described in
 // processFile), and older binaries simply ignore the new keys.
 type offsetCheckpoint struct {
@@ -29,6 +29,8 @@ type offsetCheckpoint struct {
 	// so a transcript replaced by a larger one restarts at byte 0 instead of
 	// resuming mid-line in unrelated content.
 	Fingerprints map[string]string `json:"fingerprints,omitempty"`
+	// Contexts carries inherited JSONL model/intent with its committed offset.
+	Contexts map[string]jsonlContext `json:"contexts,omitempty"`
 }
 
 // EnablePersistentOffsets restores transcript cursors from path. Missing
@@ -68,6 +70,7 @@ func (sw *SessionWatcher) EnablePersistentOffsets(path string) error {
 	for file, offset := range loaded.Offsets {
 		if offset >= 0 {
 			sw.seenOffsets[file] = offset
+			delete(sw.seenContexts, file)
 		}
 	}
 	for file, n := range loaded.Emitted {
@@ -78,6 +81,11 @@ func (sw *SessionWatcher) EnablePersistentOffsets(path string) error {
 	for file, fp := range loaded.Fingerprints {
 		if v, err := strconv.ParseUint(fp, 16, 64); err == nil {
 			sw.seenFingerprints[file] = v
+		}
+	}
+	for file, context := range loaded.Contexts {
+		if offset, ok := loaded.Offsets[file]; ok && offset >= 0 && context.ModelName != "" {
+			sw.seenContexts[file] = context
 		}
 	}
 	sw.mu.Unlock()
@@ -110,6 +118,13 @@ func (sw *SessionWatcher) saveOffsets(force bool) error {
 			fingerprints[file] = strconv.FormatUint(fp, 16)
 		}
 	}
+	var contexts map[string]jsonlContext
+	if len(sw.seenContexts) > 0 {
+		contexts = make(map[string]jsonlContext, len(sw.seenContexts))
+		for file, context := range sw.seenContexts {
+			contexts[file] = context
+		}
+	}
 	sw.mu.Unlock()
 
 	data, err := json.Marshal(offsetCheckpoint{
@@ -117,6 +132,7 @@ func (sw *SessionWatcher) saveOffsets(force bool) error {
 		Offsets:      offsets,
 		Emitted:      emitted,
 		Fingerprints: fingerprints,
+		Contexts:     contexts,
 	})
 	if err != nil {
 		return err

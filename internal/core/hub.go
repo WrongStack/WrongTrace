@@ -23,12 +23,16 @@ func NewHub() *Hub {
 
 // Subscribe registers a WebSocket connection. The returned channel delivers
 // events; the caller is responsible for forwarding them to the wire and
-// calling Unsubscribe when the connection closes.
+// calling Unsubscribe when the connection closes. Repeated registration of
+// the same connection returns its existing delivery channel.
 func (h *Hub) Subscribe(c *websocket.Conn) <-chan WSEvent {
-	ch := make(chan WSEvent, 64)
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ch, ok := h.clients[c]; ok {
+		return ch
+	}
+	ch := make(chan WSEvent, 64)
 	h.clients[c] = ch
-	h.mu.Unlock()
 	return ch
 }
 

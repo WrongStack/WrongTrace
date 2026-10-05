@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,7 +35,7 @@ func parseDBTime(s string) time.Time {
 		return time.Time{}
 	}
 	// Fast zero-allocation path for "YYYY-MM-DD HH:MM:SS" (19 chars)
-	if len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' && s[13] == ':' && s[16] == ':' {
+	if len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' && s[13] == ':' && s[16] == ':' && dbTimeDigits(s) {
 		y := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
 		m := time.Month(int(s[5]-'0')*10 + int(s[6]-'0'))
 		d := int(s[8]-'0')*10 + int(s[9]-'0')
@@ -46,7 +47,7 @@ func parseDBTime(s string) time.Time {
 		}
 	}
 	// Fast zero-allocation path for "YYYY-MM-DDTHH:MM:SSZ" (20 chars)
-	if len(s) == 20 && s[4] == '-' && s[7] == '-' && s[10] == 'T' && s[13] == ':' && s[16] == ':' && s[19] == 'Z' {
+	if len(s) == 20 && s[4] == '-' && s[7] == '-' && s[10] == 'T' && s[13] == ':' && s[16] == ':' && s[19] == 'Z' && dbTimeDigits(s) {
 		y := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
 		m := time.Month(int(s[5]-'0')*10 + int(s[6]-'0'))
 		d := int(s[8]-'0')*10 + int(s[9]-'0')
@@ -63,6 +64,16 @@ func parseDBTime(s string) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// dbTimeDigits validates numeric fields before the 19/20-byte fast paths.
+func dbTimeDigits(s string) bool {
+	for _, i := range [...]int{0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18} {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // daysInMonth returns the number of days in month m of year y under Gregorian
@@ -652,7 +663,8 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 				SELECT DISTINCT run_id FROM code_node_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
 				UNION
 				SELECT DISTINCT run_id FROM file_read_events WHERE (repo_name = ? OR repo_name = '' OR repo_name IS NULL) AND run_id IS NOT NULL
-			  ) OR NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL))
+			  ) OR (NOT EXISTS (SELECT 1 FROM code_node_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL)
+			    AND NOT EXISTS (SELECT 1 FROM file_read_events WHERE repo_name != ? AND repo_name != '' AND repo_name IS NOT NULL)))
 			GROUP BY model_name
 		),
 		models AS (
@@ -673,7 +685,7 @@ func (s *Store) ModelComparison(repoFilter ...string) ([]ModelRow, error) {
 		LEFT JOIN spend ON spend.model_name = m.model_name
 		ORDER BY m.model_name
 		`
-		args = []any{repo, repo, repo, repo}
+		args = []any{repo, repo, repo, repo, repo}
 	}
 
 	ctx, cancel := s.withTimeout(context.Background())
@@ -1381,11 +1393,18 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		); err != nil {
 			return stats, fmt.Errorf("scan read stats row: %w", err)
 		}
+		lines, linesOK := addReadStatTotal(stats.TotalLinesRead, rec.LinesReadCount)
+		prompt, promptOK := addReadStatTotal(stats.TotalPromptTokens, rec.PromptTokens)
+		cached, cachedOK := addReadStatTotal(stats.TotalCachedTokens, rec.CachedTokens)
+		cost := stats.TotalCostUSD + rec.CostUSD
+		if !linesOK || !promptOK || !cachedOK || math.IsInf(cost, 0) || math.IsNaN(cost) {
+			return stats, fmt.Errorf("read stats totals overflow for %s", filePath)
+		}
 		stats.TotalReads++
-		stats.TotalLinesRead += rec.LinesReadCount
-		stats.TotalCostUSD += rec.CostUSD
-		stats.TotalPromptTokens += rec.PromptTokens
-		stats.TotalCachedTokens += rec.CachedTokens
+		stats.TotalLinesRead = lines
+		stats.TotalCostUSD = cost
+		stats.TotalPromptTokens = prompt
+		stats.TotalCachedTokens = cached
 		if rec.ModelName != "" {
 			models[rec.ModelName] = struct{}{}
 			stats.ModelBreakdown[rec.ModelName]++
@@ -1404,6 +1423,14 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 	stats.UniqueModels = len(models)
 
 	return stats, nil
+}
+
+func addReadStatTotal[T ~int | ~int64](a, b T) (T, bool) {
+	total := a + b
+	if (b > 0 && total < a) || (b < 0 && total > a) {
+		return 0, false
+	}
+	return total, true
 }
 
 // readPathClause is the per-file filter of GetFileReadStats and
@@ -1435,11 +1462,11 @@ func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
 
 	normPath := strings.ReplaceAll(filePath, "\\", "/")
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT start_line, end_line, COUNT(*)
+		SELECT COALESCE(start_line, 0), COALESCE(end_line, 0), COUNT(*)
 		FROM file_read_events
 		WHERE `+readPathClause+`
 		  AND (start_line > 0 OR end_line > 0)
-		GROUP BY start_line, end_line
+		GROUP BY COALESCE(start_line, 0), COALESCE(end_line, 0)
 		ORDER BY COUNT(*) DESC
 		LIMIT 50
 	`, filePath, escapeLike(normPath), "%/"+escapeLike(normPath), normPath)

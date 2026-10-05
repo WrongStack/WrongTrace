@@ -257,7 +257,7 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 			parts := strings.Fields(trimmed)
 			for j, p := range parts {
 				if p == "fn" && j+1 < len(parts) {
-					name = strings.Split(parts[j+1], "(")[0]
+					name = strings.Split(strings.Split(parts[j+1], "(")[0], "<")[0]
 					break
 				}
 			}
@@ -281,6 +281,8 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 					break
 				}
 			}
+		case lang == LangPHP:
+			kind, name = phpFunctionDecl(trimmed)
 		case strings.HasPrefix(trimmed, "function ") || strings.HasPrefix(trimmed, "public function ") || strings.HasPrefix(trimmed, "private function "):
 			kind = NodeFunction
 			parts := strings.Fields(trimmed)
@@ -296,6 +298,14 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 			if len(parts) > 1 {
 				name = strings.Split(parts[1], "(")[0]
 			}
+		case lang == LangRust:
+			// Rust items carry visibility/modifier tokens before the keyword
+			// (`pub(crate) async fn f(`, `unsafe fn g(`, `extern "C" fn h(`,
+			// `pub(super) struct S`). The literal-head arms above match only
+			// "pub fn "/"fn " and "pub struct "/"struct ", so every qualified
+			// declaration produced NO node and its edits emitted no Diff
+			// event — the same defect round 89 fixed for Kotlin `fun`.
+			kind, name = rustDecl(trimmed)
 		case lang == LangKotlin:
 			// Kotlin fun declarations: the only node kind for most .kt files,
 			// whose top-level funs previously produced no nodes at all — the
@@ -356,6 +366,24 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 	return snap
 }
 
+func phpFunctionDecl(line string) (NodeKind, string) {
+	fields := strings.Fields(line)
+	for i, field := range fields {
+		switch field {
+		case "public", "protected", "private", "static", "final", "abstract":
+			continue
+		case "function":
+			if i+1 < len(fields) {
+				return NodeFunction, strings.Split(fields[i+1], "(")[0]
+			}
+		default:
+			return "", ""
+		}
+		break
+	}
+	return "", ""
+}
+
 // statementKeywords are words that begin (or sit inside) a statement or
 // expression head and therefore can never appear in the modifier/return-type
 // prefix of a typed declaration. Any of them before the parenthesised name
@@ -386,6 +414,67 @@ func typedDeclLanguage(lang Language) bool {
 		return true
 	}
 	return false
+}
+
+// rustQualifiers are the Rust item prefixes that may precede the `fn`/`struct`
+// keyword. Visibility is `pub` or `pub(<path>)`; the rest are item modifiers.
+// Matched as whole fields so an identifier like `pubkey` is never one.
+var rustQualifiers = map[string]bool{
+	"pub": true, "async": true, "unsafe": true,
+	"const": true, "extern": true, "default": true,
+}
+
+// rustDecl classifies a Rust line whose `fn`/`struct` keyword is preceded by
+// visibility or modifier tokens — `pub(crate) async fn`, `unsafe fn`,
+// `extern "C" fn`, `pub(crate) struct`. The generic arms match only the literal
+// heads "pub fn "/"fn " and "pub struct "/"struct ", so every qualified
+// declaration was invisible: no node, and therefore no ADDED/MODIFIED/DELETED
+// event when the agent edited it. Reachable because `.rs` maps to LangRust and
+// Rust has no Tree-sitter grammar, so it always lands in parseGenericSource.
+//
+// Only the fn/struct keywords are accepted. Rust statement heads share the
+// `Type name(args) {` shape (`match x {`, `if let Some(v) = f() {`), which is
+// why typedDeclLanguage excludes Rust; a looser test would declare them.
+func rustDecl(trimmed string) (NodeKind, string) {
+	fields := strings.Fields(trimmed)
+	i := 0
+	for i < len(fields) {
+		f := fields[i]
+		if rustQualifiers[f] {
+			i++
+			continue
+		}
+		if strings.HasPrefix(f, "pub(") {
+			// `pub(crate)`/`pub(super)` are one field; `pub(in path)` spans
+			// several, so consume fields until the visibility group closes.
+			for i < len(fields) {
+				closed := strings.Contains(fields[i], ")")
+				i++
+				if closed {
+					break
+				}
+			}
+			continue
+		}
+		if len(f) > 1 && f[0] == '"' {
+			i++ // extern "C" ABI string
+			continue
+		}
+		break
+	}
+	// i == 0 means the head was already literal ("fn "/"pub fn "), which the
+	// arms above own; i+1 out of range means no name token follows the keyword.
+	if i == 0 || i+1 >= len(fields) {
+		return "", ""
+	}
+	switch kw := fields[i]; kw {
+	case "fn":
+		return NodeFunction, strings.TrimSpace(strings.Split(strings.Split(fields[i+1], "(")[0], "<")[0])
+	case "struct":
+		name := strings.Split(fields[i+1], "{")[0]
+		return NodeStruct, strings.TrimSpace(strings.Split(name, "<")[0])
+	}
+	return "", ""
 }
 
 // kotlinDecl classifies a Kotlin line: a `fun` declaration yields its name as
@@ -930,6 +1019,29 @@ func buildSignature(lang Language, file string, kind NodeKind, n *sitter.Node, s
 			}
 		}
 		return fmt.Sprintf("%s:%s::%s", kind, file, name)
+	case LangPython, LangTypeScript, LangJavaScript:
+		if kind != NodeClass {
+			var owners []string
+			for parent := n.Parent(); parent != nil; parent = parent.Parent() {
+				switch parent.Type() {
+				case "function_definition", "class_definition", "function_declaration", "class_declaration", "method_definition":
+				case "arrow_function":
+					if !hasNamedAssignment(parent) {
+						continue
+					}
+				default:
+					continue
+				}
+				owners = append(owners, extractName(lang, parent, src))
+			}
+			for i := 0; i < len(owners)/2; i++ {
+				owners[i], owners[len(owners)-1-i] = owners[len(owners)-1-i], owners[i]
+			}
+			if len(owners) > 0 {
+				name = strings.Join(owners, ".") + "." + name
+			}
+		}
+		return fmt.Sprintf("%s:%s::%s", kind, file, name)
 	default:
 		if scope := enclosingTypeName(n, src); scope != "" && kind != NodeClass {
 			name = scope + "." + name
@@ -1108,12 +1220,12 @@ func hashNormalizedBodyBytes(b []byte, lang Language) string {
 		}
 		switch c {
 		case '/':
-			if i+1 < len(b) && b[i+1] == '/' {
+			if lang != LangPython && i+1 < len(b) && b[i+1] == '/' {
 				inLineComment = true
 				i++
 				continue
 			}
-			if i+1 < len(b) && b[i+1] == '*' {
+			if lang != LangPython && i+1 < len(b) && b[i+1] == '*' {
 				inBlockComment = true
 				i++
 				continue
@@ -1194,12 +1306,12 @@ func normalizeForHash(s string, lang Language) string {
 		}
 		switch c {
 		case '/':
-			if i+1 < len(s) && s[i+1] == '/' {
+			if lang != LangPython && i+1 < len(s) && s[i+1] == '/' {
 				inLineComment = true
 				i++
 				continue
 			}
-			if i+1 < len(s) && s[i+1] == '*' {
+			if lang != LangPython && i+1 < len(s) && s[i+1] == '*' {
 				inBlockComment = true
 				i++
 				continue

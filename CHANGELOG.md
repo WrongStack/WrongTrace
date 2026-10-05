@@ -11,6 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.17] - 2026-10-05
+
+### Security
+- Redact short credential values in retained gateway traffic and withhold lock ownership credentials from IPC lock-conflict replies.
+- Propagate file-health storage failures instead of approving guardrail checks with unavailable evidence.
+- Bind each queued webhook delivery to the signing secret captured with its destination.
+
+### Fixed
+- Correct OpenAI Responses JSON/SSE telemetry: usage, cached input, reasoning, output text and tool calls are collected without duplicating stream deltas and final snapshots. Explicit zero usage and zero-cost response-cache hits remain zero.
+- Keep quota reservations tied to their admission day across midnight, preserve Unicode route suffixes, and isolate cached response ownership.
+- Preserve transcript model/intent across incremental reads, distinguish sessions by full path, retain exact numeric counters, and keep model variants distinct.
+- Recognize qualified/generic Rust and PHP declarations, distinguish nested Python/JavaScript/TypeScript symbols, and preserve Python division operators when hashing source.
+- Refresh read-derived metrics after file reads, keep project selection and Atlas ordering deterministic, and return caller-owned project snapshots. Settings and project admission now report storage failures.
+- Preserve JSON-RPC request IDs and explicit-null response semantics; report the IPC endpoint actually bound after a socket-path fallback.
+- Reject overflowing read-stat totals and non-finite profiler metrics, handle nullable heatmap ranges and OTLP timestamps, and isolate profiler metadata snapshots.
+- Make dashboard diff totals and filters agree with measured rows, show unknown ROI as unavailable, share grade thresholds, and distinguish patch headers from source lines.
+- Make CLI doctor, init and trace summaries reflect failed checks, incomplete setup and uncaptured traces.
+
+### Testing & Tooling
+- Add backend and dashboard regression coverage for the fixes above; discover only actual `*-regression.mjs` guards.
+- Include the dependency and per-file path-matching updates committed since 0.3.16. Align the private dashboard package version with the release.
+
+---
+
 ## [0.3.16] - 2026-09-21
 
 ### Security

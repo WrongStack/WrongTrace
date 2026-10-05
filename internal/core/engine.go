@@ -103,8 +103,14 @@ type Engine struct {
 	projSaveMu   sync.Mutex
 	projSavedSeq uint64
 
-	cacheMu      sync.RWMutex
-	cacheGen     uint64
+	cacheMu  sync.RWMutex
+	cacheGen uint64
+	// readGen counts file_read_events writes. Overview and ModelComparison
+	// both union file_read_events into their repo-scoped run set, so they
+	// change on a read event without cacheGen moving. It is tracked
+	// separately so the read path can invalidate exactly those two queries
+	// instead of the whole snapshot — see BumpReadGen and refreshReadDerived.
+	readGen      uint64
 	atlasCache   map[string]cachedAtlas
 	metricsCache map[string]cachedMetrics
 	recentCache  map[string]cachedRecent
@@ -124,6 +130,21 @@ func (e *Engine) BumpCacheGen() {
 	e.atlasCache = nil
 	e.metricsCache = nil
 	e.recentCache = nil
+	e.cacheMu.Unlock()
+}
+
+// BumpReadGen invalidates ONLY the read-derived half of the cached metrics
+// snapshot. Overview and ModelComparison both union file_read_events into
+// their repo-scoped run set, so RecordReadEvent changes both without cacheGen
+// moving. Tracking that separately is what lets the read path stay correct
+// without a full BumpCacheGen: RecordReadEvent is the highest-frequency write
+// in the system, and bumping the main generation on every read would make
+// metricsCacheTTL useless during exactly the busy sessions it exists to serve.
+// Only the two read-derived queries re-run; Thrashing and RecentEvents keep the
+// full metricsCacheTTL.
+func (e *Engine) BumpReadGen() {
+	e.cacheMu.Lock()
+	e.readGen++
 	e.cacheMu.Unlock()
 }
 
@@ -834,11 +855,15 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 			return fmt.Errorf("insert read event: %w", err)
 		}
 	}
-	// No BumpCacheGen here: the cached payloads (metrics snapshot, atlas,
-	// recent code events) are all derived from code events and runs, which live
-	// in separate tables. Read events arrive dozens of times per agent turn,
-	// and bumping the generation on each one silently disabled every cache
-	// during exactly the sessions where the CPU matters most.
+	// Only the read-derived half of the metrics snapshot is invalidated. It is
+	// NOT true that the snapshot is "derived from code events and runs" alone:
+	// Overview and ModelComparison both union file_read_events into their
+	// repo-scoped run set (internal/db/db.go:243, internal/db/queries.go:654),
+	// so a read event changes both. Bumping the main generation here instead
+	// would make metricsCacheTTL useless — reads arrive dozens of times per
+	// agent turn. Thrashing and RecentEvents come from code_node_events only and
+	// deliberately keep the full TTL.
+	e.BumpReadGen()
 	e.hub.Broadcast(WSEvent{Type: "file_read_event", Payload: rec, EventID: rec.ReadID})
 	return nil
 }

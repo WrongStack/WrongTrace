@@ -38,6 +38,10 @@ type PayloadAnalysis struct {
 	// estPromptTokens is the request-side token estimate computed during the
 	// request decode, so the fallback never re-parses the body.
 	estPromptTokens int64
+	// Responses usage may explicitly report zero. Preserve that distinction
+	// from absent usage when applying analyzer and gateway fallbacks.
+	promptTokensReported     bool
+	completionTokensReported bool
 }
 
 // EstimatedPromptTokens returns the prompt-token estimate for reqBody, reusing
@@ -76,10 +80,10 @@ func AnalyzeWirePayloads(reqBody, respBody []byte, isStream bool) PayloadAnalysi
 			if !analysis.parseJSONResponse(respBody) {
 				analysis.AssistantReply = string(respBody)
 			}
-			if analysis.PromptTokens == 0 && len(reqBody) > 0 {
+			if analysis.PromptTokens == 0 && !analysis.promptTokensReported && len(reqBody) > 0 {
 				analysis.PromptTokens = analysis.estPromptTokens
 			}
-			if analysis.CompletionTokens == 0 && len(analysis.AssistantReply) > 0 {
+			if analysis.CompletionTokens == 0 && !analysis.completionTokensReported && len(analysis.AssistantReply) > 0 {
 				analysis.CompletionTokens = int64(float64(len(analysis.AssistantReply)) / 3.7)
 			}
 			if analysis.TotalTokens == 0 {
@@ -113,6 +117,14 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 	}
 	if model, ok := respMap["model"].(string); ok && model != "" {
 		pa.WireModel = model
+	}
+	if respMap["object"] == "response" {
+		var response wireResponsesResponse
+		if json.Unmarshal(data, &response) != nil {
+			return false
+		}
+		pa.applyResponsesResponse(response)
+		return true
 	}
 
 	// Parse Usage Details
@@ -178,6 +190,10 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 						} else {
 							pa.AssistantReply = t
 						}
+					}
+				} else if cType == "thinking" {
+					if thinking, ok := itemMap["thinking"].(string); ok {
+						pa.Reasoning += thinking
 					}
 				} else if cType == "tool_use" {
 					callID, _ := itemMap["id"].(string)
@@ -308,8 +324,24 @@ type sseDeltaItem struct {
 	ToolCalls        []sseToolCallItem `json:"tool_calls"`
 	Type             string            `json:"type"`
 	Text             string            `json:"text"`
+	Thinking         string            `json:"thinking"`
 	PartialJSON      string            `json:"partial_json"`
 	StopReason       string            `json:"stop_reason"`
+}
+
+// Responses events use a string delta; Chat Completions and Anthropic use
+// objects. Keep both shapes in the existing single chunk decode.
+type sseDeltaValue struct {
+	sseDeltaItem
+	ResponseText string
+}
+
+func (d *sseDeltaValue) UnmarshalJSON(data []byte) error {
+	if text, ok := rawJSONString(data); ok {
+		d.ResponseText = text
+		return nil
+	}
+	return json.Unmarshal(data, &d.sseDeltaItem)
 }
 
 type sseChoiceItem struct {
@@ -359,7 +391,16 @@ type sseStreamChunk struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"content_block"`
-	Delta *sseDeltaItem `json:"delta"`
+	Delta        *sseDeltaValue     `json:"delta"`
+	OutputIndex  int                `json:"output_index"`
+	ContentIndex int                `json:"content_index"`
+	SummaryIndex int                `json:"summary_index"`
+	Item         *wireResponsesItem `json:"item"`
+	Arguments    string             `json:"arguments"`
+	Input        json.RawMessage    `json:"input"`
+	Text         string             `json:"text"`
+	Refusal      string             `json:"refusal"`
+	Name         string             `json:"name"`
 }
 
 func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
@@ -372,10 +413,15 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 		args strings.Builder
 	}
 	toolMap := make(map[int]*toolBuffer)
+	var responses responsesStreamState
 
 	handleChunk := func(jsonPart []byte) {
 		var chunk sseStreamChunk
 		if err := json.Unmarshal(jsonPart, &chunk); err != nil {
+			return
+		}
+		if strings.HasPrefix(chunk.Type, "response.") {
+			responses.handle(pa, chunk)
 			return
 		}
 
@@ -462,6 +508,8 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 							buf.args.WriteString(chunk.Delta.PartialJSON)
 						}
 					}
+				} else if chunk.Delta.Type == "thinking_delta" {
+					reasoningBuilder.WriteString(chunk.Delta.Thinking)
 				} else if chunk.Delta.Type == "text_delta" {
 					if chunk.Delta.Text != "" {
 						textBuilder.WriteString(chunk.Delta.Text)
@@ -590,12 +638,13 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 			})
 		}
 	}
+	responses.finish(pa)
 
 	// If upstream stream did not emit usage metadata, compute accurate token estimate from request/reply
-	if pa.PromptTokens == 0 && len(reqBody) > 0 {
+	if pa.PromptTokens == 0 && !pa.promptTokensReported && len(reqBody) > 0 {
 		pa.PromptTokens = pa.EstimatedPromptTokens(reqBody)
 	}
-	if pa.CompletionTokens == 0 {
+	if pa.CompletionTokens == 0 && !pa.completionTokensReported {
 		outChars := len(pa.AssistantReply) + len(pa.Reasoning)
 		for _, tc := range pa.ToolCalls {
 			outChars += len(tc.Name) + len(tc.Arguments)
@@ -699,12 +748,14 @@ func EstimatePromptTokens(reqBody []byte) int64 {
 	return summarizeWireRequest(reqBody).estimatedTokens(len(reqBody))
 }
 
-// wireRequest is the subset of an OpenAI/Anthropic-style request the proxy
-// reads. Content stays raw so large tool results and images are skipped by the
+// wireRequest is the subset of Chat Completions, Responses and Anthropic
+// requests the proxy reads. Content stays raw so large tool results and images are skipped by the
 // decoder instead of being materialized as nested maps.
 type wireRequest struct {
-	System   json.RawMessage `json:"system"`
-	Messages []struct {
+	System       json.RawMessage `json:"system"`
+	Instructions string          `json:"instructions"`
+	Input        json.RawMessage `json:"input"`
+	Messages     []struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	} `json:"messages"`
@@ -833,6 +884,7 @@ func summarizeWireRequest(body []byte) wireRequestSummary {
 			sum.systemPrompt = runeSafeTruncate(sys, 120)
 		}
 	}
+	summarizeResponsesInput(&sum, req.Instructions, req.Input)
 	for _, t := range req.Tools {
 		if t.Function != nil {
 			sum.charCount += len(t.Function.Name) + len(t.Function.Description)

@@ -23,8 +23,12 @@ import (
 //     bytes) instead of on every read.
 //  2. A byte budget with LRU eviction. Past the budget the coldest snapshots
 //     give up their compressed source while KEEPING their node map, so
-//     signature/hash-level diffing stays exact and only the line-level
-//     diff_snippet degrades for files nobody has touched in a long time.
+//     signature/hash-level diffing stays exact. Line-level data degrades
+//     further than the snippet alone: with the source gone, nodeBody falls
+//     back to the node's empty Body for native parsers, so persisted
+//     added_lines/deleted_lines collapse to 0 on DELETED and degrade to
+//     all-additions on MODIFIED. See
+//     evicted_source_counts_characterization_test.go.
 const defaultSourceBudgetBytes = 48 << 20
 
 // defaultSourceBudgetBytes is the compressed-source ceiling for the snapshot
@@ -32,7 +36,7 @@ const defaultSourceBudgetBytes = 48 << 20
 // entirely (node-level diffs only, minimum footprint).
 var sourceBudgetBytes = func() int64 {
 	if v := os.Getenv("WRONGTRACE_AST_CACHE_MB"); v != "" {
-		if mb, err := strconv.ParseInt(v, 10, 64); err == nil && mb >= 0 {
+		if mb, err := strconv.ParseInt(v, 10, 64); err == nil && mb >= 0 && mb <= (1<<63-1)>>20 {
 			return mb << 20
 		}
 	}

@@ -234,6 +234,7 @@ type finalizeJob struct {
 type quotaReservation struct {
 	key    string
 	amount float64
+	day    string
 	active bool
 }
 
@@ -252,7 +253,7 @@ type relayOpts struct {
 // that end without a billable upstream exchange.
 func (p *GatewayProxy) releaseReservation(res quotaReservation) {
 	if res.active && p.Quotas != nil {
-		p.Quotas.AdjustSpend(res.key, -res.amount)
+		p.Quotas.adjustSpendForDay(res.key, -res.amount, res.day)
 	}
 }
 
@@ -264,7 +265,7 @@ func (p *GatewayProxy) settleSpend(res quotaReservation, fallbackKey string, act
 		return
 	}
 	if res.active {
-		p.Quotas.AdjustSpend(res.key, actualUSD-res.amount)
+		p.Quotas.adjustSpendForDay(res.key, actualUSD-res.amount, res.day)
 		return
 	}
 	if actualUSD > 0 {
@@ -414,10 +415,10 @@ func (p *GatewayProxy) finalize(job finalizeJob) {
 	if analysis.WireID != "" {
 		rec.ID = analysis.WireID
 	}
-	if promptTokens == 0 {
+	if promptTokens == 0 && !analysis.promptTokensReported {
 		promptTokens = analysis.EstimatedPromptTokens(job.reqBody)
 	}
-	if completionTokens == 0 && job.isStream {
+	if completionTokens == 0 && !analysis.completionTokensReported && job.isStream {
 		completionTokens = 1
 	}
 	if analysis.CachedTokens > 0 && promptTokens < analysis.CachedTokens {
@@ -1107,9 +1108,10 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// byte-preserving, allocation-light fast path.
 			estimate := estimateRequestCostUSD(provider, modelName, reqBody,
 				declaredOutputCap(parsedReq.MaxTokens, parsedReq.MaxCompletionTokens))
-			allowed, _, quotaMsg = p.Quotas.CheckAndRecordSpend(quotaKey, estimate)
+			var reservationDay string
+			allowed, _, quotaMsg, reservationDay = p.Quotas.checkAndRecordSpend(quotaKey, estimate)
 			if allowed {
-				reservation = quotaReservation{key: quotaKey, amount: estimate, active: true}
+				reservation = quotaReservation{key: quotaKey, amount: estimate, day: reservationDay, active: true}
 			}
 		}
 		if !allowed {
@@ -2251,9 +2253,7 @@ func (p *GatewayProxy) recordRun(modelName, provider, agentName, taskID, project
 		return ""
 	}
 
-	if costUSD <= 0 {
-		costUSD = models.Global.CalculateCostWithProvider(provider, modelName, promptTokens, completionTokens)
-	}
+	// Callers pass the settled cost; zero is intentional for response-cache hits.
 	runID, totalPrompt, totalCompletion, totalCost := p.getOrCreateSession(explicitRunID, sessionKey, promptTokens, completionTokens, costUSD)
 
 	_ = p.cfg.Reporter.ReportRun(ipc.TelemetryReport{

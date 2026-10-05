@@ -6,6 +6,7 @@
 package ipc
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -27,6 +28,22 @@ type Response struct {
 	Result  interface{} `json:"result,omitempty"`
 	Error   *RPCError   `json:"error,omitempty"`
 	ID      interface{} `json:"id"`
+}
+
+// MarshalJSON selects the JSON-RPC success/error envelope. A successful nil
+// result is still required on the wire; error replies must omit result.
+func (r Response) MarshalJSON() ([]byte, error) {
+	type wireResponse struct {
+		JSONRPC string       `json:"jsonrpc"`
+		Result  *interface{} `json:"result,omitempty"`
+		Error   *RPCError    `json:"error,omitempty"`
+		ID      interface{}  `json:"id"`
+	}
+	wire := wireResponse{JSONRPC: r.JSONRPC, Error: r.Error, ID: r.ID}
+	if r.Error == nil {
+		wire.Result = &r.Result
+	}
+	return json.Marshal(wire)
 }
 
 type RPCError struct {

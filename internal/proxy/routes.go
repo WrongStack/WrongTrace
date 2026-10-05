@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ProxyRoute defines an upstream mapping configured by the user.
@@ -110,7 +111,7 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 			return &r, "/"
 		}
 		if strings.HasPrefix(lowerPath, lowerPfx+"/") {
-			remaining := normPath[len(pfx):]
+			remaining := routePathRemainder(normPath, pfx)
 			if remaining == "" || !strings.HasPrefix(remaining, "/") {
 				remaining = "/" + strings.TrimPrefix(remaining, "/")
 			}
@@ -130,7 +131,7 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 					return &r, "/"
 				}
 				if strings.HasPrefix(lowerPath, proxySlug+"/") {
-					remaining := normPath[len(proxySlug):]
+					remaining := routePathRemainder(normPath, proxySlug)
 					if remaining == "" || !strings.HasPrefix(remaining, "/") {
 						remaining = "/" + strings.TrimPrefix(remaining, "/")
 					}
@@ -147,7 +148,7 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 				return &r, "/"
 			}
 			if strings.HasPrefix(lowerPath, nameSlug+"/") {
-				remaining := normPath[len(nameSlug):]
+				remaining := routePathRemainder(normPath, nameSlug)
 				if remaining == "" || !strings.HasPrefix(remaining, "/") {
 					remaining = "/" + strings.TrimPrefix(remaining, "/")
 				}
@@ -156,6 +157,19 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 		}
 	}
 	return nil, path
+}
+
+// Case folding preserves rune count, but can change byte length (e.g. K -> k).
+// Find the suffix in the original path so its bytes and case stay unchanged.
+func routePathRemainder(path, prefix string) string {
+	remainingRunes := utf8.RuneCountInString(prefix)
+	for i := range path {
+		if remainingRunes == 0 {
+			return path[i:]
+		}
+		remainingRunes--
+	}
+	return ""
 }
 
 func routesJSONPath() string {

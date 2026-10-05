@@ -211,17 +211,19 @@ func (c *ResponseCache) SetWithReplayHeader(key, provider, model string, statusC
 		// between entries that have never been read (last-access zero).
 		if len(c.items) >= c.maxEntries {
 			var victim string
+			var victimFound bool
 			var victimAccess int64
 			var victimCreated time.Time
 			for k, v := range c.items {
 				la := atomic.LoadInt64(&v.lastAccessUnix)
-				if victim == "" || la < victimAccess || (la == victimAccess && v.CreatedAt.Before(victimCreated)) {
+				if !victimFound || la < victimAccess || (la == victimAccess && v.CreatedAt.Before(victimCreated)) {
 					victim = k
+					victimFound = true
 					victimAccess = la
 					victimCreated = v.CreatedAt
 				}
 			}
-			if victim != "" {
+			if victimFound {
 				delete(c.items, victim)
 			}
 		}

@@ -21,6 +21,7 @@ type QuotaLimiter struct {
 	dailyBudgets  map[string]float64 // key -> daily limit in USD (0 = unlimited)
 	dailySpend    map[string]float64 // key -> accumulated USD spend today
 	lastResetDate string
+	now           func() time.Time
 }
 
 // NewQuotaLimiter creates a new QuotaLimiter instance.
@@ -29,6 +30,7 @@ func NewQuotaLimiter() *QuotaLimiter {
 		dailyBudgets:  make(map[string]float64),
 		dailySpend:    make(map[string]float64),
 		lastResetDate: time.Now().UTC().Format("2006-01-02"),
+		now:           time.Now,
 	}
 }
 
@@ -41,7 +43,7 @@ func (q *QuotaLimiter) SetBudget(key string, limitUSD float64) {
 
 // checkResetDayLocked checks if the day has rolled over in UTC and resets daily spend if so.
 func (q *QuotaLimiter) checkResetDayLocked() {
-	today := time.Now().UTC().Format("2006-01-02")
+	today := q.now().UTC().Format("2006-01-02")
 	if today != q.lastResetDate {
 		q.dailySpend = make(map[string]float64)
 		q.lastResetDate = today
@@ -118,23 +120,33 @@ func (q *QuotaLimiter) CheckSpend(key string, estimatedCostUSD float64) (allowed
 // immediately. It enforces the same binding budget as CheckSpend and charges both
 // the key and the global aggregate. A denied request records nothing.
 func (q *QuotaLimiter) CheckAndRecordSpend(key string, estimatedCostUSD float64) (allowed bool, remainingUSD float64, warning string) {
+	allowed, remainingUSD, warning, _ = q.checkAndRecordSpend(key, estimatedCostUSD)
+	return
+}
+
+// checkAndRecordSpend also returns the UTC day under which the reservation was
+// recorded, atomically with the spend charge. The caller must carry that day
+// into finalization so a reconciliation after midnight cannot alter the new
+// day's meter.
+func (q *QuotaLimiter) checkAndRecordSpend(key string, estimatedCostUSD float64) (allowed bool, remainingUSD float64, warning, day string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	q.checkResetDayLocked()
+	day = q.lastResetDate
 
 	limit, spend, scope, bounded := q.bindingBudgetLocked(key)
 	if !bounded {
 		// Unlimited, but keep metering so a later SetBudget sees real history.
 		q.recordLocked(key, estimatedCostUSD)
-		return true, remainingUnbounded, ""
+		return true, remainingUnbounded, "", day
 	}
 	if spend+estimatedCostUSD > limit {
-		return false, limit - spend, budgetWarning(scope, limit, spend)
+		return false, limit - spend, budgetWarning(scope, limit, spend), day
 	}
 
 	q.recordLocked(key, estimatedCostUSD)
-	return true, limit - spend - estimatedCostUSD, ""
+	return true, limit - spend - estimatedCostUSD, "", day
 }
 
 // RecordSpend records actual completed spend after an LLM request completes.
@@ -148,19 +160,26 @@ func (q *QuotaLimiter) RecordSpend(key string, costUSD float64) {
 	q.recordLocked(key, costUSD)
 }
 
-// AdjustSpend applies a signed correction to the key's and the global daily
-// spend. The gateway uses it to reconcile an admission reservation
-// (CheckAndRecordSpend of the projected cost) with the actual cost, and to
-// refund a reservation whose request produced no billable exchange. Spend is
-// clamped at zero so a refund that crosses a UTC day reset cannot drive the
-// new day's meter negative.
+// AdjustSpend applies a signed correction to the current day's key and global
+// spend. Callers that are reconciling an admission reservation should use the
+// day-aware helper below so a correction cannot cross a UTC reset.
 func (q *QuotaLimiter) AdjustSpend(key string, deltaUSD float64) {
+	q.adjustSpendForDay(key, deltaUSD, "")
+}
+
+// adjustSpendForDay applies a signed correction only when reservationDay still
+// matches the active UTC meter. An empty reservationDay means an explicitly
+// current-day adjustment for callers that did not create a reservation.
+func (q *QuotaLimiter) adjustSpendForDay(key string, deltaUSD float64, reservationDay string) {
 	if deltaUSD == 0 {
 		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.checkResetDayLocked()
+	if reservationDay != "" && reservationDay != q.lastResetDate {
+		return
+	}
 	apply := func(k string) {
 		v := q.dailySpend[k] + deltaUSD
 		if v < 0 {

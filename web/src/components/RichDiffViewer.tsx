@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react';
 import { Copy, Check, Download, Columns, AlignLeft, FileCode, WrapText } from 'lucide-react';
 import { copyToClipboard } from '../lib/clipboard';
+import { buildUnifiedPatch } from '../lib/patch';
 
 interface RichDiffViewerProps {
   diff?: string | null;
@@ -116,8 +117,10 @@ export function RichDiffViewer({
 
   const handleDownloadPatch = () => {
     if (!diff) return;
-    const header = `--- a/${filePath || 'unknown'}\n+++ b/${filePath || 'unknown'}\n@@ -1 +1 @@\n`;
-    const patchContent = header + diff;
+    // The hunk header must declare as many old/new lines as the body carries.
+    // It used to be a hardcoded single-line header, which under-declared every
+    // multi-line snippet and made git reject the whole file as a corrupt patch.
+    const patchContent = buildUnifiedPatch(diff, filePath);
     const blob = new Blob([patchContent], { type: 'text/x-diff;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

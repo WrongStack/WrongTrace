@@ -164,8 +164,8 @@ func (f *failingEngine) RescanAllProjects() []core.ProjectProfile {
 }
 func (f *failingEngine) RemoveProject(string) error    { return errForced }
 func (f *failingEngine) GetSettings() core.AppSettings { return core.AppSettings{} }
-func (f *failingEngine) UpdateSettings(s core.AppSettings) core.AppSettings {
-	return s
+func (f *failingEngine) UpdateSettings(s core.AppSettings) (core.AppSettings, error) {
+	return s, nil
 }
 func (f *failingEngine) VacuumDB() error               { return errForced }
 func (f *failingEngine) ClearStale(int) (int64, error) { return 0, errForced }

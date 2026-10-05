@@ -444,7 +444,17 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 			pkg.AvgHealthScore = math.Round((float64(totalHealth)/float64(len(pkg.Files)))*10) / 10
 		}
 		sort.Slice(pkg.Files, func(i, j int) bool {
-			return pkg.Files[i].Name < pkg.Files[j].Name
+			// Basename alone is NOT a total order inside a package:
+			// resolvePackageScope collapses every web/frontend/client/ui path
+			// into one package, so web/a/index.ts and web/b/index.ts share the
+			// Name "index.ts". Ties then kept the append order, which comes
+			// from SnapshotList's MAP iteration and is re-randomised per call,
+			// so the cached payload's file order changed from one rebuild to
+			// the next. Path is unique per file, completing the order.
+			if pkg.Files[i].Name != pkg.Files[j].Name {
+				return pkg.Files[i].Name < pkg.Files[j].Name
+			}
+			return pkg.Files[i].Path < pkg.Files[j].Path
 		})
 		if pkg.Workspace != "" && pkg.Workspace != "root" {
 			workspaceSet[pkg.Workspace] = struct{}{}

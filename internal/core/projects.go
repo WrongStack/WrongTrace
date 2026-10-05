@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -125,13 +126,19 @@ func (e *Engine) cancelPrime() {
 	e.primeMu.Unlock()
 }
 
+// cloneProjectProfile keeps mutable snapshot data owned by its caller.
+func cloneProjectProfile(p ProjectProfile) ProjectProfile {
+	p.DiscoveredSessions = maps.Clone(p.DiscoveredSessions)
+	return p
+}
+
 // ListProjects returns all currently registered project profiles.
 func (e *Engine) ListProjects() []ProjectProfile {
 	e.lockMu.RLock()
 	defer e.lockMu.RUnlock()
 	out := make([]ProjectProfile, 0, len(e.projects))
 	for _, p := range e.projects {
-		out = append(out, p)
+		out = append(out, cloneProjectProfile(p))
 	}
 	return out
 }
@@ -144,7 +151,7 @@ func (e *Engine) GetProject(id string) (ProjectProfile, error) {
 	if !ok {
 		return ProjectProfile{}, fmt.Errorf("project not found: %s", id)
 	}
-	return p, nil
+	return cloneProjectProfile(p), nil
 }
 
 // GetActiveProject returns the currently active project profile.
@@ -156,17 +163,19 @@ func (e *Engine) GetActiveProject() *ProjectProfile {
 	// a Go map returned a random one of the same-named projects per call.
 	if e.activeProjectID != "" {
 		if p, ok := e.projects[e.activeProjectID]; ok {
-			cp := p
+			cp := cloneProjectProfile(p)
 			return &cp
 		}
 	}
 	if e.cfg.RepoName != "" && e.cfg.RepoName != "default" {
 		if p, ok := resolveProjectRef(e.projects, e.cfg.RepoName, ""); ok {
+			p = cloneProjectProfile(p)
 			return &p
 		}
 		return nil
 	}
 	if p, ok := firstActiveProject(e.projects); ok {
+		p = cloneProjectProfile(p)
 		return &p
 	}
 	return nil
@@ -174,7 +183,8 @@ func (e *Engine) GetActiveProject() *ProjectProfile {
 
 // resolveProjectRef deterministically resolves a project reference that may
 // be an ID or a (non-unique) name, case-insensitively: an exact ID match wins,
-// then among same-named projects preferID, then the one flagged IsActive,
+// then the smallest case-insensitive ID, then among same-named projects
+// preferID, then the one flagged IsActive,
 // then the lexically smallest ID.
 func resolveProjectRef(projects map[string]ProjectProfile, ref, preferID string) (ProjectProfile, bool) {
 	if ref == "" {
@@ -184,13 +194,21 @@ func resolveProjectRef(projects map[string]ProjectProfile, ref, preferID string)
 		return p, true
 	}
 	var matches []ProjectProfile
+	var foldedID ProjectProfile
+	foundID := false
 	for _, p := range projects {
 		if strings.EqualFold(p.ID, ref) {
-			return p, true
+			if !foundID || p.ID < foldedID.ID {
+				foldedID, foundID = p, true
+			}
+			continue
 		}
 		if strings.EqualFold(p.Name, ref) {
 			matches = append(matches, p)
 		}
+	}
+	if foundID {
+		return foldedID, true
 	}
 	if len(matches) == 0 {
 		return ProjectProfile{}, false
@@ -258,7 +276,7 @@ func (e *Engine) FindProjectForFile(filePath string) (ProjectProfile, bool) {
 	}
 
 	if bestMatchLen > 0 {
-		return bestMatch, true
+		return cloneProjectProfile(bestMatch), true
 	}
 	return ProjectProfile{}, false
 }
@@ -589,20 +607,23 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 
 	// Isolated storage in userhome ~/.wrongtrace/projects/<slug>/
 	storageDir := GetProjectStorageDir(slug)
-	_ = os.MkdirAll(storageDir, 0o755)
+	if err := os.MkdirAll(storageDir, 0o755); err != nil {
+		return ProjectProfile{}, fmt.Errorf("create project storage %s: %w", storageDir, err)
+	}
 	dbPath := filepath.Join(storageDir, "wrongtrace.db")
 
 	// Ensure dedicated per-project SQLite database is initialized with migrations.
 	// The handle is opened only to apply the schema; keeping it open would leak
 	// a connection (and on Windows, lock the file) for every project ever added.
-	if projStore, err := db.Open(dbPath); err == nil {
-		if mErr := projStore.Migrate(); mErr != nil {
-			log.Printf("projects: migrate %s: %v", dbPath, mErr)
-		}
-		_ = projStore.Close()
-	} else {
-		log.Printf("projects: open %s: %v", dbPath, err)
+	projStore, err := db.Open(dbPath)
+	if err != nil {
+		return ProjectProfile{}, fmt.Errorf("open project database %s: %w", dbPath, err)
 	}
+	if err := projStore.Migrate(); err != nil {
+		_ = projStore.Close()
+		return ProjectProfile{}, fmt.Errorf("migrate project database %s: %w", dbPath, err)
+	}
+	_ = projStore.Close()
 
 	// Auto-discover agent session paths and language
 	sessions := ScanAgentSessions(absPath)

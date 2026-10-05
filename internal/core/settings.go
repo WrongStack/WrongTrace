@@ -2,8 +2,10 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/wrongstack/wrongtrace/internal/webhook"
@@ -97,20 +99,29 @@ func loadSettingsFromDisk() {
 	}
 }
 
-func saveSettingsToDisk(s AppSettings) {
+func saveSettingsToDisk(s AppSettings) error {
 	path := settingsFilePath()
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	if data, err := json.MarshalIndent(s, "", "  "); err == nil {
-		if os.WriteFile(path, data, 0o600) == nil {
-			_ = os.Chmod(path, 0o600)
-		}
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode settings: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create settings directory: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write settings: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("secure settings: %w", err)
+	}
+	return nil
 }
 
 // GetSettings returns a snapshot of the current settings.
 func (e *Engine) GetSettings() AppSettings {
 	settingsMu.RLock()
 	s := globalSettings
+	s.IgnorePatterns = slices.Clone(s.IgnorePatterns)
 	settingsMu.RUnlock()
 
 	if e != nil && s.DBPath == "" {
@@ -124,66 +135,72 @@ func (e *Engine) GetSettings() AppSettings {
 }
 
 // UpdateSettings updates the application settings.
-func (e *Engine) UpdateSettings(s AppSettings) AppSettings {
+func (e *Engine) UpdateSettings(s AppSettings) (AppSettings, error) {
 	settingsMu.Lock()
 	defer settingsMu.Unlock()
 
+	// Stage the patch so a failed save cannot publish unpersisted settings.
+	next := globalSettings
 	if s.DebounceMs > 0 {
-		globalSettings.DebounceMs = s.DebounceMs
+		next.DebounceMs = s.DebounceMs
 	}
 	// Use nil-check, not len>0, so an explicitly empty slice clears the field.
 	if s.IgnorePatterns != nil {
-		globalSettings.IgnorePatterns = s.IgnorePatterns
+		next.IgnorePatterns = slices.Clone(s.IgnorePatterns)
 	}
 	if s.ThrashingThreshold > 0 {
-		globalSettings.ThrashingThreshold = s.ThrashingThreshold
+		next.ThrashingThreshold = s.ThrashingThreshold
 	}
 	if s.FragilityCutoff > 0 {
-		globalSettings.FragilityCutoff = s.FragilityCutoff
+		next.FragilityCutoff = s.FragilityCutoff
 	}
 	if s.CostAlertUSD > 0 {
-		globalSettings.CostAlertUSD = s.CostAlertUSD
+		next.CostAlertUSD = s.CostAlertUSD
 	}
 	if s.AutoPruneDays > 0 {
-		globalSettings.AutoPruneDays = s.AutoPruneDays
+		next.AutoPruneDays = s.AutoPruneDays
 	}
 	if s.DefaultProvider != "" {
-		globalSettings.DefaultProvider = s.DefaultProvider
+		next.DefaultProvider = s.DefaultProvider
 	}
 	if s.SlackWebhookURL == "-" || s.SlackWebhookURL == "none" || s.SlackWebhookURL == "CLEAR" {
-		globalSettings.SlackWebhookURL = ""
+		next.SlackWebhookURL = ""
 	} else if s.SlackWebhookURL != "" {
-		globalSettings.SlackWebhookURL = s.SlackWebhookURL
+		next.SlackWebhookURL = s.SlackWebhookURL
 	}
 	if s.DiscordWebhookURL == "-" || s.DiscordWebhookURL == "none" || s.DiscordWebhookURL == "CLEAR" {
-		globalSettings.DiscordWebhookURL = ""
+		next.DiscordWebhookURL = ""
 	} else if s.DiscordWebhookURL != "" {
-		globalSettings.DiscordWebhookURL = s.DiscordWebhookURL
+		next.DiscordWebhookURL = s.DiscordWebhookURL
 	}
 	if s.CustomWebhookURL == "-" || s.CustomWebhookURL == "none" || s.CustomWebhookURL == "CLEAR" {
-		globalSettings.CustomWebhookURL = ""
+		next.CustomWebhookURL = ""
 	} else if s.CustomWebhookURL != "" {
-		globalSettings.CustomWebhookURL = s.CustomWebhookURL
+		next.CustomWebhookURL = s.CustomWebhookURL
 	}
 	if s.DBPath != "" {
-		globalSettings.DBPath = s.DBPath
+		next.DBPath = s.DBPath
 	}
 	if s.SocketPath != "" {
-		globalSettings.SocketPath = s.SocketPath
+		next.SocketPath = s.SocketPath
 	}
 
-	saveSettingsToDisk(globalSettings)
+	if err := saveSettingsToDisk(next); err != nil {
+		return AppSettings{}, err
+	}
+	globalSettings = next
 
 	if e != nil && e.webhooks != nil {
 		e.webhooks.UpdateConfig(webhook.Config{
-			SlackURL:   globalSettings.SlackWebhookURL,
-			DiscordURL: globalSettings.DiscordWebhookURL,
-			GenericURL: globalSettings.CustomWebhookURL,
+			SlackURL:   next.SlackWebhookURL,
+			DiscordURL: next.DiscordWebhookURL,
+			GenericURL: next.CustomWebhookURL,
 			// Env wins over any stored value so the HMAC secret never has to
 			// live in settings.json next to the webhook URLs.
 			SigningSecret: os.Getenv("WRONGTRACE_WEBHOOK_SECRET"),
 		})
 	}
 
-	return globalSettings
+	next.IgnorePatterns = slices.Clone(next.IgnorePatterns)
+	return next, nil
 }

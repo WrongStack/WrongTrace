@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -84,7 +85,11 @@ func (k *keyedMutex) size() int {
 }
 
 func tombstoneKey(path string) string {
-	return strings.ToLower(filepath.Clean(path))
+	clean := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(clean)
+	}
+	return clean
 }
 
 // recordTombstone remembers that path was deleted while its symbols were
@@ -141,5 +146,6 @@ func (e *Engine) firstSightIsCreation(path string, info os.FileInfo) bool {
 	if !ok || birth.IsZero() {
 		return false
 	}
-	return now.Sub(birth) <= newFileWindow
+	age := now.Sub(birth)
+	return age >= 0 && age <= newFileWindow
 }

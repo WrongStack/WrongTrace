@@ -246,12 +246,7 @@ func (e *Engine) CheckGuardrail(path string) (GuardrailResult, error) {
 
 	h, err := e.FileHealth(path)
 	if err != nil {
-		return GuardrailResult{
-			Allowed:        true,
-			HealthScore:    100,
-			Recommendation: "Allowed: No previous churn history.",
-			CheckedAt:      time.Now().UTC(),
-		}, nil
+		return GuardrailResult{}, fmt.Errorf("check guardrail file health: %w", err)
 	}
 
 	allowed := true
