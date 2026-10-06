@@ -211,6 +211,110 @@ func (e *Engine) ParseHashed(path string, src []byte, hash string) (*FileSnapsho
 	return snap, nil
 }
 
+// typeDeclModifiers are the tokens that may precede a type-declaration keyword
+// on its line: access/abstract/final modifiers plus Rust visibility.
+var typeDeclModifiers = map[string]bool{
+	"public": true, "private": true, "protected": true, "internal": true,
+	"abstract": true, "final": true, "static": true, "sealed": true,
+	"partial": true, "readonly": true, "unsafe": true, "const": true,
+	"open": true, "base": true, "data": true, "value": true, "augment": true,
+	// Kotlin spells a named singleton `companion object Name`, so `companion`
+	// sits in the prefix position typeDeclModifiersOnly validates. Without it
+	// the guard rejected the line and the whole declaration went unseen.
+	"companion": true,
+	"pub":       true,
+}
+
+// typeDeclModifiersOnly reports whether every field before a type-declaration
+// keyword is a modifier, i.e. the keyword sits in DECLARATION position.
+//
+// This is what rejects a keyword quoted inside a string literal: in
+// `System.out.println("the class is not found")` the fields before `class` are
+// `System.out.println("the` — an expression token, not a modifier. Without the
+// position requirement that line minted `class:<file>::is`, a declaration that
+// does not exist. The keyword itself being a well-formed word is exactly why an
+// identifier check alone cannot reject it.
+func typeDeclModifiersOnly(prefix []string) bool {
+	for _, f := range prefix {
+		// Rust's parenthesised visibility is one Fields entry: pub(crate),
+		// pub(super), pub(self). A multi-field `pub(in a::b)` still fails,
+		// which is vanishingly rare and was never claimed as supported.
+		if !typeDeclModifiers[f] && !strings.HasPrefix(f, "pub(") {
+			return false
+		}
+	}
+	return true
+}
+
+// typeDeclPlausibleName rejects a name token that could not have come from a
+// declaration head — punctuation, quotes or an empty field — so a stray token
+// can never become a signature. Qualified C++ names (`Foo::bar`, `Foo::~Foo`)
+// stay accepted, matching plausibleDeclName.
+func typeDeclPlausibleName(n string) bool {
+	if n == "" || !isIdentStart(n[0]) {
+		return false
+	}
+	for i := 0; i < len(n); i++ {
+		if !isIdentChar(n[i]) && n[i] != ':' && n[i] != '~' {
+			return false
+		}
+	}
+	return true
+}
+
+// typeDeclName returns the declared name of a class/interface/enum head, or ""
+// when the line declares none.
+//
+// It requires the keyword to sit in DECLARATION position (every preceding field
+// a modifier) and the taken token to be a plausible identifier. Returning ""
+// lets the caller's switch fall through to the LATER arms, which is what keeps
+// Kotlin's `fun interface Callback {` working: `fun` is not a modifier here, so
+// this arm declines the line and the `lang == LangKotlin` arm below — which
+// understands SAM interfaces — handles it. An earlier revision did the position
+// check INSIDE this arm's body while gating the case on the old substring test;
+// the case then matched, the body produced no name, and the Kotlin arm was never
+// reached, silently dropping every `fun interface` (caught by
+// TestParseGenericSource_KotlinGenericFunctions).
+func typeDeclName(trimmed string) string {
+	parts := strings.Fields(trimmed)
+	for j, p := range parts {
+		if p != "class" && p != "interface" && p != "enum" && p != "object" && p != "trait" && p != "module" {
+			continue
+		}
+		if j+1 >= len(parts) || !typeDeclModifiersOnly(parts[:j]) {
+			continue
+		}
+		k := j + 1
+		// Kotlin and Java both spell some types with TWO keywords:
+		// `enum class Color`, `enum interface Op`. The keyword found at j is
+		// then the outer qualifier, not the declarator, so the name is the field
+		// after the SECOND keyword. Reading parts[j+1] instead named the type
+		// "class"/"interface" and dropped the real one from the snapshot — a
+		// regression introduced when `enum` joined this keyword set (round 6) and
+		// untested, because no case covered the two-word spelling.
+		if k < len(parts) && (parts[k] == "class" || parts[k] == "interface") {
+			k++
+		}
+		if k >= len(parts) {
+			return ""
+		}
+		n := strings.Split(parts[k], "{")[0]
+		n = strings.Split(n, "(")[0]
+		n = strings.TrimSpace(n)
+		// PHP 8.1 backed enums spell the backing type with no space before the
+		// colon (`enum Suit: string`), so parts[k] is literally "Suit:". The
+		// colon belongs to the signature, not the identifier: keeping it keyed
+		// the node "Suit:" and left the real type absent from the snapshot, so
+		// no Diff event was ever attributed to it.
+		n = strings.TrimSuffix(n, ":")
+		if typeDeclPlausibleName(n) {
+			return n
+		}
+		return ""
+	}
+	return ""
+}
+
 // parseGenericSource extracts declarations using robust pattern matching for languages without a compiled Tree-sitter grammar.
 func parseGenericSource(path string, src []byte, lang Language, hash ...string) *FileSnapshot {
 	h := ""
@@ -244,7 +348,16 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "#") {
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") {
+			continue
+		}
+		// `#` opens a PHP line comment, so lines beginning with it were skipped as
+		// comments. But PHP 8 attributes open with `#[`, so EVERY inline-annotated
+		// declaration -- `#[Deprecated] public function old2() {` -- was discarded
+		// here before reaching the dispatch switch at all. Only a `#` NOT followed
+		// by `[` is a comment; the two spellings are distinguishable, and PHP allows
+		// a comment body to start with anything, so the test must be exactly this.
+		if strings.HasPrefix(trimmed, "#") && !strings.HasPrefix(trimmed, "#[") {
 			continue
 		}
 
@@ -271,16 +384,34 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 					break
 				}
 			}
-		case strings.HasPrefix(trimmed, "class ") || strings.Contains(trimmed, " class "):
+		case typeDeclName(trimmed) != "":
+			// `interface` and `enum` declare types exactly as `class` does. Java,
+			// C# and Dart have no Tree-sitter grammar, so every
+			// `public interface Repo {` / `public enum Color {` reached this arm's
+			// predecessor list empty and produced NO node: the declaration was
+			// absent from the snapshot, so an edit anywhere inside it matched no
+			// signature and emitted no ADDED/MODIFIED/DELETED event -- no churn
+			// analytics, no thrashing/fragility signal, no model attribution. The
+			// same class of blindness round 89 fixed for Kotlin `fun`.
+			//
+			// The gate above is a bare SUBSTRING test, so it also fires on a line
+			// that merely MENTIONS the word inside a string literal:
+			//
+			//	System.out.println("the class is not found");  -> class:Repo.java::is
+			//	warn("unknown enum value");                  -> class:Repo.java::value");
+			//
+			// Both phantoms entered the snapshot and emitted ADDED/DELETED Diff
+			// events for symbols that do not exist, corrupting churn analytics,
+			// fragility scoring and model attribution. The repo fixed this same
+			// failure mode for statement heads (parser_generic_regression_test.go)
+			// but never for string literals, and rounds 1/6 widened this arm
+			// without the guard.
+			//
+			// Both tokens in those examples are perfectly well-formed words, so an
+			// identifier check alone cannot reject them: the keyword must also sit
+			// in DECLARATION position, i.e. every field before it is a modifier.
 			kind = NodeClass
-			parts := strings.Fields(trimmed)
-			for j, p := range parts {
-				if p == "class" && j+1 < len(parts) {
-					name = strings.Split(parts[j+1], "{")[0]
-					name = strings.Split(name, "(")[0]
-					break
-				}
-			}
+			name = typeDeclName(trimmed)
 		case lang == LangPHP:
 			kind, name = phpFunctionDecl(trimmed)
 		case strings.HasPrefix(trimmed, "function ") || strings.HasPrefix(trimmed, "public function ") || strings.HasPrefix(trimmed, "private function "):
@@ -297,6 +428,13 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 			parts := strings.Fields(trimmed)
 			if len(parts) > 1 {
 				name = strings.Split(parts[1], "(")[0]
+				// `def self.make` declares the method `make`: `self.` is the
+				// receiver, part of the signature and not part of the
+				// identifier. Keeping it keyed the node "self.make", so the real
+				// method name was absent from the snapshot — the same split
+				// identity round 13 fixed for PHP's `&` and `:` sigils.
+				name = strings.TrimPrefix(name, "self.")
+				name = rubyMethodName(name)
 			}
 		case lang == LangRust:
 			// Rust items carry visibility/modifier tokens before the keyword
@@ -343,6 +481,32 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 					braceCount += scanner.lineDelta(lines[j])
 				}
 				endLine = j
+			} else if lang == LangRuby {
+				// Ruby closes blocks with `end`, never `}`, so the brace scan above
+				// never fired and EVERY Ruby node kept endLine on its declaration
+				// line. The span then froze the body hash over that one line, and
+				// since Diff decides MODIFIED by comparing BodyHash, no edit inside
+				// any Ruby method or class body could ever produce an event —
+				// Ruby's churn/thrash/attribution signals were structurally dark,
+				// and failed silently because the declaration WAS in the snapshot.
+				//
+				// Match the `end` at the DECLARATION's own indentation: that is the
+				// one that closes this block, so a nested `end` (an `if` inside a
+				// `def`) is skipped rather than closing the outer node early.
+				indent := len(line) - len(strings.TrimLeft(line, " \t"))
+				for k := i + 1; k < len(lines); k++ {
+					trimmed := strings.TrimSpace(lines[k])
+					if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+						continue
+					}
+					if len(lines[k])-len(strings.TrimLeft(lines[k], " \t")) != indent {
+						continue
+					}
+					if trimmed == "end" || strings.HasSuffix(trimmed, " end") {
+						endLine = k + 1
+						break
+					}
+				}
 			}
 
 			startByte := lineStart[startLine-1]
@@ -369,12 +533,28 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 func phpFunctionDecl(line string) (NodeKind, string) {
 	fields := strings.Fields(line)
 	for i, field := range fields {
-		switch field {
-		case "public", "protected", "private", "static", "final", "abstract":
+		switch {
+		case field == "public", field == "protected", field == "private",
+			field == "static", field == "final", field == "abstract":
 			continue
-		case "function":
+		// PHP 8 attributes precede a member declaration. `#[Deprecated]
+		// public function old2()` put one in front of `public`, and the loop
+		// below returned "" at the first field that was neither a modifier nor
+		// `function` -- so the method was declared on no node at all. The same
+		// attribute on its own line parsed fine, because the declaration's line
+		// then began with `public`: a declaration's visibility depended on an
+		// arbitrary line break. Both spellings are idiomatic PHP, so attributes
+		// are skipped wherever they appear before the `function` head.
+		case strings.HasPrefix(field, "#["):
+			continue
+		case field == "function":
 			if i+1 < len(fields) {
-				return NodeFunction, strings.Split(fields[i+1], "(")[0]
+				// PHP marks a by-reference return with `&`, which is part of the
+				// signature but not the identifier: `public function &byRef()`
+				// declares the method `byRef`. Keeping the sigil keyed the node
+				// "&byRef", so the real identifier was absent from the snapshot
+				// and no Diff event was ever attributed to that method.
+				return NodeFunction, strings.TrimLeft(strings.Split(fields[i+1], "(")[0], "&")
 			}
 		default:
 			return "", ""
@@ -382,6 +562,31 @@ func phpFunctionDecl(line string) (NodeKind, string) {
 		break
 	}
 	return "", ""
+}
+
+// rubyMethodName trims a Ruby name token down to the identifier.
+//
+// The Ruby arm takes parts[1] and splits on "(", which works while the
+// definition continues onto later lines (`def find(name)` -> "find"). A
+// ONE-LINE definition leaves the body glued to the name token:
+// `def valid?; @ok; end` -> "valid?;", `def tiny; 1; end` -> "tiny;". Those
+// became the declared name, so the real identifier never entered the snapshot.
+//
+// Ruby method names are letters, digits and '_', and may END with '?' or '!'
+// (predicate and bang forms) or '=' (setters, `def name=(v)`), so those three
+// are kept wherever they appear; everything else is the body and is cut.
+func rubyMethodName(tok string) string {
+	end := 0
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			c == '_' || c == '?' || c == '!' || c == '=' {
+			end = i + 1
+			continue
+		}
+		break
+	}
+	return tok[:end]
 }
 
 // statementKeywords are words that begin (or sit inside) a statement or
@@ -462,17 +667,48 @@ func rustDecl(trimmed string) (NodeKind, string) {
 		}
 		break
 	}
-	// i == 0 means the head was already literal ("fn "/"pub fn "), which the
-	// arms above own; i+1 out of range means no name token follows the keyword.
-	if i == 0 || i+1 >= len(fields) {
+	// i+1 out of range means no name token follows the keyword.
+	if i+1 >= len(fields) {
 		return "", ""
 	}
-	switch kw := fields[i]; kw {
+	kw := fields[i]
+	// `impl<T> Foo<T> {` keeps the type parameter glued to the keyword, so the
+	// whole field is "impl<T>" rather than "impl".
+	if strings.HasPrefix(kw, "impl<") {
+		kw = "impl"
+	}
+	switch kw {
 	case "fn":
+		if i == 0 {
+			return "", "" // literal "fn " head, which the arms above own
+		}
 		return NodeFunction, strings.TrimSpace(strings.Split(strings.Split(fields[i+1], "(")[0], "<")[0])
 	case "struct":
+		if i == 0 {
+			return "", "" // literal "struct " head, which the arms above own
+		}
 		name := strings.Split(fields[i+1], "{")[0]
 		return NodeStruct, strings.TrimSpace(strings.Split(name, "<")[0])
+	case "trait", "union", "mod", "impl":
+		// Rust's remaining item declarations, tracked like `struct`: an edit to a
+		// trait or impl body must reach the snapshot and emit a Diff event.
+		// Unlike fn/struct these have no literal-head arm above, so i == 0 is
+		// the COMMON case ("trait Greeter {") and is accepted here.
+		// All four are RESERVED Rust keywords, so no identifier can shadow one
+		// and land here — which is what makes widening safe, and why the
+		// statement heads this function must not claim (`match x {`,
+		// `if let Some(v) = f() {`, `loop {`) still fall through to the default.
+		name := fields[i+1]
+		if j := strings.IndexAny(name, "{;"); j >= 0 {
+			name = name[:j] // `mod util;` and `trait G {` both land here
+		}
+		if k := strings.IndexByte(name, '<'); k >= 0 {
+			name = name[:k]
+		}
+		if name = strings.TrimSpace(name); name == "" {
+			return "", ""
+		}
+		return NodeClass, name
 	}
 	return "", ""
 }
@@ -631,7 +867,22 @@ func typedDeclName(trimmed string) string {
 			return ""
 		}
 		name := strings.TrimLeft(f[:idx], "*&")
-		if !plausibleDeclName(name) || statementKeywords[name] {
+		// The name is NOT filtered against statementKeywords. That map is
+		// deliberately overloaded with statement heads from Rust, Python, Swift,
+		// Kotlin and JS, and many of its entries are ordinary, legal method names
+		// in Java/C#/C++/Dart — the languages typedDeclLanguage gates on. `is`,
+		// `on`, `with`, `from`, `select`, `where`, `delete` and `in` are everyday
+		// Java method names, and each one made typedDeclName return "", dropping
+		// a REAL declaration from the snapshot: editing it then emitted no
+		// ADDED/MODIFIED/DELETED Diff event, so it contributed no churn, no
+		// thrashing signal and no model attribution.
+		//
+		// The guard that actually rejects statement heads is the HEAD check above
+		// (`statementKeywords[fields[0]]`), plus the `j == 0` "call, not a
+		// declaration" rule and plausibleTypeToken. A statement head always
+		// STARTS the line, so the head check alone covers every case
+		// TestTypedDeclName_RejectsStatementHeads enumerates.
+		if !plausibleDeclName(name) {
 			return ""
 		}
 		return name
@@ -774,6 +1025,15 @@ func (sc *braceScanner) lineDelta(line string) int {
 				continue
 			}
 		case '#':
+			// `#` opens a PHP line comment, but a PHP 8 attribute opens with
+			// `#[`. Treating the whole line as comment text skipped the
+			// declaration's trailing `{`, so braceCount stayed 0, endLine never
+			// advanced past the declaration, and the node's hash was frozen over
+			// that one line: Diff then saw an unchanged body and emitted no
+			// event for any edit inside the method.
+			if i+1 < len(line) && line[i+1] == '[' {
+				continue // an attribute, not a comment
+			}
 			sc.inLineComment = true
 			continue
 		case '\'':
@@ -987,6 +1247,19 @@ func classifyNode(lang Language, typeStr string, n *sitter.Node) (NodeKind, bool
 				return NodeArrowFn, true
 			}
 		case "class_declaration":
+			return NodeClass, true
+		case "interface_declaration":
+			// `interface Repo { … }` is a first-class TypeScript declaration and
+			// the most-used type form in the language, but it had no case here,
+			// so it was classified as a non-declaration intermediate: the node
+			// never entered the snapshot, and an edit inside an interface
+			// matched no signature and emitted NO ADDED/MODIFIED/DELETED event.
+			// No churn, no fragility/thrashing signal, no model attribution —
+			// the same blindness this parser fixed repeatedly on the generic path
+			// for class/interface/enum/object/trait/module.
+			//
+			// A `type X = Y` ALIAS is deliberately not included: it is a
+			// different tree-sitter node type and carries no body to diff.
 			return NodeClass, true
 		}
 	case LangPython:
