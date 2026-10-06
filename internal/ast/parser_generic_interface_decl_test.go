@@ -35,17 +35,17 @@ func TestParseGenericSource_InterfaceDeclarationsAreVisible(t *testing.T) {
 	}{
 		{
 			path: "src/main/java/Repo.java",
-			src: "public interface Repo {\n    String find(String id);\n}\n",
+			src:  "public interface Repo {\n    String find(String id);\n}\n",
 			want: "class:Repo.java::Repo",
 		},
 		{
 			path: "Repo.cs",
-			src: "public interface IRepo {\n    string Find(string id);\n}\n",
+			src:  "public interface IRepo {\n    string Find(string id);\n}\n",
 			want: "class:Repo.cs::IRepo",
 		},
 		{
 			path: "lib/repo.dart",
-			src: "abstract interface Repo {\n  String find(String id);\n}\n",
+			src:  "abstract interface Repo {\n  String find(String id);\n}\n",
 			want: "class:repo.dart::Repo",
 		},
 	}
