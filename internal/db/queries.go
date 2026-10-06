@@ -1604,12 +1604,36 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 			       COALESCE(r.cost_usd, 0.0)
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id`
-	// The signature clause's equality arms are inert either way (the escaped
-	// contains arm subsumes them in the OR), so they keep escapeLike.
-	const sigClause = `(e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%' || LOWER(?) || '%' ESCAPE '\' OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) ESCAPE '\' OR LOWER(e.node_signature) LIKE '%:' || LOWER(?) ESCAPE '\')`
+	// The signature clause's equality arms are inert either way, so they keep
+	// escapeLike.
+	//
+	// The bare name forms are anchored at a ':' component boundary, exactly as
+	// the per-file pathMatchClause arms are anchored on '/'. They must NOT also
+	// offer an unanchored '%name%' contains arm: the dashboard sends the FULL
+	// stored signature (web/src/components/CodeAtlas.tsx:1607 passes
+	// node_signature verbatim), so lowercased it is a PREFIX of any longer
+	// sibling -- asking for "func:DoTask" also returned "func:DoTaskAsync" and
+	// "func:DoTaskHelper", interleaving their revisions into one symbol's
+	// timeline and breaking the "specific AST symbol" contract this function
+	// documents. That is the same defect class the per-file suffix arms had
+	// ("main.go" matching "cmd/domain.go"), carried on the signature axis.
+	//
+	// Reachability is the full-signature form, so the anchored arms cover it
+	// from the left: a stored "func:doTask" IS matched by "%.::" || "func:DoTask"
+	// (the needle's own leading "func:" is preceded by "/"), which also admits
+	// the historical bare-name spelling. The trailing "::" arms keep a bare name
+	// matching the last component of a qualified signature.
+	const sigClause = `(e.node_signature = ? OR LOWER(e.node_signature) = LOWER(?) OR LOWER(e.node_signature) LIKE '%::' || LOWER(?) ESCAPE '\' OR LOWER(e.node_signature) LIKE '%:' || LOWER(?) ESCAPE '\')`
 	sigArgs := func() []any {
+		// The two equality arms compare literally and perform no ESCAPE
+		// processing, so they MUST bind the raw value: an escaped value would
+		// carry a literal backslash and never match a stored '_' or '%'. Only
+		// the LIKE arms declare ESCAPE, so only they take the quoted value.
+		// This is round-77's invariant, made load-bearing here: while the
+		// contains arm existed the equality arms were inert and their escaping
+		// harmless; removing it turned a latent mis-binding into a real one.
 		q := escapeLike(cleanSig)
-		return []any{q, q, q, q, q}
+		return []any{cleanSig, cleanSig, q, q}
 	}
 
 	var where []string
