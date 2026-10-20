@@ -33,6 +33,76 @@ Watches your code with Tree-sitter, correlates AST-level edits with path-scoped 
 
 ---
 
+## 📦 Installation
+
+Prebuilt binaries are published for **Linux x64**, **macOS (Apple Silicon and Intel)**, and **Windows x64**. The installers download the latest release, verify its SHA-256 checksum, and put `wrongtrace` on your `PATH`.
+
+**Linux / macOS**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/WrongStack/WrongTrace/master/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/WrongStack/WrongTrace/master/install.ps1 | iex
+```
+
+Then open a new terminal and check it:
+
+```bash
+wrongtrace --version
+```
+
+| | Linux / macOS (`install.sh`) | Windows (`install.ps1`) |
+|:---|:---|:---|
+| Install location | `~/.local/bin/wrongtrace` | `%LOCALAPPDATA%\Programs\WrongTrace\wrongtrace.exe` |
+| PATH setup | Appends an `export PATH=...` line to `~/.zshrc`, `~/.bashrc` (+ `~/.bash_profile` on macOS), `~/.profile`, or a fish `conf.d` file — only if the directory is not already on `PATH` | Adds the directory to the **user** `Path` environment variable (no admin needed) |
+| Pin a version | `sh -s -- --version v0.3.17` or `WRONGTRACE_VERSION=v0.3.17` | `-Version v0.3.17` or `$env:WRONGTRACE_VERSION='v0.3.17'` |
+| Custom directory | `--dir /usr/local/bin` or `WRONGTRACE_INSTALL_DIR=...` | `-InstallDir C:\tools\wrongtrace` or `$env:WRONGTRACE_INSTALL_DIR=...` |
+| Leave PATH alone | `--no-modify-path` or `WRONGTRACE_NO_MODIFY_PATH=1` | `-NoModifyPath` or `$env:WRONGTRACE_NO_MODIFY_PATH='1'` |
+| Uninstall | `sh -s -- --uninstall` | `-Uninstall` (also removes the PATH entry) |
+
+Flags are passed through the pipe like this:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/WrongStack/WrongTrace/master/install.sh | sh -s -- --version v0.3.17 --dir /usr/local/bin
+```
+
+```powershell
+# irm | iex cannot take parameters; download the script to pass them:
+irm https://raw.githubusercontent.com/WrongStack/WrongTrace/master/install.ps1 -OutFile install.ps1
+.\install.ps1 -Version v0.3.17
+```
+
+Uninstalling never touches your data in `WRONGTRACE_HOME` (`~/.wrongtrace`); delete it manually if you want a clean slate.
+
+### Updating
+
+```bash
+wrongtrace update            # install the latest release in place
+wrongtrace update --check    # only report whether a newer release exists
+wrongtrace update --version v0.3.16   # install a specific release (allows downgrade)
+```
+
+`update` downloads the release asset for your platform, verifies it against the release's `checksums.txt`, makes sure it runs, and atomically swaps it in for the running binary (on Windows the old file is moved aside to `wrongtrace.exe.old` and cleaned up on the next update). Restart a running `wrongtrace start` daemon afterwards. If the binary lives in a directory you cannot write to (e.g. `/usr/local/bin`), run it with `sudo` or re-run the installer.
+
+Re-running the install script also upgrades in place.
+
+### Building from Source
+
+WrongTrace needs **CGO** (Tree-sitter grammars are C) and Node.js 20.19+/22.12+ for the dashboard:
+
+```bash
+git clone https://github.com/WrongStack/WrongTrace.git && cd WrongTrace
+CGO_ENABLED=1 make build        # -> bin/wrongtrace
+```
+
+Copy `bin/wrongtrace` into any directory on your `PATH`. Source builds report version `dev`, so `wrongtrace update` will replace them with the latest release.
+
+---
+
 ## ⚡ Quickstart
 
 ### 1. One-Command Setup (`wrongtrace init`)
@@ -144,6 +214,7 @@ Available Commands:
   export         Export telemetry and code churn records to JSON
   report         Generate an executive Markdown, HTML, or JSON observability report
   status         Print a quick summary of DB path, monitored repo, totals, and active models
+  update         Update the wrongtrace binary to the latest GitHub release
 ```
 
 ---

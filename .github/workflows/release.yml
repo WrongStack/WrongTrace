@@ -121,6 +121,12 @@ jobs:
           path: release
           merge-multiple: true
 
+      # install.sh, install.ps1 and `wrongtrace update` verify downloads
+      # against this file.
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum wrongtrace-* > checksums.txt && cat checksums.txt
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `install.sh` (Linux/macOS) and `install.ps1` (Windows) one-line installers: download the release binary for the platform, verify its SHA-256 checksum, install it (`~/.local/bin` or `%LOCALAPPDATA%\Programs\WrongTrace`), and add the directory to `PATH`. Support version pinning, a custom directory, `--no-modify-path`, and uninstall.
+- `wrongtrace update` replaces the running binary with the latest (or `--version`-pinned) release after checksum verification and a smoke run; `--check` only reports whether an update exists.
+- Release workflow publishes `checksums.txt` (SHA-256 of every binary) alongside the assets.
+
 ---
 
 ## [0.3.17] - 2026-10-05
