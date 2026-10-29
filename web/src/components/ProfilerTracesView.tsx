@@ -53,8 +53,10 @@ export function ProfilerTracesView() {
   const percentiles = useMemo(() => {
     if (traces.length === 0) return { p50: 0, p90: 0, p99: 0 };
     const durations = traces.map((t) => t.duration_ms).sort((a, b) => a - b);
+    // Nearest-rank: the value at rank ceil(p*n), index rank-1. floor(n*p) as
+    // an index was one rank high -- P99 of 100 spans was the single slowest.
     const getP = (pct: number) => {
-      const idx = Math.floor(durations.length * pct);
+      const idx = Math.max(0, Math.ceil(durations.length * pct) - 1);
       return durations[Math.min(idx, durations.length - 1)] || 0;
     };
     return {

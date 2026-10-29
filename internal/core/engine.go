@@ -75,6 +75,7 @@ type Engine struct {
 
 	primeMu     sync.Mutex
 	primeCancel context.CancelFunc
+	primeClosed bool
 
 	ipcMu      sync.RWMutex
 	ipcTraffic []ipc.IPCTrafficRecord
@@ -209,7 +210,7 @@ func NewEngine(cfg Config) *Engine {
 		SigningSecret: os.Getenv("WRONGTRACE_WEBHOOK_SECRET"),
 	})
 
-	return &Engine{
+	e := &Engine{
 		cfg:             cfg,
 		watchRoot:       absClean(cfg.WatchDir),
 		hub:             NewHub(),
@@ -221,6 +222,45 @@ func NewEngine(cfg Config) *Engine {
 		activeProjectID: activeProjID,
 		webhooks:        dispatcher,
 	}
+	e.bindActiveProjectStore()
+	return e
+}
+
+// bindActiveProjectStore makes a project restored as active at startup use
+// its own database, as SwitchActiveProject would. The restore used to adopt
+// the identity only: events went to the caller's store while the settings
+// named the project's, so the dashboard showed different history after every
+// restart. A project whose own database is still empty while the caller's
+// store holds history is pointed at that store instead -- that is where its
+// events were written -- so no recorded history drops out of view.
+//
+// The caller's store is not closed here: the caller owns it.
+func (e *Engine) bindActiveProjectStore() {
+	cur := e.cfg.Store
+	p, ok := e.projects[e.activeProjectID]
+	if !ok || cur == nil || p.DBPath == "" || cur.Path() == "" || normalizeRoot(p.DBPath) == normalizeRoot(cur.Path()) {
+		return
+	}
+	own, err := db.Open(p.DBPath)
+	if err != nil {
+		log.Printf("projects: open %s for active project %q: %v (keeping %s)", p.DBPath, p.Name, err, cur.Path())
+		return
+	}
+	if err := own.Migrate(); err != nil {
+		_ = own.Close()
+		log.Printf("projects: migrate %s for active project %q: %v (keeping %s)", p.DBPath, p.Name, err, cur.Path())
+		return
+	}
+	ownHas, ownErr := own.HasHistory()
+	curHas, curErr := cur.HasHistory()
+	if ownErr == nil && curErr == nil && !ownHas && curHas {
+		_ = own.Close()
+		p.DBPath = cur.Path()
+		e.projects[p.ID] = p
+		e.persistProjects(e.snapshotProjectsLocked())
+		return
+	}
+	e.cfg.Store = own
 }
 
 // Hub exposes the WebSocket broadcaster. The server package reads from it.
@@ -370,7 +410,7 @@ func (e *Engine) persistAndBroadcast(res ast.DiffResult) {
 		attributionSource = "tool_path"
 		attributionConfidence = 0.95
 	} else {
-		runID = e.recentRunID()
+		runID = e.recentRunID(res.Events[0].FilePath)
 		if runID != "" {
 			attributionSource = "single_active_run"
 			attributionConfidence = 0.60
@@ -623,6 +663,22 @@ func (e *Engine) pruneActiveRuns() {
 // ReportRun is invoked by the IPC server for "telemetry/report_run". It writes
 // the agent_runs row, records the run in the in-memory active set, and
 // broadcasts a "run" event for the dashboard badge.
+// RunTotals returns the stored totals of a run, so a reporter that tracks
+// running totals (the proxy) can resume a run it no longer holds in memory.
+// ok is false when the run is unknown or the store cannot answer.
+func (e *Engine) RunTotals(runID string) (prompt, completion int64, costUSD float64, ok bool) {
+	store := e.Store()
+	if store == nil || runID == "" {
+		return 0, 0, 0, false
+	}
+	prompt, completion, costUSD, ok, err := store.RunTotals(runID)
+	if err != nil {
+		log.Printf("engine: run totals %s: %v", runID, err)
+		return 0, 0, 0, false
+	}
+	return prompt, completion, costUSD, ok
+}
+
 func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 	if p.RunID == "" {
 		return errors.New("run_id is required")
@@ -665,7 +721,7 @@ func (e *Engine) ReportRun(p ipc.TelemetryReport) error {
 		return fmt.Errorf("upsert run: %w", err)
 	}
 	e.runMu.Lock()
-	if len(e.activeRuns) > 250 {
+	if _, exists := e.activeRuns[p.RunID]; !exists && len(e.activeRuns) > 250 {
 		cutoff := time.Now().Add(-e.correlate)
 		for id, m := range e.activeRuns {
 			if m.LastSeen.Before(cutoff) {
@@ -789,11 +845,16 @@ func (e *Engine) ReportRunMCP(model, provider, taskID, intent string, promptToke
 
 // FileHealth is invoked by IPC and MCP clients for the fragility guardrail.
 func (e *Engine) FileHealth(path string) (IPCHealth, error) {
+	return e.FileHealthIn(path, "")
+}
+
+// FileHealthIn is FileHealth limited to repo ("" picks fileScope's default).
+func (e *Engine) FileHealthIn(path, repo string) (IPCHealth, error) {
 	store := e.Store()
 	if store == nil {
 		return IPCHealth{FilePath: path, HealthScore: 100}, nil
 	}
-	h, err := store.FileHealth(path)
+	h, err := store.FileHealth(path, e.fileScope(path, repo))
 	if err != nil {
 		return IPCHealth{}, err
 	}
@@ -840,13 +901,13 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 		rec.ModelName = "unknown-model"
 	}
 	if rec.CostUSD <= 0 && rec.PromptTokens > 0 {
-		rec.CostUSD = models.Global.CalculateCost(rec.ModelName, rec.PromptTokens, 0)
+		rec.CostUSD, _ = models.Global.CalculateCostDetailed(rec.Provider, rec.ModelName, rec.PromptTokens, 0, rec.CachedTokens)
 	}
 	if rec.ReadTime.IsZero() {
 		rec.ReadTime = time.Now().UTC()
 	}
 	if rec.RunID == "" {
-		rec.RunID = e.recentRunID()
+		rec.RunID = e.recentRunID(rec.FilePath)
 	}
 
 	store := e.Store()
@@ -870,11 +931,40 @@ func (e *Engine) RecordReadEvent(rec db.FileReadRecord) error {
 
 // GetFileReadStats returns aggregated read metrics for a given file.
 func (e *Engine) GetFileReadStats(filePath string) (db.FileReadStats, error) {
+	return e.GetFileReadStatsIn(filePath, "")
+}
+
+// GetFileReadStatsIn is GetFileReadStats limited to repo ("" picks
+// fileScope's default).
+func (e *Engine) GetFileReadStatsIn(filePath, repo string) (db.FileReadStats, error) {
 	store := e.Store()
 	if store == nil {
 		return db.FileReadStats{FilePath: filePath}, nil
 	}
-	return store.GetFileReadStats(filePath)
+	return store.GetFileReadStats(filePath, e.fileScope(filePath, repo))
+}
+
+// fileScope is the repository label a per-file query is limited to. Every
+// project's events share the active store, and a project-relative path
+// ("main.go") suffix-matches the same file in all of them, so answers mixed
+// projects and a calm file could be blocked for another project's churn.
+// An explicit filter wins; an absolute path belongs to the project that holds
+// it; a relative one to the active project, as relative tool paths already
+// resolve against its root. With no project to go by, nothing is filtered.
+func (e *Engine) fileScope(path string, repoFilter ...string) string {
+	if len(repoFilter) > 0 && repoFilter[0] != "" {
+		return repoFilter[0]
+	}
+	if filepath.IsAbs(path) {
+		if p, ok := e.FindProjectForFile(path); ok {
+			return p.Name
+		}
+		return ""
+	}
+	if active := e.GetActiveProject(); active != nil {
+		return active.Name
+	}
+	return ""
 }
 
 // GetRecentEvents returns the most recent code mutation and diff events.
@@ -913,9 +1003,14 @@ func (e *Engine) GetRecentEventsFiltered(limit int, repo string, filePath string
 	}
 	cacheable := filePath == "" && since.IsZero()
 	key := fmt.Sprintf("%d\x00%s", limit, repo)
+	// gen is captured before the query: a write landing while it runs bumps
+	// cacheGen, and stamping the pre-write rows with the post-write
+	// generation served them as current until the TTL expired.
+	var gen uint64
 	if cacheable {
 		e.cacheMu.RLock()
-		if cached, ok := e.recentCache[key]; ok && cached.gen == e.cacheGen && time.Since(cached.cachedAt) < recentCacheTTL {
+		gen = e.cacheGen
+		if cached, ok := e.recentCache[key]; ok && cached.gen == gen && time.Since(cached.cachedAt) < recentCacheTTL {
 			e.cacheMu.RUnlock()
 			return cached.events, nil
 		}
@@ -935,7 +1030,7 @@ func (e *Engine) GetRecentEventsFiltered(limit int, repo string, filePath string
 		if e.recentCache == nil {
 			e.recentCache = make(map[string]cachedRecent)
 		}
-		e.recentCache[key] = cachedRecent{gen: e.cacheGen, cachedAt: time.Now(), events: events}
+		e.recentCache[key] = cachedRecent{gen: gen, cachedAt: time.Now(), events: events}
 		e.cacheMu.Unlock()
 	}
 	return events, nil
@@ -966,30 +1061,30 @@ func (e *Engine) GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileR
 }
 
 // GetFileReadHeatmap returns line range frequencies for a file.
-func (e *Engine) GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, error) {
+func (e *Engine) GetFileReadHeatmap(filePath string, repoFilter ...string) ([]db.LineReadHeatmap, error) {
 	store := e.Store()
 	if store == nil {
 		return nil, nil
 	}
-	return store.GetFileReadHeatmap(filePath)
+	return store.GetFileReadHeatmap(filePath, e.fileScope(filePath, repoFilter...))
 }
 
 // GetSymbolHistory returns the chronological evolution and revision history of an AST symbol.
-func (e *Engine) GetSymbolHistory(filePath, signature string, limit int) ([]db.SymbolHistoryRecord, error) {
+func (e *Engine) GetSymbolHistory(filePath, signature string, limit int, repoFilter ...string) ([]db.SymbolHistoryRecord, error) {
 	store := e.Store()
 	if store == nil {
 		return nil, nil
 	}
-	return store.SymbolHistory(filePath, signature, limit)
+	return store.SymbolHistory(filePath, signature, limit, e.fileScope(filePath, repoFilter...))
 }
 
 // GetFileModelActivity returns per-model read vs write activity breakdown for a file.
-func (e *Engine) GetFileModelActivity(filePath string) ([]db.ModelActivitySummary, error) {
+func (e *Engine) GetFileModelActivity(filePath string, repoFilter ...string) ([]db.ModelActivitySummary, error) {
 	store := e.Store()
 	if store == nil {
 		return nil, nil
 	}
-	return store.FileModelActivity(filePath)
+	return store.FileModelActivity(filePath, e.fileScope(filePath, repoFilter...))
 }
 
 // GetAllFileModelActivity returns aggregated model activity across all files.
@@ -1059,7 +1154,11 @@ func (e *Engine) GetIPCTraffic() []ipc.IPCTrafficRecord {
 // correlation window. With concurrent agents, "last seen wins" silently
 // assigns another model's edit to the newest telemetry report; ambiguous
 // events must remain unattributed unless a path-scoped tool hint exists.
-func (e *Engine) recentRunID() string {
+func (e *Engine) recentRunID(filePath string) string {
+	// Only runs that may belong to the edited file's project count: a single
+	// agent active in another workspace was credited with every unattributed
+	// edit here (ActiveRuns, which applies the same rule, showed no agent).
+	proj, scoped := e.FindProjectForFile(filePath)
 	e.runMu.Lock()
 	defer e.runMu.Unlock()
 	cutoff := time.Now().Add(-e.correlate)
@@ -1068,6 +1167,9 @@ func (e *Engine) recentRunID() string {
 	for id, meta := range e.activeRuns {
 		if meta.LastSeen.Before(cutoff) {
 			delete(e.activeRuns, id)
+			continue
+		}
+		if scoped && !runInProject(meta, proj) {
 			continue
 		}
 		active++

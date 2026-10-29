@@ -320,10 +320,11 @@ export function DiffInspectorView({ events, loading, currentProject }: DiffInspe
                 <SymbolHistoryTimeline
                   filePath={currentEvent.file_path}
                   signature={currentEvent.node_signature}
+                  projectId={currentProject?.id}
                 />
 
                 {/* File Read & Context Analytics */}
-                <FileReadDetails filePath={currentEvent.file_path} />
+                <FileReadDetails filePath={currentEvent.file_path} projectId={currentProject?.id} />
               </div>
 
               {/* Metadata Footer */}

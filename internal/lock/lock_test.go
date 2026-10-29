@@ -7,7 +7,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestAcquireAndRelease(t *testing.T) {
@@ -60,10 +62,23 @@ func TestStalePIDReclaimed(t *testing.T) {
 // healthStub serves GET /api/health with the given body and returns its port.
 func healthStub(t *testing.T, body string) int {
 	t.Helper()
+	return healthStubDelayingFirst(t, body, 0)
+}
+
+// healthStubDelayingFirst is healthStub whose FIRST response is delayed by d,
+// after which it answers instantly. It encodes a loaded machine
+// deterministically: isPortActive bounds a single attempt at 300ms, so a
+// machine under load can miss one window even against a local, instant stub.
+func healthStubDelayingFirst(t *testing.T, body string, d time.Duration) int {
+	t.Helper()
+	var calls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/health" {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		if d > 0 && calls.Add(1) == 1 {
+			time.Sleep(d)
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(body))
@@ -83,13 +98,46 @@ func healthStub(t *testing.T, body string) int {
 
 // TestPortActiveCollision: a live daemon on the port must abort startup with
 // the friendly ErrAlreadyRunning rather than a raw bind failure.
+//
+// The stub delays its first answer, which is the condition that used to fail
+// this test on a loaded machine: the probe's single 300ms window expired,
+// isPortActive reported "no daemon", Acquire took the lock, and the assertion
+// below read as a contract violation ("expected ErrAlreadyRunning, got <nil>").
 func TestPortActiveCollision(t *testing.T) {
-	port := healthStub(t, `{"service":"wrongtrace","ok":true,"status":"ok"}`)
+	port := healthStubDelayingFirst(t, `{"service":"wrongtrace","ok":true,"status":"ok"}`, 400*time.Millisecond)
 
-	_, err := Acquire(t.TempDir(), port)
+	// The probe is ONE 300ms-bounded HTTP attempt, so on a loaded machine it
+	// can expire against a stub that is local and instant. Wait for the
+	// precondition -- the production probe actually seeing the stub -- so the
+	// assertion below only ever runs against a reachable daemon; without it the
+	// test reported a contract failure for a probe timeout.
+	awaitStubReachable(t, port)
+
+	l, err := Acquire(t.TempDir(), port)
+	if l != nil {
+		// Acquire must not have taken the lock. Release defensively so the
+		// unexpected-success path cannot leak the instance lock -- which also
+		// made the TempDir cleanup fail on Windows ("used by another process").
+		l.Release()
+	}
 	if !errors.Is(err, ErrAlreadyRunning) {
 		t.Errorf("expected ErrAlreadyRunning, got %v", err)
 	}
+}
+
+// awaitStubReachable waits, bounded, until the production probe can see the
+// stub on port. A loaded machine can miss a single 300ms window; the contract
+// under test needs the daemon to be visible, not one attempt to land.
+func awaitStubReachable(t *testing.T, port int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if isPortActive(port) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("stub on port %d never answered the health probe within the budget", port)
 }
 
 // TestPortActive_IgnoresForeignHealthEndpoint guards the misdiagnosis: the

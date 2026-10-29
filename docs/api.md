@@ -63,7 +63,7 @@ Records agent execution metadata at task completion.
 ```json
 {
   "run_id": "run-ws-402",           // Optional: auto-generated if omitted
-  "task_id": "TASK-12",             // Required: issue/task reference
+  "task_id": "TASK-12",             // Required by the MCP tool; optional here
   "agent_name": "WrongStack",       // Agent framework / client name
   "model_name": "claude-3-7-sonnet",// Model identifier
   "provider": "anthropic",          // Model provider (anthropic, openai, google, etc.)
@@ -109,8 +109,8 @@ Returns time-ordered AST mutation and code diff events.
     "author_model": "claude-3-7-sonnet",
     "added_lines": 14,
     "deleted_lines": 2,
-    "loc": 45,
-    "body_hash": "a1b2c3d4...",
+    "lines_of_code": 45,
+    "ast_content_hash": "a1b2c3d4...",
     "timestamp": "2026-08-24T20:45:10Z"
   }
 ]
@@ -147,17 +147,13 @@ Returns inter-agent conflict metrics, overwrite matrices, and cross-thrash event
       "author_model": "claude-3-7-sonnet",
       "overwriter_model": "gemini-2.5-flash",
       "is_cross_agent": true,
-      "occurred_at": "2026-08-24T20:50:00Z"
+      "author_time": "2026-08-24T20:45:10Z",
+      "overwriter_time": "2026-08-24T20:50:00Z"
     }
   ],
-  "summary": {
-    "total_conflicts": 4,
-    "cross_agent_conflicts": 4,
-    "cross_agent_ratio_pct": 100.0,
-    "total_wasted_cost_usd": 0.084,
-    "most_conflicted_file": "internal/core/guardrails.go",
-    "most_aggressive_model": "gemini-2.5-flash"
-  }
+  "total_collisions": 4,
+  "cross_agent_ratio_pct": 100.0,
+  "top_friction_pair": "claude-3-7-sonnet ➔ gemini-2.5-flash (4 collisions)"
 }
 ```
 
@@ -203,11 +199,16 @@ Returned when the file is already actively locked by another owner and `force: t
   "path": "internal/server/server.go",
   "reason": "critical AST refactoring",
   "owner": "Devin (claude-3-7-sonnet)",
-  "owner_run_id": "run-devin-101",
   "locked_at": "2026-08-24T20:55:00Z",
   "expires_at": "2026-08-24T21:10:00Z"
 }
 ```
+
+The holder's `owner_run_id` is deliberately **not** included: it is the credential
+`unlock_file` verifies, so publishing it would hand the losing caller the
+authorization to release a lock it was just refused. The holder's name, reason
+and expiry stay for diagnostics. (The POST success response above may return
+`owner_run_id` because that one is the caller's *own* credential.)
 
 * **GET `/api/guardrail/locks` Response (200 OK):**
 ```json
@@ -216,12 +217,14 @@ Returned when the file is already actively locked by another owner and `force: t
     "path": "internal/server/server.go",
     "reason": "WrongStack refactor in progress",
     "owner": "WrongStack (claude-3-7-sonnet)",
-    "owner_run_id": "run-ws-402",
     "locked_at": "2026-08-24T21:00:00Z",
     "expires_at": "2026-08-24T21:15:00Z"
   }
 ]
 ```
+
+Like the conflict response, this list withholds every holder's `owner_run_id`
+(it is `unlock_file`'s credential) while keeping the name, reason and expiry.
 
 ---
 
@@ -230,14 +233,16 @@ Returns the file health score, fragility status, thrash count, and guardrail loc
 
 * **Query Parameters:**
   * `path` or `file_path` *(string, required)*: Path to file.
+  * `project_id` or `repo` *(string, optional)*: Project whose history is counted. Without it, an absolute path is counted in the project that contains it and a relative path in the active project. The same rule applies to `/api/guardrail/check`, `/api/symbol/history`, `/api/files/activity`, `/api/files/reads` and `/api/files/heatmap`.
 
 * **File Health Scoring Formula:**
-  $$\text{HealthScore} = \max\left(0, 100 - (\text{RecentThrashingCount} \times 15) - (\text{ChurnCount} \times 2)\right)$$
-  * **Fragility Threshold**: `HealthScore < 40` or `RecentThrashingCount >= 3` marks `is_fragile: true`.
+  $$\text{HealthScore} = \max\left(0, 100 - (\text{edits in the last 24h} \times 8) - (5 \text{ if distinct signatures} \ge 3)\right)$$
+  * **Fragility Threshold**: `RecentThrashingCount >= 5` marks `is_fragile: true`. A
+    low score alone does not: 4 edits in 24h scores 68 and is *not* fragile.
   * **Recommendation**:
     * Score $\ge 70$: Safe to modify.
     * $40 \le \text{Score} < 70$: Caution: Apply minimal localized diffs.
-    * Score $< 40$ or Fragile: Modification discouraged without human review.
+    * Score below the Settings fragility cutoff (default 50) or Fragile: Modification discouraged without human review; the guardrail check (HTTP, IPC, MCP) returns `allowed: false`.
     * Locked: Modification blocked by guardrail.
 
 * **Response (200 OK):**
@@ -250,11 +255,13 @@ Returns the file health score, fragility status, thrash count, and guardrail loc
   "is_locked": true,
   "lock_reason": "WrongStack refactor in progress",
   "lock_owner": "WrongStack (claude-3-7-sonnet)",
-  "lock_owner_run_id": "run-ws-402",
   "lock_expires_at": "2026-08-24T21:15:00Z",
   "warning": ""
 }
 ```
+
+`lock_owner_run_id` is never returned here: it is the credential `unlock_file`
+verifies, and this is a read surface any caller can reach.
 
 ---
 
@@ -269,6 +276,8 @@ Queries the chronological modification lineage for an AST symbol or all symbols 
     * **Supported AST Kinds**: `function`, `method`, `class`, `struct`, `interface`, `arrow_function`, `type`, `variable`.
     * **File-Wide Mode**: When signature is omitted (`?file_path=internal/server/server.go`), returns the history of all AST symbols in that file.
   * `limit` *(int, default: 100)*: Maximum history records.
+  * `project_id` or `repo` *(string, optional)*: Project scope, as for `/api/file/health`.
+  * Go pointer-receiver methods are stored as `*T.M`; `?signature=(*T).M` is accepted too.
 
 ---
 
@@ -379,17 +388,23 @@ Upon connecting, the server broadcasts live JSON messages for every observed eve
 ```json
 {
   "type": "code_event",
-  "data": {
-    "id": 402,
-    "event_time": "2026-08-22T20:10:00Z",
+  "event_id": "ev-8f2a1b",
+  "at": "2026-08-22T20:10:00Z",
+  "payload": {
+    "run_id": "run-ws-402",
+    "repo_name": "wrongtrace",
     "file_path": "internal/db/queries.go",
-    "node_type": "func",
-    "node_name": "Thrashing",
+    "node_signature": "function:queries.go::Thrashing",
+    "node_type": "function",
     "action": "MODIFIED",
-    "loc_delta": 4,
-    "diff_content": "@@ -120,3 +120,7 @@ ...",
-    "agent_name": "Antigravity",
-    "model_name": "gemini-3.7-flash"
+    "ast_content_hash": "a1b2c3d4...",
+    "lines_of_code": 45,
+    "start_line": 120,
+    "end_line": 127,
+    "diff_snippet": "@@ -120,3 +120,7 @@ ...",
+    "added_lines": 4,
+    "deleted_lines": 0,
+    "event_time": "2026-08-22T20:10:00Z"
   }
 }
 ```
@@ -398,15 +413,18 @@ Upon connecting, the server broadcasts live JSON messages for every observed eve
 ```json
 {
   "type": "run_reported",
-  "data": {
+  "at": "2026-08-24T21:00:00Z",
+  "payload": {
     "run_id": "run-ws-402",
     "task_id": "TASK-12",
     "agent_name": "WrongStack",
     "model_name": "claude-3-7-sonnet",
+    "provider": "anthropic",
     "prompt_tokens": 12000,
     "completion_tokens": 850,
     "cost_usd": 0.048,
-    "intent": "Refactor auth middleware"
+    "intent": "Refactor auth middleware",
+    "created_at": "2026-08-24T21:00:00Z"
   }
 }
 ```
@@ -422,8 +440,8 @@ WrongTrace includes an embedded MCP server (`wrongtrace mcp`) communicating over
 2. **`check_guardrail`**: `{ file_path }` → `{ allowed: bool, health_score: int, is_fragile: bool, is_locked: bool, lock_reason, lock_owner, recommendation }`
 3. **`get_file_health_score`**: `{ file_path }` → `{ health_score: int, is_fragile: bool, recent_thrashing_count: int, is_locked: bool }`
 4. **`lock_file`**: `{ file_path, reason, owner, owner_run_id, ttl_minutes, ttl_seconds }`
-5. **`unlock_file`**: `{ file_path }`
-6. **`list_locks`**: `{ filter?: string }`
+5. **`unlock_file`**: `{ file_path, owner_run_id }`. A live lock taken with an `owner_run_id` is released only by that same credential; without one, only unowned or expired locks are cleared. Force unlock is reserved for `POST /api/guardrail/unlock`.
+6. **`list_locks`**: no inputs. Returns every active lock; each holder's `owner_run_id` credential is withheld.
 7. **`report_file_read`**: `{ file_path, model, provider, tool_name, start_line, end_line, prompt_tokens, cost, intent }`
 8. **`get_file_read_stats`**: `{ file_path }`
 9. **`get_file_diff_history`**: `{ file_path, limit }`

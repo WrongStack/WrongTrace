@@ -28,6 +28,21 @@ var schemaSQL string
 type Store struct {
 	db      *sql.DB
 	writeMu sync.Mutex
+	path    string
+}
+
+// Path is the database file the store was opened from.
+func (s *Store) Path() string { return s.path }
+
+// HasHistory reports whether the store holds any recorded edits, reads or
+// runs.
+func (s *Store) HasHistory() (bool, error) {
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+	var has bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM code_node_events)
+		OR EXISTS(SELECT 1 FROM file_read_events) OR EXISTS(SELECT 1 FROM agent_runs)`).Scan(&has)
+	return has, err
 }
 
 // Open opens (or creates) the SQLite database at path and configures pragmas
@@ -72,7 +87,7 @@ func Open(path string) (*Store, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
-	return &Store{db: conn}, nil
+	return &Store{db: conn, path: path}, nil
 }
 
 // dsnPragmas is the connection-level pragma set applied to every connection.
@@ -215,6 +230,15 @@ type Overview struct {
 }
 
 // Overview returns at-a-glance counts from the store, optionally filtered by repo_name.
+//
+// UniqueModels follows the convention every sibling surface already applies to
+// an unnamed run: GetFileReadStats skips an empty model name before counting
+// (pinned by TestGetFileReadStats_EmptyModelIsNotUnique), ModelComparison's
+// spend CTE filters out an empty model_name, and IsJunkModel keeps the "unknown"
+// bucket out of the leaderboard. An unattributed run is an ordinary row -- POST
+// /api/telemetry accepts a body with no model_name -- so counting its empty
+// string as a distinct model inflated this KPI by one. TotalRuns and TotalCost
+// still include those runs: they are runs, and their spend is real.
 func (s *Store) Overview(repoFilter ...string) (Overview, error) {
 	var repo string
 	if len(repoFilter) > 0 {
@@ -231,7 +255,7 @@ func (s *Store) Overview(repoFilter ...string) (Overview, error) {
 				(SELECT COUNT(*) FROM agent_runs),
 				(SELECT COUNT(*) FROM code_node_events),
 				COALESCE((SELECT SUM(cost_usd) FROM agent_runs), 0),
-				(SELECT COUNT(DISTINCT model_name) FROM agent_runs)
+				(SELECT COUNT(DISTINCT model_name) FROM agent_runs WHERE model_name <> '')
 		`)
 		if err := row.Scan(&o.TotalRuns, &o.TotalEvents, &o.TotalCost, &o.UniqueModels); err != nil {
 			return Overview{}, fmt.Errorf("overview scan: %w", err)
@@ -259,7 +283,7 @@ func (s *Store) Overview(repoFilter ...string) (Overview, error) {
 			COALESCE((SELECT SUM(r.cost_usd) FROM agent_runs r, only_other
 			 WHERE no_other OR r.run_id IN (SELECT run_id FROM matched)), 0),
 			(SELECT COUNT(DISTINCT r.model_name) FROM agent_runs r, only_other
-			 WHERE no_other OR r.run_id IN (SELECT run_id FROM matched))
+			 WHERE (no_other OR r.run_id IN (SELECT run_id FROM matched)) AND r.model_name <> '')
 	`, repo, repo, repo, repo, repo)
 	if err := row.Scan(&o.TotalRuns, &o.TotalEvents, &o.TotalCost, &o.UniqueModels); err != nil {
 		return Overview{}, fmt.Errorf("overview scan: %w", err)

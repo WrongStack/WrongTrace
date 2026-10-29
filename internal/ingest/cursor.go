@@ -43,6 +43,13 @@ func (sw *SessionWatcher) EnablePersistentOffsets(path string) error {
 	clean := filepath.Clean(path)
 	sw.mu.Lock()
 	sw.cursorPath = clean
+	// A continuous observer should not replay an unbounded lifetime of agent
+	// logs for paths absent from its checkpoint. PollOnce will baseline old
+	// files and retain a bounded tail of recently active JSONL transcripts.
+	// Set before any early return: an unreadable or torn checkpoint (the
+	// caller logs and continues) must fall back to fresh-install behaviour,
+	// not to replaying every transcript from byte 0.
+	sw.baselineBefore = time.Now()
 	sw.mu.Unlock()
 	data, err := os.ReadFile(clean)
 	if err != nil && !os.IsNotExist(err) {
@@ -63,10 +70,6 @@ func (sw *SessionWatcher) EnablePersistentOffsets(path string) error {
 	}
 
 	sw.mu.Lock()
-	// A continuous observer should not replay an unbounded lifetime of agent
-	// logs for paths absent from its checkpoint. PollOnce will baseline old
-	// files and retain a bounded tail of recently active JSONL transcripts.
-	sw.baselineBefore = time.Now()
 	for file, offset := range loaded.Offsets {
 		if offset >= 0 {
 			sw.seenOffsets[file] = offset

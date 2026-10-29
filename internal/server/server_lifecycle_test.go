@@ -110,7 +110,13 @@ func (f *failingEngine) Atlas(...string) (core.AtlasSnapshot, error) {
 func (f *failingEngine) FileHealth(string) (core.IPCHealth, error) {
 	return core.IPCHealth{}, errForced
 }
+func (f *failingEngine) FileHealthIn(string, string) (core.IPCHealth, error) {
+	return core.IPCHealth{}, errForced
+}
 func (f *failingEngine) CheckGuardrail(string) (core.GuardrailResult, error) {
+	return core.GuardrailResult{}, errForced
+}
+func (f *failingEngine) CheckGuardrailIn(string, string) (core.GuardrailResult, error) {
 	return core.GuardrailResult{}, errForced
 }
 func (f *failingEngine) LockFile(string, string) core.LockInfo {
@@ -172,13 +178,16 @@ func (f *failingEngine) ClearStale(int) (int64, error) { return 0, errForced }
 func (f *failingEngine) GetFileReadStats(string) (db.FileReadStats, error) {
 	return db.FileReadStats{}, errForced
 }
+func (f *failingEngine) GetFileReadStatsIn(string, string) (db.FileReadStats, error) {
+	return db.FileReadStats{}, errForced
+}
 func (f *failingEngine) GetRecentFileReads(int, ...string) ([]db.FileReadRecord, error) {
 	return nil, errForced
 }
 func (f *failingEngine) GetRecentFileEvents(string, int) ([]db.EventRecord, error) {
 	return nil, errForced
 }
-func (f *failingEngine) GetFileReadHeatmap(string) ([]db.LineReadHeatmap, error) {
+func (f *failingEngine) GetFileReadHeatmap(string, ...string) ([]db.LineReadHeatmap, error) {
 	return nil, errForced
 }
 func (f *failingEngine) GetRecentEvents(int, ...string) ([]db.EventRecord, error) {
@@ -187,10 +196,10 @@ func (f *failingEngine) GetRecentEvents(int, ...string) ([]db.EventRecord, error
 func (f *failingEngine) GetRecentEventsFiltered(int, string, string, time.Time) ([]db.EventRecord, error) {
 	return nil, errForced
 }
-func (f *failingEngine) GetSymbolHistory(string, string, int) ([]db.SymbolHistoryRecord, error) {
+func (f *failingEngine) GetSymbolHistory(string, string, int, ...string) ([]db.SymbolHistoryRecord, error) {
 	return nil, errForced
 }
-func (f *failingEngine) GetFileModelActivity(string) ([]db.ModelActivitySummary, error) {
+func (f *failingEngine) GetFileModelActivity(string, ...string) ([]db.ModelActivitySummary, error) {
 	return nil, errForced
 }
 func (f *failingEngine) GetAllFileModelActivity(int) ([]db.ModelActivitySummary, error) {

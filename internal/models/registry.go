@@ -49,6 +49,10 @@ type Registry struct {
 	providers  map[string]ProviderInfo // keyed by provider slug
 	canonicals map[string]string       // bare model ID -> canonical full ID
 	aliasCache map[string]ModelInfo    // cache for resolved versioned aliases / prefix matches
+	// aliasGen counts catalog changes. Get resolves a fuzzy alias under the
+	// read lock and caches it under the write lock; a change landing in
+	// between must not let the pre-change answer into the fresh cache.
+	aliasGen uint64
 }
 
 // Global default registry singleton with built-in provider defaults.
@@ -251,6 +255,7 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 		model ModelInfo
 	}
 	var candidates []candidate
+	gen := r.aliasGen
 	for k, model := range r.models {
 		if model.ModelID != "" && (strings.HasPrefix(norm, model.ModelID) || strings.Contains(norm, model.ModelID)) {
 			candidates = append(candidates, candidate{k, model})
@@ -282,7 +287,7 @@ func (r *Registry) Get(id string) (ModelInfo, bool) {
 			}
 		}
 		r.mu.Lock()
-		if r.aliasCache != nil {
+		if r.aliasCache != nil && r.aliasGen == gen {
 			// Model IDs arrive from proxy traffic and can be attacker-controlled.
 			// Keep successful fuzzy aliases bounded instead of retaining every
 			// version-stamped spelling for the lifetime of the daemon.
@@ -389,12 +394,20 @@ func (r *Registry) Upsert(m ModelInfo) {
 
 	key := normModel
 	if m.ID != "" {
-		key = m.ID
+		// Get lowercases what it looks up; a mixed-case key was stored as a
+		// second entry no lookup by its own ID could reach.
+		key = strings.ToLower(strings.TrimSpace(m.ID))
 	}
 	m.ID = key
 
 	r.models[key] = m
-	r.canonicals[normModel] = key
+	// The bare name keeps pointing at its owning provider: a reseller entry
+	// (openrouter/gpt-4o) must not reprice every provider-less gpt-4o lookup.
+	// A canonical model, a provider-less override, or replacing a non-canonical
+	// target still takes it.
+	if cur, ok := r.canonicals[normModel]; !ok || cur == key || m.IsCanonical || !strings.Contains(key, "/") || !r.models[cur].IsCanonical {
+		r.canonicals[normModel] = key
+	}
 
 	// Keep the provider index in sync with the stored model: AllProviders/
 	// GetProvider back the dashboard's provider catalog, and a stored model
@@ -438,6 +451,7 @@ func (r *Registry) Upsert(m ModelInfo) {
 	r.providers[m.ProviderID] = p
 
 	r.aliasCache = make(map[string]ModelInfo)
+	r.aliasGen++
 }
 
 // CalculateCost computes total dollar cost from prompt and completion token counts.
@@ -596,6 +610,42 @@ func IsJunkModel(s string) bool {
 	return false
 }
 
+// modelOwnerHints maps each normalized model ID to the provider (lowercased
+// catalog key) whose namespace the catalog most often files it under; ties go
+// to the lexically first namespace. Namespaces that are not providers in the
+// catalog are ignored.
+func modelOwnerHints(providers map[string]modelsDevProvider) map[string]string {
+	known := make(map[string]bool, len(providers))
+	for pk := range providers {
+		known[strings.ToLower(pk)] = true
+	}
+	counts := make(map[string]map[string]int)
+	for _, p := range providers {
+		for mk := range p.Models {
+			ns, _, ok := strings.Cut(mk, "/")
+			if ns = strings.ToLower(ns); !ok || !known[ns] {
+				continue
+			}
+			norm := normalizeModelID(mk)
+			if counts[norm] == nil {
+				counts[norm] = make(map[string]int)
+			}
+			counts[norm][ns]++
+		}
+	}
+	owners := make(map[string]string, len(counts))
+	for norm, c := range counts {
+		best, bestN := "", 0
+		for ns, n := range c {
+			if n > bestN || (n == bestN && ns < best) {
+				best, bestN = ns, n
+			}
+		}
+		owners[norm] = best
+	}
+	return owners
+}
+
 // ImportModelsDevJSON parses the provider→models catalog published at https://models.dev/api.json
 // and populates all providers and their respective model pricings into the registry.
 func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
@@ -609,6 +659,24 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 		providerKeys = append(providerKeys, k)
 	}
 	sort.Strings(providerKeys)
+
+	// models.dev lists a provider's OWN models under bare keys ("gpt-4o"
+	// inside "openai"), exactly as resellers list theirs, so a key alone
+	// never identified the owner and every bare name went to whichever
+	// reseller sorted first. The owner is inferred from the catalog itself --
+	// the namespace other providers most often file the model under
+	// ("openai/gpt-4o") -- falling back to the provider this registry already
+	// holds as the model's canonical owner.
+	owners := modelOwnerHints(providers)
+	r.mu.RLock()
+	for norm, key := range r.canonicals {
+		if m := r.models[key]; m.IsCanonical && m.ProviderID != "" {
+			if _, ok := owners[norm]; !ok {
+				owners[norm] = m.ProviderID
+			}
+		}
+	}
+	r.mu.RUnlock()
 
 	nextModels := make(map[string]ModelInfo)
 	nextProviders := make(map[string]ProviderInfo)
@@ -652,10 +720,20 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 			}
 
 			// First-party / canonical owner check
-			ns, _, _ := strings.Cut(mk, "/")
-			isCanonical := (ns == pk)
+			ns, _, namespaced := strings.Cut(mk, "/")
+			isCanonical := (namespaced && ns == pk) || (!namespaced && owners[normModel] == strings.ToLower(pk))
 
 			fullKey := provSlug + "/" + normModel
+			if _, taken := nextModels[fullKey]; taken {
+				// A gateway listing one model under two upstreams
+				// ("openai/gpt-4o", "azure/gpt-4o") normalized both to the
+				// same key: the map kept one price while the provider list
+				// held both. The later one keeps its namespace in its key.
+				fullKey = provSlug + "/" + strings.ToLower(mk[:strings.LastIndex(mk, "/")+1]) + normModel
+				if _, taken := nextModels[fullKey]; taken {
+					continue
+				}
+			}
 			entry := ModelInfo{
 				ID:                 fullKey,
 				ModelID:            normModel,
@@ -725,7 +803,11 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 					break
 				}
 			}
-			if v.ModelID != "" {
+			// Same rule as Upsert: a preserved reseller override
+			// (openrouter/gpt-4o) must not take the bare name back from
+			// the owner on every sync.
+			if cur, ok := nextCanonicals[v.ModelID]; v.ModelID != "" &&
+				(!ok || cur == k || v.IsCanonical || !strings.Contains(k, "/") || !nextModels[cur].IsCanonical) {
 				nextCanonicals[v.ModelID] = k
 			}
 			if v.ProviderID == "" {
@@ -754,5 +836,6 @@ func (r *Registry) ImportModelsDevJSON(data []byte) (int, error) {
 	r.providers = nextProviders
 	r.canonicals = nextCanonicals
 	r.aliasCache = make(map[string]ModelInfo)
+	r.aliasGen++
 	return len(nextModels), nil
 }

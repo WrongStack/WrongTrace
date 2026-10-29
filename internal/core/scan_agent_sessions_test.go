@@ -35,8 +35,8 @@ func TestScanAgentSessions_ClaudeCountsOnlyOwnEncodedProject(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("APPDATA", filepath.Join(fixture, "appdata"))
 
-	own := encodeClaudeProjectDir(root)                     // this project's encoded cwd
-	sibling := encodeClaudeProjectDir(root + "-docs")       // sibling checkout: base name still matches
+	own := encodeClaudeProjectDir(root)               // this project's encoded cwd
+	sibling := encodeClaudeProjectDir(root + "-docs") // sibling checkout: base name still matches
 	unrelated := encodeClaudeProjectDir(filepath.Join(fixture, "ws", "UnrelatedProject"))
 
 	proj := func(dirName string, transcripts int) {
@@ -55,8 +55,8 @@ func TestScanAgentSessions_ClaudeCountsOnlyOwnEncodedProject(t *testing.T) {
 
 	// Case variant on the own directory pins the case-insensitive match:
 	// real machines hold both "D--..." and "d--..." spellings.
-	proj(upperFirst(own), 2)      // own project — counts
-	proj(sibling, 1)              // sibling project — must not count
+	proj(upperFirst(own), 2)            // own project — counts
+	proj(sibling, 1)                    // sibling project — must not count
 	proj(strings.ToLower(unrelated), 3) // unrelated project — must not count
 
 	counts := ScanAgentSessions(root)

@@ -121,6 +121,13 @@ export function SettingsView() {
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
+    // The form holds placeholder defaults until GET /api/settings answers, and
+    // the payload is a full replacement: saving then sent ignore_patterns []
+    // and '-' (the clear marker) for every webhook, wiping them server-side.
+    if (!initialSettings) {
+      setSettingsError('Settings have not loaded yet; nothing was saved.');
+      return;
+    }
     setIsSaving(true);
     try {
       const payload: Partial<AppSettings> = {
@@ -905,7 +912,7 @@ export function SettingsView() {
               </div>
               <button
                 type="submit"
-                disabled={isSaving}
+                disabled={isSaving || !initialSettings}
                 className="flex items-center gap-1.5 px-4 py-1.5 rounded bg-accent hover:bg-accent-hover text-white text-xs font-semibold shadow-md transition-colors"
               >
                 {savedSuccess ? <Check className="h-4 w-4 text-emerald-300" /> : <Save className="h-4 w-4" />}
@@ -1046,7 +1053,7 @@ export function SettingsView() {
               <div className="pt-3">
                 <button
                   type="submit"
-                  disabled={isSaving}
+                  disabled={isSaving || !initialSettings}
                   className="w-full flex items-center justify-center gap-1.5 px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md transition-colors"
                 >
                   <Save className="h-4 w-4" />
@@ -1070,7 +1077,7 @@ export function SettingsView() {
             </div>
             <button
               type="submit"
-              disabled={isSaving}
+              disabled={isSaving || !initialSettings}
               className="flex items-center gap-1.5 px-4 py-1.5 rounded bg-accent hover:bg-accent-hover text-white text-xs font-semibold shadow-md transition-colors"
             >
               <Save className="h-4 w-4" />

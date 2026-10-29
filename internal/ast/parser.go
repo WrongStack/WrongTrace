@@ -256,6 +256,36 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 			continue
 		}
 
+		// A PHP declaration can share the `<?php` opener's line (`<?php class C {`,
+		// `<?php function f() {`). `<?php` is not a declaration modifier, so the
+		// head guards rejected the whole line and the declaration produced NO node:
+		// no body hash, no churn event, no model attribution. Drop the opener tag
+		// (and a trailing `?>` closer) so the head is what the guards expect.
+		// Gated on PHP: no other supported language opens a line with that tag.
+		if lang == LangPHP {
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "<?php"))
+			trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "?>"))
+		}
+
+		// A declaration head does not always carry its body-opening '{'. That is
+		// a brace STYLE, not a language feature: Microsoft's own C# convention,
+		// PHP PSR-12 class bodies and much Java and Dart put the brace on the
+		// NEXT line. braceLine is that line (the first following non-blank line,
+		// when it opens with '{'), or -1. Ruby is excluded: `end` closes its
+		// blocks, so a later '{' there is a hash literal, not the body — its
+		// span has its own `end` scan below.
+		braceLine := -1
+		if !strings.Contains(line, "{") && lang != LangRuby {
+			for k := i + 1; k < len(lines); k++ {
+				if t := strings.TrimSpace(lines[k]); t != "" {
+					if strings.HasPrefix(t, "{") {
+						braceLine = k
+					}
+					break
+				}
+			}
+		}
+
 		var kind NodeKind
 		var name string
 
@@ -318,9 +348,9 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 					break
 				}
 			}
-		case strings.HasPrefix(trimmed, "def ") || strings.HasPrefix(trimmed, "def self."):
+		case rubyDefDecl(trimmed) != "":
 			kind = NodeFunction
-			parts := strings.Fields(trimmed)
+			parts := strings.Fields(rubyDefDecl(trimmed))
 			if len(parts) > 1 {
 				name = strings.Split(parts[1], "(")[0]
 				// `def self.make` declares the method `make`: `self.` is the
@@ -353,7 +383,7 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 			// Kotlin funs above. Gated by language: Rust/Ruby/PHP/Python heads
 			// (`match parse(x) {`, `if let Some(v) = f() {`) share the shape
 			// but never declare anything.
-			if n := typedDeclName(trimmed); n != "" {
+			if n := typedDeclNameWithBrace(trimmed, braceLine >= 0); n != "" {
 				kind, name = NodeFunction, n
 			}
 		}
@@ -365,13 +395,26 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 			startLine := i + 1
 			endLine := i + 1
 
-			if strings.Contains(line, "{") {
+			// Start the body scan at the line that actually carries '{'. When the
+			// head has none, that is braceLine, the following line that opens the
+			// body (Allman / PSR-12 / Microsoft C# style). Treating such a head
+			// as brace-less left the span on the head line, so the node's body
+			// hash was frozen and Diff — which decides MODIFIED by comparing that
+			// hash — could never emit an event for an edit inside the body,
+			// silently: the declaration WAS in the snapshot. bodyOpen is -1 when
+			// no brace opens the body, which is Ruby's case (`end` closes it) and
+			// the case of a head with no block body at all.
+			bodyOpen := i
+			if !strings.Contains(line, "{") {
+				bodyOpen = braceLine
+			}
+			if bodyOpen >= 0 {
 				// The scanner carries string/comment state across lines, so a
 				// '}' inside a multi-line block comment or multi-line string
 				// is no longer mistaken for the end of the body.
 				scanner := braceScanner{rust: lang == LangRust}
-				braceCount := scanner.lineDelta(line)
-				j := i + 1
+				braceCount := scanner.lineDelta(lines[bodyOpen])
+				j := bodyOpen + 1
 				for ; j < len(lines) && braceCount > 0; j++ {
 					braceCount += scanner.lineDelta(lines[j])
 				}
@@ -423,6 +466,28 @@ func parseGenericSource(path string, src []byte, lang Language, hash ...string) 
 
 	snap.SortedSignatures()
 	return snap
+}
+
+// rubyDefDecl returns the `def` head of a Ruby declaration line with any
+// visibility modifiers stripped, or "" when the line declares nothing.
+//
+// Ruby's `private def foo`, `protected def foo` and `module_function def foo`
+// spellings are ordinary style, and matching only a bare `def ` prefix made
+// every one of them invisible: the method produced no node, so its edits
+// emitted no Diff event, its body hash never moved and no model could be
+// attributed to it.
+func rubyDefDecl(trimmed string) string {
+	head := trimmed
+	for _, mod := range []string{"private_class_method ", "module_function ", "private ", "protected ", "public "} {
+		if strings.HasPrefix(head, mod) {
+			head = strings.TrimSpace(head[len(mod):])
+			break
+		}
+	}
+	if strings.HasPrefix(head, "def ") || strings.HasPrefix(head, "def self.") {
+		return head
+	}
+	return ""
 }
 
 // Snapshot returns the cached snapshot for a file, if any.
@@ -539,14 +604,69 @@ func (e *Engine) Forget(path string) {
 // arg types are normalized so trivial rename-only changes still register as
 // the same signature.
 func collectNodes(root *sitter.Node, src []byte, lang Language, file string, out *FileSnapshot) {
+	spans := collectLiteralSpans(root, lang)
 	cursor := sitter.NewTreeCursor(root)
 	defer cursor.Close()
 
-	walk(cursor, src, lang, file, out, 0)
+	walk(cursor, src, lang, file, out, spans, 0)
+}
+
+// litSpan is a byte range the grammar identified as a comment or as a
+// string-like literal (string, template, regex, rune).
+type litSpan struct {
+	start, end uint32
+	comment    bool
+}
+
+// collectLiteralSpans lists, in source order, every comment and string-like
+// literal in the tree. Native node hashes are normalized from these instead
+// of re-lexing the bytes: a lexer that does not know regex literals or
+// template nesting read `/^https?:\/\//` as a `//` comment and `/["']/` as an
+// open string, silently dropping the real code after it from the hash.
+// Literals are not descended, so a comment inside a template substitution
+// stays part of the verbatim literal.
+func collectLiteralSpans(root *sitter.Node, lang Language) []litSpan {
+	var spans []litSpan
+	cur := sitter.NewTreeCursor(root)
+	defer cur.Close()
+	for {
+		n := cur.CurrentNode()
+		if comment, ok := literalNodeKind(lang, n); ok {
+			spans = append(spans, litSpan{start: n.StartByte(), end: n.EndByte(), comment: comment})
+		} else if cur.GoToFirstChild() {
+			continue
+		}
+		for !cur.GoToNextSibling() {
+			if !cur.GoToParent() {
+				return spans
+			}
+		}
+	}
+}
+
+// literalNodeKind classifies n as a comment (true) or a verbatim literal
+// (false); ok is false for every other node.
+func literalNodeKind(lang Language, n *sitter.Node) (comment, ok bool) {
+	if !n.IsNamed() {
+		return false, false
+	}
+	switch t := n.Type(); t {
+	case "comment":
+		return true, true
+	case "html_comment":
+		return true, lang == LangJavaScript || lang == LangTypeScript
+	case "interpreted_string_literal", "raw_string_literal", "rune_literal":
+		return false, lang == LangGo
+	case "template_string", "regex":
+		return false, lang == LangJavaScript || lang == LangTypeScript
+	case "string":
+		return false, lang != LangGo
+	}
+	return false, false
 }
 
 // walk is an explicit-stack traversal that keeps allocations minimal with a depth bound.
-func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out *FileSnapshot, depth int) {
+func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out *FileSnapshot, spans []litSpan, depth int) {
 	if depth > 250 {
 		return
 	}
@@ -555,29 +675,48 @@ func walk(cursor *sitter.TreeCursor, src []byte, lang Language, file string, out
 	kind, ok := classifyNode(lang, kindStr, node)
 	if ok {
 		sig := buildSignature(lang, file, kind, node, src)
-		a, b := node.StartByte(), node.EndByte()
+		// Declarations sharing a name in one scope (getter/setter pairs,
+		// Python property setters, several Go init funcs) used to overwrite
+		// each other, so an edit to the overwritten one emitted nothing. Later
+		// ones get an occurrence suffix in document order.
+		if _, taken := out.Nodes[sig]; taken {
+			base := sig
+			for n := 2; ; n++ {
+				if sig = fmt.Sprintf("%s#%d", base, n); out.Nodes[sig].Signature == "" {
+					break
+				}
+			}
+		}
+		span := node
+		if p := node.Parent(); lang == LangPython && p != nil && p.Type() == "decorated_definition" {
+			// Decorators belong to the parent node; they are part of what the
+			// declaration says (route, fixture scope, cache size), so an edit
+			// to them is an edit to this declaration.
+			span = p
+		}
+		a, b := span.StartByte(), span.EndByte()
 		var nodeHash string
 		if a <= b && b <= uint32(len(src)) {
-			nodeHash = hashNormalizedBodyBytes(src[a:b], lang)
+			nodeHash = hashNormalized(src[a:b], lang, spansWithin(spans, a, b), a, false)
 		} else {
-			nodeHash = hashNormalizedBody(sliceText(node, src), lang)
+			nodeHash = hashNormalizedBody(sliceText(span, src), lang)
 		}
 		out.Nodes[sig] = Node{
 			Signature: sig,
 			Kind:      kind,
 			StartByte: a,
 			EndByte:   b,
-			StartLine: node.StartPoint().Row + 1,
-			EndLine:   node.EndPoint().Row + 1,
+			StartLine: span.StartPoint().Row + 1,
+			EndLine:   span.EndPoint().Row + 1,
 			Hash:      nodeHash,
-			LOC:       int(node.EndPoint().Row-node.StartPoint().Row) + 1,
+			LOC:       int(span.EndPoint().Row-span.StartPoint().Row) + 1,
 		}
 	}
 
 	// Recurse into children.
 	if cursor.GoToFirstChild() {
 		for {
-			walk(cursor, src, lang, file, out, depth+1)
+			walk(cursor, src, lang, file, out, spans, depth+1)
 			if !cursor.GoToNextSibling() {
 				cursor.GoToParent()
 				return
@@ -602,6 +741,11 @@ func classifyNode(lang Language, typeStr string, n *sitter.Node) (NodeKind, bool
 			if isStructType(n, "") {
 				return NodeStruct, true
 			}
+			// type Store interface {...}: a method-set change is as much an
+			// API change as a struct field change, but it never became a node.
+			if hasChildType(n, "interface_type") {
+				return NodeClass, true
+			}
 		}
 	case LangTypeScript, LangJavaScript:
 		switch typeStr {
@@ -611,10 +755,26 @@ func classifyNode(lang Language, typeStr string, n *sitter.Node) (NodeKind, bool
 			return NodeMethod, true
 		case "arrow_function":
 			// Only count named arrow functions assigned to a const/let.
-			if hasNamedAssignment(n) {
+			if isNamedExpression(n) {
 				return NodeArrowFn, true
 			}
-		case "class_declaration":
+		case "function_expression", "function":
+			// `const h = function () {}` and `export default function () {}`
+			// are function EXPRESSIONS; at top level nothing encloses them, so
+			// without a case an edit to one emitted nothing. IsNamed skips the
+			// anonymous `function` keyword token.
+			if n.IsNamed() && isNamedExpression(n) {
+				return NodeFunction, true
+			}
+		case "class":
+			// `export default class {}` / `const K = class {}`: same gap.
+			if n.IsNamed() && isNamedExpression(n) {
+				return NodeClass, true
+			}
+		case "class_declaration", "abstract_class_declaration":
+			// `abstract class` is its own tree-sitter node type; without it the
+			// class never entered the snapshot and its methods lost their owner,
+			// so same-named methods of two abstract classes collided.
 			return NodeClass, true
 		case "interface_declaration":
 			// `interface Repo { … }` is a first-class TypeScript declaration and
@@ -661,26 +821,27 @@ func buildSignature(lang Language, file string, kind NodeKind, n *sitter.Node, s
 		}
 		return fmt.Sprintf("%s:%s::%s", kind, file, name)
 	case LangPython, LangTypeScript, LangJavaScript:
-		if kind != NodeClass {
-			var owners []string
-			for parent := n.Parent(); parent != nil; parent = parent.Parent() {
-				switch parent.Type() {
-				case "function_definition", "class_definition", "function_declaration", "class_declaration", "method_definition":
-				case "arrow_function":
-					if !hasNamedAssignment(parent) {
-						continue
-					}
-				default:
+		// Classes carry the owner chain too: nested classes (Django `class
+		// Meta`, classes built in factories) were keyed by bare name, so
+		// inserting one above re-keyed every later one as MODIFIED.
+		var owners []string
+		for parent := n.Parent(); parent != nil; parent = parent.Parent() {
+			switch parent.Type() {
+			case "function_definition", "class_definition", "function_declaration", "class_declaration", "abstract_class_declaration", "method_definition":
+			case "arrow_function", "function_expression", "function", "class":
+				if !parent.IsNamed() || !isNamedExpression(parent) {
 					continue
 				}
-				owners = append(owners, extractName(lang, parent, src))
+			default:
+				continue
 			}
-			for i := 0; i < len(owners)/2; i++ {
-				owners[i], owners[len(owners)-1-i] = owners[len(owners)-1-i], owners[i]
-			}
-			if len(owners) > 0 {
-				name = strings.Join(owners, ".") + "." + name
-			}
+			owners = append(owners, extractName(lang, parent, src))
+		}
+		for i := 0; i < len(owners)/2; i++ {
+			owners[i], owners[len(owners)-1-i] = owners[len(owners)-1-i], owners[i]
+		}
+		if len(owners) > 0 {
+			name = strings.Join(owners, ".") + "." + name
 		}
 		return fmt.Sprintf("%s:%s::%s", kind, file, name)
 	default:
@@ -718,15 +879,32 @@ func extractName(lang Language, n *sitter.Node, src []byte) string {
 		if c := n.ChildByFieldName("name"); c != nil {
 			return string(src[c.StartByte():c.EndByte()])
 		}
-		if kindStr := n.Type(); kindStr == "arrow_function" {
+		if kindStr := n.Type(); kindStr == "arrow_function" || kindStr == "function_expression" || kindStr == "function" || kindStr == "class" {
 			if p := n.Parent(); p != nil {
 				if c := p.ChildByFieldName("name"); c != nil {
 					return string(src[c.StartByte():c.EndByte()])
 				}
-				// variable_declarator: name is the first child.
+				if p.Type() == "export_statement" {
+					return "default" // export default function/class/arrow
+				}
+				// `obj.h = () =>` / `this.x = () =>` and `{ get: () => }` name
+				// the function by their target; falling through to the
+				// byte-range fallback re-keyed it on every edit above it.
+				switch p.Type() {
+				case "assignment_expression":
+					if c := p.ChildByFieldName("left"); c != nil {
+						return string(src[c.StartByte():c.EndByte()])
+					}
+				case "pair":
+					if c := p.ChildByFieldName("key"); c != nil {
+						return string(src[c.StartByte():c.EndByte()])
+					}
+				}
+				// variable_declarator: name is the first child; jsx_attribute:
+				// the attribute name (onClick).
 				for i := 0; i < int(p.ChildCount()); i++ {
 					ch := p.Child(i)
-					if ch.Type() == "identifier" {
+					if ch.Type() == "identifier" || ch.Type() == "property_identifier" {
 						return string(src[ch.StartByte():ch.EndByte()])
 					}
 				}
@@ -737,8 +915,10 @@ func extractName(lang Language, n *sitter.Node, src []byte) string {
 			return string(src[c.StartByte():c.EndByte()])
 		}
 	}
-	// Fallback to a stable synthetic identifier from the byte range.
-	return fmt.Sprintf("anon@%d-%d", n.StartByte(), n.EndByte())
+	// Fallback for a declaration without a resolvable name. A byte-range key
+	// changed with every edit above the node (a DELETED+ADDED pair each
+	// time); walk's occurrence suffix keeps same-named fallbacks distinct.
+	return "anon"
 }
 
 // receiverType pulls the type token from a Go method receiver list. We keep the
@@ -786,6 +966,27 @@ func hasNamedAssignment(n *sitter.Node) bool {
 	return false
 }
 
+// isNamedExpression reports whether a function/class/arrow EXPRESSION has a
+// stable name: a binding (hasNamedAssignment) or `export default`, which
+// names the module's default export.
+func isNamedExpression(n *sitter.Node) bool {
+	if hasNamedAssignment(n) {
+		return true
+	}
+	p := n.Parent()
+	return p != nil && p.Type() == "export_statement"
+}
+
+// hasChildType reports whether n has a direct child of the given node type.
+func hasChildType(n *sitter.Node, typ string) bool {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if n.Child(i).Type() == typ {
+			return true
+		}
+	}
+	return false
+}
+
 // isStructType checks whether a Go type_spec introduces a struct. Tree-sitter
 // exposes the type body via the "type" field; we confirm the keyword.
 func isStructType(n *sitter.Node, _ string) bool {
@@ -816,6 +1017,21 @@ func hashNormalizedBody(s string, lang Language) string {
 // hashNormalizedBodyBytes strips comments and collapses whitespace directly from a byte slice into a pooled buffer
 // and returns the hex-encoded SHA256 without string allocations.
 func hashNormalizedBodyBytes(b []byte, lang Language) string {
+	return hashNormalized(b, lang, nil, 0, true)
+}
+
+// spansWithin returns the sorted spans that overlap [a, b).
+func spansWithin(spans []litSpan, a, b uint32) []litSpan {
+	i := sort.Search(len(spans), func(i int) bool { return spans[i].end > a })
+	j := i
+	for j < len(spans) && spans[j].start < b {
+		j++
+	}
+	return spans[i:j]
+}
+
+// hashNormalized hashes appendNormalized's output from a pooled buffer.
+func hashNormalized(b []byte, lang Language, spans []litSpan, off uint32, lexical bool) string {
 	bufPtr := hashBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
 	if cap(buf) < len(b) {
@@ -826,16 +1042,60 @@ func hashNormalizedBodyBytes(b []byte, lang Language) string {
 		hashBufPool.Put(bufPtr)
 	}()
 
+	buf = appendNormalized(buf, b, lang, spans, off, lexical)
+	sum := sha256.Sum256(bytes.TrimSpace(buf))
+	return hex.EncodeToString(sum[:])
+}
+
+// normalizeForHash strips comments and collapses whitespace so cosmetic-only
+// edits (formatting, comment tweaks) do not register as semantic changes. It
+// is the exact text hashNormalizedBodyBytes hashes.
+func normalizeForHash(s string, lang Language) string {
+	return string(bytes.TrimSpace(appendNormalizedBody(nil, []byte(s), lang)))
+}
+
+// appendNormalizedBody appends the normalized form of b to buf: comments
+// stripped, whitespace runs collapsed to one space, string literals verbatim
+// except for a CR before LF (Go raw strings, JS templates and Python source
+// all read CRLF as LF, so a line-ending conversion is not a change).
+//
+// Python indentation is syntax, so there a newline outside brackets is not
+// whitespace: each logical line is emitted on its own line prefixed by its
+// block depth, computed like the tokenizer's INDENT/DEDENT stack. Moving a
+// statement into or out of a block changes the hash; switching between 2- and
+// 4-space indentation, blank lines and comment-only lines do not.
+func appendNormalizedBody(buf, b []byte, lang Language) []byte {
+	return appendNormalized(buf, b, lang, nil, 0, true)
+}
+
+// appendNormalized is appendNormalizedBody with a choice of where comments
+// and literals come from. lexical finds them by scanning the bytes (generic
+// parsers have no tree). Otherwise spans -- the grammar's own comment and
+// literal ranges, in source coordinates, with b starting at off -- are
+// authoritative and the bytes are never re-lexed, so a regex literal or a
+// nested template cannot be mistaken for a comment or an open string. Both
+// modes produce identical output wherever the lexer reads the code correctly.
+func appendNormalized(buf, b []byte, lang Language, spans []litSpan, off uint32, lexical bool) []byte {
+	py := lang == LangPython
+	k := 0 // next candidate in spans
 	prevSpace := false
 	inLineComment := false
 	inBlockComment := false
 	inString := byte(0)
+
+	lineStart := false // Python: at a line start, before its first token
+	indentFrom := 0    // Python: where the current line's indentation begins
+	depth := 0         // Python: open brackets (implicit line joining)
+	var indents []int  // Python: widths of the enclosing indented blocks
 
 	for i := 0; i < len(b); i++ {
 		c := b[i]
 		if inLineComment {
 			if c == '\n' {
 				inLineComment = false
+				if py && depth == 0 {
+					lineStart, indentFrom = true, i+1
+				}
 			}
 			continue
 		}
@@ -847,6 +1107,9 @@ func hashNormalizedBodyBytes(b []byte, lang Language) string {
 			continue
 		}
 		if inString != 0 {
+			if c == '\r' && i+1 < len(b) && b[i+1] == '\n' {
+				continue
+			}
 			buf = append(buf, c)
 			if c == inString {
 				backslashes := 0
@@ -859,14 +1122,89 @@ func hashNormalizedBodyBytes(b []byte, lang Language) string {
 			}
 			continue
 		}
+		inSpan := false
+		if !lexical {
+			pos := off + uint32(i)
+			for k < len(spans) && spans[k].end <= pos {
+				k++
+			}
+			inSpan = k < len(spans) && spans[k].start <= pos
+			if inSpan && spans[k].comment {
+				end := min(int(spans[k].end-off), len(b))
+				i = end - 1
+				// The lexer consumes a line comment's newline without emitting
+				// whitespace; do the same so both modes hash alike.
+				if s := b[int(max(spans[k].start, off)-off):end]; bytes.HasPrefix(s, []byte("//")) || bytes.HasPrefix(s, []byte("#")) {
+					j := end
+					if j < len(b) && b[j] == '\r' {
+						j++
+					}
+					if j < len(b) && b[j] == '\n' {
+						i = j
+						if py && depth == 0 {
+							lineStart, indentFrom = true, j+1
+						}
+					}
+				}
+				continue
+			}
+		}
+		if py && lineStart {
+			switch c {
+			case ' ', '\t':
+				continue
+			case '\r', '\n':
+				indentFrom = i + 1 // blank line
+				continue
+			case '#':
+				if lexical {
+					inLineComment = true // comment-only line
+					continue
+				}
+			}
+			lineStart = false
+			width := 0
+			for _, w := range b[indentFrom:i] {
+				if w == '\t' {
+					width += 8 - width%8
+				} else {
+					width++
+				}
+			}
+			for len(indents) > 0 && width < indents[len(indents)-1] {
+				indents = indents[:len(indents)-1]
+			}
+			if len(indents) == 0 || width > indents[len(indents)-1] {
+				indents = append(indents, width)
+			}
+			buf = bytes.TrimRight(buf, " ")
+			buf = append(buf, '\n')
+			for range indents {
+				buf = append(buf, '\t')
+			}
+			prevSpace = true
+		}
+		if inSpan {
+			// A grammar literal: verbatim, minus CR before LF.
+			end := min(int(spans[k].end-off), len(b))
+			for ; i < end; i++ {
+				if b[i] == '\r' && i+1 < len(b) && b[i+1] == '\n' {
+					continue
+				}
+				buf = append(buf, b[i])
+			}
+			i--
+			prevSpace = false
+			continue
+		}
 		switch c {
 		case '/':
-			if lang != LangPython && i+1 < len(b) && b[i+1] == '/' {
+			if lexical && lang != LangPython && i+1 < len(b) && b[i+1] == '/' {
 				inLineComment = true
 				i++
 				continue
 			}
-			if lang != LangPython && i+1 < len(b) && b[i+1] == '*' {
+			if lexical && lang != LangPython && i+1 < len(b) && b[i+1] == '*' {
 				inBlockComment = true
 				i++
 				continue
@@ -874,14 +1212,30 @@ func hashNormalizedBodyBytes(b []byte, lang Language) string {
 		case '#':
 			// Python-only line comment. In JS/TS '#' starts a private field
 			// (this.#x) — stripping it there corrupts the hash.
-			if lang == LangPython {
+			if lexical && lang == LangPython {
 				inLineComment = true
 				continue
 			}
 		case '"', '\'', '`':
-			inString = c
-			buf = append(buf, c)
-			continue
+			if lexical {
+				inString = c
+				buf = append(buf, c)
+				prevSpace = false
+				continue
+			}
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case '\n':
+			// A newline ends a logical line unless brackets or a trailing
+			// backslash join it to the next one.
+			if t := bytes.TrimRight(buf, " "); py && depth == 0 && (len(t) == 0 || t[len(t)-1] != '\\') {
+				lineStart, indentFrom = true, i+1
+				continue
+			}
 		}
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
 			if !prevSpace {
@@ -893,92 +1247,7 @@ func hashNormalizedBodyBytes(b []byte, lang Language) string {
 		buf = append(buf, c)
 		prevSpace = false
 	}
-
-	trimmed := bytes.TrimSpace(buf)
-	sum := sha256.Sum256(trimmed)
-	return hex.EncodeToString(sum[:])
-}
-
-// normalizeForHash strips comments and collapses whitespace so cosmetic-only
-// edits (formatting, comment tweaks) do not register as semantic changes.
-func normalizeForHash(s string, lang Language) string {
-	bufPtr := hashBufPool.Get().(*[]byte)
-	buf := (*bufPtr)[:0]
-	if cap(buf) < len(s) {
-		buf = make([]byte, 0, len(s))
-	}
-	defer func() {
-		*bufPtr = buf
-		hashBufPool.Put(bufPtr)
-	}()
-
-	prevSpace := false
-	inLineComment := false
-	inBlockComment := false
-	inString := byte(0)
-
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if inLineComment {
-			if c == '\n' {
-				inLineComment = false
-			}
-			continue
-		}
-		if inBlockComment {
-			if c == '*' && i+1 < len(s) && s[i+1] == '/' {
-				inBlockComment = false
-				i++
-			}
-			continue
-		}
-		if inString != 0 {
-			buf = append(buf, c)
-			if c == inString {
-				backslashes := 0
-				for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
-					backslashes++
-				}
-				if backslashes%2 == 0 {
-					inString = 0
-				}
-			}
-			continue
-		}
-		switch c {
-		case '/':
-			if lang != LangPython && i+1 < len(s) && s[i+1] == '/' {
-				inLineComment = true
-				i++
-				continue
-			}
-			if lang != LangPython && i+1 < len(s) && s[i+1] == '*' {
-				inBlockComment = true
-				i++
-				continue
-			}
-		case '#':
-			if lang == LangPython {
-				inLineComment = true
-				continue
-			}
-		case '"', '\'', '`':
-			inString = c
-			buf = append(buf, c)
-			continue
-		}
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			if !prevSpace {
-				buf = append(buf, ' ')
-				prevSpace = true
-			}
-			continue
-		}
-		buf = append(buf, c)
-		prevSpace = false
-	}
-
-	return string(bytes.TrimSpace(buf))
+	return buf
 }
 
 // HashBytes computes the SHA256 hex digest for arbitrary byte content.

@@ -3,16 +3,18 @@ import { useFileReadStats, useFileReadHeatmap, useFileModelActivity } from '../h
 
 interface FileReadDetailsProps {
   filePath: string;
+  /** Project whose history the (project-relative) path belongs to. */
+  projectId?: string | null;
 }
 
 function fmtUSD(n: number): string {
   return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
 }
 
-export function FileReadDetails({ filePath }: FileReadDetailsProps) {
-  const { data: stats, isLoading: statsLoading } = useFileReadStats(filePath);
-  const { data: heatmap = [] } = useFileReadHeatmap(filePath);
-  const { data: modelActivity = [] } = useFileModelActivity(filePath);
+export function FileReadDetails({ filePath, projectId }: FileReadDetailsProps) {
+  const { data: stats, isLoading: statsLoading } = useFileReadStats(filePath, projectId);
+  const { data: heatmap = [] } = useFileReadHeatmap(filePath, projectId);
+  const { data: modelActivity = [] } = useFileModelActivity(filePath, projectId);
 
   if (statsLoading) {
     return (

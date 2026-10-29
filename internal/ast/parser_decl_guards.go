@@ -84,7 +84,12 @@ func typeDeclPlausibleName(n string) bool {
 func typeDeclName(trimmed string) string {
 	parts := strings.Fields(trimmed)
 	for j, p := range parts {
-		if p != "class" && p != "interface" && p != "enum" && p != "object" && p != "trait" && p != "module" {
+		// Dart's `mixin` and `extension` and C++'s `namespace` are container
+		// declarations too; without them the whole body was invisible to churn,
+		// fragility and attribution. The modifier guard still rejects C++'s
+		// `using namespace std;`, whose prefix is not a declaration modifier.
+		if p != "class" && p != "interface" && p != "enum" && p != "object" && p != "trait" && p != "module" &&
+			p != "mixin" && p != "extension" && p != "namespace" {
 			continue
 		}
 		if j+1 >= len(parts) || !typeDeclModifiersOnly(parts[:j]) {

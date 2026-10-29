@@ -562,7 +562,7 @@ func TestServeStdio_NotificationSuppression(t *testing.T) {
 func TestServeStdio_MalformedLineGetsParseError(t *testing.T) {
 	out := runStdioSession(t, &fakeSink{}, []string{
 		`{this is not json`,
-		`{"jsonrpc":"2.0","id":5,"method":"ping"}`,
+		`{"jsonrpc":"2.0","id":5,"method":"no/such-method"}`,
 	})
 	if len(out) != 2 {
 		t.Fatalf("want 2 responses (parse error + method-not-found), got %d: %q", len(out), out)
@@ -763,5 +763,20 @@ func TestServeStdio_BlankLineDoesNotEndSession(t *testing.T) {
 		if id, _ := resp.ID.(float64); id != want {
 			t.Fatalf("response %d id = %v, want %v", i, resp.ID, want)
 		}
+	}
+}
+
+// MCP base protocol: ping MUST be answered with an empty result.
+func TestServeStdio_PingAnswered(t *testing.T) {
+	out := runStdioSession(t, &fakeSink{}, []string{`{"jsonrpc":"2.0","id":"p1","method":"ping"}`})
+	if len(out) != 1 {
+		t.Fatalf("want 1 response, got %d: %q", len(out), out)
+	}
+	var r jsonRPCResponse
+	if err := json.Unmarshal([]byte(out[0]), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Error != nil || r.ID != "p1" {
+		t.Fatalf("ping response = %s; want an empty result for id p1", out[0])
 	}
 }

@@ -171,7 +171,10 @@ export function Dashboard() {
 		invalidate(['models']);
 	  }
       if (pending.has('project_switched')) {
-        ['projects', 'overview', 'thrashing', 'models', 'atlas', 'proxy_traffic', 'profiler_traces'].forEach((key) => invalidate([key]));
+        // Every view not keyed by a project id (friction, profiler, per-file
+        // panels, ...) reads whichever store the daemon just activated; a
+        // fixed list here left the rest on the previous project.
+        void queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] !== 'recent' });
         // The incremental `since` merge would keep the previous store's rows.
         void queryClient.resetQueries({ queryKey: ['recent'] });
       }
@@ -278,6 +281,7 @@ export function Dashboard() {
 			  recentEvents={recent.data}
 			  loading={atlas.isLoading}
 			  onRefresh={() => atlas.refetch()}
+			  projectId={activeProjId}
 			/>
 		  </Suspense>
         )}

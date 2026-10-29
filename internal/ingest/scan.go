@@ -121,6 +121,12 @@ func classifyLogFile(name, parentName string) fileKind {
 	if strings.HasSuffix(name, ".jsonl") {
 		return kindJSONL
 	}
+	if name == "ui_messages.json" {
+		// Cline/Roo keep one directory per task (tasks/<taskId>/), so the
+		// parent is a task id the switch below never matched. Its sibling
+		// api_conversation_history.json repeats the same edits and is not read.
+		return kindJSON
+	}
 	if strings.HasSuffix(name, ".json") {
 		// Only known task files (Cline/Roo and friends), never arbitrary JSON.
 		switch parentName {
@@ -229,14 +235,20 @@ func (sw *SessionWatcher) scanRoot(root string, gen uint64, now time.Time) {
 			if kind == kindNone {
 				continue
 			}
+			pathBuf = appendPath(pathBuf[:0], cur.dir, name)
 			fi, iErr := entry.Info()
-			if iErr != nil || fi == nil {
+			if iErr == nil && fi != nil && fi.Mode()&os.ModeSymlink != 0 {
+				// Info describes the link, but processFile reads through it:
+				// the link's own (smaller) size looked like a truncation of
+				// the target every poll, replaying the whole transcript.
+				fi, iErr = os.Stat(string(pathBuf))
+			}
+			if iErr != nil || fi == nil || fi.IsDir() {
 				continue
 			}
 			if mod := fi.ModTime(); mod.After(newestFile) {
 				newestFile = mod
 			}
-			pathBuf = appendPath(pathBuf[:0], cur.dir, name)
 			sw.visit(pathBuf, kind, fi.Size(), fi.ModTime())
 		}
 

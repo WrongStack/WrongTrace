@@ -78,7 +78,7 @@ export function useRecentEvents(projectId?: string | null, limit: number = 500, 
       const merged = [...fresh, ...previous.filter((e) => !seen.has(e.event_id))];
       // Both inputs are newest-first, but equal-timestamp rows can flip order
       // between polls and defensive re-sorting keeps the cap deterministic.
-      merged.sort((a, b) => b.event_time.localeCompare(a.event_time) || a.event_id.localeCompare(b.event_id));
+      merged.sort((a, b) => b.event_time.localeCompare(a.event_time) || b.event_id.localeCompare(a.event_id));
       return merged.slice(0, limit);
     },
     enabled,
@@ -98,10 +98,15 @@ export function useHealth() {
   });
 }
 
-export function useFileHealth(path: string | null) {
+// Per-file hooks take the viewed project like useRecentFileEvents: paths
+// are project-relative and the server matches them by suffix, so without it
+// another project's same-named file merged into this one's answers.
+const projectParam = (projectId?: string | null) => (projectId ? `&project_id=${encodeURIComponent(projectId)}` : '');
+
+export function useFileHealth(path: string | null, projectId?: string | null) {
   return useQuery<FileHealth>({
-    queryKey: ['file_health', path],
-    queryFn: ({ signal }) => jget<FileHealth>(`${base}/file/health?path=${encodeURIComponent(path ?? '')}`, signal),
+    queryKey: ['file_health', projectId || 'active', path],
+    queryFn: ({ signal }) => jget<FileHealth>(`${base}/file/health?path=${encodeURIComponent(path ?? '')}${projectParam(projectId)}`, signal),
     enabled: !!path,
     staleTime: 30_000,
   });
@@ -224,50 +229,55 @@ export function useRecentReads(limit: number = 50, projectId?: string | null) {
   });
 }
 
-export function useFileReadStats(path: string | null) {
+export function useFileReadStats(path: string | null, projectId?: string | null) {
   return useQuery<import('../types').FileReadStats>({
-    queryKey: ['file_read_stats', path],
-    queryFn: ({ signal }) => jget<import('../types').FileReadStats>(`${base}/files/reads?path=${encodeURIComponent(path ?? '')}`, signal),
+    queryKey: ['file_read_stats', projectId || 'active', path],
+    queryFn: ({ signal }) => jget<import('../types').FileReadStats>(`${base}/files/reads?path=${encodeURIComponent(path ?? '')}${projectParam(projectId)}`, signal),
     enabled: !!path,
     staleTime: 5_000,
   });
 }
 
-export function useFileReadHeatmap(path: string | null) {
+export function useFileReadHeatmap(path: string | null, projectId?: string | null) {
   return useQuery<import('../types').LineReadHeatmap[]>({
-    queryKey: ['file_read_heatmap', path],
-    queryFn: ({ signal }) => jget<import('../types').LineReadHeatmap[]>(`${base}/files/heatmap?path=${encodeURIComponent(path ?? '')}`, signal),
+    queryKey: ['file_read_heatmap', projectId || 'active', path],
+    queryFn: ({ signal }) => jget<import('../types').LineReadHeatmap[]>(`${base}/files/heatmap?path=${encodeURIComponent(path ?? '')}${projectParam(projectId)}`, signal),
     enabled: !!path,
     staleTime: 5_000,
   });
 }
 
-export function useRecentFileEvents(filePath: string | null, limit: number = 50) {
+// projectId scopes the history like useRecentEvents: atlas paths are
+// project-relative and the server matches file_path by suffix, so without it
+// another project's same-named file merged into this file's history (and
+// shared its cache entry).
+export function useRecentFileEvents(filePath: string | null, limit: number = 50, projectId?: string | null) {
+  const pParam = projectId ? `&project_id=${encodeURIComponent(projectId)}` : '';
   return useQuery<EventRecord[]>({
-    queryKey: ['recent_file_events', filePath, limit],
-    queryFn: ({ signal }) => jget<EventRecord[]>(`${base}/metrics/recent?file_path=${encodeURIComponent(filePath ?? '')}&limit=${limit}`, signal),
+    queryKey: ['recent_file_events', projectId || 'active', filePath, limit],
+    queryFn: ({ signal }) => jget<EventRecord[]>(`${base}/metrics/recent?file_path=${encodeURIComponent(filePath ?? '')}&limit=${limit}${pParam}`, signal),
     enabled: !!filePath,
     staleTime: 3_000,
   });
 }
 
-export function useSymbolHistory(filePath: string | null, signature: string | null, limit: number = 100) {
+export function useSymbolHistory(filePath: string | null, signature: string | null, limit: number = 100, projectId?: string | null) {
   const pParam = filePath ? `path=${encodeURIComponent(filePath)}` : '';
   const sParam = signature ? `signature=${encodeURIComponent(signature)}` : '';
-  const queryStr = [pParam, sParam, `limit=${limit}`].filter(Boolean).join('&');
+  const queryStr = [pParam, sParam, `limit=${limit}`].filter(Boolean).join('&') + projectParam(projectId);
 
   return useQuery<import('../types').SymbolHistoryRecord[]>({
-    queryKey: ['symbol_history', filePath, signature, limit],
+    queryKey: ['symbol_history', projectId || 'active', filePath, signature, limit],
     queryFn: ({ signal }) => jget<import('../types').SymbolHistoryRecord[]>(`${base}/symbol/history?${queryStr}`, signal),
     enabled: !!(filePath || signature),
     staleTime: 3_000,
   });
 }
 
-export function useFileModelActivity(filePath: string | null) {
+export function useFileModelActivity(filePath: string | null, projectId?: string | null) {
   return useQuery<import('../types').ModelActivitySummary[]>({
-    queryKey: ['file_model_activity', filePath],
-    queryFn: ({ signal }) => jget<import('../types').ModelActivitySummary[]>(`${base}/files/activity?path=${encodeURIComponent(filePath ?? '')}`, signal),
+    queryKey: ['file_model_activity', projectId || 'active', filePath],
+    queryFn: ({ signal }) => jget<import('../types').ModelActivitySummary[]>(`${base}/files/activity?path=${encodeURIComponent(filePath ?? '')}${projectParam(projectId)}`, signal),
     enabled: !!filePath,
     staleTime: 5_000,
   });

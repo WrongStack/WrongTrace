@@ -98,7 +98,8 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 	normPath := "/" + strings.Trim(filepath.ToSlash(path), "/")
 	lowerPath := strings.ToLower(normPath)
 
-	for _, r := range rm.sortedRoutesLocked() {
+	routes := rm.sortedRoutesLocked()
+	for _, r := range routes {
 		if !r.Enabled {
 			continue
 		}
@@ -139,8 +140,17 @@ func (rm *RouteManager) MatchRoute(path string) (*ProxyRoute, string) {
 				}
 			}
 		}
+	}
 
-		// 3. Match by Route Name (e.g. /proxy/zai matches route named "zai" or "ZAI")
+	// 3. Match by Route Name (e.g. /proxy/zai matches route named "zai" or "ZAI").
+	// A separate pass: a name fallback must never beat another route's
+	// configured prefix. Checked per route, a longer-prefixed route matching
+	// only by name came first in the sort and won, forwarding the caller's
+	// Authorization header to the wrong upstream.
+	for _, r := range routes {
+		if !r.Enabled {
+			continue
+		}
 		trimmedName := strings.ToLower(strings.TrimSpace(r.Name))
 		if trimmedName != "" {
 			nameSlug := "/proxy/" + trimmedName

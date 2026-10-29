@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -66,7 +67,14 @@ func (r *jsonRPCRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*r = jsonRPCRequest(wire)
-	_, r.idPresent = members["id"]
+	var rawID json.RawMessage
+	rawID, r.idPresent = members["id"]
+	// A numeric id decodes to float64, which rounds integers above 2^53, so
+	// the response id differed from the request's. json.Number echoes every
+	// digit. Strings and null keep their decoded form.
+	if t := bytes.TrimSpace(rawID); len(t) > 0 && (t[0] == '-' || (t[0] >= '0' && t[0] <= '9')) {
+		r.ID = json.Number(t)
+	}
 	return nil
 }
 
@@ -214,6 +222,10 @@ func dispatch(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		return callTool(sink, req)
 	case "notifications/initialized", "notifications/cancelled":
 		resp.Result = map[string]interface{}{}
+	case "ping":
+		// MCP base protocol: the receiver MUST answer ping with an empty
+		// result; clients use it as a liveness check.
+		resp.Result = map[string]interface{}{}
 	default:
 		resp.Error = &rpcError{Code: -32601, Message: "method not found: " + req.Method}
 	}
@@ -335,7 +347,7 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 						"lock_reason":            lockInfo.Reason,
 						"lock_owner":             lockInfo.Owner,
 						"lock_expires_at":        lockInfo.ExpiresAt,
-						"recommendation":          rec,
+						"recommendation":         rec,
 					},
 				}
 				return resp
@@ -367,10 +379,20 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 			}
 			return resp
 		}
-		allowed := !h.IsFragile && h.HealthScore >= 40
+		// Same cutoff as core.Engine.CheckGuardrail (the saved setting).
+		cutoff := core.FragilityCutoff()
+		allowed := !h.IsFragile && h.HealthScore >= cutoff
 		rec := "Safe to modify."
-		if h.IsFragile || h.HealthScore < 40 {
+		if h.IsFragile || h.HealthScore < cutoff {
 			rec = fmt.Sprintf("GUARDRAIL WARNING: File %s has high churn (%d thrashing events, health score %d/100).", path, h.RecentThrashingCount, h.HealthScore)
+		} else if h.HealthScore < 70 {
+			// The engine's tier set has a THIRD band (core.Engine.CheckGuardrail,
+			// guardrails.go:266-268) and this local copy had only two, so a file
+			// with health 40-69 -- 4 edits in 24h is 68, and fragility only starts
+			// at 5 edits -- was answered "Safe to modify." here while HTTP and IPC
+			// answered "Caution: ..." for the very same file. MCP is the transport
+			// the bundled agents read, so keep the wording identical to the engine's.
+			rec = fmt.Sprintf("Caution: File health score is %d/100. Apply minimal localized diffs.", h.HealthScore)
 		}
 		text := fmt.Sprintf("allowed=%v health_score=%d fragile=%v recent_thrashing_count=%d recommendation=%q",
 			allowed, h.HealthScore, h.IsFragile, h.RecentThrashingCount, rec)
@@ -463,6 +485,13 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 		if path == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "file_path is required"}
 			return resp
+		}
+		if ownerRunID == "" {
+			// The engine reads an empty owner_run_id as a force unlock, which
+			// would let any agent release another run's live lock just by
+			// omitting its credential. Present one no run can hold: unowned
+			// and expired locks still clear, owned live locks are refused.
+			ownerRunID = "\x00no-credential"
 		}
 		if locker, ok := sink.(interface {
 			UnlockFile(path string, ownerRunID string) error
@@ -590,6 +619,15 @@ func callTool(sink EngineSink, req *jsonRPCRequest) jsonRPCResponse {
 func toInt64(v interface{}) int64 {
 	switch t := v.(type) {
 	case float64:
+		// Saturate instead of converting out of range: int64(1e19) is
+		// MinInt64 on amd64, which slipped a huge TTL under the 24h cap
+		// (and turned huge token counts negative).
+		if t >= math.MaxInt64 {
+			return math.MaxInt64
+		}
+		if t <= math.MinInt64 {
+			return math.MinInt64
+		}
 		return int64(t)
 	case int:
 		return int64(t)

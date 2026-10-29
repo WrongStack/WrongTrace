@@ -50,10 +50,28 @@ foreach ($tool in 'go', 'npm') {
 if (-not $NoBuild) {
     Write-Host '==> building daemon' -ForegroundColor Cyan
     New-Item -ItemType Directory -Force (Split-Path $Bin) | Out-Null
+    $previousCgoEnabled = $env:CGO_ENABLED
+    $previousCC = $env:CC
     Push-Location $Root
-    try { go build -o $Bin ./cmd/wrongtrace }
-    finally { Pop-Location }
-    if ($LASTEXITCODE -ne 0) { Write-Error 'daemon build failed' }
+    try {
+        # tree-sitter's C runtime and grammars require CGO. Go disables it by
+        # default on Windows when its default compiler (gcc) is not in PATH.
+        $env:CGO_ENABLED = '1'
+        if ((go env CC) -eq 'gcc' -and -not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            if (Get-Command clang -ErrorAction SilentlyContinue) {
+                $env:CC = 'clang'
+            } else {
+                Write-Error 'dev.ps1: tree-sitter requires a C compiler. Add gcc or clang to PATH, or configure $env:CC.'
+            }
+        }
+        Write-Host "    CGO_ENABLED=1, CC=$(go env CC)"
+        go build -o $Bin ./cmd/wrongtrace
+        if ($LASTEXITCODE -ne 0) { Write-Error 'daemon build failed' }
+    } finally {
+        $env:CGO_ENABLED = $previousCgoEnabled
+        $env:CC = $previousCC
+        Pop-Location
+    }
 }
 
 # Clean up any lingering wrongtrace processes before starting

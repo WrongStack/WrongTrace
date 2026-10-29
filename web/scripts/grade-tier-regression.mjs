@@ -87,9 +87,23 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
 const viewer = fs.readFileSync(path.join(root, 'web', 'src', 'components', 'ModelIntelligenceMatrix.tsx'), 'utf8');
 check(/getGradeBadge/.test(viewer), 'ModelIntelligenceMatrix.tsx must use getGradeBadge from lib/grade');
 check(/from '\.\.\/lib\/grade'/.test(viewer), 'ModelIntelligenceMatrix.tsx must import getGradeBadge from lib/grade');
-// The call site must pass the ROI-data fact, else a free model is demoted.
-check(/getGradeBadge\([^)]*total_survived_nodes\s*>\s*0/s.test(viewer) || /hasRoiData|total_survived_nodes\s*>\s*0[^)]*\)/s.test(viewer),
-  'ModelIntelligenceMatrix.tsx must pass whether the row has ROI data (total_survived_nodes > 0)');
+
+// The call site must feed the badge the producer's ROI-data fact. Asserting the
+// string "total_survived_nodes > 0" appears ANYWHERE in the file is not enough:
+// the ROI column on the same row tests that condition too, so a loose match
+// stays green even when the badge is handed a different flag (e.g.
+// total_nodes > 0) and the round-23 misgrading silently returns. Assert the
+// argument itself, so the cross-reference is actually pinned.
+const call = viewer.match(/getGradeBadge\(([\s\S]*?)\);/);
+check(call !== null, 'ModelIntelligenceMatrix.tsx must call getGradeBadge(...)');
+if (call) {
+  const args = call[1];
+  const fourthArg = args.slice(args.lastIndexOf(',') + 1).trim();
+  check(
+    /total_survived_nodes\s*>\s*0$/.test(fourthArg),
+    `the 4th getGradeBadge argument must be the Go producer's ROI-data fact (total_survived_nodes > 0); got "${fourthArg}"`,
+  );
+}
 
 if (failures.length > 0) {
   for (const f of failures) console.log('  - ' + f);

@@ -47,6 +47,11 @@ type SessionWatcher struct {
 	seenFingerprints map[string]uint64
 	seenContexts     map[string]jsonlContext
 
+	// parseFailed remembers the size and mtime of whole-file transcripts that
+	// failed to parse, so an unchanged undecodable file is not re-read and
+	// re-logged on every poll. Not persisted: one retry per daemon start.
+	parseFailed map[string]fileState
+
 	// dirCache remembers what each directory looked like on the previous poll
 	// so dormant ones can be skipped. It has its own mutex because directory
 	// enumeration runs outside mu, where event delivery happens. See scan.go.
@@ -68,6 +73,7 @@ func NewSessionWatcher(onToolCall func(ToolCallEvent)) *SessionWatcher {
 		seenEmitted:      make(map[string]int),
 		seenFingerprints: make(map[string]uint64),
 		seenContexts:     make(map[string]jsonlContext),
+		parseFailed:      make(map[string]fileState),
 		onToolCall:       onToolCall,
 		scanDepth:        maxScanDepthFromEnv(),
 	}
@@ -266,6 +272,10 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 		sw.mu.Unlock()
 		return
 	}
+	if f, failed := sw.parseFailed[path]; failed && currentSize == f.offset && modTime.Equal(f.modTime) {
+		sw.mu.Unlock()
+		return
+	}
 
 	lastOffset := st.offset
 	if currentSize < lastOffset {
@@ -299,6 +309,11 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 
 	if parseErr != nil {
 		log.Printf("ingest: parse %s: %v", path, parseErr)
+		if wholeFile {
+			sw.mu.Lock()
+			sw.parseFailed[path] = fileState{offset: currentSize, modTime: modTime}
+			sw.mu.Unlock()
+		}
 		return
 	}
 
@@ -321,6 +336,7 @@ func (sw *SessionWatcher) processFile(path string, kind fileKind, currentSize in
 	}
 
 	sw.mu.Lock()
+	delete(sw.parseFailed, path)
 	sw.seenOffsets[path] = newOffset
 	sw.seenFiles[path] = fileState{offset: newOffset, modTime: modTime}
 	if wholeFile {
@@ -377,8 +393,11 @@ func (sw *SessionWatcher) pruneMissingFiles(now time.Time) {
 		return
 	}
 	sw.lastStatePrune = now
-	paths := make([]string, 0, len(sw.seenOffsets))
+	paths := make([]string, 0, len(sw.seenOffsets)+len(sw.parseFailed))
 	for path := range sw.seenOffsets {
+		paths = append(paths, path)
+	}
+	for path := range sw.parseFailed {
 		paths = append(paths, path)
 	}
 	sw.mu.Unlock()
@@ -398,6 +417,7 @@ func (sw *SessionWatcher) pruneMissingFiles(now time.Time) {
 		// A file may have been recreated while the stat pass was running.
 		if !fileExists(path) {
 			delete(sw.seenFiles, path)
+			delete(sw.parseFailed, path)
 			delete(sw.seenOffsets, path)
 			delete(sw.seenEmitted, path)
 			delete(sw.seenFingerprints, path)
@@ -409,12 +429,20 @@ func (sw *SessionWatcher) pruneMissingFiles(now time.Time) {
 	sw.mu.Unlock()
 }
 
-// StartPolling runs a background loop polling session logs every interval.
-func (sw *SessionWatcher) StartPolling(ctx context.Context, interval time.Duration) {
+// StartPolling runs a background loop polling session logs every interval. The
+// returned channel is closed once the loop has exited AND its final offset
+// checkpoint has been saved, so a caller that has cancelled ctx can wait for
+// this poller before tearing the store down underneath it.
+func (sw *SessionWatcher) StartPolling(ctx context.Context, interval time.Duration) <-chan struct{} {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
+	done := make(chan struct{})
 	go func() {
+		// Registered FIRST so it runs LAST: a caller's await must not return
+		// before the final checkpoint save has run, or the deferred Closes
+		// could still take the store down underneath that save.
+		defer close(done)
 		defer func() {
 			if err := sw.saveOffsets(true); err != nil {
 				log.Printf("ingest: save final offset checkpoint: %v", err)
@@ -432,6 +460,7 @@ func (sw *SessionWatcher) StartPolling(ctx context.Context, interval time.Durati
 			}
 		}
 	}()
+	return done
 }
 
 func dirExists(p string) bool {

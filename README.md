@@ -6,7 +6,7 @@
 
 Watches your code with Tree-sitter, correlates AST-level edits with path-scoped agent tool operations, ingests OpenTelemetry/profiler runtime traces, tracks inter-agent code collisions ("Who Broke Whose Code?"), provides an interactive Code Atlas with full-screen graph visualization, serves an embedded React dashboard, and operates an AI Gateway observer — all from a single, high-performance Go binary.
 
-[![Version](https://img.shields.io/badge/Version-0.3.17-blue.svg?style=flat)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-0.3.18-blue.svg?style=flat)](CHANGELOG.md)
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-purple.svg)](LICENSE)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat&logo=react)](https://react.dev)
@@ -59,7 +59,7 @@ wrongtrace --version
 |:---|:---|:---|
 | Install location | `~/.local/bin/wrongtrace` | `%LOCALAPPDATA%\Programs\WrongTrace\wrongtrace.exe` |
 | PATH setup | Appends an `export PATH=...` line to `~/.zshrc`, `~/.bashrc` (+ `~/.bash_profile` on macOS), `~/.profile`, or a fish `conf.d` file — only if the directory is not already on `PATH` | Adds the directory to the **user** `Path` environment variable (no admin needed) |
-| Pin a version | `sh -s -- --version v0.3.17` or `WRONGTRACE_VERSION=v0.3.17` | `-Version v0.3.17` or `$env:WRONGTRACE_VERSION='v0.3.17'` |
+| Pin a version | `sh -s -- --version v0.3.18` or `WRONGTRACE_VERSION=v0.3.18` | `-Version v0.3.18` or `$env:WRONGTRACE_VERSION='v0.3.18'` |
 | Custom directory | `--dir /usr/local/bin` or `WRONGTRACE_INSTALL_DIR=...` | `-InstallDir C:\tools\wrongtrace` or `$env:WRONGTRACE_INSTALL_DIR=...` |
 | Leave PATH alone | `--no-modify-path` or `WRONGTRACE_NO_MODIFY_PATH=1` | `-NoModifyPath` or `$env:WRONGTRACE_NO_MODIFY_PATH='1'` |
 | Uninstall | `sh -s -- --uninstall` | `-Uninstall` (also removes the PATH entry) |
@@ -67,13 +67,13 @@ wrongtrace --version
 Flags are passed through the pipe like this:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/WrongStack/WrongTrace/master/install.sh | sh -s -- --version v0.3.17 --dir /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/WrongStack/WrongTrace/master/install.sh | sh -s -- --version v0.3.18 --dir /usr/local/bin
 ```
 
 ```powershell
 # irm | iex cannot take parameters; download the script to pass them:
 irm https://raw.githubusercontent.com/WrongStack/WrongTrace/master/install.ps1 -OutFile install.ps1
-.\install.ps1 -Version v0.3.17
+.\install.ps1 -Version v0.3.18
 ```
 
 Uninstalling never touches your data in `WRONGTRACE_HOME` (`~/.wrongtrace`); delete it manually if you want a clean slate.

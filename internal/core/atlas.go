@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -91,12 +92,12 @@ func (e *Engine) PrimeDirectory(dir string) {
 	if e.cfg.AST == nil || dir == "" {
 		return
 	}
-	// The primed tree doubles as the ignore-scoping root when Config.WatchDir
-	// was not supplied.
-	e.adoptWatchRoot(dir)
-
 	// Single-flight indexing: cancel previous active indexing job if still running
 	e.primeMu.Lock()
+	if e.primeClosed {
+		e.primeMu.Unlock()
+		return
+	}
 	if e.primeCancel != nil {
 		e.primeCancel()
 	}
@@ -105,6 +106,13 @@ func (e *Engine) PrimeDirectory(dir string) {
 	e.primeMu.Unlock()
 
 	defer cancel()
+
+	// Register the job before any blocking work so Close can cancel even a
+	// queued entry. A closed engine must never restart its indexer.
+	e.adoptWatchRoot(dir)
+	if ctx.Err() != nil {
+		return
+	}
 
 	start := time.Now()
 
@@ -261,7 +269,10 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	}
 
 	e.cacheMu.RLock()
-	if cached, ok := e.atlasCache[filter]; ok && cached.gen == e.cacheGen && time.Since(cached.cachedAt) < 3*time.Second {
+	// Captured before the build so a write landing mid-build leaves this
+	// snapshot stale instead of stamping it with the post-write generation.
+	gen := e.cacheGen
+	if cached, ok := e.atlasCache[filter]; ok && cached.gen == gen && time.Since(cached.cachedAt) < 3*time.Second {
 		e.cacheMu.RUnlock()
 		return cloneAtlasSnapshot(cached.snapshot), nil
 	}
@@ -277,8 +288,15 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 	var nodeStats map[string]db.NodeStat
 	var allHealth map[string]db.FileHealth
 	if store := e.Store(); store != nil {
-		nodeStats, _ = store.AllNodeStats(filter)
-		allHealth, _ = store.AllFilesHealth(filter)
+		// A failed scan must not become an all-healthy (and cached) atlas:
+		// empty maps fall back to health 100 with no fragility.
+		var err error
+		if nodeStats, err = store.AllNodeStats(filter); err != nil {
+			return AtlasSnapshot{}, fmt.Errorf("atlas node stats: %w", err)
+		}
+		if allHealth, err = store.AllFilesHealth(filter); err != nil {
+			return AtlasSnapshot{}, fmt.Errorf("atlas file health: %w", err)
+		}
 	}
 	if nodeStats == nil {
 		nodeStats = make(map[string]db.NodeStat)
@@ -482,7 +500,7 @@ func (e *Engine) Atlas(repoFilter ...string) (AtlasSnapshot, error) {
 		e.atlasCache = make(map[string]cachedAtlas)
 	}
 	e.atlasCache[filter] = cachedAtlas{
-		gen:      e.cacheGen,
+		gen:      gen,
 		cachedAt: time.Now(),
 		snapshot: snap,
 	}

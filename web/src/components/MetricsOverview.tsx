@@ -73,14 +73,22 @@ export function MetricsOverview({ overview, thrashing, models, loading, currentP
           </div>
         </div>
         <div className="mt-3 stat-num text-white">
-          {indexStatus ? `${indexStatus.percentage.toFixed(0)}%` : '100%'}
+          {/* Without status data there is nothing to report; a finished index
+              with failed files is not 100%. Both used to read "100%". */}
+          {indexStatus ? `${indexStatus.percentage.toFixed(0)}%` : '—'}
         </div>
         <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
           <span>
-            {indexStatus ? `${indexStatus.indexed_files}/${indexStatus.eligible_files} files` : 'AST Synchronized'}
+            {indexStatus ? `${indexStatus.indexed_files}/${indexStatus.eligible_files} files` : 'Status unavailable'}
           </span>
           <span className="text-[10px] text-cyan-400 font-mono">
-            {indexStatus?.is_indexing ? 'Scanning…' : '100% Ready'}
+            {!indexStatus
+              ? '—'
+              : indexStatus.is_indexing
+              ? 'Scanning…'
+              : indexStatus.failed_files > 0
+              ? `${indexStatus.failed_files} failed`
+              : `${indexStatus.percentage.toFixed(0)}% Ready`}
           </span>
         </div>
       </div>

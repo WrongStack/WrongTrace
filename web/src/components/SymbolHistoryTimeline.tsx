@@ -7,6 +7,8 @@ import type { SymbolHistoryRecord } from '../types';
 interface SymbolHistoryTimelineProps {
   filePath?: string;
   signature: string;
+  /** Project whose history the (project-relative) path belongs to. */
+  projectId?: string | null;
 }
 
 function fmtUSD(n: number): string {
@@ -27,8 +29,8 @@ function fmtRelativeTime(isoStr: string): string {
   return `${diffDay}d ago`;
 }
 
-export function SymbolHistoryTimeline({ filePath = '', signature }: SymbolHistoryTimelineProps) {
-  const { data: history = [], isLoading } = useSymbolHistory(filePath, signature);
+export function SymbolHistoryTimeline({ filePath = '', signature, projectId }: SymbolHistoryTimelineProps) {
+  const { data: history = [], isLoading } = useSymbolHistory(filePath, signature, 100, projectId);
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
 
   if (isLoading) {

@@ -27,6 +27,26 @@ func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 	}
 }
 
+// awaitPollerDone waits for the session poller's completion signal, giving up
+// after d. The poller runs its own loop rather than under superviseLoop (it must
+// not be restarted or duplicated), so shutdown awaits it here: its in-flight
+// poll and its final offset checkpoint must finish before the deferred Close
+// calls tear the store down underneath it. A nil channel means no poller was
+// started, which needs no wait.
+func awaitPollerDone(done <-chan struct{}, d time.Duration) bool {
+	if done == nil {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
 // supervisePolicy is the restart timing for one supervised component.
 type supervisePolicy struct {
 	// minDelay is the wait after the first failure and the value the backoff
@@ -39,6 +59,21 @@ type supervisePolicy struct {
 	// working", which resets the backoff. Without it a component that ran fine
 	// for hours would restart at maxDelay after its first hiccup.
 	healthyRun time.Duration
+	// sleep is the ctx-aware wait between attempts. Production leaves it nil,
+	// which means sleepCtx. A test sets it to observe the EXACT ramp the loop
+	// requests: inferring the ramp from wall-clock gaps between attempt starts
+	// also measures the attempt's own runtime and scheduler wakeup jitter, so a
+	// correct ramp failed its assertion on a loaded machine (see
+	// TestSuperviseLoop_BacksOffOnRepeatedFailure).
+	sleep func(context.Context, time.Duration) bool
+}
+
+// wait performs one inter-attempt wait for this policy.
+func (p supervisePolicy) wait(ctx context.Context, d time.Duration) bool {
+	if p.sleep != nil {
+		return p.sleep(ctx, d)
+	}
+	return sleepCtx(ctx, d)
 }
 
 // defaultSupervisePolicy is what the daemon's components run under. The values
@@ -89,7 +124,7 @@ func superviseLoopWith(ctx context.Context, name string, pol supervisePolicy, fn
 			// returns nil on graceful close); loop straight back with the
 			// backoff reset.
 			delay, attempt = pol.minDelay, 0
-			if !sleepCtx(ctx, pol.minDelay) {
+			if !pol.wait(ctx, pol.minDelay) {
 				return
 			}
 			continue
@@ -105,7 +140,7 @@ func superviseLoopWith(ctx context.Context, name string, pol supervisePolicy, fn
 				name, err, attempt, ranFor.Round(time.Millisecond), delay)
 		}
 
-		if !sleepCtx(ctx, delay) {
+		if !pol.wait(ctx, delay) {
 			return
 		}
 		if delay *= 2; delay > pol.maxDelay {

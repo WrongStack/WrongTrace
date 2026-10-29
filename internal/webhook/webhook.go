@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -207,8 +208,8 @@ func (d *Dispatcher) sendSlack(ctx context.Context, url string, p Payload) error
 		"attachments": []map[string]interface{}{
 			{
 				"color": color,
-				"title": fmt.Sprintf("[WrongTrace] %s", p.EventType),
-				"text":  p.Message,
+				"title": slackEscape(fmt.Sprintf("[WrongTrace] %s", p.EventType)),
+				"text":  slackEscape(p.Message),
 				"ts":    time.Now().Unix(),
 			},
 		},
@@ -228,6 +229,35 @@ func (d *Dispatcher) sendSlack(ctx context.Context, url string, p Payload) error
 	return nil
 }
 
+// slackEscape escapes the three characters Slack treats as control syntax in
+// message text. Messages carry agent-controlled strings (file paths, lock
+// reasons), and unescaped "<...>" reaches Slack as a live <!channel> mention or
+// a masked <url|label> link inside a trusted WrongTrace alert. "&" goes first
+// so the entities produced for "<" and ">" are not escaped twice.
+var slackEscape = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace
+
+// discordEscape backslash-escapes Discord markdown in message text. The
+// Slack counterpart above exists for the same reason: an agent-controlled
+// path or lock reason such as "[Approve unlock](https://evil)" otherwise
+// renders as a disguised clickable link inside a trusted alert.
+var discordEscape = strings.NewReplacer(
+	`\`, `\\`, "[", `\[`, "]", `\]`, "(", `\(`, ")", `\)`,
+	"*", `\*`, "_", `\_`, "~", `\~`, "`", "\\`", "|", `\|`, ">", `\>`, "#", `\#`,
+).Replace
+
+// discordDescriptionMax is Discord's limit on an embed description, in
+// characters. A longer description is rejected with 400 and the alert is lost.
+const discordDescriptionMax = 4096
+
+// truncateRunes cuts s to at most max runes, marking the cut with an ellipsis.
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
+}
+
 func (d *Dispatcher) sendDiscord(ctx context.Context, url string, p Payload) error {
 	color := 0x6366f1
 	if p.Severity == "critical" {
@@ -240,7 +270,7 @@ func (d *Dispatcher) sendDiscord(ctx context.Context, url string, p Payload) err
 		"embeds": []map[string]interface{}{
 			{
 				"title":       fmt.Sprintf("WrongTrace Alert: %s", p.EventType),
-				"description": p.Message,
+				"description": truncateRunes(discordEscape(p.Message), discordDescriptionMax),
 				"color":       color,
 				"timestamp":   p.Timestamp,
 			},

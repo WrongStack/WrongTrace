@@ -106,6 +106,20 @@ type Config struct {
 	OnTraffic       func(rec ProxyTrafficRecord)
 }
 
+// runTotalsReader is implemented by a Reporter that can return a run's
+// stored totals (core.Engine).
+type runTotalsReader interface {
+	RunTotals(runID string) (prompt, completion int64, costUSD float64, ok bool)
+}
+
+// hasSession reports whether a tracker for key exists.
+func (p *GatewayProxy) hasSession(key string) bool {
+	p.sessionMu.Lock()
+	defer p.sessionMu.Unlock()
+	_, ok := p.sessions[key]
+	return ok
+}
+
 type proxySessionTracker struct {
 	runID            string
 	promptTokens     int64
@@ -415,10 +429,24 @@ func (p *GatewayProxy) finalize(job finalizeJob) {
 	if analysis.WireID != "" {
 		rec.ID = analysis.WireID
 	}
-	if promptTokens == 0 && !analysis.promptTokensReported {
+	// Only a successful exchange is billable. An error body reports no
+	// usage, and estimating tokens for it priced every 429/401/500 into the
+	// traffic record and the run's spend while the quota (correctly) saw $0.
+	billable := rec.StatusCode >= 200 && rec.StatusCode < 300
+	if !billable {
+		// The analysis estimates from the request and the reply text; for an
+		// error the "reply" is the error body. Keep only reported usage.
+		if !analysis.promptTokensReported {
+			promptTokens = 0
+		}
+		if !analysis.completionTokensReported {
+			completionTokens = 0
+		}
+	}
+	if billable && promptTokens == 0 && !analysis.promptTokensReported {
 		promptTokens = analysis.EstimatedPromptTokens(job.reqBody)
 	}
-	if completionTokens == 0 && !analysis.completionTokensReported && job.isStream {
+	if billable && completionTokens == 0 && !analysis.completionTokensReported && job.isStream {
 		completionTokens = 1
 	}
 	if analysis.CachedTokens > 0 && promptTokens < analysis.CachedTokens {
@@ -438,6 +466,9 @@ func (p *GatewayProxy) finalize(job finalizeJob) {
 	}
 
 	costUSD, cacheSavingsUSD := models.Global.CalculateCostDetailed(rec.Provider, rec.Model, promptTokens, completionTokens, analysis.CachedTokens)
+	if !billable {
+		costUSD, cacheSavingsUSD = 0, 0
+	}
 	rec.CostUSD = costUSD
 	rec.CacheSavingsUSD = cacheSavingsUSD
 	rec.ToolCalls = analysis.ToolCalls
@@ -462,17 +493,13 @@ func (p *GatewayProxy) finalize(job finalizeJob) {
 	}
 	p.recordTraffic(rec)
 
-	// Only a successful exchange is billable; upstream error responses refund
-	// the admission reservation instead of consuming budget.
+	// Upstream error responses carry no cost (billable above), so settling
+	// refunds the admission reservation instead of consuming budget.
 	quotaKey := rec.ProjectSlug
 	if quotaKey == "" {
 		quotaKey = rec.AgentName
 	}
-	billedUSD := 0.0
-	if rec.StatusCode >= 200 && rec.StatusCode < 300 {
-		billedUSD = rec.CostUSD
-	}
-	p.settleSpend(job.quota, quotaKey, billedUSD)
+	p.settleSpend(job.quota, quotaKey, rec.CostUSD)
 
 	// Save to response cache if successful. cacheKey is the lookup-time
 	// response-cache key; reusing it for the store (instead of recomputing
@@ -1134,7 +1161,11 @@ func (p *GatewayProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// stored entries under a key no lookup could ever hit.
 	parsedStream := parsedReq.Stream != nil && *parsedReq.Stream
 	isStream := parsedStream || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
-	if policyEnabled && isStream && bytes.Contains(reqBody, []byte(`"stream"`)) && !bytes.Contains(reqBody, []byte(`"stream_options"`)) {
+	// Only a body that really streams (an Accept header alone is not one, and
+	// stream_options beside "stream": false is rejected) on the chat
+	// completions API that defines the field; Anthropic, Gemini and the
+	// Responses API received an unknown top-level field.
+	if policyEnabled && parsedStream && strings.Contains(strings.ToLower(cleanPath), "chat/completions") && !bytes.Contains(reqBody, []byte(`"stream_options"`)) {
 		var reqMap map[string]interface{}
 		if err := json.Unmarshal(reqBody, &reqMap); err == nil {
 			reqMap["stream_options"] = map[string]interface{}{
@@ -1578,7 +1609,7 @@ func (p *GatewayProxy) relayStreamingResponse(w http.ResponseWriter, body io.Rea
 		}
 	}
 
-	fullSSE := streamAnalysisPayload(capturedHead.Bytes(), capturedTail.Bytes())
+	fullSSE := streamAnalysisPayload(capturedHead.Bytes(), capturedTail.Bytes(), capturedTail.Overwrote())
 
 	// Guarantee terminal marker: if upstream closed stream cleanly without [DONE], emit terminal marker
 	if opts.policyEnabled && cleanEOF && !writeFailed && expectsDoneMarker(rec) && bytes.Contains(fullSSE, []byte("data:")) && !bytes.Contains(fullSSE, []byte("[DONE]")) {
@@ -1653,6 +1684,9 @@ type cappedTailBuffer struct {
 	limit int
 	start int
 	size  int
+	// written counts every byte offered, so Overwrote can tell a ring that
+	// discarded old bytes from one still holding everything since the head.
+	written int64
 }
 
 func newCappedTailBuffer(limit int) *cappedTailBuffer {
@@ -1663,6 +1697,7 @@ func (b *cappedTailBuffer) Write(chunk []byte) {
 	if b == nil || b.limit == 0 || len(chunk) == 0 {
 		return
 	}
+	b.written += int64(len(chunk))
 	if len(chunk) >= b.limit {
 		if b.buf == nil {
 			b.buf = make([]byte, b.limit)
@@ -1692,6 +1727,12 @@ func (b *cappedTailBuffer) Write(chunk []byte) {
 	}
 }
 
+// Overwrote reports whether bytes were discarded, i.e. Bytes no longer starts
+// right where the captured head ended.
+func (b *cappedTailBuffer) Overwrote() bool {
+	return b != nil && b.written > int64(b.limit)
+}
+
 func (b *cappedTailBuffer) Bytes() []byte {
 	if b == nil || b.size == 0 {
 		return nil
@@ -1706,10 +1747,14 @@ func (b *cappedTailBuffer) Bytes() []byte {
 // streamAnalysisPayload joins the captured head and tail into the single
 // buffer handed to finalize. It is built once as bytes, with spare room for a
 // terminal marker, instead of string concatenation followed by a []byte copy.
-func streamAnalysisPayload(head, tail []byte) []byte {
+func streamAnalysisPayload(head, tail []byte, tailOverwrote bool) []byte {
 	// The tail can start in the middle of an SSE record. Drop that fragment so
 	// the final usage/message_stop records remain independently parseable.
-	if idx := bytes.IndexByte(tail, '\n'); idx >= 0 && idx+1 < len(tail) {
+	// It only can when the ring discarded bytes or the head stopped mid-line:
+	// a tail continuing a newline-terminated head starts with a whole record,
+	// and dropping it lost e.g. the usage event at that seam.
+	midRecord := tailOverwrote || (len(head) > 0 && head[len(head)-1] != '\n')
+	if idx := bytes.IndexByte(tail, '\n'); midRecord && idx >= 0 && idx+1 < len(tail) {
 		tail = tail[idx+1:]
 	}
 	out := make([]byte, 0, len(head)+1+len(tail)+len("data: [DONE]\n\n"))
@@ -2183,6 +2228,25 @@ func sanitizeURLForRecord(rawURL string) string {
 }
 
 func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, promptTokens, completionTokens int64, costUSD float64) (string, int64, int64, float64) {
+	lookupKey := explicitSessionID
+	if lookupKey == "" {
+		lookupKey = sessionKey
+	}
+	// The store replaces a run's totals on every report. An explicit run ID
+	// this map no longer (or not yet) tracks -- evicted under the session
+	// cap, or reported before a daemon restart -- resumes from its stored
+	// totals instead of zero, which erased the run's earlier spend. Read
+	// outside sessionMu; a concurrent creator simply makes this seed unused.
+	var seedPrompt, seedCompletion int64
+	var seedCost float64
+	if explicitSessionID != "" && !p.hasSession(explicitSessionID) {
+		if rt, ok := p.cfg.Reporter.(runTotalsReader); ok {
+			if sp, sc, cost, found := rt.RunTotals(explicitSessionID); found {
+				seedPrompt, seedCompletion, seedCost = sp, sc, cost
+			}
+		}
+	}
+
 	p.sessionMu.Lock()
 	defer p.sessionMu.Unlock()
 
@@ -2193,8 +2257,9 @@ func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, 
 	now := time.Now()
 	// Periodic cleanup of sessions inactive for more than 15 minutes or when exceeding capacity
 	if len(p.sessions) > 250 {
+		// The session being updated is never evicted by its own call.
 		for k, s := range p.sessions {
-			if now.Sub(s.lastSeen) > 15*time.Minute {
+			if k != lookupKey && now.Sub(s.lastSeen) > 15*time.Minute {
 				delete(p.sessions, k)
 			}
 		}
@@ -2203,7 +2268,7 @@ func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, 
 			var oldestKey string
 			var oldestTime time.Time
 			for k, s := range p.sessions {
-				if oldestTime.IsZero() || s.lastSeen.Before(oldestTime) {
+				if k != lookupKey && (oldestTime.IsZero() || s.lastSeen.Before(oldestTime)) {
 					oldestTime = s.lastSeen
 					oldestKey = k
 				}
@@ -2214,13 +2279,12 @@ func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, 
 		}
 	}
 
-	lookupKey := explicitSessionID
-	if lookupKey == "" {
-		lookupKey = sessionKey
-	}
-
 	if lookupKey != "" {
-		if sess, ok := p.sessions[lookupKey]; ok && now.Sub(sess.lastSeen) <= 10*time.Minute {
+		// The idle window only splits inferred sessions. An explicit ID keeps
+		// its run ID across any pause, and the store replaces (not adds) a
+		// run's totals on every report, so restarting the tracker from zero
+		// there erased everything recorded for the run before the pause.
+		if sess, ok := p.sessions[lookupKey]; ok && (explicitSessionID != "" || now.Sub(sess.lastSeen) <= 10*time.Minute) {
 			sess.promptTokens += promptTokens
 			sess.completionTokens += completionTokens
 			sess.costUSD += costUSD
@@ -2233,6 +2297,9 @@ func (p *GatewayProxy) getOrCreateSession(explicitSessionID, sessionKey string, 
 	if runID == "" {
 		runID = randomID("proxy-run")
 	}
+	promptTokens += seedPrompt
+	completionTokens += seedCompletion
+	costUSD += seedCost
 
 	if lookupKey != "" {
 		p.sessions[lookupKey] = &proxySessionTracker{

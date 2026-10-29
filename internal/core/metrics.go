@@ -91,6 +91,9 @@ func (e *Engine) refreshReadDerived(filter string, snap MetricsSnapshot) (Metric
 	//     time-windowed aggregates.
 	stale := ok && cached.gen == e.cacheGen &&
 		(cached.readGen != e.readGen || time.Since(cached.readAt) >= readDerivedTTL)
+	// Captured before the queries, like gen in buildMetrics: a read landing
+	// while they run must leave the pair stale, not be marked as reflected.
+	readGen := e.readGen
 	e.cacheMu.RUnlock()
 	if !stale {
 		return snap, nil
@@ -116,7 +119,7 @@ func (e *Engine) refreshReadDerived(filter string, snap MetricsSnapshot) (Metric
 	if cur, ok := e.metricsCache[filter]; ok && cur.gen == e.cacheGen {
 		cur.snapshot.Overview = overview
 		cur.snapshot.Models = models
-		cur.readGen = e.readGen
+		cur.readGen = readGen
 		cur.readAt = time.Now()
 		e.metricsCache[filter] = cur
 	}
@@ -170,7 +173,7 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 		e.metricsCalls = make(map[string]*metricsCall)
 	}
 	e.metricsCalls[filter] = call
-	gen := e.cacheGen
+	gen, readGen := e.cacheGen, e.readGen
 	e.cacheMu.Unlock()
 
 	defer func() {
@@ -179,14 +182,15 @@ func (e *Engine) Metrics(repoFilter ...string) (MetricsSnapshot, error) {
 		e.cacheMu.Unlock()
 		close(call.done)
 	}()
-	call.res, call.err = e.buildMetrics(filter, gen)
+	call.res, call.err = e.buildMetrics(filter, gen, readGen)
 	return call.res, call.err
 }
 
-// buildMetrics runs the snapshot queries and caches the result under gen, the
-// generation observed before the queries started, so a write that lands
-// mid-build leaves the entry stale instead of caching pre-write data as current.
-func (e *Engine) buildMetrics(filter string, gen uint64) (MetricsSnapshot, error) {
+// buildMetrics runs the snapshot queries and caches the result under gen and
+// readGen, the generations observed before the queries started, so a write or
+// read event that lands mid-build leaves the entry stale instead of caching
+// pre-write data as current.
+func (e *Engine) buildMetrics(filter string, gen, readGen uint64) (MetricsSnapshot, error) {
 	store := e.Store()
 	if store == nil {
 		return MetricsSnapshot{
@@ -200,7 +204,8 @@ func (e *Engine) buildMetrics(filter string, gen uint64) (MetricsSnapshot, error
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
-	thrashing, err := store.Thrashing(3, 7, filter)
+	minEdits, _ := guardrailThresholds()
+	thrashing, err := store.Thrashing(minEdits, 7, filter)
 	if err != nil {
 		return MetricsSnapshot{}, err
 	}
@@ -235,7 +240,7 @@ func (e *Engine) buildMetrics(filter string, gen uint64) (MetricsSnapshot, error
 	e.metricsCache[filter] = cachedMetrics{
 		gen:      gen,
 		cachedAt: now,
-		readGen:  e.readGen,
+		readGen:  readGen,
 		readAt:   now,
 		snapshot: res,
 	}
@@ -273,7 +278,8 @@ func (e *Engine) ThrashingRows(repoFilter ...string) ([]db.ThrashingRow, error) 
 	if store == nil {
 		return nil, nil
 	}
-	return store.Thrashing(3, 7, filter)
+	minEdits, _ := guardrailThresholds()
+	return store.Thrashing(minEdits, 7, filter)
 }
 
 // ModelRows returns just the per-model survival and ROI comparison, without

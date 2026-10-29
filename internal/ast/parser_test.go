@@ -190,7 +190,13 @@ func TestNormalizeForHash(t *testing.T) {
 		want string
 	}{
 		{"line comment stripped", LangGo, "a // tail\nb", "a b"},
-		{"python comment stripped", LangPython, "a # tail\nb", "a b"},
+		// Python keeps logical lines, each prefixed by its block depth: the
+		// newline is syntax there, not whitespace.
+		{"python comment stripped", LangPython, "a # tail\nb", "a\n\tb"},
+		{"python block depth kept", LangPython, "def f():\n    if x:\n        y\n    z", "def f():\n\tif x:\n\t\ty\n\tz"},
+		{"python indent width ignored", LangPython, "def f():\n  if x:\n    y\n  z", "def f():\n\tif x:\n\t\ty\n\tz"},
+		{"python blank, comment and CRLF lines dropped", LangPython, "if x:\r\n\r\n    # c\r\n    y  \r\n", "if x:\n\ty"},
+		{"python brackets join lines", LangPython, "f(a,\n      b)\nz", "f(a, b)\n\tz"},
 		{"python private-name marker preserved (JS not Python)", LangJavaScript, "class A { #x = 1 }", "class A { #x = 1 }"},
 		{"python private-dunder preserved", LangPython, "self.__x = 1", "self.__x = 1"},
 		{"block comment stripped", LangGo, "a /* mid */ b", "a b"},
@@ -198,6 +204,7 @@ func TestNormalizeForHash(t *testing.T) {
 		{"string kept verbatim", LangGo, `x := "a  b // c"`, `x := "a  b // c"`},
 		{"python string kept verbatim", LangPython, `x := "a # not a comment"`, `x := "a # not a comment"`},
 		{"raw string kept", LangGo, "s := `a /* b */`", "s := `a /* b */`"},
+		{"CR before LF inside a string dropped", LangGo, "s := `a\r\nb`", "s := `a\nb`"},
 		{"empty", LangGo, "   \n\t ", ""},
 	}
 	for _, c := range cases {

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -177,7 +179,12 @@ func (h *Handlers) ReportTelemetry(w http.ResponseWriter, r *http.Request) {
 
 	runID := req.RunID
 	if runID == "" {
-		runID = "run-" + time.Now().UTC().Format("20060102150405") + "-" + fmt.Sprintf("%04x", time.Now().UnixNano()%0xffff)
+		// Random, not clock-derived: on Windows the clock is coarse and two
+		// reports in one tick got the same run_id, so the second replaced the
+		// first run's totals (UpsertRun).
+		var b [8]byte
+		_, _ = rand.Read(b[:])
+		runID = "run-" + time.Now().UTC().Format("20060102150405") + "-" + hex.EncodeToString(b[:])
 	}
 	promptTokens := req.PromptTokens
 	if promptTokens == 0 && req.TokensUsed > 0 {
@@ -317,7 +324,7 @@ func (h *Handlers) SymbolHistory(w http.ResponseWriter, r *http.Request) {
 	if limit > maxRecentEventsLimit {
 		limit = maxRecentEventsLimit
 	}
-	history, err := h.Engine.GetSymbolHistory(filePath, signature, limit)
+	history, err := h.Engine.GetSymbolHistory(filePath, signature, limit, h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -349,7 +356,7 @@ func (h *Handlers) FileModelActivity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, activity)
 		return
 	}
-	activity, err := h.Engine.GetFileModelActivity(filePath)
+	activity, err := h.Engine.GetFileModelActivity(filePath, h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -493,7 +500,7 @@ func (h *Handlers) FileHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	hl, err := h.Engine.FileHealth(path)
+	hl, err := h.Engine.FileHealthIn(path, h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -592,7 +599,7 @@ func (h *Handlers) CheckGuardrail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "path query parameter is required")
 		return
 	}
-	res, err := h.Engine.CheckGuardrail(path)
+	res, err := h.Engine.CheckGuardrailIn(path, h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -691,13 +698,13 @@ func (h *Handlers) LockFile(w http.ResponseWriter, r *http.Request) {
 		}
 		existing := conflict.Existing
 		writeJSON(w, http.StatusConflict, map[string]interface{}{
-			"ok":           false,
-			"status":       "conflict",
-			"error":        "file is already locked",
-			"message":      fmt.Sprintf("file %s is already locked by %s", targetPath, existing.Owner),
-			"path":         existing.Path,
-			"reason":       existing.Reason,
-			"owner":        existing.Owner,
+			"ok":      false,
+			"status":  "conflict",
+			"error":   "file is already locked",
+			"message": fmt.Sprintf("file %s is already locked by %s", targetPath, existing.Owner),
+			"path":    existing.Path,
+			"reason":  existing.Reason,
+			"owner":   existing.Owner,
 			// existing.OwnerRunID is deliberately withheld. This is the
 			// HOLDER's credential, not the caller's, and owner_run_id is
 			// exactly what Engine.UnlockFile verifies, so echoing it here
@@ -938,10 +945,12 @@ func (h *Handlers) AddProject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Now extract values — raw.Name and raw.Path are guaranteed non-nil strings.
-	if err := json.Unmarshal(raw.Name, &name); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
-		return
+	// Decode the optional name and required path after checking field types.
+	if raw.Name != nil {
+		if err := json.Unmarshal(raw.Name, &name); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
 	}
 	if err := json.Unmarshal(raw.Path, &path); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -1014,8 +1023,18 @@ func (h *Handlers) ImportFromWrongStack(w http.ResponseWriter, r *http.Request) 
 // The dashboard's edit form sends only name/description/*_logs_path, so
 // requiring a body id (as this handler once did) broke every edit.
 func (h *Handlers) UpdateProject(w http.ResponseWriter, r *http.Request) {
+	var body json.RawMessage
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
 	var p core.ProjectProfile
-	if err := decodeJSON(w, r, &p); err != nil {
+	var present map[string]json.RawMessage
+	if err := json.Unmarshal(body, &p); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := json.Unmarshal(body, &present); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -1032,6 +1051,26 @@ func (h *Handlers) UpdateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.ID = id
+	// Engine.UpdateProject reads an empty log path as "clear". A field the
+	// body does not mention is not a clear: a rename-only PUT wiped every
+	// configured log path. Absent keys carry the current value through.
+	if cur, err := h.Engine.GetProject(id); err == nil {
+		for _, f := range []struct {
+			key string
+			dst *string
+			cur string
+		}{
+			{"claude_logs_path", &p.ClaudeLogsPath, cur.ClaudeLogsPath},
+			{"cursor_logs_path", &p.CursorLogsPath, cur.CursorLogsPath},
+			{"cline_logs_path", &p.ClineLogsPath, cur.ClineLogsPath},
+			{"aider_logs_path", &p.AiderLogsPath, cur.AiderLogsPath},
+			{"custom_logs_path", &p.CustomLogsPath, cur.CustomLogsPath},
+		} {
+			if _, ok := present[f.key]; !ok {
+				*f.dst = f.cur
+			}
+		}
+	}
 	updated, err := h.Engine.UpdateProject(p)
 	if err != nil {
 		if errors.Is(err, core.ErrProjectNotFound) {
@@ -1068,7 +1107,13 @@ func (h *Handlers) SwitchActiveProject(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := h.Engine.SwitchActiveProject(id)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		// Only an unknown id is a 404. A registered project whose store
+		// cannot be opened or migrated is a server-side failure.
+		status := http.StatusInternalServerError
+		if errors.Is(err, core.ErrProjectNotFound) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
@@ -1305,6 +1350,9 @@ func (h *Handlers) GetProfilerHotspots(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if hotspots == nil {
+		hotspots = []db.ProfilerHotspotRow{}
+	}
 	writeJSON(w, http.StatusOK, hotspots)
 }
 
@@ -1351,7 +1399,7 @@ func (h *Handlers) GetFileReadStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "path query parameter is required")
 		return
 	}
-	stats, err := h.Engine.GetFileReadStats(path)
+	stats, err := h.Engine.GetFileReadStatsIn(path, h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1366,7 +1414,7 @@ func (h *Handlers) GetFileReadHeatmap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "path query parameter is required")
 		return
 	}
-	heatmap, err := h.Engine.GetFileReadHeatmap(path)
+	heatmap, err := h.Engine.GetFileReadHeatmap(path, h.getProjectFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

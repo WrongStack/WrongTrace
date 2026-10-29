@@ -117,6 +117,31 @@ func saveSettingsToDisk(s AppSettings) error {
 	return nil
 }
 
+// guardrailThresholds returns the saved thrashing threshold (edits within the
+// window) and fragility cutoff (health score), defaulting unset values. They
+// were persisted and shown in Settings but nothing read them: the thrashing
+// panel and the guardrail used hard-coded 3 and 40.
+func guardrailThresholds() (thrashing, fragility int) {
+	settingsMu.RLock()
+	thrashing, fragility = globalSettings.ThrashingThreshold, globalSettings.FragilityCutoff
+	settingsMu.RUnlock()
+	if thrashing <= 0 {
+		thrashing = 3
+	}
+	if fragility <= 0 {
+		fragility = 50
+	}
+	return thrashing, fragility
+}
+
+// FragilityCutoff is the health score below which the guardrail refuses a
+// modification (Settings "fragility cutoff"), for transports that evaluate
+// FileHealth themselves.
+func FragilityCutoff() int {
+	_, cutoff := guardrailThresholds()
+	return cutoff
+}
+
 // GetSettings returns a snapshot of the current settings.
 func (e *Engine) GetSettings() AppSettings {
 	settingsMu.RLock()
@@ -188,7 +213,11 @@ func (e *Engine) UpdateSettings(s AppSettings) (AppSettings, error) {
 	if err := saveSettingsToDisk(next); err != nil {
 		return AppSettings{}, err
 	}
+	thresholdsChanged := next.ThrashingThreshold != globalSettings.ThrashingThreshold
 	globalSettings = next
+	if thresholdsChanged && e != nil {
+		e.BumpCacheGen() // cached metrics were computed with the old threshold
+	}
 
 	if e != nil && e.webhooks != nil {
 		e.webhooks.UpdateConfig(webhook.Config{

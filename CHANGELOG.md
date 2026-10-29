@@ -9,10 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.3.18] - 2026-10-29
+
 ### Added
 - `install.sh` (Linux/macOS) and `install.ps1` (Windows) one-line installers: download the release binary for the platform, verify its SHA-256 checksum, install it (`~/.local/bin` or `%LOCALAPPDATA%\Programs\WrongTrace`), and add the directory to `PATH`. Support version pinning, a custom directory, `--no-modify-path`, and uninstall.
 - `wrongtrace update` replaces the running binary with the latest (or `--version`-pinned) release after checksum verification and a smoke run; `--check` only reports whether an update exists.
 - Release workflow publishes `checksums.txt` (SHA-256 of every binary) alongside the assets.
+
+### Security
+- Update Vite to 8.3.5 and `source-map-js` to 1.2.2, resolving the dashboard toolchain's reported npm advisories, including [Windows editor command execution](https://github.com/advisories/GHSA-587h-7wmj-h5pm) and [indexed source-map denial of service](https://github.com/advisories/GHSA-68fv-2mgg-jv7q).
+- Agent-facing `unlock_file` (MCP and IPC) no longer treats a missing `owner_run_id` as a force unlock: unowned or expired locks still clear, a live credential-protected lock is refused. Force unlock stays on `POST /api/guardrail/unlock`.
+- Route matching tries every configured path prefix before any name fallback, so a request is never forwarded (with its Authorization header) to a route that matched only by name.
+- Escape Slack control sequences and Discord markdown in alert text, and cap Discord embed descriptions at the API limit.
+- On POSIX, a live IPC socket is never reclaimed by a second server, and `Stop` removes only the socket file it created.
+- `clear-stale` with an out-of-range `days` deletes nothing instead of every event.
+- The gateway no longer forwards WrongTrace's own credentials upstream: a `?token=`, an `Authorization: Bearer <WRONGTRACE_TOKEN>` or the dashboard session cookie that authenticated a `/proxy` or `/v1` request is removed before forwarding (provider keys and other parameters pass unchanged).
+
+### Changed
+- Python body hashes follow block structure: moving a statement into or out of a block is a change, re-indenting is not. Decorators are part of the declaration they decorate; CRLF conversions inside strings are not changes.
+- Declaration identity: arrow functions are named by their member target, object key or JSX attribute; same-named declarations in one scope get an occurrence suffix (`#2`); TypeScript `abstract class` is a class. History recorded under the old keys of those nodes does not carry over.
+- The live event feed matches `?repo=` exactly, like every aggregate shown beside it.
+- `hook install`/`uninstall` use the hooks directory git reports (`core.hooksPath`, submodules, worktrees).
+- Enforce-mode `stream_options` injection is limited to streaming chat-completions requests.
+- JS/TS/Go/Python node hashes take comments and string, template, regex and rune literals from the parse tree instead of re-lexing the text. Function and class expressions with a binding or `export default` (named `default`), Go interfaces, and nested classes (keyed under their owner, e.g. `A.Meta`) are tracked declarations; history under the old keys of nested classes does not carry over. Same-named declarations are matched by body, so inserting one above the others no longer re-keys them as modified.
+- `report --format` rejects unknown formats instead of writing Markdown under another name.
+- `init` adds the `wrongtrace` server to an existing `.mcp.json`, keeping its other entries; a file it cannot parse is left unchanged and reported.
+- Model friction blames the immediately preceding write; an unattributed or low-confidence predecessor is an `unknown` author, never cross-agent friction.
+- Per-file answers (symbol history, file health, the guardrail check, read stats/heatmap, model activity) are limited to one project: `project_id`/`repo` when given, otherwise the project containing an absolute path or the active project for a relative one. They used to merge every project's same-named file.
+- The Settings thrashing threshold and fragility cutoff take effect (thrashing panel; guardrail over HTTP, IPC and MCP). The guardrail cutoff was a fixed 40; it now follows the setting, whose default is 50.
+- Renaming a project relabels its recorded events, so its history stays visible.
+- The first project uses the database that is already open instead of a new empty one, and at startup the active project's own database is bound (or, when it is empty while the open store holds the history, the project is pointed at that store).
+- JSONL transcripts: each edit reports the session's running usage (runs are stored with replaced totals, so they held only the last edit's usage). Claude Code transcripts (`message.content` tool_use blocks, `message.usage`, counted once per message) are ingested.
+- `report` scopes its figures to `--repo` when the flag is given, and otherwise says it covers all repositories.
+
+### Fixed
+- Instance lock: a failed PID write keeps the lock, `Release` never deletes a successor's PID file, and a recycled PID no longer blocks a portless start.
+- Ingest: a torn offset checkpoint no longer replays transcript history; reads in a rewritten transcript are no longer dropped; symlinked transcripts are not replayed every poll; an unparseable task file is not re-read every poll; parallel reads count their row's usage once; Aider edits use the model announced above them and only real `Applied edit to` lines; Cline/Roo `tasks/<taskId>/ui_messages.json` is discovered and parsed.
+- The file watcher waits for in-flight change handlers before returning.
+- Proxy: run totals survive idle gaps, session-cap eviction and daemon restarts; failed upstream responses are not billed; Gemini thinking tokens are counted; usage at the stream capture seam is not dropped.
+- Explicit zero usage stays zero across Chat Completions, Anthropic, Gemini and Ollama responses. Imported transcripts normalize cached input and thinking tokens, retain session identity on reads, and rebuild older usage checkpoints without replaying events. Read-cost estimates use the provider's cache pricing.
+- Refreshing an active run or pending file hint at capacity preserves its existing state and start time. Indexing cannot start after the engine closes.
+- Export and report commands reject output paths that refer to the source database, including hard links and symbolic links, before opening it.
+- IPC/HTTP-minted read and run IDs are random (they collided on Windows' coarse clock); array `params` get -32602; out-of-range `tokens_used` is rejected.
+- MCP: out-of-range TTLs are rejected and large numeric request ids are echoed exactly.
+- Core: caches no longer mark pre-write data current; Atlas reports store errors instead of an all-healthy snapshot; single-active-run attribution stays within the edited file's project; removing the active project hands over to a remaining one; a concurrent switch cannot resurrect a removed project.
+- Model registry: reseller entries no longer reprice bare model names, mixed-case IDs are normalized, and a lookup racing a catalog update cannot cache the old price. After a models.dev sync a bare name resolves to the model's owner (models.dev files owners and resellers alike under bare keys), a custom reseller override keeps it only until its owner is known, and a gateway listing one model under two upstreams keeps both entries.
+- Store: `./`-prefixed read paths and non-ASCII path spellings match their files; symbol history understands `*T.M` and `(*T).M` and never drops its signature filter; node stats merge a file stored under both slash spellings.
+- Server: activating a project whose store fails returns 500; empty profiler hotspots return `[]`; a partial project update keeps unmentioned log paths.
+- Creating a project through the API accepts an omitted name and derives it from the project path.
+- Daemon log lines reach `daemon.log` even when stderr is unwritable.
+- `trace` survives Ctrl+C: it waits for the command, records the trace and exits with the command's code; SIGTERM is forwarded.
+- Proxy: an interrupted Anthropic stream estimates its output instead of keeping `message_start`'s placeholder of 1 token; Gemini `functionCall` parts are extracted as tool calls (file edits and reads are attributed). Parallel reads in one exchange carry its usage once, and id-less tool calls no longer collide on one read id.
+- Profiler: OTLP spans using the current semantic-convention names (`http.response.status_code`, `code.file.path`, `code.function.name`) keep their status, file and function.
+- MCP answers `ping`.
+- The watcher scopes ignore rules to every watched project root, so a project under a folder named `build`, `out`, `tmp`, ... is watched.
+- Dashboard: Self-Thrash shows only same-model overwrites; ROI sorting puts models without data last; a project switch from another tab refreshes every panel; diff context lines are aligned; file history is scoped to the open project; the index card no longer reports 100% for incomplete or unknown status; settings cannot be saved before they load (which cleared webhooks and ignore patterns); proxy filter counts, summary cards and charts follow the project scope; session details show only a listed session; profiler P50/P90/P99 use nearest-rank (P99 of 100 spans was the slowest one); per-file panels send the viewed project.
+- Recent dashboard events retain their insertion order when timestamps fall in the same second; unknown ROI longevity remains unavailable and the WrongStack banner keeps its intended hover behavior.
+
+### Testing & Tooling
+- Add backend regression tests and 32 portable dashboard guards covering the fixes above.
+- Detect a usable C compiler in the Windows development script and enable CGO for the AST parser.
 
 ---
 

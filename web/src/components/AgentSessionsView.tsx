@@ -132,13 +132,16 @@ export function AgentSessionsView({
     });
   }, [activeRuns, search, currentProject]);
 
+  // The details panel shows only a run the list shows. Reading the unfiltered
+  // activeRuns put another project's (or a junk-model) run, with its diffs,
+  // beside a list that said no sessions were connected.
   const selectedRun = useMemo(() => {
     if (selectedRunId) {
-      const found = activeRuns.find((r) => r.run_id === selectedRunId);
+      const found = filteredRuns.find((r) => r.run_id === selectedRunId);
       if (found) return found;
     }
-    return activeRuns[0] ?? null;
-  }, [selectedRunId, activeRuns]);
+    return filteredRuns[0] ?? null;
+  }, [selectedRunId, filteredRuns]);
 
   // Extract all unique providers with counts
   const allProviders = useMemo(() => {

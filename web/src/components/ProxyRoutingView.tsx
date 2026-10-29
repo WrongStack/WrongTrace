@@ -104,20 +104,26 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
     return Array.from(provs.values());
   }, [catalog]);
 
+  // The project scope applies to everything on this tab -- the list, the
+  // filter-chip counts, the summary cards and the charts. Only the list was
+  // scoped, so "Cache (3)" showed one row and the spend card summed other
+  // workspaces' requests next to the "current project" toggle.
+  const scopedTraffic = useMemo(() => {
+    if (projectScope !== 'current' || !currentProject) return traffic;
+    return traffic.filter((t) =>
+      t.project_id
+        ? t.project_id === currentProject.id
+        : !t.project_slug || t.project_slug.toLowerCase() === currentProject.name.toLowerCase(),
+    );
+  }, [traffic, projectScope, currentProject]);
+
   const filteredTraffic = useMemo(() => {
-    return traffic.filter((t) => {
+    return scopedTraffic.filter((t) => {
       if (statusFilter === '2xx' && (t.status_code < 200 || t.status_code >= 300)) return false;
       if (statusFilter === 'errors' && t.status_code >= 200 && t.status_code < 300) return false;
       if (statusFilter === 'tools' && !(t.tool_calls && t.tool_calls.length > 0) && !(t.tool_count && t.tool_count > 0)) return false;
       if (statusFilter === 'cached' && !(t.cached_tokens && t.cached_tokens > 0)) return false;
       if (statusFilter === 'reasoning' && !t.reasoning && !(t.reasoning_tokens && t.reasoning_tokens > 0)) return false;
-      if (projectScope === 'current' && currentProject) {
-        const matchesProj =
-          t.project_id
-            ? t.project_id === currentProject.id
-            : !t.project_slug || t.project_slug.toLowerCase() === currentProject.name.toLowerCase();
-        if (!matchesProj) return false;
-      }
       if (!trafficFilter) return true;
       const q = trafficFilter.toLowerCase();
       return (
@@ -130,7 +136,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
         (t.agent_name || '').toLowerCase().includes(q)
       );
     });
-  }, [traffic, trafficFilter, statusFilter, projectScope, currentProject]);
+  }, [scopedTraffic, trafficFilter, statusFilter]);
 
   // Deep Tool Call Intelligence & Aggregates
   const toolAnalytics = useMemo(() => {
@@ -269,7 +275,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
     let totalSavings = 0;
     let totalTools = 0;
 
-    traffic.forEach((t) => {
+    scopedTraffic.forEach((t) => {
       totalPrompt += t.prompt_tokens || 0;
       totalCompletion += t.completion_tokens || 0;
       totalCached += t.cached_tokens || 0;
@@ -284,7 +290,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
     const avgReasoningRatio = totalCompletion > 0 ? (totalReasoning / totalCompletion) * 100 : 0;
 
     return {
-      totalRequests: traffic.length,
+      totalRequests: scopedTraffic.length,
       totalTokens,
       totalPrompt,
       totalCompletion,
@@ -296,12 +302,12 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
       avgCacheHit,
       avgReasoningRatio,
     };
-  }, [traffic]);
+  }, [scopedTraffic]);
 
   // Token flow timeline data
   const tokenChartData = useMemo(() => {
-    if (traffic.length === 0) return [];
-    const sorted = [...traffic].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    if (scopedTraffic.length === 0) return [];
+    const sorted = [...scopedTraffic].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
     return sorted.map((t, idx) => {
       const d = new Date(t.timestamp);
       return {
@@ -316,12 +322,12 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
         model: t.model,
       };
     });
-  }, [traffic]);
+  }, [scopedTraffic]);
 
   // Model breakdown data
   const modelBreakdownData = useMemo(() => {
     const map = new Map<string, { model: string; cost: number; savings: number; tokens: number; requests: number }>();
-    traffic.forEach((t) => {
+    scopedTraffic.forEach((t) => {
       const m = t.model || 'unknown';
       if (!map.has(m)) {
         map.set(m, { model: m, cost: 0, savings: 0, tokens: 0, requests: 0 });
@@ -337,7 +343,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
       cost: Number(v.cost.toFixed(4)),
       savings: Number(v.savings.toFixed(4)),
     }));
-  }, [traffic]);
+  }, [scopedTraffic]);
 
   useEffect(() => {
     if (selectedTraffic && filteredTraffic.some((t) => t.id === selectedTraffic.id)) return;
@@ -965,7 +971,7 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
                   onClick={() => setStatusFilter('all')}
                   className={`px-2 py-1 rounded transition-colors ${statusFilter === 'all' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
                 >
-                  All ({traffic.length})
+                  All ({scopedTraffic.length})
                 </button>
                 <button
                   onClick={() => setStatusFilter('2xx')}
@@ -977,19 +983,19 @@ export function ProxyRoutingView({ currentProject }: ProxyRoutingViewProps) {
                   onClick={() => setStatusFilter('tools')}
                   className={`px-2 py-1 rounded transition-colors ${statusFilter === 'tools' ? 'bg-amber-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
                 >
-                  🛠️ Tools ({traffic.filter((t) => (t.tool_calls && t.tool_calls.length > 0) || (t.tool_count && t.tool_count > 0)).length})
+                  🛠️ Tools ({scopedTraffic.filter((t) => (t.tool_calls && t.tool_calls.length > 0) || (t.tool_count && t.tool_count > 0)).length})
                 </button>
                 <button
                   onClick={() => setStatusFilter('cached')}
                   className={`px-2 py-1 rounded transition-colors ${statusFilter === 'cached' ? 'bg-teal-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
                 >
-                  ⚡ Cache ({traffic.filter((t) => t.cached_tokens && t.cached_tokens > 0).length})
+                  ⚡ Cache ({scopedTraffic.filter((t) => t.cached_tokens && t.cached_tokens > 0).length})
                 </button>
                 <button
                   onClick={() => setStatusFilter('reasoning')}
                   className={`px-2 py-1 rounded transition-colors ${statusFilter === 'reasoning' ? 'bg-purple-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
                 >
-                  🧠 Think ({traffic.filter((t) => t.reasoning || (t.reasoning_tokens && t.reasoning_tokens > 0)).length})
+                  🧠 Think ({scopedTraffic.filter((t) => t.reasoning || (t.reasoning_tokens && t.reasoning_tokens > 0)).length})
                 </button>
                 <button
                   onClick={() => setStatusFilter('errors')}

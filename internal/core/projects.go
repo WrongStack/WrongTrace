@@ -104,7 +104,8 @@ func (e *Engine) SetWatcher(w WatcherAPI) {
 
 // Close stops the engine's background helpers: the webhook-occupancy sampler
 // and any in-flight PrimeDirectory job. It is idempotent. The store and AST
-// engine are owned by the caller and are NOT closed here.
+// engine are owned by the caller and are NOT closed here. Later indexing
+// requests are rejected, including entries delayed until after shutdown.
 func (e *Engine) Close() {
 	e.samplerMu.Lock()
 	e.samplerClosed = true
@@ -113,7 +114,13 @@ func (e *Engine) Close() {
 		e.samplerStop = nil
 	}
 	e.samplerMu.Unlock()
-	e.cancelPrime()
+	e.primeMu.Lock()
+	e.primeClosed = true
+	if e.primeCancel != nil {
+		e.primeCancel()
+		e.primeCancel = nil
+	}
+	e.primeMu.Unlock()
 }
 
 // cancelPrime cancels the in-flight PrimeDirectory job, if any.
@@ -287,7 +294,7 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 	target, ok := e.projects[id]
 	if !ok {
 		e.lockMu.Unlock()
-		return nil, fmt.Errorf("project not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrProjectNotFound, id)
 	}
 	watcher := e.watcher
 	e.lockMu.Unlock()
@@ -314,6 +321,17 @@ func (e *Engine) SwitchActiveProject(id string) (*ProjectProfile, error) {
 	// Identity, registry, persisted index, and the active store now commit
 	// together — the switch cannot half-apply.
 	e.lockMu.Lock()
+	// The store was opened without the lock held: a RemoveProject in that
+	// window must win, not be undone by writing the stale copy back.
+	cur, ok := e.projects[id]
+	if !ok {
+		e.lockMu.Unlock()
+		if newStore != nil {
+			_ = newStore.Close()
+		}
+		return nil, fmt.Errorf("%w: %s", ErrProjectNotFound, id)
+	}
+	target = cur
 	for k := range e.projects {
 		p := e.projects[k]
 		p.IsActive = (k == id)
@@ -595,6 +613,13 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	for _, p := range e.projects {
 		taken[normalizeRoot(filepath.Dir(p.DBPath))] = struct{}{}
 	}
+	// The first project becomes active, and events keep landing in the store
+	// already open. Giving it a fresh database of its own split its history:
+	// the first switch away and back opened that empty file instead.
+	adoptPath := ""
+	if len(e.projects) == 0 && e.cfg.Store != nil {
+		adoptPath = e.cfg.Store.Path()
+	}
 	e.lockMu.RUnlock()
 
 	slug := base
@@ -615,15 +640,19 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	// Ensure dedicated per-project SQLite database is initialized with migrations.
 	// The handle is opened only to apply the schema; keeping it open would leak
 	// a connection (and on Windows, lock the file) for every project ever added.
-	projStore, err := db.Open(dbPath)
-	if err != nil {
-		return ProjectProfile{}, fmt.Errorf("open project database %s: %w", dbPath, err)
-	}
-	if err := projStore.Migrate(); err != nil {
+	// A project adopting the open store needs none (and if it loses the race
+	// to be first, SwitchActiveProject creates and migrates it on demand).
+	if adoptPath == "" {
+		projStore, err := db.Open(dbPath)
+		if err != nil {
+			return ProjectProfile{}, fmt.Errorf("open project database %s: %w", dbPath, err)
+		}
+		if err := projStore.Migrate(); err != nil {
+			_ = projStore.Close()
+			return ProjectProfile{}, fmt.Errorf("migrate project database %s: %w", dbPath, err)
+		}
 		_ = projStore.Close()
-		return ProjectProfile{}, fmt.Errorf("migrate project database %s: %w", dbPath, err)
 	}
-	_ = projStore.Close()
 
 	// Auto-discover agent session paths and language
 	sessions := ScanAgentSessions(absPath)
@@ -652,6 +681,9 @@ func (e *Engine) AddProject(name, path string) (ProjectProfile, error) {
 	// isFirst must be decided under the lock: reading len(e.projects) before
 	// it let two concurrent adds both mark themselves active.
 	proj.IsActive = len(e.projects) == 0
+	if proj.IsActive && adoptPath != "" {
+		proj.DBPath = adoptPath
+	}
 	e.projects[id] = proj
 	indexSnap := e.snapshotProjectsLocked()
 	watcher := e.watcher
@@ -903,8 +935,22 @@ func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 		return ProjectProfile{}, fmt.Errorf("%w: %s", ErrProjectNotFound, p.ID)
 	}
 
+	oldName := existing.Name
 	if p.Name != "" {
 		existing.Name = p.Name
+	}
+	renamed := existing.Name != oldName
+	// Events belong to a project only through its name. Two projects that
+	// share the old name cannot be told apart in the store, so their events
+	// are left as they are.
+	sharedOldName := false
+	if renamed {
+		for id, other := range e.projects {
+			sharedOldName = sharedOldName || (id != p.ID && other.Name == oldName)
+		}
+		if e.activeProjectID == p.ID {
+			e.cfg.RepoName = existing.Name
+		}
 	}
 	if p.Description != "" {
 		existing.Description = p.Description
@@ -940,6 +986,9 @@ func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 	indexSnap := e.snapshotProjectsLocked()
 	e.lockMu.Unlock()
 	e.persistProjects(indexSnap)
+	if renamed {
+		e.relabelProjectEvents(existing, oldName, sharedOldName)
+	}
 
 	// Re-scan sessions outside the lock: ScanAgentSessions walks many user
 	// directories and easily takes seconds — holding lockMu that long stalls
@@ -964,6 +1013,42 @@ func (e *Engine) UpdateProject(p ProjectProfile) (ProjectProfile, error) {
 	return existing, nil
 }
 
+// relabelProjectEvents moves a renamed project's recorded events to its new
+// name: in the active store, where every project's edits are written, and in
+// the project's own database when it is not the active one. Renaming without
+// it emptied every panel scoped to the project and split later history
+// across two names.
+func (e *Engine) relabelProjectEvents(p ProjectProfile, oldName string, ambiguous bool) {
+	defer e.BumpCacheGen()
+	if ambiguous {
+		log.Printf("projects: %q renamed to %q; another project still uses the old name, so recorded events keep it", oldName, p.Name)
+		return
+	}
+	if store := e.Store(); store != nil {
+		if _, err := store.RenameRepo(oldName, p.Name); err != nil {
+			log.Printf("projects: relabel events %q -> %q: %v", oldName, p.Name, err)
+		}
+	}
+	e.lockMu.RLock()
+	active := e.activeProjectID == p.ID
+	e.lockMu.RUnlock()
+	if active || p.DBPath == "" {
+		return
+	}
+	if _, err := os.Stat(p.DBPath); err != nil {
+		return
+	}
+	own, err := db.Open(p.DBPath)
+	if err != nil {
+		log.Printf("projects: relabel events in %s: %v", p.DBPath, err)
+		return
+	}
+	defer own.Close()
+	if _, err := own.RenameRepo(oldName, p.Name); err != nil {
+		log.Printf("projects: relabel events in %s: %v", p.DBPath, err)
+	}
+}
+
 // RemoveProject removes a project workspace and stops watching it.
 func (e *Engine) RemoveProject(id string) error {
 	e.lockMu.Lock()
@@ -973,6 +1058,19 @@ func (e *Engine) RemoveProject(id string) error {
 		return fmt.Errorf("project not found: %s", id)
 	}
 	delete(e.projects, id)
+	// Removing the active project must not leave the engine bound to it
+	// (its store, name and root kept receiving telemetry no remaining
+	// project could show). Hand over to a remaining project; with none left,
+	// no project is active until one is added.
+	successor := ""
+	if e.activeProjectID == id {
+		e.activeProjectID = ""
+		for k := range e.projects {
+			if successor == "" || k < successor {
+				successor = k
+			}
+		}
+	}
 	indexSnap := e.snapshotProjectsLocked()
 	watcher := e.watcher
 	e.lockMu.Unlock()
@@ -980,6 +1078,11 @@ func (e *Engine) RemoveProject(id string) error {
 
 	if watcher != nil {
 		_ = watcher.RemoveWatchDir(proj.Path)
+	}
+	if successor != "" {
+		if _, err := e.SwitchActiveProject(successor); err != nil {
+			log.Printf("projects: removed active project %s; switching to %s failed: %v", id, successor, err)
+		}
 	}
 	return nil
 }

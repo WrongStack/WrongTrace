@@ -40,7 +40,8 @@ const PER_GUARD_TIMEOUT_MS = 2 * 60 * 1000;
 //   - isFile()     : a same-named DIRECTORY is not a runnable guard
 // Every real guard ends in `-regression.mjs`, so this keeps all of them and
 // admits none of the junk. A guard that fails to clean up now fails visibly in
-// its own run instead of silently becoming a phantom.
+// its own run instead of silently becoming a phantom. Anything that misses the
+// contract is reported by the check below rather than skipped in silence.
 const guards = readdirSync(here, { withFileTypes: true })
   .filter(
     (e) =>
@@ -48,6 +49,35 @@ const guards = readdirSync(here, { withFileTypes: true })
   )
   .map((e) => e.name)
   .sort();
+
+// The narrow filter cannot tell a misnamed guard from a helper, so a script
+// that misses the naming contract used to be skipped in SILENCE while the
+// summary still read N/N: a guard named `foo-guard.mjs`, or one parked in a
+// subdirectory, would never run and never say so. Enforce the contract here
+// instead of relying on the author remembering it — any other non-hidden
+// script in this directory fails the run and is named.
+const strays = readdirSync(here, { withFileTypes: true })
+  .filter(
+    (e) =>
+      e.isFile() &&
+      !e.name.startsWith('.') &&
+      e.name !== 'run-all.mjs' &&
+      /\.(mjs|js)$/.test(e.name) &&
+      !e.name.endsWith('-regression.mjs'),
+  )
+  .map((e) => e.name)
+  .sort();
+
+if (strays.length > 0) {
+  console.error(
+    `run-all: ${strays.length} script(s) in ${here} are neither this runner nor a *-regression.mjs guard:`,
+  );
+  for (const f of strays) console.error(`  - ${f}`);
+  console.error(
+    'run-all: name a guard *-regression.mjs, or move a helper into a subdirectory (or dot-prefix it as scratch).',
+  );
+  process.exit(1);
+}
 
 if (guards.length === 0) {
   console.error(`run-all: no guards found in ${here}`);

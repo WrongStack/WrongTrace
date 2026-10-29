@@ -1,7 +1,7 @@
 {
   "name": "wrongtrace-web",
   "private": true,
-  "version": "0.3.17",
+  "version": "0.3.18",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -26,6 +26,6 @@
     "postcss": "^8.5.28",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
-    "vite": "^8.3.0"
+    "vite": "^8.3.5"
   }
 }

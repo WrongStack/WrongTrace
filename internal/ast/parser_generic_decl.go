@@ -94,6 +94,18 @@ var statementKeywords = map[string]bool{
 	"finally": true, "from": true, "select": true, "where": true,
 }
 
+// declModifierKeywords are words that are BOTH a statement keyword and a legal
+// declaration modifier. `synchronized` is the overlap that matters: Java's
+// `public synchronized void f() {` is a declaration whose modifier is also a
+// statement keyword, so the type-token check below rejected the whole head and
+// the method produced no node at all — no body hash, no churn, no attribution.
+// Position still separates the two forms: a statement head like
+// `synchronized (lock) {` is rejected by the fields[0] check, because there
+// `synchronized` IS the first field.
+var declModifierKeywords = map[string]bool{
+	"synchronized": true,
+}
+
 // typedDeclLanguage reports whether the `Type name(args) {` heuristic applies.
 // Only C-family languages declare functions in that shape; Kotlin uses `fun`
 // and Rust/Ruby/PHP/Python have their own keywords, where the same shape is
@@ -324,17 +336,45 @@ func kotlinIdent(s string) string {
 // `for (int i = 0; i < size(); i++) {` would otherwise declare `size` and
 // overwrite the real declaration of that name.
 func typedDeclName(trimmed string) string {
-	// Cheap pre-checks before tokenizing: a declaration head ends in '{' and
-	// carries a parameter list; a statement head usually starts with '}' / '('.
+	return typedDeclNameWithBrace(trimmed, false)
+}
+
+// typedDeclNameWithBrace is typedDeclName for a head whose body-opening '{'
+// sits on the FOLLOWING line.
+//
+// That spelling is a brace STYLE, not a language feature: Microsoft's own C#
+// convention, PHP PSR-12 class bodies and much Java and Dart put the brace
+// there, and nothing in the language requires the K&R form. The `{` test below
+// is the cheap reject that keeps statement heads out, so without this flag a
+// `public int Add(int a, int b)` head was rejected outright — the method sat in
+// no node at all, so no ADDED/MODIFIED/DELETED event could ever be attributed
+// to it. Every other arm of the dispatch switch (typeDeclName, rustDecl,
+// kotlinDecl, phpFunctionDecl, `def`) already accepts a head without a trailing
+// brace, which is what made the typed arm the odd one out.
+//
+// The flag only replaces the missing brace; every remaining guard — the
+// parameter-list requirement, the statement-keyword head check, the `j == 0`
+// "call, not a declaration" rule and plausibleTypeToken — still has to pass, so
+// a continuation line cannot turn a statement into a declaration. The caller
+// sets it only when the very next non-blank line opens with '{'.
+func typedDeclNameWithBrace(trimmed string, braceOnNextLine bool) string {
+	// Cheap pre-checks before tokenizing: a declaration head ends in '{' (or is
+	// followed by a line that opens the body) and carries a parameter list; a
+	// statement head usually starts with '}' / '('.
 	n := len(trimmed)
-	if n < 4 || trimmed[n-1] != '{' || !isIdentStart(trimmed[0]) && trimmed[0] != '@' {
+	if n < 4 || (trimmed[n-1] != '{' && !braceOnNextLine) || !isIdentStart(trimmed[0]) && trimmed[0] != '@' {
 		return ""
 	}
 	if strings.IndexByte(trimmed, '(') < 0 {
 		return ""
 	}
 	fields := strings.Fields(trimmed)
-	if statementKeywords[fields[0]] {
+	// A statement head is never a declaration. `synchronized` is the one word
+	// that is both a statement keyword and a legal modifier, so it is accepted
+	// at the head position only when the next field is not the statement's
+	// parenthesised lock: `synchronized (lock) {` is a statement, while
+	// `synchronized void f() {` is a declaration.
+	if statementKeywords[fields[0]] && !(declModifierKeywords[fields[0]] && len(fields) > 1 && !strings.HasPrefix(fields[1], "(")) {
 		return ""
 	}
 	for j := 0; j < len(fields); j++ {
@@ -379,7 +419,7 @@ func typedDeclName(trimmed string) string {
 // of a modifier/return-type prefix: identifiers, qualified names, generics,
 // arrays, pointers/references, nullable markers and annotations.
 func plausibleTypeToken(f string) bool {
-	if statementKeywords[f] || strings.Contains(f, "&&") || strings.Contains(f, "||") {
+	if (statementKeywords[f] && !declModifierKeywords[f]) || strings.Contains(f, "&&") || strings.Contains(f, "||") {
 		return false
 	}
 	hasIdent := false

@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"strings"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 

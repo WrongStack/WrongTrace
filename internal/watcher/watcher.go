@@ -108,6 +108,10 @@ type Watcher struct {
 	// never changes while the watcher lives, so any survivor is equally valid.
 	decisionMu sync.RWMutex
 	decisions  map[string]bool
+	// extraRoots are the roots registered later with AddWatchDir (other
+	// projects). Their paths are scoped to their own root like root's are;
+	// guarded by decisionMu, whose cache they invalidate.
+	extraRoots []string
 
 	// DebugFSEvents captures every fsnotify event in a bounded circular buffer
 	// when Config.DebugFSEvents is true. Access via Watcher.FSNotifyLog().
@@ -543,6 +547,21 @@ func (w *Watcher) AddWatchDir(dir string) error {
 	if w == nil || w.fs == nil {
 		return nil
 	}
+	// Scope ignore rules to this tree too: matched against its absolute
+	// path, an ancestor named build/out/bin/tmp hit the default IgnoreDirs
+	// and addRecursive skipped the new project's root, watching nothing.
+	if r := absRoot(dir); r != "" && r != w.root {
+		w.decisionMu.Lock()
+		known := false
+		for _, x := range w.extraRoots {
+			known = known || x == r
+		}
+		if !known {
+			w.extraRoots = append(w.extraRoots, r)
+			w.decisions = make(map[string]bool, 256)
+		}
+		w.decisionMu.Unlock()
+	}
 	return w.addRecursive(dir)
 }
 
@@ -550,6 +569,17 @@ func (w *Watcher) AddWatchDir(dir string) error {
 func (w *Watcher) RemoveWatchDir(dir string) error {
 	if w == nil || w.fs == nil {
 		return nil
+	}
+	if r := absRoot(dir); r != "" {
+		w.decisionMu.Lock()
+		for i, x := range w.extraRoots {
+			if x == r {
+				w.extraRoots = append(w.extraRoots[:i], w.extraRoots[i+1:]...)
+				w.decisions = make(map[string]bool, 256)
+				break
+			}
+		}
+		w.decisionMu.Unlock()
 	}
 	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d == nil || !d.IsDir() {
@@ -609,31 +639,50 @@ func (w *Watcher) addRecursiveFiles(root string, onFile func(string)) error {
 // callers) fall back to whole-path matching, which is the historical
 // behavior.
 func (w *Watcher) scopedPath(p string) string {
-	if w.root == "" {
-		return p
+	best, bestLen := p, -1
+	if rel, ok := relToRoot(w.root, p); ok {
+		best, bestLen = rel, len(w.root)
 	}
-	if len(p) >= len(w.root) {
-		if strings.HasPrefix(p, w.root) {
-			if len(p) == len(w.root) {
-				return ""
-			}
-			if p[len(w.root)] == filepath.Separator || p[len(w.root)] == '/' {
-				return p[len(w.root)+1:]
+	w.decisionMu.RLock()
+	for _, r := range w.extraRoots {
+		// The innermost root that holds p decides.
+		if len(r) > bestLen {
+			if rel, ok := relToRoot(r, p); ok {
+				best, bestLen = rel, len(r)
 			}
 		}
 	}
-	rel, err := filepath.Rel(w.root, p)
+	w.decisionMu.RUnlock()
+	return best
+}
+
+// relToRoot is p relative to root ("" for root itself, which is never
+// ignored by its own name); ok is false when p is not under root.
+func relToRoot(root, p string) (string, bool) {
+	if root == "" {
+		return "", false
+	}
+	if len(p) >= len(root) {
+		if strings.HasPrefix(p, root) {
+			if len(p) == len(root) {
+				return "", true
+			}
+			if p[len(root)] == filepath.Separator || p[len(root)] == '/' {
+				return p[len(root)+1:], true
+			}
+		}
+	}
+	rel, err := filepath.Rel(root, p)
 	if err != nil {
-		return p
+		return "", false
 	}
 	if rel == "." {
-		// The watched root itself is never ignored by its own name.
-		return ""
+		return "", true
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return p
+		return "", false
 	}
-	return rel
+	return rel, true
 }
 
 // pathIgnored is a fast-path filter for events and directory walking. The
@@ -716,6 +765,12 @@ func (w *Watcher) Run(ctx context.Context) {
 
 	var pendingMu sync.Mutex
 	pending := make(map[string]*debounceEntry)
+	// inFlight counts debounce callbacks that passed the pending check and
+	// may be inside HandleFileChange. Run waits for them: its caller closes
+	// the engine, store and parser as soon as Run returns. stopped (guarded
+	// by pendingMu) keeps any callback from joining after that wait begins.
+	var inFlight sync.WaitGroup
+	stopped := false
 
 	// discovered carries files found inside newly created directories back
 	// into this loop, so they go through the same debounce as real events.
@@ -726,12 +781,14 @@ func (w *Watcher) Run(ctx context.Context) {
 
 	defer func() {
 		pendingMu.Lock()
+		stopped = true
 		for _, e := range pending {
 			if e != nil && e.timer != nil {
 				e.timer.Stop()
 			}
 		}
 		pendingMu.Unlock()
+		inFlight.Wait()
 	}()
 
 	schedule := func(path string) {
@@ -751,12 +808,14 @@ func (w *Watcher) Run(ctx context.Context) {
 			// deadline in the future and leaves it for the rearmed
 			// timer. Timers never fire early, so firing at or after
 			// the deadline means this callback owns the schedule.
-			if cur == nil || cur.timer != entry.timer || time.Now().Before(cur.deadline) {
+			if stopped || cur == nil || cur.timer != entry.timer || time.Now().Before(cur.deadline) {
 				pendingMu.Unlock()
 				return
 			}
 			delete(pending, path)
+			inFlight.Add(1)
 			pendingMu.Unlock()
+			defer inFlight.Done()
 			if ctx.Err() != nil {
 				return
 			}

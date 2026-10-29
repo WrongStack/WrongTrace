@@ -213,8 +213,14 @@ func TestJSONLContextContinuity(t *testing.T) {
 		}
 		f.process(t, header+first+regressionContextTools("second.go"))
 		regressionContextAssert(t, f, 2, "fixture-model", "row context")
-		if f.mods[1].PromptTokens != 0 || f.reads[1].PromptTokens != 0 {
-			t.Fatal("per-row usage leaked through inherited context")
+		// Reads are summed downstream, so they keep their own row's usage
+		// (none here). Edits report the session's running total across the
+		// resume, because the run row they update is replaced, not summed.
+		if f.reads[1].PromptTokens != 0 {
+			t.Fatal("per-row read usage leaked through inherited context")
+		}
+		if f.mods[1].PromptTokens != 5 {
+			t.Fatalf("edit after resume reports %d prompt tokens; want the session total 5", f.mods[1].PromptTokens)
 		}
 	})
 	if t.Failed() {

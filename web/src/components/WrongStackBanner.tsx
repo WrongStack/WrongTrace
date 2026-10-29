@@ -1,13 +1,23 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { Sparkles, ExternalLink, X, Layers, GitBranch, ArrowRight } from 'lucide-react';
 
-export function WrongStackBanner() {
-  const [dismissed, setDismissed] = useState(false);
+// The stored flag is read during INITIALIZATION, not from an effect: effects
+// run after the first paint, so a user who had dismissed the banner saw it
+// flash back for one frame on every reload before the effect hid it again.
+function storedDismissed(): boolean {
+  // The regression guards server-render this component, where there is no
+  // window. An unknown storage state means "show the banner", which is what a
+  // first-time visitor gets anyway.
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem('wrongstack_banner_dismissed') === 'true';
+  } catch {
+    return false;
+  }
+}
 
-  useEffect(() => {
-    const isDismissed = localStorage.getItem('wrongstack_banner_dismissed') === 'true';
-    setDismissed(isDismissed);
-  }, []);
+export function WrongStackBanner() {
+  const [dismissed, setDismissed] = useState(storedDismissed);
 
   const handleDismiss = () => {
     setDismissed(true);

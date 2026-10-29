@@ -36,13 +36,8 @@ func (e *Engine) ActiveRuns() []ActiveRun {
 			continue
 		}
 		// If an active project is set, filter runs that explicitly belong to other projects
-		if activeProj != nil {
-			if m.ProjectID != "" && m.ProjectID != activeProj.ID {
-				continue
-			}
-			if m.ProjectID == "" && m.ProjectSlug != "" && !strings.EqualFold(m.ProjectSlug, activeProj.Name) && !strings.EqualFold(m.ProjectSlug, activeProj.ID) {
-				continue
-			}
+		if activeProj != nil && !runInProject(m, *activeProj) {
+			continue
 		}
 		out = append(out, ActiveRun{
 			RunID:       id,
@@ -79,7 +74,7 @@ func (e *Engine) RegisterFileOperation(filePath, runID string, observedAt time.T
 	// maintenance ticker; a per-entry scan here cost O(pendingOps) on every
 	// proxy tool call during bursts. The per-key cap below still bounds this
 	// path's own slice.
-	if len(e.pendingOps) >= 2048 {
+	if _, exists := e.pendingOps[key]; !exists && len(e.pendingOps) >= 2048 {
 		var oldestPath string
 		var oldest time.Time
 		for path, ops := range e.pendingOps {
@@ -182,4 +177,13 @@ func absDuration(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
+}
+
+// runInProject reports whether a run may belong to project p: it is unscoped,
+// names p by ID, or (legacy) by slug matching p's name or ID.
+func runInProject(m runMeta, p ProjectProfile) bool {
+	if m.ProjectID != "" {
+		return m.ProjectID == p.ID
+	}
+	return m.ProjectSlug == "" || strings.EqualFold(m.ProjectSlug, p.Name) || strings.EqualFold(m.ProjectSlug, p.ID)
 }

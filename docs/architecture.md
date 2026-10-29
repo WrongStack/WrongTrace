@@ -46,21 +46,20 @@ flowchart TD
 ## 2. Core Subsystems
 
 ### A. Semantic AST Diff Engine (`internal/ast/`)
-* **Tree-sitter Native Grammar Parsers**: Analyzes code structure in Go, TypeScript, JavaScript, Python, Rust, C/C++, Java, C#, PHP, and Ruby.
-* **Symbol Identity**: Generates unique node signatures (e.g., `func:AuthMiddleware`, `method:User.Validate`, `class:OrderService`).
+* **Tree-sitter Native Grammar Parsers**: Go, TypeScript, JavaScript and Python are parsed with native Tree-sitter grammars. The remaining supported languages — Rust, C/C++, Java, C#, PHP, Ruby, Kotlin and Dart — have no compiled grammar in this repo and go through the documented `parseGenericSource` heuristic fallback, so their declarations are recognised from line structure rather than a full parse tree.
+* **Symbol Identity**: Generates unique node signatures of the form `kind:<basename>::<name>` (e.g., `func:auth.go::ValidateToken`, `method:server.go::*Server.Handle`, `class:ui.tsx::Dashboard`).
 * **Normalized AST Hashing**: Strips non-semantic whitespace and comment volatility to detect true structural mutations.
 * **Diff Classification**: Categorizes mutations into `ADDED`, `MODIFIED`, and `DELETED` nodes.
 
 ### B. Thrashing & Fragility Detection Algorithm (`internal/core/guardrails.go`)
 * **Definition of Thrashing**: When the same AST node is mutated $\ge 3$ times within a sliding 24-hour window.
 * **Health Score Formula**:
-  $$\text{HealthScore} = \max\left(0, 100 - (\text{RecentThrashCount} \times 15) - (\text{LockPenalty})\right)$$
-* **Fragile Threshold**: Any file with a score $< 40$ or active thrashing is marked as `is_fragile = true`, triggering guardrail warnings.
+  $$\text{HealthScore} = \max\left(0, 100 - (\text{edits in the last 24h} \times 8) - (5 \text{ if distinct signatures} \ge 3)\right)$$
+* **Fragile Threshold**: `RecentThrashingCount >= 5` marks `is_fragile = true`. A low score alone does not: 4 edits in 24h scores 68 and is *not* fragile. A lock does not affect the score — it is a separate guardrail that blocks modification outright.
 
 ### C. True Token ROI & Code Longevity (`internal/db/queries.go`)
 * **Survival Window**: 14-day maturity window.
-* **Survival Rate**:
-  $$\text{SurvivalRate} = \frac{\text{Nodes Still Intact after 14 Days}}{\text{Total Nodes Introduced by Model}} \times 100\%$$
+* **Survival Rate**: the share of a model's nodes still alive, i.e. $\frac{\text{Active Nodes}}{\text{Total Nodes Introduced by Model}} \times 100\%$. The 14-day maturity window below governs the ROI survivor count, not this ratio.
 * **Cost Per Survived Node**:
   $$\text{CostPerSurvivedNode} = \frac{\text{Total Model Dollar Spend}}{\text{Surviving AST Nodes}}$$
 
@@ -86,5 +85,7 @@ flowchart TD
 
 * **`agent_runs`**: Records run metadata, intent, model, provider, tokens, and USD cost.
 * **`code_node_events`**: Granular AST diff records tied to file paths, function signatures, and diff text.
-* **`runtime_traces`**: OpenTelemetry spans, latency percentiles (P50/P90/P99), error rates, and command traces.
-* **`file_locks`**: Active administrative guardrails and lock reasons.
+* **`runtime_traces`**: OpenTelemetry spans, durations, error rates, and command traces (percentiles are computed on read, not stored).
+* **`file_read_events`**: Per-file read telemetry captured from agent transcripts, the watcher, and the gateway.
+
+Guardrail locks are **not** a table: they live in the engine's in-memory map with their own TTL sweep.

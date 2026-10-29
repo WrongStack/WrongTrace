@@ -112,7 +112,7 @@ func TestReportRun_RegistersAndPersists(t *testing.T) {
 func TestRecentRunID_ConcurrentRunsAreAmbiguous(t *testing.T) {
 	e, _ := newTestEngine(t)
 
-	if got := e.recentRunID(); got != "" {
+	if got := e.recentRunID(""); got != "" {
 		t.Errorf("no runs reported, recentRunID = %q, want empty", got)
 	}
 
@@ -124,7 +124,7 @@ func TestRecentRunID_ConcurrentRunsAreAmbiguous(t *testing.T) {
 		t.Fatalf("report r-second: %v", err)
 	}
 
-	if got := e.recentRunID(); got != "" {
+	if got := e.recentRunID(""); got != "" {
 		t.Errorf("recentRunID = %q, want empty for concurrent runs", got)
 	}
 	// Both stay active within the window.
@@ -186,7 +186,7 @@ func TestCorrelation_WindowPruning(t *testing.T) {
 	if _, ok := ids["r-new"]; !ok {
 		t.Errorf("surviving run should be r-new, got %+v", ids)
 	}
-	if got := e.recentRunID(); got != "r-new" {
+	if got := e.recentRunID(""); got != "r-new" {
 		t.Errorf("recentRunID = %q, want r-new", got)
 	}
 
@@ -195,7 +195,7 @@ func TestCorrelation_WindowPruning(t *testing.T) {
 	if runs := e.ActiveRuns(); len(runs) != 0 {
 		t.Errorf("all runs expired, ActiveRuns = %+v", runs)
 	}
-	if got := e.recentRunID(); got != "" {
+	if got := e.recentRunID(""); got != "" {
 		t.Errorf("all runs expired, recentRunID = %q, want empty", got)
 	}
 }

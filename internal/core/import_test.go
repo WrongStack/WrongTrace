@@ -555,10 +555,10 @@ func TestDetectPrimaryLanguage_PhpRubyAreCounted(t *testing.T) {
 // always deterministic: highest count wins; alphabetical order breaks ties.
 func TestDetectPrimaryLanguage_NonPrecedenceOverridesPrecedence(t *testing.T) {
 	// Scenario: Python(20) vs Go(20) — both have same count.
-// PHP(10) is in the precedence list. The first loop picks Python(20) as winner.
-// With the map loop (bug): Python(20) stays winner (no count beats 20).
-// FIXED: Python(20) stays winner with the extended slice loop.
-// We also verify non-determinism: run 3 times; if it ever differs, the fix regressed.
+	// PHP(10) is in the precedence list. The first loop picks Python(20) as winner.
+	// With the map loop (bug): Python(20) stays winner (no count beats 20).
+	// FIXED: Python(20) stays winner with the extended slice loop.
+	// We also verify non-determinism: run 3 times; if it ever differs, the fix regressed.
 	pythonRoot := t.TempDir()
 	for i := 0; i < 20; i++ {
 		writeFiles(t, pythonRoot, map[string]string{

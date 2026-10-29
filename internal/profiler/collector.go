@@ -157,11 +157,16 @@ func (c *Collector) IngestOTLP(data []byte) (int, error) {
 				for _, attr := range span.Attributes {
 					meta[attr.Key] = otlpAttributeValue(attr.Value)
 					switch attr.Key {
-					case "code.filepath", "code.file":
+					// Current OTel semantic conventions renamed these
+					// (http.response.status_code since v1.23, code.file.path and
+					// code.function.name later); up-to-date SDKs send only the new
+					// names, so a 404 from them was stored as 200 and never
+					// counted as an error.
+					case "code.filepath", "code.file", "code.file.path":
 						filePath = attr.Value.StringValue
-					case "code.function", "code.name":
+					case "code.function", "code.name", "code.function.name":
 						functionName = attr.Value.StringValue
-					case "http.status_code":
+					case "http.status_code", "http.response.status_code":
 						if attr.Value.IntValue > 0 {
 							statusCode = int(attr.Value.IntValue)
 						} else if attr.Value.StringValue != "" {

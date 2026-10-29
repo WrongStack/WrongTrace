@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -115,6 +118,9 @@ type Server struct {
 	// this server created, if any. Both are removed by Stop.
 	boundPath string
 	linkPath  string
+	// boundInfo identifies the socket file this server created (POSIX), so
+	// Stop never deletes a successor's socket that replaced it at boundPath.
+	boundInfo os.FileInfo
 }
 
 // NewServer returns a Server ready to be started with Start.
@@ -148,6 +154,9 @@ func (s *Server) Start() error {
 	}
 	s.ln = ln
 	s.boundPath, s.linkPath = bound, link
+	if runtime.GOOS != "windows" {
+		s.boundInfo, _ = os.Lstat(bound)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
@@ -190,10 +199,14 @@ func (s *Server) Stop() {
 		s.linkPath = ""
 	}
 	// Only the path actually bound: after the long-path fallback the
-	// configured SocketPath was never created by us.
+	// configured SocketPath was never created by us. And only while it is
+	// still the file we created: another server may have bound a new socket
+	// there since, and deleting it would make that live server unreachable.
 	if s.boundPath != "" {
-		if err := os.Remove(s.boundPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("ipc: remove socket %s: %v", s.boundPath, err)
+		if cur, err := os.Lstat(s.boundPath); err == nil && s.boundInfo != nil && os.SameFile(cur, s.boundInfo) {
+			if err := os.Remove(s.boundPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("ipc: remove socket %s: %v", s.boundPath, err)
+			}
 		}
 	}
 }
@@ -346,8 +359,14 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 		if err := json.Unmarshal(line, &wire); err != nil {
 			code, prefix := -32700, "parse error: "
 			var typeErr *json.UnmarshalTypeError
-			if errors.As(err, &typeErr) && typeErr.Field != "params" {
+			if errors.As(err, &typeErr) {
+				// The line is valid JSON, so -32700 does not apply. A
+				// non-object params (positional array, scalar) is valid
+				// JSON-RPC this server does not support: invalid params.
 				code, prefix = -32600, "invalid request: "
+				if typeErr.Field == "params" {
+					code, prefix = -32602, "invalid params: "
+				}
 			}
 			if !writeErrorLine(code, prefix+err.Error()) {
 				return
@@ -402,7 +421,7 @@ func (s *Server) handleConn(ctx context.Context, c net.Conn) {
 				clientAddr = c.RemoteAddr().String()
 			}
 			s.cfg.Engine.RecordIPCTraffic(IPCTrafficRecord{
-				ID:         fmt.Sprintf("ipc-%d", time.Now().UnixNano()),
+				ID:         mintID("ipc"),
 				Method:     req.Method,
 				Params:     req.Params,
 				Result:     resp.Result,
@@ -459,6 +478,13 @@ func (s *Server) dispatch(req *Request) Response {
 		}
 		if p.PromptTokens == 0 {
 			if tok, ok := req.Params["tokens_used"].(float64); ok {
+				// Same contract decoding enforces for prompt_tokens: an
+				// integer in int64 range. int64(tok) overflowed silently into
+				// a huge negative count.
+				if tok != math.Trunc(tok) || tok < math.MinInt64 || tok >= math.MaxInt64 {
+					resp.Error = &RPCError{Code: -32602, Message: fmt.Sprintf("tokens_used %v is not an int64 token count", tok)}
+					return resp
+				}
 				p.PromptTokens = int64(tok)
 			}
 		}
@@ -472,7 +498,7 @@ func (s *Server) dispatch(req *Request) Response {
 				resp.Error = &RPCError{Code: -32602, Message: "run_id is required"}
 				return resp
 			}
-			p.RunID = fmt.Sprintf("ipc-%d", time.Now().UnixNano())
+			p.RunID = mintID("ipc")
 		}
 		if err := s.cfg.Engine.ReportRun(p); err != nil {
 			resp.Error = &RPCError{Code: -32010, Message: err.Error()}
@@ -510,7 +536,7 @@ func (s *Server) dispatch(req *Request) Response {
 			promptTokens = p.TokensConsumed
 		}
 		rec := db.FileReadRecord{
-			ReadID:         fmt.Sprintf("read-%d", time.Now().UnixNano()),
+			ReadID:         mintID("read"),
 			RunID:          p.RunID,
 			RepoName:       p.RepoName,
 			FilePath:       filePath,
@@ -653,7 +679,16 @@ func (s *Server) dispatch(req *Request) Response {
 			resp.Error = &RPCError{Code: -32602, Message: "file_path or path is required"}
 			return resp
 		}
-		if err := s.cfg.Engine.UnlockFile(filePath, p.OwnerRunID); err != nil {
+		ownerRunID := p.OwnerRunID
+		if ownerRunID == "" {
+			// The engine reads an empty owner_run_id as a force unlock. That
+			// is an operator action (HTTP/dashboard), not something any agent
+			// on this socket gets by omitting its credential: present a
+			// credential no run can hold, so unowned and expired locks still
+			// clear but a live credential-protected lock is refused.
+			ownerRunID = noCredentialRunID
+		}
+		if err := s.cfg.Engine.UnlockFile(filePath, ownerRunID); err != nil {
 			// Surface the refusal (e.g. ErrNotLockOwner for a foreign owner)
 			// instead of answering a lock-steal attempt with success; matches
 			// the lock_file handler's engine-error convention above.
@@ -839,6 +874,14 @@ func bindSocketPaths(path string) (net.Listener, string, string, error) {
 		if !ownedByCurrentUser(fi) {
 			return nil, "", "", fmt.Errorf("refusing to replace %s: it is owned by another user", targetPath)
 		}
+		// Only a socket nobody answers on is stale. Deleting a live one
+		// hijacked a running server's endpoint and left it unreachable.
+		if fi.Mode()&os.ModeSocket != 0 {
+			if c, dErr := net.DialTimeout("unix", targetPath, time.Second); dErr == nil {
+				_ = c.Close()
+				return nil, "", "", fmt.Errorf("socket %s is in use by a running server", targetPath)
+			}
+		}
 		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
 			log.Printf("ipc: remove stale socket %s: %v", targetPath, err)
 		}
@@ -846,6 +889,11 @@ func bindSocketPaths(path string) (net.Listener, string, string, error) {
 	ln, err := net.Listen("unix", targetPath)
 	if err != nil {
 		return nil, "", "", err
+	}
+	// Close must not unlink by path: by then the path may hold a successor's
+	// socket. Stop removes it only after confirming it is still ours.
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
 	}
 
 	// On POSIX, if the primary socket is ~/.wrongtrace/wrongtrace.sock, also
@@ -887,6 +935,20 @@ func publishDiscoveryLink(target, linkPath string) bool {
 // the HTTP surface's maxRecentEventsLimit, so a single oversized request
 // cannot make the engine scan unbounded event history.
 const maxIPCHistoryLimit = 1000
+
+// mintID returns prefix-<random hex> for IDs the server makes up. Wall-clock
+// nanoseconds are coarse on Windows: reports landing in one tick got the same
+// ID, so reads were dropped (ON CONFLICT DO NOTHING) and runs overwrote each
+// other (UpsertRun), each acknowledged as ok.
+func mintID(prefix string) string {
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return prefix + "-" + hex.EncodeToString(b[:])
+}
+
+// noCredentialRunID stands in for an absent owner_run_id on unlock_file. The
+// NUL byte keeps it from ever equalling a real run's ID.
+const noCredentialRunID = "\x00no-credential"
 
 const maxJSONLineBytes = 16 * 1024 * 1024 // 16 MB max line length to protect against unbounded RAM allocation
 

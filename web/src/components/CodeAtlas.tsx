@@ -69,6 +69,7 @@ interface CodeAtlasProps {
   recentEvents?: EventRecord[];
   loading: boolean;
   onRefresh?: () => void;
+  projectId?: string | null;
 }
 
 // ----------------------------------------------------
@@ -332,7 +333,7 @@ const nodeTypes = {
 // Main CodeAtlas Component
 // ----------------------------------------------------
 
-export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlasProps) {
+export function CodeAtlas({ atlas, recentEvents, loading, onRefresh, projectId }: CodeAtlasProps) {
   const [viewMode, setViewMode] = useState<'graph' | 'tree'>('graph');
   const [colorMode, setColorMode] = useState<'hierarchy' | 'health' | 'churn'>('hierarchy');
   const [searchQuery, setSearchQuery] = useState('');
@@ -1606,11 +1607,12 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                   <SymbolHistoryTimeline
                     signature={selectedItem.symbol.node_signature}
                     filePath={selectedItem.file?.path}
+                    projectId={projectId}
                   />
                 )}
 
                 {inspectorTab === 'activity' && selectedItem.file && (
-                  <FileReadDetails filePath={selectedItem.file.path} />
+                  <FileReadDetails filePath={selectedItem.file.path} projectId={projectId} />
                 )}
               </div>
             )}
@@ -1640,7 +1642,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
                 </div>
 
                 {/* File Read & Context Analytics */}
-                <FileReadDetails filePath={selectedItem.file.path} />
+                <FileReadDetails filePath={selectedItem.file.path} projectId={projectId} />
               </div>
             )}
 
@@ -1705,7 +1707,7 @@ export function CodeAtlas({ atlas, recentEvents, loading, onRefresh }: CodeAtlas
         </div>
 
         {historyFilePath ? (
-          <FileHistoryTimeline key={historyFilePath} filePath={historyFilePath} />
+          <FileHistoryTimeline key={historyFilePath} filePath={historyFilePath} projectId={projectId} />
         ) : (
           <div className="p-6 rounded-xl bg-slate-950/40 border border-dashed border-white/10 text-xs text-slate-500 flex flex-col items-center gap-2 text-center">
             <GitCommit className="h-6 w-6 text-slate-700" />

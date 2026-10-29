@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -146,6 +148,23 @@ type EventRecord struct {
 
 // UpsertRun inserts an agent_run, replacing any existing row with the same
 // run_id. This makes IPC report retries idempotent.
+// RunTotals returns the stored token and cost totals of a run. ok is false
+// when no such run exists.
+func (s *Store) RunTotals(runID string) (prompt, completion int64, costUSD float64, ok bool, err error) {
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(prompt_tokens, 0), COALESCE(completion_tokens, 0), COALESCE(cost_usd, 0) FROM agent_runs WHERE run_id = ?`,
+		runID).Scan(&prompt, &completion, &costUSD)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, 0, false, fmt.Errorf("run totals: %w", err)
+	}
+	return prompt, completion, costUSD, true, nil
+}
+
 func (s *Store) UpsertRun(r RunRecord) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -309,8 +328,12 @@ func escapeLike(s string) string {
 // "file_read.go". The stored value is the PATTERN side, so its metacharacters
 // are quoted in SQL (ESCAPE processing touches only the pattern); the caller is
 // the LIKE SUBJECT, stays raw, and is bound by the caller's own placeholder.
+//
+// A stored "./x" (agents' read paths are stored as written) is reduced to "x"
+// the same way: "%/./x" matched no absolute caller.
 func callerLongerArm(normCol string) string {
 	return ` OR ? LIKE '%/' || REPLACE(REPLACE(LTRIM(CASE WHEN SUBSTR(` + normCol +
+		`, 1, 2) = './' THEN SUBSTR(` + normCol + `, 3) WHEN SUBSTR(` + normCol +
 		`, 2, 1) = ':' THEN SUBSTR(` + normCol + `, 3) ELSE ` + normCol + ` END, '/'), '%', '\%'), '_', '\_') ESCAPE '\'`
 }
 
@@ -383,7 +406,12 @@ func (s *Store) RecentEventsFiltered(limit int, repo string, filePath string, si
 	var args []any
 
 	if repo != "" && repo != "all" && repo != "*" {
-		whereClauses = append(whereClauses, "(LOWER(e.repo_name) = LOWER(?) OR e.repo_name = '' OR e.repo_name IS NULL)")
+		// Same exact rule as every aggregate the dashboard shows beside this
+		// feed (Overview, Thrashing, ModelComparison, file health): a
+		// case-insensitive feed listed edits for a ?repo= spelling whose
+		// totals all read 0. Exact equality also keeps the repo_name indexes
+		// usable; events carry the project's canonical name.
+		whereClauses = append(whereClauses, "(e.repo_name = ? OR e.repo_name = '' OR e.repo_name IS NULL)")
 		args = append(args, repo)
 	}
 
@@ -735,7 +763,7 @@ type FileHealth struct {
 
 // FileHealth scores a file for agent guardrails: -8 per edit in the last 24h,
 // -5 extra when 3+ distinct signatures churned, fragile at >= 5 edits.
-func (s *Store) FileHealth(filePath string) (FileHealth, error) {
+func (s *Store) FileHealth(filePath string, repoFilter ...string) (FileHealth, error) {
 	out := FileHealth{FilePath: filePath, HealthScore: 100}
 
 	var edits, sigs int
@@ -753,16 +781,18 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 	// Guardrail queries arrive with agent-supplied casing (MCP/IPC/HTTP) while
 	// stored event paths carry FS-native casing, so the normalized comparison
 	// must be case-insensitive — mirroring RecentEventsFiltered's LOWER arms.
-	lowerNorm := strings.ToLower(normSlash)
+	// Both sides are lowered by SQLite: Go's strings.ToLower also folds
+	// non-ASCII letters (Ü, Ç) that SQLite's LOWER leaves alone, so a
+	// Go-lowered caller never matched a stored "internal/Über/x.go".
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
 	// Arm 3 of the path clause is a plain EQUALITY arm, so its value must be
-	// the plain lowercased path: binding escapeLike(normSlash) there (round-91
+	// the plain path (lowered by SQLite): binding escapeLike(normSlash) there (round-91
 	// bug) injected literal backslashes and left the case mixed, killing the
 	// case-insensitive exact match for every '_'/'%'-bearing or mixed-case
 	// path — and arms 4/5 cannot rescue an exact query because they require
-	// the stored path to end with '/'+caller. Bind lowerNorm; arms 4/5 keep
+	// the stored path to end with '/'+caller. Bind normSlash; arms 4/5 keep
 	// escapeLike (their placeholders are pattern-side).
 	// Arm 6 is the caller-LONGER direction. The other five arms all require the
 	// caller to be no longer than the stored row, so an absolute caller against
@@ -772,19 +802,20 @@ func (s *Store) FileHealth(filePath string) (FileHealth, error) {
 	// (the '/' anchor, the leading-slash trim, the drive-root strip) cannot drift
 	// from pathMatchClause and readPathClause. This clause is case-insensitive,
 	// so the stored value is LOWER-wrapped; the caller is the LIKE SUBJECT, so it
-	// stays raw (no escapeLike) and is bound lowercased below.
+	// stays raw (no escapeLike); LIKE ignores its ASCII case.
+	scope, scopeArgs := repoScope("repo_name", repoFilter)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*), COUNT(DISTINCT node_signature)
 		FROM code_node_events
 		WHERE (file_path = ?
 			OR REPLACE(file_path, '\', '/') = ?
-			OR LOWER(REPLACE(file_path, '\', '/')) = ?
+			OR LOWER(REPLACE(file_path, '\', '/')) = LOWER(?)
 			OR REPLACE(file_path, '\', '/') LIKE '%/' || ? ESCAPE '\'
 			OR LOWER(REPLACE(file_path, '\', '/')) LIKE '%/' || LOWER(?) ESCAPE '\'`+
 		callerLongerArm(`LOWER(REPLACE(file_path, '\', '/'))`)+`
 		)
-		  AND event_time >= datetime('now', '-1 day')
-	`, filePath, normSlash, lowerNorm, escapeLike(lowerNorm), escapeLike(lowerNorm), lowerNorm)
+		  AND event_time >= datetime('now', '-1 day')`+scope+`
+	`, append([]any{filePath, normSlash, normSlash, escapeLike(normSlash), escapeLike(normSlash), normSlash}, scopeArgs...)...)
 	if err := row.Scan(&edits, &sigs); err != nil {
 		return out, fmt.Errorf("file health scan: %w", err)
 	}
@@ -915,7 +946,10 @@ func (s *Store) AllNodeStats(repoFilter ...string) (map[string]NodeStat, error) 
 	// previous shape grouped by node_signature alone (merging same-named
 	// files in different directories) and re-joined on
 	// event_time = MAX(event_time) under a bare GROUP BY, so a same-second tie
-	// returned an arbitrary row's action/model/file.
+	// returned an arbitrary row's action/model/file. Partitions use the
+	// slash-normalized path, the same identity NodeStatKey uses: partitioning
+	// by the raw spelling let one file stored as both `a\b.go` and `a/b.go`
+	// yield two rows for one key, the later scan overwriting the other.
 	where := ""
 	var args []any
 	if repo != "" {
@@ -926,8 +960,8 @@ func (s *Store) AllNodeStats(repoFilter ...string) (map[string]NodeStat, error) 
 		SELECT x.node_signature, x.file_path, x.edit_count, x.action, COALESCE(r.model_name, 'unknown'), x.event_time
 		FROM (
 			SELECT node_signature, file_path, action, run_id, event_time,
-			       COUNT(*) OVER (PARTITION BY file_path, node_signature) AS edit_count,
-			       ROW_NUMBER() OVER (PARTITION BY file_path, node_signature ORDER BY event_time DESC, event_id DESC) AS rn
+			       COUNT(*) OVER (PARTITION BY REPLACE(file_path, '\', '/'), node_signature) AS edit_count,
+			       ROW_NUMBER() OVER (PARTITION BY REPLACE(file_path, '\', '/'), node_signature ORDER BY event_time DESC, event_id DESC) AS rn
 			FROM code_node_events
 			` + where + `
 		) x
@@ -1335,7 +1369,7 @@ func (s *Store) GetRecentFileReads(limit int, repoFilter ...string) ([]FileReadR
 }
 
 // GetFileReadStats returns detailed read counts, model breakdown, and recent reads for a single file.
-func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
+func (s *Store) GetFileReadStats(filePath string, repoFilter ...string) (FileReadStats, error) {
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
@@ -1352,6 +1386,8 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 	// anchored on '/'. The suffix arm used to be '%' || path with no
 	// directory boundary, so stats for "main.go" absorbed "cmd/domain.go".
 	readPathArgs := []any{filePath, escapeLike(normPath), "%/" + escapeLike(normPath), normPath}
+	scope, scopeArgs := repoScope("repo_name", repoFilter)
+	readPathArgs = append(readPathArgs, scopeArgs...)
 
 	// readPathClause's LIKE arms cannot use an index, so every statement
 	// filtered by it is a full scan of file_read_events -- usually the largest
@@ -1371,7 +1407,7 @@ func (s *Store) GetFileReadStats(filePath string) (FileReadStats, error) {
 		            THEN COALESCE(intent, '') ELSE '' END,
 		       COALESCE(read_time, CURRENT_TIMESTAMP)
 		FROM file_read_events
-		WHERE `+readPathClause+`
+		WHERE `+readPathClause+scope+`
 		ORDER BY read_time DESC, read_id DESC
 	`, readPathArgs...)
 	if err != nil {
@@ -1456,20 +1492,21 @@ var readPathClause = `(file_path = ? OR REPLACE(file_path, '\', '/') LIKE ? ESCA
 	callerLongerArm(`REPLACE(file_path, '\', '/')`) + `)`
 
 // GetFileReadHeatmap computes line-range frequencies for inspecting hot read regions.
-func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
+func (s *Store) GetFileReadHeatmap(filePath string, repoFilter ...string) ([]LineReadHeatmap, error) {
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
 	normPath := strings.ReplaceAll(filePath, "\\", "/")
+	scope, scopeArgs := repoScope("repo_name", repoFilter)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT COALESCE(start_line, 0), COALESCE(end_line, 0), COUNT(*)
 		FROM file_read_events
-		WHERE `+readPathClause+`
+		WHERE `+readPathClause+scope+`
 		  AND (start_line > 0 OR end_line > 0)
 		GROUP BY COALESCE(start_line, 0), COALESCE(end_line, 0)
 		ORDER BY COUNT(*) DESC
 		LIMIT 50
-	`, filePath, escapeLike(normPath), "%/"+escapeLike(normPath), normPath)
+	`, append([]any{filePath, escapeLike(normPath), "%/" + escapeLike(normPath), normPath}, scopeArgs...)...)
 	if err != nil {
 		return nil, fmt.Errorf("read heatmap query: %w", err)
 	}
@@ -1486,8 +1523,62 @@ func (s *Store) GetFileReadHeatmap(filePath string) ([]LineReadHeatmap, error) {
 	return out, rows.Err()
 }
 
+// maxStaleDays bounds ClearStale's horizon. Nothing stored is older than this,
+// and beyond it time.AddDate overflows: a huge "days" wrapped the cutoff into
+// the future (or past year 9999, which sorts after every stored timestamp) and
+// "keep everything" deleted every row.
+const maxStaleDays = 1000 * 366
+
+// repoScope is the AND clause that limits a per-file query to one repository
+// label (unlabelled rows still match, as in every other repo filter) and its
+// argument; empty when no filter is given. Per-file paths are often
+// project-relative ("main.go"), and their suffix arms matched the same file in
+// every project sharing the store.
+func repoScope(col string, repoFilter []string) (string, []any) {
+	if len(repoFilter) == 0 || repoFilter[0] == "" {
+		return "", nil
+	}
+	return " AND (" + col + " = ? OR " + col + " = '' OR " + col + " IS NULL)", []any{repoFilter[0]}
+}
+
+// RenameRepo relabels every event recorded under repo name from as to, in one
+// transaction. Events reach a project only through this label, so renaming a
+// project without it hid the project's whole history.
+func (s *Store) RenameRepo(from, to string) (int64, error) {
+	if from == "" || to == "" || from == to {
+		return 0, nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	ctx, cancel := s.withTimeout(context.Background())
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("rename repo: begin: %w", err)
+	}
+	defer tx.Rollback()
+	var n int64
+	for _, table := range []string{"code_node_events", "file_read_events"} {
+		res, err := tx.ExecContext(ctx, "UPDATE "+table+" SET repo_name = ? WHERE repo_name = ?", to, from)
+		if err != nil {
+			return 0, fmt.Errorf("rename repo in %s: %w", table, err)
+		}
+		if k, _ := res.RowsAffected(); k > 0 {
+			n += k
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("rename repo: commit: %w", err)
+	}
+	return n, nil
+}
+
 // ClearStale prunes old telemetry records older than N days across all analytical tables.
 func (s *Store) ClearStale(days int) (int64, error) {
+	if days > maxStaleDays {
+		return 0, nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -1574,7 +1665,29 @@ type SymbolHistoryRecord struct {
 }
 
 // SymbolHistory returns the chronological revision history of a specific AST symbol / node or all symbols in a file.
-func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHistoryRecord, error) {
+// cleanSymbolSignature reduces a caller's signature to the stored spelling.
+// The AST engine keys Go pointer-receiver methods as "*T.M", so the leading
+// '*' is kept, and Go's method-expression form "(*T).M" / "(T).M" is
+// rewritten to it rather than cut at its first '(' (which left nothing). Only
+// a trailing parameter list, as in "helper(string)", is dropped.
+func cleanSymbolSignature(signature string) string {
+	sig := strings.TrimSpace(signature)
+	head, tail := "", sig
+	if i := strings.LastIndex(sig, "::"); i >= 0 {
+		head, tail = sig[:i+2], sig[i+2:]
+	}
+	if strings.HasPrefix(tail, "(") {
+		if j := strings.Index(tail, ")."); j > 0 {
+			tail = strings.TrimSpace(tail[1:j]) + tail[j+1:]
+		}
+	}
+	if idx := strings.Index(tail, "("); idx > 0 {
+		tail = tail[:idx]
+	}
+	return strings.TrimSpace(head + tail)
+}
+
+func (s *Store) SymbolHistory(filePath, signature string, limit int, repoFilter ...string) ([]SymbolHistoryRecord, error) {
 	limit = clampLimit(limit, 100)
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
@@ -1582,11 +1695,12 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 	normSlash := strings.ReplaceAll(strings.TrimSpace(filePath), "\\", "/")
 	normSlash = strings.TrimPrefix(normSlash, "./")
 
-	cleanSig := strings.TrimSpace(signature)
-	if idx := strings.Index(cleanSig, "("); idx != -1 {
-		cleanSig = strings.TrimSpace(cleanSig[:idx])
+	cleanSig := cleanSymbolSignature(signature)
+	if cleanSig == "" && strings.TrimSpace(signature) != "" {
+		// A signature was asked for but nothing usable is left; dropping the
+		// filter would return every symbol's history as this one's.
+		return []SymbolHistoryRecord{}, nil
 	}
-	cleanSig = strings.TrimPrefix(cleanSig, "*")
 
 	// All four variants order by e.event_time, which fmtDBTime stores at
 	// SECOND granularity, so same-second rows tie and SQLite returns them
@@ -1645,6 +1759,10 @@ func (s *Store) SymbolHistory(filePath, signature string, limit int) ([]SymbolHi
 	if cleanSig != "" {
 		where = append(where, sigClause)
 		args = append(args, sigArgs()...)
+	}
+	if clause, rargs := repoScope("e.repo_name", repoFilter); clause != "" {
+		where = append(where, strings.TrimPrefix(clause, " AND "))
+		args = append(args, rargs...)
 	}
 	args = append(args, limit)
 
@@ -1710,17 +1828,20 @@ type ModelActivitySummary struct {
 }
 
 // FileModelActivity returns per-model read and write statistics for a target file.
-func (s *Store) FileModelActivity(filePath string) ([]ModelActivitySummary, error) {
+func (s *Store) FileModelActivity(filePath string, repoFilter ...string) ([]ModelActivitySummary, error) {
 	ctx, cancel := s.withTimeout(context.Background())
 	defer cancel()
 
 	normSlash := strings.ReplaceAll(strings.TrimSpace(filePath), "\\", "/")
 	normSlash = strings.TrimPrefix(normSlash, "./")
 	args := pathMatchArgs(filePath, normSlash)
+	readScope, scopeArgs := repoScope("repo_name", repoFilter)
+	writeScope, _ := repoScope("e.repo_name", repoFilter)
+	args = append(args, scopeArgs...)
 
 	return s.modelActivity(ctx,
-		"WHERE "+pathMatchClause("file_path"), args,
-		"WHERE "+pathMatchClause("e.file_path"), args,
+		"WHERE "+pathMatchClause("file_path")+readScope, args,
+		"WHERE "+pathMatchClause("e.file_path")+writeScope, args,
 		0)
 }
 
@@ -1923,6 +2044,7 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 	// UNLIMITED GROUP BY over it; only RecentCollisions is LIMITed. They used
 	// to be tallied from the LIMITed row set, so every summary number silently
 	// described just the newest `limit` collisions.
+	const attributedEvent = `(e.run_id IS NOT NULL AND e.run_id <> '' AND COALESCE(e.attribution_confidence, 0.0) >= 0.8)`
 	const collisionsCTE = `
 		WITH OrderedEvents AS (
 			SELECT 
@@ -1935,18 +2057,22 @@ func (s *Store) ModelFrictionMatrix(limit int) (*InterAgentFrictionReport, error
 				e.event_time,
 				COALESCE(r.model_name, 'unknown') AS overwriter_model,
 				COALESCE(r.run_id, '') AS overwriter_run_id,
-				LAG(COALESCE(r.model_name, 'unknown')) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_model,
-				LAG(COALESCE(r.run_id, '')) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_run_id,
-				LAG(e.event_time) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_time
+				-- The window spans EVERY write to the node so the author is the
+				-- immediately preceding one. Filtering unattributed and
+				-- low-confidence writes out before LAG blamed the next write
+				-- on an older author (inventing cross-agent and self-thrash
+				-- edges); such a predecessor is now an 'unknown' author, which
+				-- frictionPair never counts as cross-agent.
+				LAG(CASE WHEN ` + attributedEvent + ` THEN COALESCE(r.model_name, 'unknown') ELSE 'unknown' END) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_model,
+				LAG(CASE WHEN ` + attributedEvent + ` THEN COALESCE(r.run_id, '') ELSE '' END) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_run_id,
+				LAG(e.event_time) OVER (PARTITION BY e.file_path, e.node_signature ORDER BY e.event_time, e.event_id) AS author_time,
+				CASE WHEN ` + attributedEvent + ` THEN 1 ELSE 0 END AS attributed
 			FROM code_node_events e
 			LEFT JOIN agent_runs r ON e.run_id = r.run_id
-			WHERE e.run_id IS NOT NULL
-			  AND e.run_id <> ''
-			  AND COALESCE(e.attribution_confidence, 0.0) >= 0.8
 		),
 		Collisions AS (
 			SELECT * FROM OrderedEvents
-			WHERE author_model IS NOT NULL AND action IN ('MODIFIED', 'DELETED')
+			WHERE author_model IS NOT NULL AND action IN ('MODIFIED', 'DELETED') AND attributed = 1
 		)`
 
 	var (

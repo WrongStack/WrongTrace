@@ -102,6 +102,14 @@ export function ModelIntelligenceMatrix({
     });
 
     list.sort((a, b) => {
+      // cost_per_surviving_node is 0 when nothing survived: "not computed",
+      // shown as "—". Those rows sort last in both directions, as in
+      // ROIAnalysis, instead of ranking as the cheapest ROI.
+      if (sortBy === 'roi') {
+        const aNone = a.total_survived_nodes === 0;
+        const bNone = b.total_survived_nodes === 0;
+        if (aNone || bNone) return aNone === bNone ? 0 : aNone ? 1 : -1;
+      }
       let diff = 0;
       if (sortBy === 'survival') diff = b.survival_rate_pct - a.survival_rate_pct;
       else if (sortBy === 'roi') diff = a.cost_per_surviving_node - b.cost_per_surviving_node;

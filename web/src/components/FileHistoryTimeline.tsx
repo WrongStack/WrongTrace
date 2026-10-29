@@ -215,13 +215,14 @@ function RevisionDetail({ rev }: RevisionDetailProps) {
 
 interface FileHistoryTimelineProps {
   filePath: string;
+  projectId?: string | null;
 }
 
 // Chronological commit-graph of every recorded mutation of one file.
 // Renders vertically (default, git-log style newest on top) or horizontally;
 // the +/- sparkline strip on top gives the whole lifetime at a glance.
-export function FileHistoryTimeline({ filePath }: FileHistoryTimelineProps) {
-  const { data: events = [], isLoading } = useRecentFileEvents(filePath, 1000);
+export function FileHistoryTimeline({ filePath, projectId }: FileHistoryTimelineProps) {
+  const { data: events = [], isLoading } = useRecentFileEvents(filePath, 1000, projectId);
   const [orientation, setOrientation] = useState<'vertical' | 'horizontal'>('vertical');
   const [newestFirst, setNewestFirst] = useState(true);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);

@@ -44,7 +44,9 @@ type EngineAPI interface {
 	ModelRows(repoFilter ...string) ([]db.ModelRow, error)
 	Atlas(repoFilter ...string) (core.AtlasSnapshot, error)
 	FileHealth(path string) (core.IPCHealth, error)
+	FileHealthIn(path, repo string) (core.IPCHealth, error)
 	CheckGuardrail(path string) (core.GuardrailResult, error)
+	CheckGuardrailIn(path, repo string) (core.GuardrailResult, error)
 	LockFile(path, reason string) core.LockInfo
 	LockFileWithOptions(path, reason, owner, ownerRunID string, ttl time.Duration) core.LockInfo
 	TryLockFile(path, reason, owner, ownerRunID string, ttl time.Duration, force bool) (core.LockInfo, error)
@@ -73,14 +75,15 @@ type EngineAPI interface {
 	ClearStale(days int) (int64, error)
 	GetRecentEvents(limit int, repoFilter ...string) ([]db.EventRecord, error)
 	GetRecentEventsFiltered(limit int, repo string, filePath string, since time.Time) ([]db.EventRecord, error)
-	GetSymbolHistory(filePath, signature string, limit int) ([]db.SymbolHistoryRecord, error)
-	GetFileModelActivity(filePath string) ([]db.ModelActivitySummary, error)
+	GetSymbolHistory(filePath, signature string, limit int, repoFilter ...string) ([]db.SymbolHistoryRecord, error)
+	GetFileModelActivity(filePath string, repoFilter ...string) ([]db.ModelActivitySummary, error)
 	GetAllFileModelActivity(limit int) ([]db.ModelActivitySummary, error)
 	GetModelFrictionReport(limit int) (*db.InterAgentFrictionReport, error)
 	GetFileReadStats(filePath string) (db.FileReadStats, error)
+	GetFileReadStatsIn(filePath, repo string) (db.FileReadStats, error)
 	GetRecentFileReads(limit int, repoFilter ...string) ([]db.FileReadRecord, error)
 	GetRecentFileEvents(filePath string, limit int) ([]db.EventRecord, error)
-	GetFileReadHeatmap(filePath string) ([]db.LineReadHeatmap, error)
+	GetFileReadHeatmap(filePath string, repoFilter ...string) ([]db.LineReadHeatmap, error)
 	GetIPCTraffic() []ipc.IPCTrafficRecord
 	GetIPCTrafficSummaries() []ipc.IPCTrafficRecord
 	GetIPCTrafficRecord(id string) (ipc.IPCTrafficRecord, bool)
@@ -375,8 +378,48 @@ func (s *Server) tokenAuth(next http.Handler) http.Handler {
 					"X-WrongTrace-Token, ?token=, or open /auth?token=<token> once to mint a session cookie")
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, "/proxy") || strings.HasPrefix(r.URL.Path, "/v1") {
+			s.stripDaemonCredentials(r)
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// stripDaemonCredentials removes WrongTrace's own credentials from a gateway
+// request before the proxy forwards it. The proxy copies Authorization,
+// Cookie and the raw query upstream, so a client authenticating with
+// `Authorization: Bearer <WRONGTRACE_TOKEN>` or `?token=` sent the daemon's
+// admin token to the LLM provider. A Bearer value that is NOT the daemon
+// token (the provider key) is left alone.
+func (s *Server) stripDaemonCredentials(r *http.Request) {
+	r.Header.Del("X-WrongTrace-Token")
+	if auth := r.Header.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") &&
+		subtle.ConstantTimeCompare([]byte(strings.TrimSpace(auth[7:])), []byte(s.authToken)) == 1 {
+		r.Header.Del("Authorization")
+	}
+	if r.URL.RawQuery != "" {
+		parts := strings.Split(r.URL.RawQuery, "&")
+		kept := parts[:0]
+		for _, part := range parts {
+			k, v, _ := strings.Cut(part, "=")
+			if key, err := url.QueryUnescape(k); err == nil && key == "token" {
+				if val, err := url.QueryUnescape(v); err == nil && subtle.ConstantTimeCompare([]byte(val), []byte(s.authToken)) == 1 {
+					continue
+				}
+			}
+			kept = append(kept, part)
+		}
+		r.URL.RawQuery = strings.Join(kept, "&")
+	}
+	if _, err := r.Cookie(authCookieName); err == nil {
+		cookies := r.Cookies()
+		r.Header.Del("Cookie")
+		for _, c := range cookies {
+			if c.Name != authCookieName {
+				r.AddCookie(c)
+			}
+		}
+	}
 }
 
 // routeRequiresAuth covers every data-bearing surface: the JSON API
@@ -515,7 +558,11 @@ func (s *Server) buildRouter() chi.Router {
 					// Every read row of this turn used to carry the whole
 					// assistant reply, duplicating it N times in SQLite.
 					readIntent := shortIntent(rec.AssistantReply)
-					for _, tc := range rec.ToolCalls {
+					// The exchange has ONE usage block and read rows are summed
+					// downstream: only its first read carries it (copying it
+					// onto every parallel read multiplied tokens and cost).
+					usageTaken := false
+					for i, tc := range rec.ToolCalls {
 						if tc.TargetFile != "" && ingest.IsFileModifyingTool(tc.Name) {
 							s.cfg.Engine.RegisterFileOperation(tc.TargetFile, rec.RunID, rec.Timestamp)
 						}
@@ -523,8 +570,14 @@ func (s *Server) buildRouter() chi.Router {
 							var args map[string]interface{}
 							_ = json.Unmarshal([]byte(tc.Arguments), &args)
 							sLine, eLine, lCount := ingest.ExtractLineRange(args)
-							_ = s.cfg.Engine.RecordReadEvent(db.FileReadRecord{
-								ReadID:         fmt.Sprintf("gw-read-%s-%s", rec.ID, tc.ID),
+							// Gemini tool calls carry no id; keyed by id alone,
+							// every read after the first collided and was dropped.
+							callID := tc.ID
+							if callID == "" {
+								callID = fmt.Sprintf("#%d", i)
+							}
+							read := db.FileReadRecord{
+								ReadID:         fmt.Sprintf("gw-read-%s-%s", rec.ID, callID),
 								SessionID:      rec.RunID,
 								RunID:          rec.RunID,
 								RepoName:       rec.ProjectSlug,
@@ -536,12 +589,14 @@ func (s *Server) buildRouter() chi.Router {
 								StartLine:      sLine,
 								EndLine:        eLine,
 								LinesReadCount: lCount,
-								PromptTokens:   rec.PromptTokens,
-								CachedTokens:   rec.CachedTokens,
-								CostUSD:        rec.CostUSD,
 								Intent:         readIntent,
 								ReadTime:       rec.Timestamp,
-							})
+							}
+							if !usageTaken {
+								read.PromptTokens, read.CachedTokens, read.CostUSD = rec.PromptTokens, rec.CachedTokens, rec.CostUSD
+								usageTaken = true
+							}
+							_ = s.cfg.Engine.RecordReadEvent(read)
 						}
 					}
 					if s.cfg.Engine.Hub() != nil {

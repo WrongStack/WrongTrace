@@ -77,7 +77,12 @@ export function ROIAnalysis({ models }: ROIAnalysisProps) {
                   </td>
                   <td className="py-1.5 text-right text-slate-300">{m.total_survived_nodes}</td>
                   <td className="py-1.5 text-right text-slate-400">
-                    {m.avg_longevity_days.toFixed(1)}d
+                    {/* The producer COALESCEs an empty AVG (a model with no nodes)
+                        to 0, so 0 means "never computed", not "its code dies
+                        instantly". ModelIntelligenceMatrix gates the same field
+                        the same way, and this table's Cost/Survived cell already
+                        renders "—" for its own no-data case. */}
+                    {m.avg_longevity_days > 0 ? `${m.avg_longevity_days.toFixed(1)}d` : '—'}
                   </td>
                 </tr>
               ))}

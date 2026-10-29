@@ -158,9 +158,26 @@ type jsonlCursor struct {
 	context        jsonlContext
 }
 
+const jsonlUsageVersion = 1
+
 type jsonlContext struct {
 	ModelName string `json:"model"`
 	Intent    string `json:"intent,omitempty"`
+	// Running session usage, persisted with the cursor so a resumed parse
+	// keeps summing. Runs are upserted with REPLACED totals, so every edit
+	// event reports these, not just its own row's usage.
+	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty"`
+	CostUSD          float64 `json:"cost_usd,omitempty"`
+	// LastMessageID dedupes Claude Code's one-line-per-content-block
+	// writes, which repeat a single response's usage on every line.
+	LastMessageID string `json:"last_message_id,omitempty"`
+	// Totals marks sums covering the whole prefix; cursors saved before the
+	// sums existed lack it and are rebuilt by replaying the prefix.
+	Totals bool `json:"totals,omitempty"`
+	// Older totals omitted cache discounts and some billed tokens. Rebuild
+	// those once from the prefix rather than perpetuating them on resume.
+	UsageVersion int `json:"usage_version,omitempty"`
 }
 
 // fingerprintBytes is how much of the committed prefix identifies the file.
@@ -232,9 +249,9 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64, inherited ..
 	var readEvents []FileReadEvent
 	sessionID := sessionIDForPath(filePath)
 	agentName := detectAgentFromPath(filePath)
-	context := jsonlContext{ModelName: detectAgentDefaultModel(agentName)}
+	context := jsonlContext{ModelName: detectAgentDefaultModel(agentName), Totals: true, UsageVersion: jsonlUsageVersion}
 	if startOffset > 0 {
-		if len(inherited) > 0 && inherited[0] != nil && inherited[0].ModelName != "" {
+		if len(inherited) > 0 && inherited[0] != nil && inherited[0].ModelName != "" && inherited[0].Totals && inherited[0].UsageVersion == jsonlUsageVersion {
 			context = *inherited[0]
 		} else {
 			var err error
@@ -290,106 +307,124 @@ func parseJSONLFile(f *os.File, filePath string, startOffset int64, inherited ..
 				continue
 			}
 
-			if row, uErr := decodeJSONLRow(trimmed); uErr == nil {
+			if row, claudeMsg, uErr := decodeJSONLRowMessage(trimmed); uErr == nil {
 				updateJSONLContext(&context, row)
 
-				// Extract usage tokens if present
-				var promptTokens, completionTokens int64
-				if usage, ok := row["usage"].(map[string]interface{}); ok {
-					promptTokens = extractInt64(usage, "input_tokens", "prompt_tokens", "promptTokenCount", "inputTokens")
-					completionTokens = extractInt64(usage, "output_tokens", "completion_tokens", "candidatesTokenCount", "outputTokens")
+				// This row's own usage, counted once (see accumulateRowUsage).
+				// Edit events carry the session's running totals: the run is
+				// upserted with REPLACED totals, so stamping each edit with
+				// only its own row's usage left the run holding the last
+				// edit's cost instead of the session's.
+				usage := accumulateRowUsage(&context, row, claudeMsg)
+
+				toolCalls, _ := row["tool_calls"].([]interface{})
+				if claudeMsg != nil {
+					toolCalls = claudeMsg.toolCalls()
 				}
+				readIndex := 0
+				for _, tc := range toolCalls {
+					tcMap, ok := tc.(map[string]interface{})
+					if !ok {
+						continue
+					}
 
-				// Extract tool calls
-				if toolCalls, ok := row["tool_calls"].([]interface{}); ok {
-					readIndex := 0
-					for _, tc := range toolCalls {
-						tcMap, ok := tc.(map[string]interface{})
-						if !ok {
-							continue
-						}
+					name, _ := tcMap["name"].(string)
+					if name == "" {
+						name, _ = tcMap["tool"].(string)
+					}
 
-						name, _ := tcMap["name"].(string)
-						if name == "" {
-							name, _ = tcMap["tool"].(string)
-						}
+					isMod := IsFileModifyingTool(name)
+					isRead := IsFileReadingTool(name)
+					if !isMod && !isRead {
+						continue
+					}
 
-						isMod := IsFileModifyingTool(name)
-						isRead := IsFileReadingTool(name)
-						if !isMod && !isRead {
-							continue
-						}
+					// Check if tool call has its own specific model override
+					tcModel := context.ModelName
+					if m := extractModelFromRow(tcMap); m != "" {
+						tcModel = m
+					}
 
-						// Check if tool call has its own specific model override
-						tcModel := context.ModelName
-						if m := extractModelFromRow(tcMap); m != "" {
-							tcModel = m
-						}
+					// Extract args
+					var args map[string]interface{}
+					if a, ok := tcMap["args"].(map[string]interface{}); ok {
+						args = a
+					} else if a, ok := tcMap["parameters"].(map[string]interface{}); ok {
+						args = a
+					}
 
-						// Extract args
-						var args map[string]interface{}
-						if a, ok := tcMap["args"].(map[string]interface{}); ok {
-							args = a
-						} else if a, ok := tcMap["parameters"].(map[string]interface{}); ok {
-							args = a
-						}
+					targetFile := ExtractTargetFile(args)
 
-						targetFile := ExtractTargetFile(args)
-						cost := models.Global.CalculateCost(tcModel, promptTokens, completionTokens)
-
-						occurredAt := time.Now().UTC()
-						if created, ok := row["created_at"].(string); ok {
+					occurredAt := time.Now().UTC()
+					for _, key := range []string{"created_at", "timestamp"} {
+						if created, ok := row[key].(string); ok {
 							if t, err := time.Parse(time.RFC3339, created); err == nil {
 								occurredAt = t
+								break
 							}
 						}
+					}
 
-						if isMod {
-							ev := ToolCallEvent{
-								SessionID:        sessionID,
-								AgentName:        agentName,
-								ModelName:        tcModel,
-								ToolName:         name,
-								TargetFile:       targetFile,
-								PromptTokens:     promptTokens,
-								CompletionTokens: completionTokens,
-								CostUSD:          cost,
-								Intent:           context.Intent,
-								OccurredAt:       occurredAt,
-							}
-							modEvents = append(modEvents, ev)
+					if isMod {
+						ev := ToolCallEvent{
+							SessionID:        sessionID,
+							AgentName:        agentName,
+							ModelName:        tcModel,
+							ToolName:         name,
+							TargetFile:       targetFile,
+							PromptTokens:     context.PromptTokens,
+							CompletionTokens: context.CompletionTokens,
+							CostUSD:          context.CostUSD,
+							Intent:           context.Intent,
+							OccurredAt:       occurredAt,
 						}
+						modEvents = append(modEvents, ev)
+					}
 
-						if isRead && targetFile != "" {
-							sLine, eLine, lCount := ExtractLineRange(args)
-							readID := fmt.Sprintf("read-%s-%d", sessionID, lineStart)
-							if readIndex > 0 {
-								readID += fmt.Sprintf("-%d", readIndex)
-							}
-							readIndex++
-							rEv := FileReadEvent{
-								// Keyed by the line's byte offset so the ID is
-								// stable across re-reads (dedup on the PK) and
-								// unique per session file. A per-batch counter
-								// collided across polls, silently discarding
-								// every batch after the first.
-								// Additional reads in the same row need distinct IDs too.
-								ReadID:         readID,
-								SessionID:      sessionID,
-								FilePath:       targetFile,
-								AgentName:      agentName,
-								ModelName:      tcModel,
-								ToolName:       name,
-								StartLine:      sLine,
-								EndLine:        eLine,
-								LinesReadCount: lCount,
-								PromptTokens:   promptTokens,
-								CostUSD:        cost,
-								Intent:         context.Intent,
-								OccurredAt:     occurredAt,
-							}
-							readEvents = append(readEvents, rEv)
+					if isRead && targetFile != "" {
+						sLine, eLine, lCount := ExtractLineRange(args)
+						// The line's content hash rides along with its
+						// offset: a rewritten or replaced transcript restarts
+						// at byte 0, and offset alone gave its new reads the
+						// IDs of the old ones, which the store's ON CONFLICT
+						// DO NOTHING then silently dropped.
+						lineSum := sha256.Sum256(trimmed)
+						readID := fmt.Sprintf("read-%s-%d-%x", sessionID, lineStart, lineSum[:4])
+						if readIndex > 0 {
+							readID += fmt.Sprintf("-%d", readIndex)
 						}
+						readIndex++
+						rEv := FileReadEvent{
+							// Keyed by the line's byte offset so the ID is
+							// stable across re-reads (dedup on the PK) and
+							// unique per session file. A per-batch counter
+							// collided across polls, silently discarding
+							// every batch after the first.
+							// Additional reads in the same row need distinct IDs too.
+							ReadID:         readID,
+							SessionID:      sessionID,
+							RunID:          sessionID,
+							FilePath:       targetFile,
+							AgentName:      agentName,
+							ModelName:      tcModel,
+							ToolName:       name,
+							StartLine:      sLine,
+							EndLine:        eLine,
+							LinesReadCount: lCount,
+							PromptTokens:   usage.prompt,
+							CachedTokens:   usage.cached,
+							CostUSD:        usage.cost,
+							Intent:         context.Intent,
+							OccurredAt:     occurredAt,
+						}
+						if readIndex > 1 {
+							// The row has ONE usage block. Read rows are
+							// summed downstream, so copying it onto every
+							// parallel read multiplied the row's tokens and
+							// cost by the number of reads.
+							rEv.PromptTokens, rEv.CachedTokens, rEv.CostUSD = 0, 0, 0
+						}
+						readEvents = append(readEvents, rEv)
 					}
 				}
 			}
@@ -435,8 +470,9 @@ func readJSONLContext(f *os.File, end int64, context jsonlContext) (jsonlContext
 			first = false
 		}
 		if trimmed := bytes.TrimSpace(line); jsonlRowHasSignals(trimmed) {
-			if row, decodeErr := decodeJSONLRow(trimmed); decodeErr == nil {
+			if row, msg, decodeErr := decodeJSONLRowMessage(trimmed); decodeErr == nil {
 				updateJSONLContext(&context, row)
+				accumulateRowUsage(&context, row, msg)
 			}
 		}
 		if err == io.EOF {
@@ -481,14 +517,14 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 	// share the tasks/sessions/conversations layout (Continue, Zed) never
 	// carry that key, yet are rewritten on every message; decoding each whole
 	// file into nested maps produced nothing.
-	if !bytes.Contains(data, []byte(`"say"`)) {
+	if !bytes.Contains(data, []byte(`"say"`)) && !bytes.Contains(data, []byte(`"ask"`)) {
 		return nil, nil
 	}
 
-	var root map[string]interface{}
+	var decoded interface{}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	if err := decoder.Decode(&root); err != nil {
+	if err := decoder.Decode(&decoded); err != nil {
 		return nil, fmt.Errorf("unmarshal cline task: %w", err)
 	}
 	if len(bytes.TrimSpace(data[decoder.InputOffset():])) != 0 {
@@ -496,6 +532,13 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 	}
 
 	sessionID := sessionIDForPath(filePath)
+	if msgs, ok := decoded.([]interface{}); ok {
+		return parseClineUIMessages(msgs, sessionID), nil
+	}
+	root, ok := decoded.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unmarshal cline task: root is neither an object nor an array")
+	}
 	modelName := "unknown-model"
 	if m := extractModelFromRow(root); m != "" {
 		modelName = m
@@ -538,6 +581,87 @@ func ParseClineTask(filePath string) ([]ToolCallEvent, error) {
 	return events, nil
 }
 
+// clineFileTools are the ClineSayTool kinds that change a file
+// (cline apps/vscode/src/shared/ExtensionMessage.ts).
+var clineFileTools = map[string]bool{"editedExistingFile": true, "newFileCreated": true, "fileDeleted": true}
+
+// parseClineUIMessages reads a Cline/Roo ui_messages.json, the file the
+// extension writes per task (tasks/<taskId>/ui_messages.json): an array of
+// {ts, type, say|ask, text, partial, modelInfo{modelId, providerId}}. A file
+// change is a "tool" message (say when auto-approved, ask otherwise) whose
+// text is a ClineSayTool JSON {tool, path}; usage is the ClineApiReqInfo JSON
+// {tokensIn, tokensOut, cost} in the text of say "api_req_started". Each
+// event carries the task's usage so far, because every report replaces the
+// run's stored totals.
+func parseClineUIMessages(msgs []interface{}, sessionID string) []ToolCallEvent {
+	modelName, provider := "unknown-model", ""
+	var tokensIn, tokensOut int64
+	var cost float64
+	var events []ToolCallEvent
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if mi, ok := m["modelInfo"].(map[string]interface{}); ok {
+			if id, _ := mi["modelId"].(string); id != "" {
+				modelName = id
+			}
+			if p, _ := mi["providerId"].(string); p != "" {
+				provider = p
+			}
+		}
+		if partial, _ := m["partial"].(bool); partial {
+			continue // a streaming row; its final form is stored separately
+		}
+		kind, _ := m["say"].(string)
+		if kind == "" {
+			kind, _ = m["ask"].(string)
+		}
+		text, _ := m["text"].(string)
+		switch kind {
+		case "api_req_started":
+			var info map[string]interface{}
+			if json.Unmarshal([]byte(text), &info) == nil {
+				tokensIn += extractInt64(info, "tokensIn")
+				tokensOut += extractInt64(info, "tokensOut")
+				if c, ok := info["cost"].(float64); ok && c > 0 {
+					cost += c
+				}
+			}
+		case "tool":
+			var tool struct {
+				Tool string `json:"tool"`
+				Path string `json:"path"`
+			}
+			if json.Unmarshal([]byte(text), &tool) != nil || tool.Path == "" || !clineFileTools[tool.Tool] {
+				continue
+			}
+			occurredAt := time.Now().UTC()
+			if ts := extractInt64(m, "ts"); ts > 0 {
+				occurredAt = time.UnixMilli(ts).UTC()
+			}
+			eventCost := cost
+			if eventCost == 0 && (tokensIn > 0 || tokensOut > 0) {
+				eventCost = models.Global.CalculateCost(modelName, tokensIn, tokensOut)
+			}
+			events = append(events, ToolCallEvent{
+				SessionID:        sessionID,
+				AgentName:        "Cline/Roo",
+				ModelName:        modelName,
+				Provider:         provider,
+				ToolName:         tool.Tool,
+				TargetFile:       tool.Path,
+				PromptTokens:     tokensIn,
+				CompletionTokens: tokensOut,
+				CostUSD:          eventCost,
+				OccurredAt:       occurredAt,
+			})
+		}
+	}
+	return events
+}
+
 // ParseAiderHistory parses an Aider Markdown history log.
 func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 	data, err := os.ReadFile(filePath)
@@ -545,17 +669,19 @@ func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 		return nil, fmt.Errorf("read aider history: %w", err)
 	}
 
-	content := string(data)
 	var events []ToolCallEvent
 
+	// The history is append-only across sessions, each announcing its own
+	// model: an edit belongs to the model line most recently above it, not
+	// to the file's first one. Aider prints tool output as "> " quoted lines.
 	model := "unknown-model"
-	if match := aiderModelRe.FindStringSubmatch(content); len(match) > 1 {
-		model = match[1]
-	}
-
-	fileMatches := aiderFileRe.FindAllStringSubmatch(content, -1)
-	for _, fm := range fileMatches {
-		if len(fm) > 1 {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), ">"))
+		if mm := aiderModelRe.FindStringSubmatch(line); len(mm) > 1 {
+			model = mm[1]
+			continue
+		}
+		if fm := aiderFileRe.FindStringSubmatch(line); len(fm) > 1 {
 			events = append(events, ToolCallEvent{
 				// Derived from the path like every other parser: a constant
 				// here collapsed every workspace's aider history into one
@@ -577,8 +703,12 @@ func ParseAiderHistory(filePath string) ([]ToolCallEvent, error) {
 }
 
 var (
-	aiderModelRe     = regexp.MustCompile(`(?i)Model:\s*([\w\.\-]+)`)
-	aiderFileRe      = regexp.MustCompile(`(?i)(?:Applied edit to|Updated|Created|Modified)\s*([\w\.\/\\]+)`)
+	// Anchored to aider's own lines ("Model: x", "Main model: provider/x
+	// with ...", "Applied edit to <path>"). Free-floating verbs matched chat
+	// prose ("Updated the docs" -> "the"), the path class stopped at '-' and
+	// drive colons, and the model class stopped at '/'.
+	aiderModelRe     = regexp.MustCompile(`(?i)^(?:main\s+)?model:\s*([^\s,]+)`)
+	aiderFileRe      = regexp.MustCompile(`^Applied edit to\s+(.+?)\s*$`)
 	modelSelectionRe = regexp.MustCompile(`(?i)(?:Model Selection|Active Model)[\x60'\s:]+(?:from\s+[^\n]+?\s+)?to\s+([A-Za-z0-9\.\-_ ]+?)(?:\s*\(|\n|$)`)
 	modelTagRe       = regexp.MustCompile(`(?i)<(?:model|model_name)>([^<]+)</(?:model|model_name)>|<!--\s*model:\s*([a-zA-Z0-9\.\-_/]+)\s*-->`)
 )
@@ -592,7 +722,7 @@ var (
 // extractModelFromRow read from a transcript line.
 var jsonlRowKeys = func() map[string]struct{} {
 	keys := map[string]struct{}{
-		"content": {}, "type": {}, "usage": {}, "tool_calls": {}, "created_at": {},
+		"content": {}, "type": {}, "usage": {}, "tool_calls": {}, "created_at": {}, "timestamp": {},
 	}
 	for _, k := range modelKeys {
 		keys[k] = struct{}{}
@@ -611,9 +741,132 @@ var jsonlRowKeys = func() map[string]struct{} {
 // they stay raw bytes and are dropped. Key matching and duplicate-key handling
 // are those of map decoding, so the parser sees an identical row.
 func decodeJSONLRow(line []byte) (map[string]interface{}, error) {
+	row, _, err := decodeJSONLRowWith(line, false)
+	return row, err
+}
+
+// decodeJSONLRowMessage is decodeJSONLRow that also decodes the "message"
+// payload of a Claude Code assistant line (nil for every other row).
+func decodeJSONLRowMessage(line []byte) (map[string]interface{}, *claudeMessage, error) {
+	return decodeJSONLRowWith(line, true)
+}
+
+// claudeMessage is the "message" payload of a Claude Code assistant line:
+// tool calls are content blocks, model and usage sit beside them. Only the
+// small input fields the parser reads are decoded; a Write input carries the
+// whole file, and the decoder skips it without allocating.
+type claudeMessage struct {
+	ID      string                 `json:"id"`
+	Model   string                 `json:"model"`
+	Content []claudeBlock          `json:"content"`
+	Usage   map[string]interface{} `json:"usage"`
+}
+
+type claudeBlock struct {
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+	Input struct {
+		FilePath     string      `json:"file_path"`
+		NotebookPath string      `json:"notebook_path"`
+		Path         string      `json:"path"`
+		Offset       interface{} `json:"offset"`
+		Limit        interface{} `json:"limit"`
+	} `json:"input"`
+}
+
+// toolCalls returns the message's file tool_use blocks in the generic
+// tool_calls shape ({"name", "args"}).
+func (m *claudeMessage) toolCalls() []interface{} {
+	var calls []interface{}
+	for _, b := range m.Content {
+		if b.Type != "tool_use" || (!IsFileModifyingTool(b.Name) && !IsFileReadingTool(b.Name)) {
+			continue
+		}
+		args := map[string]interface{}{}
+		for _, p := range []string{b.Input.FilePath, b.Input.NotebookPath, b.Input.Path} {
+			if p != "" {
+				args["file_path"] = p
+				break
+			}
+		}
+		if b.Input.Offset != nil {
+			args["offset"] = b.Input.Offset
+		}
+		if b.Input.Limit != nil {
+			args["limit"] = b.Input.Limit
+		}
+		calls = append(calls, map[string]interface{}{"name": b.Name, "args": args})
+	}
+	return calls
+}
+
+// rowUsage is one transcript row's own usage, after deduplication.
+type rowUsage struct {
+	prompt, completion, cached int64
+	cost                       float64
+}
+
+// accumulateRowUsage adds a row's usage to the session totals in c and
+// returns it. Claude Code lines report usage under message.usage (input
+// excludes cache reads/writes, which still count as prompt) and repeat one
+// response's usage on each of its content-block lines, so it is counted once
+// per message id. Its model also comes from the message.
+func accumulateRowUsage(c *jsonlContext, row map[string]interface{}, msg *claudeMessage) rowUsage {
+	var u rowUsage
+	if msg != nil {
+		if m := normalizeModelName(msg.Model); m != "" && !strings.HasPrefix(msg.Model, "<") && !models.IsJunkModel(m) {
+			c.ModelName = m
+		}
+		if msg.ID != "" && msg.ID == c.LastMessageID {
+			return u
+		}
+		c.LastMessageID = msg.ID
+		if msg.Usage == nil {
+			return u
+		}
+		u.cached = extractInt64(msg.Usage, "cache_read_input_tokens")
+		u.prompt = extractInt64(msg.Usage, "input_tokens") + u.cached + extractInt64(msg.Usage, "cache_creation_input_tokens")
+		u.completion = extractInt64(msg.Usage, "output_tokens")
+		u.cost, _ = models.Global.CalculateCostDetailed("", c.ModelName, u.prompt, u.completion, u.cached)
+	} else if usage, ok := row["usage"].(map[string]interface{}); ok {
+		u.prompt = extractInt64(usage, "input_tokens", "prompt_tokens", "promptTokenCount", "inputTokens")
+		u.completion = extractInt64(usage, "output_tokens", "completion_tokens", "candidatesTokenCount", "outputTokens")
+		cacheRead := extractInt64(usage, "cache_read_input_tokens")
+		for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
+			if details, ok := usage[key].(map[string]interface{}); ok {
+				u.cached = extractInt64(details, "cached_tokens", "cache_read_tokens")
+				if u.cached > 0 {
+					break
+				}
+			}
+		}
+		if u.cached == 0 {
+			u.cached = extractInt64(usage, "cache_read_input_tokens", "prompt_cache_hit_tokens", "cachedContentTokenCount", "cached_tokens")
+		}
+		// Only Anthropic's direct fields are additive. Responses input_tokens
+		// already includes its input_tokens_details.cached_tokens.
+		if _, ok := usage["input_tokens"]; ok {
+			u.prompt += cacheRead + extractInt64(usage, "cache_creation_input_tokens")
+		}
+		// A normalized output total already includes thinking. Only add
+		// Gemini's separate thoughts counter when no such total was supplied.
+		if usage["output_tokens"] == nil && usage["completion_tokens"] == nil {
+			if _, candidates := usage["candidatesTokenCount"]; candidates || usage["outputTokens"] == nil {
+				u.completion += extractInt64(usage, "thoughtsTokenCount")
+			}
+		}
+		u.cost, _ = models.Global.CalculateCostDetailed("", c.ModelName, u.prompt, u.completion, u.cached)
+	}
+	c.PromptTokens += u.prompt
+	c.CompletionTokens += u.completion
+	c.CostUSD += u.cost
+	return u
+}
+
+func decodeJSONLRowWith(line []byte, withMessage bool) (map[string]interface{}, *claudeMessage, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(line, &raw); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	row := make(map[string]interface{}, 4)
 	for k, v := range raw {
@@ -624,11 +877,20 @@ func decodeJSONLRow(line []byte) (map[string]interface{}, error) {
 		decoder := json.NewDecoder(bytes.NewReader(v))
 		decoder.UseNumber()
 		if err := decoder.Decode(&val); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		row[k] = val
 	}
-	return row, nil
+	var msg *claudeMessage
+	if m, ok := raw["message"]; ok && withMessage && row["type"] == "assistant" {
+		// Unmarshal, not a Decoder: a Decoder copies the whole payload
+		// (often a file) into its buffer first.
+		var cm claudeMessage
+		if json.Unmarshal(m, &cm) == nil {
+			msg = &cm
+		}
+	}
+	return row, msg, nil
 }
 
 func extractModelFromRow(m map[string]interface{}) string {

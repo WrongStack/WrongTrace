@@ -174,83 +174,217 @@ func Diff(repoName string, prev, next *FileSnapshot) DiffResult {
 		return res
 	}
 
-	prevSigs := prev.SortedSignatures()
-	nextSigs := next.SortedSignatures()
-
-	// DELETED first — anything in prev but not in next.
-	for _, sig := range prevSigs {
-		if _, ok := next.Nodes[sig]; !ok {
-			n := prev.Nodes[sig]
-			diff, added, deleted := formatDeletedDiff(nodeBody(prevSrc(), n))
-			res.Events = append(res.Events, Event{
-				RepoName:     repoName,
-				FilePath:     prev.Path,
-				Signature:    sig,
-				NodeType:     n.Kind,
-				Action:       ActionDeleted,
-				BodyHash:     n.Hash,
-				LOC:          n.LOC,
-				StartLine:    n.StartLine,
-				EndLine:      n.EndLine,
-				DiffSnippet:  diff,
-				AddedLines:   added,
-				DeletedLines: deleted,
-				OccurredAt:   now,
-			})
+	deleted := func(sig string, n Node) Event {
+		diff, added, deleted := formatDeletedDiff(nodeBody(prevSrc(), n))
+		return Event{
+			RepoName:     repoName,
+			FilePath:     prev.Path,
+			Signature:    sig,
+			NodeType:     n.Kind,
+			Action:       ActionDeleted,
+			BodyHash:     n.Hash,
+			LOC:          n.LOC,
+			StartLine:    n.StartLine,
+			EndLine:      n.EndLine,
+			DiffSnippet:  diff,
+			AddedLines:   added,
+			DeletedLines: deleted,
+			OccurredAt:   now,
+		}
+	}
+	added := func(sig string, n Node) Event {
+		diff, added, deleted := formatAddedDiff(nodeBody(nextSrc(), n))
+		return Event{
+			RepoName:     repoName,
+			FilePath:     next.Path,
+			Signature:    sig,
+			NodeType:     n.Kind,
+			Action:       ActionAdded,
+			BodyHash:     n.Hash,
+			LOC:          n.LOC,
+			StartLine:    n.StartLine,
+			EndLine:      n.EndLine,
+			DiffSnippet:  diff,
+			AddedLines:   added,
+			DeletedLines: deleted,
+			OccurredAt:   now,
+		}
+	}
+	modified := func(sig string, oldNode, newNode Node) Event {
+		diff, added, deleted := generateLineDiff(nodeBody(prevSrc(), oldNode), nodeBody(nextSrc(), newNode))
+		return Event{
+			RepoName:     repoName,
+			FilePath:     next.Path,
+			Signature:    sig,
+			NodeType:     newNode.Kind,
+			Action:       ActionModified,
+			BodyHash:     newNode.Hash,
+			LOC:          newNode.LOC,
+			StartLine:    newNode.StartLine,
+			EndLine:      newNode.EndLine,
+			DiffSnippet:  diff,
+			AddedLines:   added,
+			DeletedLines: deleted,
+			OccurredAt:   now,
 		}
 	}
 
-	// MODIFIED — same signature, hash changed.
-	// ADDED — new signature.
-	for _, sig := range nextSigs {
-		newNode := next.Nodes[sig]
-		if _, existed := prev.Nodes[sig]; !existed {
-			diff, added, deleted := formatAddedDiff(nodeBody(nextSrc(), newNode))
-			res.Events = append(res.Events, Event{
-				RepoName:     repoName,
-				FilePath:     next.Path,
-				Signature:    sig,
-				NodeType:     newNode.Kind,
-				Action:       ActionAdded,
-				BodyHash:     newNode.Hash,
-				LOC:          newNode.LOC,
-				StartLine:    newNode.StartLine,
-				EndLine:      newNode.EndLine,
-				DiffSnippet:  diff,
-				AddedLines:   added,
-				DeletedLines: deleted,
-				OccurredAt:   now,
-			})
-			continue
+	// Same-named declarations (several Go init funcs, getter/setter pairs)
+	// are keyed base, base#2, base#3 in document order. Comparing those keys
+	// one-to-one made the suffix positional: inserting one above the others
+	// re-keyed every later one, reporting untouched bodies as MODIFIED. Each
+	// base name's occurrences are aligned by body hash instead (unchanged
+	// ones anchor), and only the gaps between anchors pair up positionally.
+	prevGroups := groupByBase(prev)
+	nextGroups := groupByBase(next)
+	for base, ps := range prevGroups {
+		if _, ok := nextGroups[base]; !ok {
+			for _, sig := range ps {
+				res.Events = append(res.Events, deleted(sig, prev.Nodes[sig]))
+			}
 		}
-		oldNode := prev.Nodes[sig]
-		if oldNode.Hash != newNode.Hash {
-			diff, added, deleted := generateLineDiff(nodeBody(prevSrc(), oldNode), nodeBody(nextSrc(), newNode))
-			res.Events = append(res.Events, Event{
-				RepoName:     repoName,
-				FilePath:     next.Path,
-				Signature:    sig,
-				NodeType:     newNode.Kind,
-				Action:       ActionModified,
-				BodyHash:     newNode.Hash,
-				LOC:          newNode.LOC,
-				StartLine:    newNode.StartLine,
-				EndLine:      newNode.EndLine,
-				DiffSnippet:  diff,
-				AddedLines:   added,
-				DeletedLines: deleted,
-				OccurredAt:   now,
-			})
+	}
+	for base, ns := range nextGroups {
+		for _, step := range alignOccurrences(prev, next, prevGroups[base], ns) {
+			switch {
+			case step.prev == "":
+				res.Events = append(res.Events, added(step.next, next.Nodes[step.next]))
+			case step.next == "":
+				res.Events = append(res.Events, deleted(step.prev, prev.Nodes[step.prev]))
+			default:
+				if oldNode, newNode := prev.Nodes[step.prev], next.Nodes[step.next]; oldNode.Hash != newNode.Hash {
+					res.Events = append(res.Events, modified(step.next, oldNode, newNode))
+				}
+			}
 		}
 	}
 
-	// Stable ordering: deleted, modified, added.
+	// Stable ordering: deleted, modified, added; by signature within each,
+	// as the per-signature loops used to emit them.
 	sort.SliceStable(res.Events, func(i, j int) bool {
-		return actionRank(res.Events[i].Action) < actionRank(res.Events[j].Action)
+		ri, rj := actionRank(res.Events[i].Action), actionRank(res.Events[j].Action)
+		if ri != rj {
+			return ri < rj
+		}
+		return res.Events[i].Signature < res.Events[j].Signature
 	})
 
 	res.NewSnap = next
 	return res
+}
+
+// occurrenceBase splits walk's occurrence suffix off a signature:
+// "func:a.go::init#3" is occurrence 3 of "func:a.go::init".
+func occurrenceBase(sig string) (string, int) {
+	i := strings.LastIndexByte(sig, '#')
+	if i <= 0 || i == len(sig)-1 {
+		return sig, 1
+	}
+	n := 0
+	for _, c := range sig[i+1:] {
+		if c < '0' || c > '9' || n > 1<<20 {
+			return sig, 1
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n < 2 {
+		return sig, 1
+	}
+	return sig[:i], n
+}
+
+// groupByBase lists each base signature's occurrences in document order.
+func groupByBase(s *FileSnapshot) map[string][]string {
+	type occ struct {
+		sig string
+		n   int
+	}
+	tmp := make(map[string][]occ, len(s.Nodes))
+	for sig := range s.Nodes {
+		base, n := occurrenceBase(sig)
+		tmp[base] = append(tmp[base], occ{sig, n})
+	}
+	groups := make(map[string][]string, len(tmp))
+	for base, os := range tmp {
+		sort.Slice(os, func(i, j int) bool { return os[i].n < os[j].n })
+		sigs := make([]string, len(os))
+		for i, o := range os {
+			sigs[i] = o.sig
+		}
+		groups[base] = sigs
+	}
+	return groups
+}
+
+// alignStep pairs a previous occurrence with a next one; an empty side means
+// the occurrence was added (prev == "") or deleted (next == "").
+type alignStep struct{ prev, next string }
+
+// alignOccurrences matches one base name's occurrences across snapshots.
+// Occurrences with identical bodies anchor (longest common subsequence over
+// body hashes); between anchors the rest pair up in order, and any surplus
+// is an addition or deletion.
+func alignOccurrences(prev, next *FileSnapshot, ps, ns []string) []alignStep {
+	if len(ps) <= 1 && len(ns) <= 1 {
+		switch {
+		case len(ps) == 0 && len(ns) == 0:
+			return nil
+		case len(ps) == 0:
+			return []alignStep{{next: ns[0]}}
+		case len(ns) == 0:
+			return []alignStep{{prev: ps[0]}}
+		}
+		return []alignStep{{prev: ps[0], next: ns[0]}}
+	}
+	m, n := len(ps), len(ns)
+	lcs := make([][]int, m+1)
+	for i := range lcs {
+		lcs[i] = make([]int, n+1)
+	}
+	for i := m - 1; i >= 0; i-- {
+		for j := n - 1; j >= 0; j-- {
+			if prev.Nodes[ps[i]].Hash == next.Nodes[ns[j]].Hash {
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			} else {
+				lcs[i][j] = max(lcs[i+1][j], lcs[i][j+1])
+			}
+		}
+	}
+	var steps []alignStep
+	var gapP, gapN []string
+	flush := func() {
+		k := 0
+		for ; k < len(gapP) && k < len(gapN); k++ {
+			steps = append(steps, alignStep{prev: gapP[k], next: gapN[k]})
+		}
+		for _, p := range gapP[k:] {
+			steps = append(steps, alignStep{prev: p})
+		}
+		for _, q := range gapN[k:] {
+			steps = append(steps, alignStep{next: q})
+		}
+		gapP, gapN = gapP[:0], gapN[:0]
+	}
+	i, j := 0, 0
+	for i < m && j < n {
+		switch {
+		case prev.Nodes[ps[i]].Hash == next.Nodes[ns[j]].Hash && lcs[i][j] == lcs[i+1][j+1]+1:
+			flush()
+			steps = append(steps, alignStep{prev: ps[i], next: ns[j]})
+			i++
+			j++
+		case lcs[i+1][j] >= lcs[i][j+1]:
+			gapP = append(gapP, ps[i])
+			i++
+		default:
+			gapN = append(gapN, ns[j])
+			j++
+		}
+	}
+	gapP = append(gapP, ps[i:]...)
+	gapN = append(gapN, ns[j:]...)
+	flush()
+	return steps
 }
 
 // nodeBody resolves a native parser node directly from the snapshot's single

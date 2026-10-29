@@ -23,6 +23,12 @@ interface SplitDiffRow {
   rightType?: 'add' | 'context' | 'empty';
 }
 
+// internal/ast/diff.go prefixes every line with a 2-char marker ("+ ", "- ",
+// "  "). The gutter already shows it, so the content column drops it for
+// context lines too; leaving their "  " shifted unchanged code two columns
+// right of the changed lines around it.
+const stripDiffMarker = (text: string) => text.replace(/^(?:[+-] ?| {2})/, '');
+
 export function RichDiffViewer({
   diff,
   filePath,
@@ -276,7 +282,7 @@ export function RichDiffViewer({
                   <span className="inline-block w-4 text-slate-500 select-none shrink-0 font-bold">
                     {isAdd ? '+' : isDel ? '-' : ' '}
                   </span>
-                  <span className="flex-1 break-all">{line.text.replace(/^[+-]\s?/, '')}</span>
+                  <span className="flex-1 break-all">{stripDiffMarker(line.text)}</span>
                 </div>
               );
             })}
@@ -304,7 +310,7 @@ export function RichDiffViewer({
                   <span className="inline-block w-6 text-slate-600 select-none text-right shrink-0 pr-2">
                     {row.leftNum || ''}
                   </span>
-                  <span className="flex-1 truncate">{row.leftText ? row.leftText.replace(/^-\s?/, '') : ''}</span>
+                  <span className="flex-1 truncate">{row.leftText ? stripDiffMarker(row.leftText) : ''}</span>
                 </div>
               ))}
             </div>
@@ -328,7 +334,7 @@ export function RichDiffViewer({
                   <span className="inline-block w-6 text-slate-600 select-none text-right shrink-0 pr-2">
                     {row.rightNum || ''}
                   </span>
-                  <span className="flex-1 truncate">{row.rightText ? row.rightText.replace(/^\+\s?/, '') : ''}</span>
+                  <span className="flex-1 truncate">{row.rightText ? stripDiffMarker(row.rightText) : ''}</span>
                 </div>
               ))}
             </div>

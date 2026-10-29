@@ -38,7 +38,7 @@ type PayloadAnalysis struct {
 	// estPromptTokens is the request-side token estimate computed during the
 	// request decode, so the fallback never re-parses the body.
 	estPromptTokens int64
-	// Responses usage may explicitly report zero. Preserve that distinction
+	// Provider usage may explicitly report zero. Preserve that distinction
 	// from absent usage when applying analyzer and gateway fallbacks.
 	promptTokensReported     bool
 	completionTokensReported bool
@@ -249,6 +249,10 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 				pa.FinishReason = cand.FinishReason
 			}
 			for _, part := range cand.Content.Parts {
+				if part.FunctionCall != nil {
+					pa.ToolCalls = append(pa.ToolCalls, geminiToolCall(part.FunctionCall.Name, part.FunctionCall.Args))
+					continue
+				}
 				if part.Thought {
 					pa.Reasoning += part.Text
 				} else {
@@ -276,13 +280,15 @@ func (pa *PayloadAnalysis) parseJSONResponse(data []byte) bool {
 		if chunk.DoneReason != "" {
 			pa.FinishReason = chunk.DoneReason
 		}
-		if chunk.PromptEvalCount > 0 {
-			pa.PromptTokens = int64(chunk.PromptEvalCount)
+		if chunk.PromptEvalCount != nil {
+			pa.PromptTokens = int64(*chunk.PromptEvalCount)
+			pa.promptTokensReported = true
 		}
-		if chunk.EvalCount > 0 {
-			pa.CompletionTokens = int64(chunk.EvalCount)
+		if chunk.EvalCount != nil {
+			pa.CompletionTokens = int64(*chunk.EvalCount)
+			pa.completionTokensReported = true
 		}
-		if (chunk.PromptEvalCount > 0 || chunk.EvalCount > 0) && pa.TotalTokens < pa.PromptTokens+pa.CompletionTokens {
+		if chunk.PromptEvalCount != nil || chunk.EvalCount != nil {
 			pa.TotalTokens = pa.PromptTokens + pa.CompletionTokens
 		}
 	}
@@ -373,14 +379,20 @@ type sseStreamChunk struct {
 	// raw because OpenAI Responses API events use "response" for an object.
 	Response        json.RawMessage `json:"response"`
 	DoneReason      string          `json:"done_reason"`
-	PromptEvalCount float64         `json:"prompt_eval_count"`
-	EvalCount       float64         `json:"eval_count"`
+	PromptEvalCount *float64        `json:"prompt_eval_count"`
+	EvalCount       *float64        `json:"eval_count"`
 	// Gemini generateContent / streamGenerateContent chunks.
 	Candidates []struct {
 		Content struct {
 			Parts []struct {
 				Text    string `json:"text"`
 				Thought bool   `json:"thought"`
+				// Gemini's tool call; nothing read it, so Gemini traffic
+				// never registered a file edit or read.
+				FunctionCall *struct {
+					Name string                 `json:"name"`
+					Args map[string]interface{} `json:"args"`
+				} `json:"functionCall"`
 			} `json:"parts"`
 		} `json:"content"`
 		FinishReason string `json:"finishReason"`
@@ -446,7 +458,17 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 				pa.WireModel = chunk.Message.Model
 			}
 			if chunk.Message.Usage != nil {
-				pa.extractUsage(chunk.Message.Usage)
+				// message_start's output_tokens is a placeholder (1); the real
+				// count arrives in message_delta. Taking it as reported left
+				// every interrupted stream at 1 output token, since the
+				// estimate below only fills a count nobody reported.
+				usage := make(map[string]interface{}, len(chunk.Message.Usage))
+				for k, v := range chunk.Message.Usage {
+					if k != "output_tokens" {
+						usage[k] = v
+					}
+				}
+				pa.extractUsage(usage)
 			}
 		}
 
@@ -532,6 +554,11 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 				pa.FinishReason = cand.FinishReason
 			}
 			for _, part := range cand.Content.Parts {
+				if part.FunctionCall != nil {
+					// Gemini streams each call whole in one part.
+					pa.ToolCalls = append(pa.ToolCalls, geminiToolCall(part.FunctionCall.Name, part.FunctionCall.Args))
+					continue
+				}
 				if part.Thought {
 					reasoningBuilder.WriteString(part.Text)
 				} else {
@@ -561,13 +588,15 @@ func (pa *PayloadAnalysis) parseSSEResponse(data []byte, reqBody []byte) {
 		if chunk.DoneReason != "" {
 			pa.FinishReason = chunk.DoneReason
 		}
-		if chunk.PromptEvalCount > 0 {
-			pa.PromptTokens = int64(chunk.PromptEvalCount)
+		if chunk.PromptEvalCount != nil {
+			pa.PromptTokens = int64(*chunk.PromptEvalCount)
+			pa.promptTokensReported = true
 		}
-		if chunk.EvalCount > 0 {
-			pa.CompletionTokens = int64(chunk.EvalCount)
+		if chunk.EvalCount != nil {
+			pa.CompletionTokens = int64(*chunk.EvalCount)
+			pa.completionTokensReported = true
 		}
-		if (chunk.PromptEvalCount > 0 || chunk.EvalCount > 0) && pa.TotalTokens < pa.PromptTokens+pa.CompletionTokens {
+		if chunk.PromptEvalCount != nil || chunk.EvalCount != nil {
 			pa.TotalTokens = pa.PromptTokens + pa.CompletionTokens
 		}
 	}
@@ -697,36 +726,54 @@ func (pa *PayloadAnalysis) extractUsage(usageMap map[string]interface{}) {
 	}
 
 	// Prompt / Input Tokens
-	if pt, ok := usageMap["input_tokens"].(float64); ok && (pt > 0 || cacheRead > 0 || cacheCreate > 0) {
+	if pt, ok := usageMap["input_tokens"].(float64); ok {
 		// In Anthropic/MiniMax API specs, input_tokens is NON-cached delta.
 		// Total actual prompt context sent to model is input_tokens + cache_read + cache_creation.
 		pa.PromptTokens = int64(pt) + cacheRead + cacheCreate
+		pa.promptTokensReported = true
 	} else if pt, ok := usageMap["prompt_tokens"].(float64); ok {
 		pa.PromptTokens = int64(pt)
+		pa.promptTokensReported = true
 		if pa.CachedTokens > pa.PromptTokens {
 			// Some providers report non-cached delta as prompt_tokens while returning large cache_read
 			pa.PromptTokens += pa.CachedTokens
 		}
 	} else if pt, ok := usageMap["promptTokenCount"].(float64); ok {
 		pa.PromptTokens = int64(pt)
+		pa.promptTokensReported = true
 	} else if cacheRead > 0 {
 		pa.PromptTokens = cacheRead + cacheCreate
+		pa.promptTokensReported = true
 	}
 
 	// Completion / Output Tokens
-	if ct, ok := usageMap["completion_tokens"].(float64); ok && ct > 0 {
+	candidates, hasCandidates := usageMap["candidatesTokenCount"].(float64)
+	th, hasThoughts := usageMap["thoughtsTokenCount"].(float64)
+	if ct, ok := usageMap["completion_tokens"].(float64); ok {
 		pa.CompletionTokens = int64(ct)
-	} else if ct, ok := usageMap["output_tokens"].(float64); ok && ct > 0 {
+		pa.completionTokensReported = true
+	} else if ct, ok := usageMap["output_tokens"].(float64); ok {
 		pa.CompletionTokens = int64(ct)
-	} else if ct, ok := usageMap["candidatesTokenCount"].(float64); ok && ct > 0 {
-		pa.CompletionTokens = int64(ct)
+		pa.completionTokensReported = true
+	} else if hasCandidates || hasThoughts {
+		// Gemini reports thinking in thoughtsTokenCount, outside
+		// candidatesTokenCount but inside totalTokenCount, and bills it as
+		// output. Assigned (not added) because every streamed chunk repeats
+		// the running usage snapshot.
+		pa.CompletionTokens = int64(candidates + th)
+		pa.completionTokensReported = true
+		if hasThoughts {
+			pa.ReasoningTokens = int64(th)
+		}
 	}
 
 	// Total Tokens
-	if tt, ok := usageMap["total_tokens"].(float64); ok && tt > 0 {
+	if tt, ok := usageMap["total_tokens"].(float64); ok {
 		pa.TotalTokens = int64(tt)
-	} else if tt, ok := usageMap["totalTokenCount"].(float64); ok && tt > 0 {
+	} else if tt, ok := usageMap["totalTokenCount"].(float64); ok {
 		pa.TotalTokens = int64(tt)
+	} else {
+		pa.TotalTokens = pa.PromptTokens + pa.CompletionTokens
 	}
 	if pa.TotalTokens < pa.PromptTokens+pa.CompletionTokens {
 		pa.TotalTokens = pa.PromptTokens + pa.CompletionTokens
@@ -913,6 +960,15 @@ func extractFileFromArgsString(args string) string {
 var extractFileKeys = []string{
 	"AbsolutePath", "target_file", "TargetFile", "path", "FilePath", "file_path",
 	"filename", "file", "target", "dest", "uri",
+}
+
+// geminiToolCall maps a Gemini functionCall part onto a ProxyToolCall.
+func geminiToolCall(name string, args map[string]interface{}) ProxyToolCall {
+	argStr := "{}"
+	if b, err := json.Marshal(args); err == nil && args != nil {
+		argStr = string(b)
+	}
+	return ProxyToolCall{Name: name, TargetFile: extractFileFromMap(args), Arguments: argStr}
 }
 
 func extractFileFromMap(m map[string]interface{}) string {

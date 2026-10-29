@@ -29,6 +29,10 @@ type InstanceLock struct {
 	lockPath string
 	pidPath  string
 	file     *os.File
+	// pid is the content this instance wrote to pidPath, or "" when that
+	// advisory write failed. Release only removes a pid file that still
+	// carries it.
+	pid string
 }
 
 // Acquire attempts to acquire the single-instance daemon lock in dataDir.
@@ -43,10 +47,17 @@ func Acquire(dataDir string, port int) (*InstanceLock, error) {
 	lockPath := filepath.Join(dataDir, "daemon.lock")
 
 	// 1. Check if an existing PID is registered and alive
+	livePID := 0
 	if raw, err := os.ReadFile(pidPath); err == nil {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 0 {
 			if isDaemonAlive(pid, port) {
-				return nil, fmt.Errorf("%w (PID %d on port %d)", ErrAlreadyRunning, pid, port)
+				if port > 0 {
+					return nil, fmt.Errorf("%w (PID %d on port %d)", ErrAlreadyRunning, pid, port)
+				}
+				// Without a port, "alive" only means some process has this
+				// PID, which a recycled PID satisfies. Let the lock decide and
+				// keep the PID for the message if it really is held.
+				livePID = pid
 			}
 		}
 	}
@@ -69,16 +80,21 @@ func Acquire(dataDir string, port int) (*InstanceLock, error) {
 	if err := tryLock(f); err != nil {
 		_ = f.Close()
 		if errors.Is(err, ErrAlreadyRunning) {
+			if livePID > 0 {
+				return nil, fmt.Errorf("%w (PID %d, lock file held by another daemon)", ErrAlreadyRunning, livePID)
+			}
 			return nil, fmt.Errorf("%w (lock file held by another daemon)", ErrAlreadyRunning)
 		}
 		return nil, err
 	}
 
-	// Record current PID
+	// Record current PID. The file is advisory -- it only feeds the friendly
+	// message in step 1 -- so a failed write must not give up the lock: the
+	// caller treats any non-ErrAlreadyRunning error as "continue unlocked",
+	// which let every start run concurrently while daemon.pid was unwritable.
 	currentPID := strconv.Itoa(os.Getpid())
 	if err := os.WriteFile(pidPath, []byte(currentPID), 0o644); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("write pid file: %w", err)
+		currentPID = ""
 	}
 
 	return &InstanceLock{
@@ -86,20 +102,28 @@ func Acquire(dataDir string, port int) (*InstanceLock, error) {
 		lockPath: lockPath,
 		pidPath:  pidPath,
 		file:     f,
+		pid:      currentPID,
 	}, nil
 }
 
 // Release releases the lock and removes the PID file. daemon.lock itself is
 // deliberately kept: removing it would let a second process open a new file
 // (new inode) and lock that instead of contending with the live lock holder.
+//
+// The PID file is removed BEFORE the handle closes, and only if it still
+// carries our PID: once the lock is released a successor can acquire it and
+// write its own PID, which a later remove would delete. Release is idempotent.
 func (l *InstanceLock) Release() {
-	if l == nil {
+	if l == nil || l.file == nil {
 		return
 	}
-	if l.file != nil {
-		_ = l.file.Close() // closing the handle releases the OS lock
+	if l.pid != "" {
+		if raw, err := os.ReadFile(l.pidPath); err == nil && strings.TrimSpace(string(raw)) == l.pid {
+			_ = os.Remove(l.pidPath)
+		}
 	}
-	_ = os.Remove(l.pidPath)
+	_ = l.file.Close() // closing the handle releases the OS lock
+	l.file = nil
 }
 
 // isDaemonAlive checks if a process with the given PID is running and responds on the health port.

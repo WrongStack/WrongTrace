@@ -212,6 +212,12 @@ func (e *Engine) ListLocks() []LockInfo {
 
 // CheckGuardrail assesses file safety before an AI agent attempts to edit it.
 func (e *Engine) CheckGuardrail(path string) (GuardrailResult, error) {
+	return e.CheckGuardrailIn(path, "")
+}
+
+// CheckGuardrailIn is CheckGuardrail with the file's history limited to repo
+// ("" picks fileScope's default).
+func (e *Engine) CheckGuardrailIn(path, repo string) (GuardrailResult, error) {
 	locked, lockInfo := e.IsFileLocked(path)
 	if locked {
 		if e.webhooks != nil {
@@ -238,13 +244,13 @@ func (e *Engine) CheckGuardrail(path string) (GuardrailResult, error) {
 			// safety harvest another agent's credential and present it
 			// back to unlock_file. The holder's name and reason stay for
 			// diagnostics; only the authorization material is withheld.
-			LockExpiresAt: expPtr,
+			LockExpiresAt:  expPtr,
 			Recommendation: "BLOCKED: File is locked against automated agent changes.",
 			CheckedAt:      time.Now().UTC(),
 		}, nil
 	}
 
-	h, err := e.FileHealth(path)
+	h, err := e.FileHealthIn(path, repo)
 	if err != nil {
 		return GuardrailResult{}, fmt.Errorf("check guardrail file health: %w", err)
 	}
@@ -252,7 +258,7 @@ func (e *Engine) CheckGuardrail(path string) (GuardrailResult, error) {
 	allowed := true
 	rec := "Safe to modify."
 
-	if h.IsFragile || h.HealthScore < 40 {
+	if _, cutoff := guardrailThresholds(); h.IsFragile || h.HealthScore < cutoff {
 		allowed = false
 		rec = fmt.Sprintf("GUARDRAIL WARNING: File %s has high churn (Health Score: %d/100, %d thrash events). Consider human review.", path, h.HealthScore, h.RecentThrashingCount)
 		if e.webhooks != nil {

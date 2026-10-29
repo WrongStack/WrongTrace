@@ -34,9 +34,15 @@ func silenceLog(t *testing.T) {
 // return, failing the test if it never does.
 func runSupervised(t *testing.T, ctx context.Context, fn func() error) {
 	t.Helper()
+	runSupervisedWith(t, ctx, testPolicy, fn)
+}
+
+// runSupervisedWith is runSupervised on an explicit policy.
+func runSupervisedWith(t *testing.T, ctx context.Context, pol supervisePolicy, fn func() error) {
+	t.Helper()
 	done := make(chan struct{})
 	go func() {
-		superviseLoopWith(ctx, "test", testPolicy, fn)
+		superviseLoopWith(ctx, "test", pol, fn)
 		close(done)
 	}()
 	select {
@@ -44,6 +50,29 @@ func runSupervised(t *testing.T, ctx context.Context, fn func() error) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("superviseLoop did not return after cancellation")
 	}
+}
+
+// captureWaits returns testPolicy with its inter-attempt wait replaced by a
+// recorder that returns immediately, so the ramp can be asserted on the delays
+// the loop REQUESTED -- the actual contract.
+//
+// The previous assertions measured the wall-clock gap between attempt STARTS,
+// which is (the requested wait) + (the attempt's own runtime) + (scheduler
+// wakeup jitter). Nothing bounds the last two, so a correct ramp failed its
+// assertion as soon as one attempt outlasted the next nominal delay: measured
+// on a loaded machine, a 20ms->40ms step read as 46.8ms followed by 40.2ms, and
+// a first attempt taking 50ms produces [71.6ms 40.5ms 80.3ms] for the correct
+// 20ms/40ms/80ms ramp. The recorded waits are appended from the supervisor's
+// goroutine but read only after runSupervisedWith returns, which is ordered by
+// the done channel.
+func captureWaits(t *testing.T, waits *[]time.Duration) supervisePolicy {
+	t.Helper()
+	pol := testPolicy
+	pol.sleep = func(_ context.Context, d time.Duration) bool {
+		*waits = append(*waits, d)
+		return true
+	}
+	return pol
 }
 
 // TestSuperviseLoop_RestartsOnError is the core contract: a component that
@@ -97,32 +126,29 @@ func TestSuperviseLoop_BacksOffOnRepeatedFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var starts []time.Time
-	runSupervised(t, ctx, func() error {
-		starts = append(starts, time.Now())
-		if len(starts) >= 4 {
+	var waits []time.Duration
+	var attempts atomic.Int32
+	runSupervisedWith(t, ctx, captureWaits(t, &waits), func() error {
+		if attempts.Add(1) >= 4 {
 			cancel()
 		}
 		return errors.New("permanent")
 	})
 
-	if len(starts) < 4 {
-		t.Fatalf("only %d attempts recorded, want 4", len(starts))
+	// The contract is the ramp the loop REQUESTS: each consecutive failure
+	// doubles the wait. Asserting it on the requested delays is what makes this
+	// deterministic -- see captureWaits for why the wall-clock gaps it replaced
+	// could fail a ramp that was correct.
+	want := []time.Duration{testPolicy.minDelay, 2 * testPolicy.minDelay, 4 * testPolicy.minDelay}
+	if len(waits) < len(want) {
+		t.Fatalf("supervisor requested %d waits (%v), want at least %d: %v",
+			len(waits), waits, len(want), want)
 	}
-	// Waits between attempts 1->2, 2->3, 3->4 must each roughly double.
-	var gaps []time.Duration
-	for i := 1; i < 4; i++ {
-		gaps = append(gaps, starts[i].Sub(starts[i-1]))
-	}
-	for i := 1; i < len(gaps); i++ {
-		if gaps[i] <= gaps[i-1] {
-			t.Errorf("wait before attempt %d was %s, not longer than the previous %s; "+
-				"repeated failures are not backing off", i+2, gaps[i], gaps[i-1])
+	for i, w := range want {
+		if waits[i] != w {
+			t.Errorf("wait %d = %s, want %s: consecutive failures must double the delay",
+				i+1, waits[i], w)
 		}
-	}
-	if gaps[len(gaps)-1] < 2*testPolicy.minDelay {
-		t.Errorf("last wait was only %s; expected the delay to have ramped past the %s floor",
-			gaps[len(gaps)-1], testPolicy.minDelay)
 	}
 }
 
@@ -134,25 +160,36 @@ func TestSuperviseLoop_CapsBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var starts []time.Time
-	runSupervised(t, ctx, func() error {
-		starts = append(starts, time.Now())
-		if len(starts) >= 8 {
+	var waits []time.Duration
+	var attempts atomic.Int32
+	runSupervisedWith(t, ctx, captureWaits(t, &waits), func() error {
+		if attempts.Add(1) >= 10 {
 			cancel()
 		}
 		return errors.New("permanent")
 	})
 
-	if len(starts) < 8 {
-		t.Fatalf("only %d attempts recorded, want 8", len(starts))
+	// The ramp doubles from the floor and then holds at the cap. With a 20ms
+	// floor and a 200ms cap the requested waits are 20, 40, 80, 160, then 200
+	// for every further failure.
+	if len(waits) < 5 {
+		t.Fatalf("supervisor requested %d waits (%v), want at least 5", len(waits), waits)
 	}
-	// By attempt 8 the raw doubling would be far past maxDelay; the observed
-	// wait must be near the cap. Generous upper bound: scheduler jitter under
-	// -race is real, but an uncapped ramp would be several times larger.
-	last := starts[7].Sub(starts[6])
-	if last > 3*testPolicy.maxDelay {
-		t.Errorf("wait before attempt 8 was %s, well past the %s cap; the backoff is uncapped",
-			last, testPolicy.maxDelay)
+	delay := testPolicy.minDelay
+	for i := 0; i < 4; i++ {
+		if waits[i] != delay {
+			t.Errorf("wait %d = %s, want %s: the ramp must double from the floor", i+1, waits[i], delay)
+		}
+		delay *= 2
+	}
+	for i := 4; i < len(waits); i++ {
+		if waits[i] != testPolicy.maxDelay {
+			t.Errorf("wait %d = %s, want the %s cap: an uncapped ramp drifts toward never retrying",
+				i+1, waits[i], testPolicy.maxDelay)
+		}
+	}
+	if waits[len(waits)-1] != testPolicy.maxDelay {
+		t.Errorf("last wait = %s, want the %s cap", waits[len(waits)-1], testPolicy.maxDelay)
 	}
 }
 
@@ -164,43 +201,36 @@ func TestSuperviseLoop_ResetsBackoffAfterHealthyRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var (
-		attempt     int
-		healthyEnd  time.Time
-		restartGap  time.Duration
-		rampedGap   time.Duration
-		lastFailEnd time.Time
-	)
+	var waits []time.Duration
+	var attempt int
 
-	runSupervised(t, ctx, func() error {
+	runSupervisedWith(t, ctx, captureWaits(t, &waits), func() error {
 		attempt++
 		switch {
 		case attempt <= 4:
 			// Fail fast repeatedly so the delay ramps well past the floor.
-			lastFailEnd = time.Now()
 			return errors.New("early failure")
 		case attempt == 5:
-			// Measure how long the ramped-up wait actually was, then run long
-			// enough to count as healthy before failing.
-			rampedGap = time.Since(lastFailEnd)
+			// Run longer than healthyRun: this attempt counts as "it was working".
 			time.Sleep(testPolicy.healthyRun + 20*time.Millisecond)
-			healthyEnd = time.Now()
 			return errors.New("failure after a healthy run")
 		default:
-			restartGap = time.Since(healthyEnd)
 			cancel()
 			return nil
 		}
 	})
 
-	if rampedGap == 0 || restartGap == 0 {
-		t.Fatalf("supervisor did not reach the measured attempts (ramped=%s restart=%s)",
-			rampedGap, restartGap)
+	// waits[0..3] are the ramped waits before attempts 2..5; waits[4] is the wait
+	// the healthy run must reset to the floor.
+	if len(waits) < 5 {
+		t.Fatalf("supervisor requested %d waits (%v), want at least 5", len(waits), waits)
 	}
-	if restartGap >= rampedGap {
-		t.Errorf("restart after a healthy run waited %s, no shorter than the ramped %s; "+
-			"a run lasting longer than healthyRun (%s) must reset the backoff",
-			restartGap, rampedGap, testPolicy.healthyRun)
+	if waits[3] <= waits[2] {
+		t.Errorf("the streak must ramp before the healthy run: waits=%v", waits)
+	}
+	if waits[4] != testPolicy.minDelay {
+		t.Errorf("wait after a healthy run = %s, want the %s floor: a run lasting longer than "+
+			"healthyRun (%s) must reset the backoff", waits[4], testPolicy.minDelay, testPolicy.healthyRun)
 	}
 }
 

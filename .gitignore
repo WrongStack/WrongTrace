@@ -41,3 +41,6 @@ dev-daemon-out.log
 
 .mimosa/
 wrongtrace.exe
+
+# Local captured API traffic (debugging samples).
+openai/

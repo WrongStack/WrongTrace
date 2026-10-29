@@ -77,7 +77,9 @@ export function ModelFrictionMatrix() {
     const q = searchQuery.toLowerCase().trim();
     return rawCollisions.filter((c) => {
       if (filterMode === 'cross_only' && !c.is_cross_agent) return false;
-      if (filterMode === 'self_only' && c.is_cross_agent) return false;
+      // Not `!is_cross_agent`: the backend also clears that flag for pairs
+      // involving "unknown", which are two different authors, not self-thrash.
+      if (filterMode === 'self_only' && c.author_model !== c.overwriter_model) return false;
       if (
         selectedPair &&
         (c.author_model !== selectedPair.author || c.overwriter_model !== selectedPair.overwriter)

@@ -181,10 +181,25 @@ func resolvePort(cmd *cobra.Command) int {
 	return port
 }
 
-func runStart(cmd *cobra.Command, _ []string) error {
+func runStart(cmd *cobra.Command, _ []string) (err error) {
+	var logFile *os.File
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("FATAL PANIC in runStart: %v\n%s", r, debug.Stack())
+			// A recovered panic makes the function return its ZERO value, so
+			// this used to report success (exit 0) after a fatal startup panic:
+			// main() exits non-zero only on a returned error, so a supervisor or
+			// script gating on that code was told a daemon that never came up had
+			// started.
+			err = fmt.Errorf("fatal panic in runStart: %v", r)
+		}
+		// The log file is closed HERE, after the panic was logged. Its own
+		// deferred Close was registered later than this recovery, and defers run
+		// LIFO, so the file used to be closed first and the fatal panic and its
+		// stack were written to a closed file -- never reaching daemon.log, the
+		// one artifact an operator reads afterwards.
+		if logFile != nil {
+			_ = logFile.Close()
 		}
 	}()
 
@@ -192,9 +207,12 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	dataDir := defaultDataDir()
 	_ = os.MkdirAll(dataDir, 0o755)
 	logFilePath := filepath.Join(dataDir, "daemon.log")
-	if logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
-		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
-		defer logFile.Close()
+	if f, openErr := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); openErr == nil {
+		logFile = f
+		// The file goes first: io.MultiWriter stops at the first failing
+		// writer, and a detached daemon's stderr (closed pipe, gone tty) fails
+		// on every write, which left daemon.log empty.
+		log.SetOutput(io.MultiWriter(logFile, os.Stderr))
 	}
 
 	// GC pacing, heap ceiling, and parallelism caps. See runtime_tuning.go for
@@ -380,17 +398,19 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	}
 	sessionWatcher.DiscoverAgentDirs(abs)
 	sessionWatcher.DiscoverGlobalAgentDirs()
-	sessionWatcher.StartPolling(ctx, 25*time.Second)
+	pollerDone := sessionWatcher.StartPolling(ctx, 25*time.Second)
 
 	// Optional pprof listener; no-op unless WRONGTRACE_PPROF=1.
 	server.StartDebugServer(ctx)
 
-	// Each long-lived component runs under superviseLoop: panics and errors
+	// Each supervised component runs under superviseLoop: panics and errors
 	// restart the component with backoff instead of taking the daemon down,
 	// and every wait is cancellable so shutdown stays prompt.
 	// They are tracked so shutdown waits for them to return before the
 	// deferred Close calls tear down the store, watcher, and AST engine
-	// underneath still-running goroutines.
+	// underneath still-running goroutines. The session poller above runs its
+	// own loop (it must not be restarted or duplicated) and is awaited in the
+	// shutdown path below for exactly the same reason.
 	var supervised sync.WaitGroup
 	goSupervised := func(name string, fn func() error) {
 		supervised.Add(1)
@@ -451,6 +471,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	}
 	if !waitTimeout(&supervised, supervisedShutdownGrace) {
 		log.Printf("shutdown: supervised components still running after %s; closing resources anyway", supervisedShutdownGrace)
+	}
+	// The poller is cancelled by cancel() above; wait for its loop and its final
+	// offset checkpoint to finish before the deferred Closes run.
+	if !awaitPollerDone(pollerDone, supervisedShutdownGrace) {
+		log.Printf("shutdown: session poller still running after %s; closing resources anyway", supervisedShutdownGrace)
 	}
 	log.Printf("wrongtrace stopped gracefully")
 	return nil
@@ -655,7 +680,33 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	// `wrongtrace trace -- cmd | jq` pipes only cmd's output.
 	banner := cmd.ErrOrStderr()
 	fmt.Fprintf(banner, "⏱  [WrongTrace] Profiling command: %s\n", strings.Join(args, " "))
-	runErr := execCmd.Run()
+	// Ctrl+C reaches the child through the terminal (console group on
+	// Windows), but the runtime's default handler killed this wrapper at once:
+	// the child was left finishing unsupervised, no trace was recorded, and
+	// the exit code was death-by-signal instead of the child's. Hold the
+	// signals while the child runs; SIGTERM, which a terminal does not fan
+	// out, is forwarded.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	runErr := execCmd.Start()
+	if runErr == nil {
+		waited := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case s := <-sigCh:
+					if s != os.Interrupt {
+						_ = execCmd.Process.Signal(s)
+					}
+				case <-waited:
+					return
+				}
+			}
+		}()
+		runErr = execCmd.Wait()
+		close(waited)
+	}
+	signal.Stop(sigCh)
 	duration := time.Since(startTime)
 	durationMs := float64(duration.Microseconds()) / 1000.0
 
@@ -747,10 +798,50 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	return runErr
 }
 
+// validateDatabaseOutput prevents an export/report from replacing its own
+// source. File identity also catches hard links and symlink aliases.
+func validateDatabaseOutput(dbPath, outputPath string) error {
+	if outputPath == "" {
+		return nil
+	}
+	dbAbs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return fmt.Errorf("resolve database path: %w", err)
+	}
+	outAbs, err := filepath.Abs(outputPath)
+	if err != nil {
+		return fmt.Errorf("resolve output path: %w", err)
+	}
+	if dbAbs == outAbs || (runtime.GOOS == "windows" && strings.EqualFold(dbAbs, outAbs)) {
+		return fmt.Errorf("output path %q refers to the source database; choose a different --out path", outputPath)
+	}
+	source, err := os.Stat(dbAbs)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect source database: %w", err)
+	}
+	target, err := os.Stat(outAbs)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect output path: %w", err)
+	}
+	if os.SameFile(source, target) {
+		return fmt.Errorf("output path %q refers to the source database; choose a different --out path", outputPath)
+	}
+	return nil
+}
+
 func runExport(cmd *cobra.Command, _ []string) error {
 	dbPath, _ := cmd.Flags().GetString("db")
 	outFile, _ := cmd.Flags().GetString("out")
 
+	if err := validateDatabaseOutput(dbPath, outFile); err != nil {
+		return err
+	}
 	store, err := db.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
@@ -808,7 +899,19 @@ func runReport(cmd *cobra.Command, _ []string) error {
 	outFile, _ := cmd.Flags().GetString("out")
 	format, _ := cmd.Flags().GetString("format")
 	repoName, _ := cmd.Flags().GetString("repo")
+	// An unknown format used to fall back to Markdown while the success line
+	// echoed the requested one ("Generated pdf report"), exiting 0.
+	switch format = strings.ToLower(strings.TrimSpace(format)); format {
+	case "markdown", "md":
+		format = "markdown"
+	case "html", "json":
+	default:
+		return fmt.Errorf("unsupported --format %q (want markdown, html, or json)", format)
+	}
 
+	if err := validateDatabaseOutput(dbPath, outFile); err != nil {
+		return err
+	}
 	store, err := db.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
@@ -818,20 +921,32 @@ func runReport(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	overview, err := store.Overview()
+	// The database is shared by every project. The report used to be labelled
+	// with --repo (by default the current directory's name) while every
+	// aggregate covered all repositories. An explicit --repo now scopes the
+	// metrics; without one the report says it covers all of them. Profiler
+	// traces carry no repository and stay global.
+	var repoFilter []string
+	if cmd.Flags().Changed("repo") {
+		repoFilter = []string{repoName}
+	} else {
+		repoName = "all repositories"
+	}
+
+	overview, err := store.Overview(repoFilter...)
 	if err != nil {
 		return fmt.Errorf("overview: %w", err)
 	}
 
-	events, err := store.RecentEvents(20)
+	events, err := store.RecentEvents(20, repoFilter...)
 	if err != nil {
 		return fmt.Errorf("recent events: %w", err)
 	}
-	thrashing, err := store.Thrashing(3, 7)
+	thrashing, err := store.Thrashing(3, 7, repoFilter...)
 	if err != nil {
 		return fmt.Errorf("thrashing: %w", err)
 	}
-	models, err := store.ModelComparison()
+	models, err := store.ModelComparison(repoFilter...)
 	if err != nil {
 		return fmt.Errorf("model comparison: %w", err)
 	}
@@ -858,7 +973,7 @@ func runReport(cmd *cobra.Command, _ []string) error {
 	}
 
 	var outputContent string
-	switch strings.ToLower(format) {
+	switch format {
 	case "html":
 		outputContent = report.GenerateHTMLReport(data)
 	case "json":
@@ -916,7 +1031,18 @@ func runInit(cmd *cobra.Command, _ []string) error {
 			fmt.Printf("  ✓ Created %s (MCP server registration for Claude Code, Cursor, Windsurf)\n", filepath.Base(mcpPath))
 		}
 	} else {
-		fmt.Printf("  - %s already exists\n", filepath.Base(mcpPath))
+		// Most projects already have a .mcp.json for other servers. Only
+		// noting that it existed left WrongTrace unregistered while the
+		// verdict below still said "Setup complete!".
+		switch added, mErr := mergeMCPServer(mcpPath); {
+		case mErr != nil:
+			fmt.Printf("  ✗ Could not register wrongtrace in %s: %v\n", filepath.Base(mcpPath), mErr)
+			writeFailures++
+		case added:
+			fmt.Printf("  ✓ Added wrongtrace to existing %s\n", filepath.Base(mcpPath))
+		default:
+			fmt.Printf("  - %s already registers wrongtrace\n", filepath.Base(mcpPath))
+		}
 	}
 
 	// 2. Generate CLAUDE.md
@@ -1018,8 +1144,12 @@ func runHook(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		dir = "."
 	}
+	// Git itself knows where it runs hooks from: core.hooksPath (husky),
+	// submodules and linked worktrees included. The directory walk below is
+	// the fallback for a machine without a git binary.
+	gitHooksDir, viaGit := gitHooksPath(dir)
 	var gitRoot string
-	for {
+	for !viaGit {
 		candidate := filepath.Join(dir, ".git")
 		if info, err := os.Stat(candidate); err == nil {
 			if info.IsDir() {
@@ -1040,10 +1170,12 @@ func runHook(cmd *cobra.Command, args []string) error {
 		dir = parent
 	}
 
-	if gitRoot == "" {
-		return fmt.Errorf("current directory is not a git repository (.git directory or worktree pointer not found)")
+	if !viaGit {
+		if gitRoot == "" {
+			return fmt.Errorf("current directory is not a git repository (.git directory or worktree pointer not found)")
+		}
+		gitHooksDir = filepath.Join(gitRoot, "hooks")
 	}
-	gitHooksDir := filepath.Join(gitRoot, "hooks")
 	_ = os.MkdirAll(gitHooksDir, 0755)
 	hookFile := filepath.Join(gitHooksDir, "post-commit")
 
@@ -1079,10 +1211,27 @@ fi
 	return nil
 }
 
-// commonDirFromGitdirFile resolves a linked worktree's `.git` pointer file
-// ("gitdir: <main>/.git/worktrees/<name>") to the repository's common dir
-// (<main>/.git), where git looks up hooks shared by every worktree. Returns
-// false when the file is not a gitdir pointer or its target is unusable.
+// gitHooksPath asks git for the absolute hooks directory of the repository
+// containing dir. It reports false when git is unavailable or dir is not in a
+// repository.
+func gitHooksPath(dir string) (string, bool) {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-path", "hooks").Output()
+	if err != nil {
+		return "", false
+	}
+	p := strings.TrimSpace(string(out))
+	if p == "" {
+		return "", false
+	}
+	return filepath.Clean(p), true
+}
+
+// commonDirFromGitdirFile resolves a `.git` pointer file ("gitdir: <path>") to
+// the directory git looks up hooks in. A linked worktree's gitdir carries a
+// `commondir` file naming the shared repository dir; a submodule's gitdir
+// (<super>/.git/modules/<name>) has none and is its own repository, so its
+// hooks are its own. Returns false when the file is not a gitdir pointer or
+// its target is unusable.
 func commonDirFromGitdirFile(gitFile, containingDir string) (string, bool) {
 	data, err := os.ReadFile(gitFile)
 	if err != nil {
@@ -1100,15 +1249,63 @@ func commonDirFromGitdirFile(gitFile, containingDir string) (string, bool) {
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(containingDir, target)
 	}
-	// <main>/.git/worktrees/<name> → <main>/.git (git's stable worktree layout)
-	common := filepath.Dir(filepath.Dir(filepath.Clean(target)))
-	if filepath.Base(common) != ".git" {
-		return "", false
+	// Inferring the common dir from the layout (two levels up) also matched a
+	// submodule's gitdir and installed into the superproject's hooks.
+	common := filepath.Clean(target)
+	if raw, err := os.ReadFile(filepath.Join(common, "commondir")); err == nil {
+		if c := strings.TrimSpace(string(raw)); c != "" {
+			if !filepath.IsAbs(c) {
+				c = filepath.Join(common, c)
+			}
+			common = filepath.Clean(c)
+		}
+	} else if parent := filepath.Dir(common); filepath.Base(parent) == "worktrees" && filepath.Base(filepath.Dir(parent)) == ".git" {
+		// A worktree gitdir without commondir (older layouts): <main>/.git.
+		common = filepath.Dir(parent)
 	}
 	if info, err := os.Stat(common); err != nil || !info.IsDir() {
 		return "", false
 	}
 	return common, true
+}
+
+// mergeMCPServer adds the wrongtrace server to an existing .mcp.json,
+// keeping every other key, and reports whether it changed the file. A file
+// that is not a JSON object, or whose mcpServers is not one, is left alone.
+func mergeMCPServer(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil || doc == nil {
+		return false, fmt.Errorf("not a JSON object, left unchanged")
+	}
+	servers := map[string]json.RawMessage{}
+	if cur, ok := doc["mcpServers"]; ok {
+		if err := json.Unmarshal(cur, &servers); err != nil || servers == nil {
+			return false, fmt.Errorf("mcpServers is not an object, left unchanged")
+		}
+	}
+	if _, ok := servers["wrongtrace"]; ok {
+		return false, nil
+	}
+	servers["wrongtrace"] = json.RawMessage(`{"command":"wrongtrace","args":["mcp"]}`)
+	if doc["mcpServers"], err = json.Marshal(servers); err != nil {
+		return false, err
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(path, append(out, '\n'), info.Mode().Perm()); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func fileExists(p string) bool {
