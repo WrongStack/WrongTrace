@@ -278,6 +278,10 @@ const maxIgnoreDecisions = 8192
 
 // New constructs and primes a Watcher. It does not start the event loop; call
 // Run from a goroutine.
+//
+// An empty cfg.Dir builds a watcher that observes nothing until AddWatchDir
+// registers a tree. The daemon uses this when it is started from the user's
+// home directory, which must never be walked recursively.
 func New(cfg Config) (*Watcher, error) {
 	if cfg.Debounce <= 0 {
 		cfg.Debounce = 250 * time.Millisecond
@@ -296,7 +300,10 @@ func New(cfg Config) (*Watcher, error) {
 		ignoreSet[strings.ToLower(filepath.Clean(ig))] = struct{}{}
 	}
 
-	rules := loadGitIgnoreRules(cfg.Dir)
+	var rules []ignoreRule
+	if cfg.Dir != "" {
+		rules = loadGitIgnoreRules(cfg.Dir)
+	}
 	anchoredNegation := false
 	for _, r := range rules {
 		if r.negate && r.anchored {
@@ -326,6 +333,9 @@ func New(cfg Config) (*Watcher, error) {
 	// Wire the SSE handler after w is allocated so it can capture w.
 	if cfg.DebugFSEvents {
 		w.httpHandler = debugFSNotifyHandler(w)
+	}
+	if cfg.Dir == "" {
+		return w, nil
 	}
 	if err := w.addRecursive(cfg.Dir); err != nil {
 		_ = fw.Close()

@@ -251,6 +251,19 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 	log.Printf("  socket : %s", socketPath)
 	log.Printf("  repo   : %s", repoName)
 
+	// scanDir is the tree the daemon walks, parses and watches. The home
+	// directory is never scanned: see isUserHome.
+	scanDir := abs
+	if isUserHome(abs) {
+		scanDir = ""
+		log.Printf("WARNING: wrongtrace was started in your home directory (%s).", abs)
+		log.Printf("WARNING: The home directory is not scanned, so no files are being watched.")
+		log.Printf("WARNING: Start it from a project directory instead:")
+		log.Printf("WARNING:     cd <project-dir>")
+		log.Printf("WARNING:     wrongtrace start")
+		log.Printf("WARNING: or pass the directory explicitly: wrongtrace start --watch <project-dir>")
+	}
+
 	// Storage layer.
 	store, err := db.Open(dbPath)
 	if err != nil {
@@ -275,18 +288,21 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 		RepoName: repoName,
 		Store:    store,
 		AST:      astEngine,
-		WatchDir: abs,
+		WatchDir: scanDir,
 	})
 	// Registered after the store/AST defers so it runs BEFORE them: it stops
 	// the engine's sampler and background indexing, which still use both.
 	// Deferred calls run after the supervised-goroutine wait below.
 	defer engine.Close()
-	engine.PrimeDirectory(abs)
+	if scanDir != "" {
+		engine.PrimeDirectory(scanDir)
+	}
 
-	// Filesystem watcher with debouncing + ignore rules.
+	// Filesystem watcher with debouncing + ignore rules. An empty Dir watches
+	// nothing until a project is added.
 	debugFS, _ := cmd.Flags().GetBool("debug-fs")
 	w, err := watcher.New(watcher.Config{
-		Dir:           abs,
+		Dir:           scanDir,
 		Engine:        engine,
 		DebugFSEvents: debugFS,
 	})

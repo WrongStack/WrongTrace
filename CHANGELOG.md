@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `wrongtrace start` run from the home directory (the default working directory of a new terminal) no longer walks and parses the whole home tree before the HTTP server starts. The dashboard used to stay unreachable for minutes with no explanation. The home directory is now never scanned; the daemon starts immediately and prints a warning telling you to start it from a project directory or pass `--watch <dir>`. Projects added from the dashboard are still watched.
+
 ---
 
 ## [0.3.18] - 2026-10-29
