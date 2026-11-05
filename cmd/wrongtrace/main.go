@@ -244,24 +244,29 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 		return fmt.Errorf("resolve watch dir: %w", err)
 	}
 
+	// scanDir is the tree the daemon walks, parses and watches. The home
+	// directory is never scanned: see isUserHome. Started from home, the
+	// --repo default (the cwd's base name, i.e. the user name) names no
+	// project, so it is dropped and the engine restores the persisted active
+	// project instead; that project is watched in place of the home tree.
+	homeStart := isUserHome(abs)
+	scanDir := abs
+	if homeStart {
+		scanDir = ""
+		if !cmd.Flags().Changed("repo") {
+			repoName = ""
+		}
+	}
+
 	log.Printf("wrongtrace %s starting (resilient daemon mode)", version)
 	log.Printf("  watch  : %s", abs)
 	log.Printf("  port   : %d", port)
 	log.Printf("  db     : %s", dbPath)
 	log.Printf("  socket : %s", socketPath)
-	log.Printf("  repo   : %s", repoName)
-
-	// scanDir is the tree the daemon walks, parses and watches. The home
-	// directory is never scanned: see isUserHome.
-	scanDir := abs
-	if isUserHome(abs) {
-		scanDir = ""
-		log.Printf("WARNING: wrongtrace was started in your home directory (%s).", abs)
-		log.Printf("WARNING: The home directory is not scanned, so no files are being watched.")
-		log.Printf("WARNING: Start it from a project directory instead:")
-		log.Printf("WARNING:     cd <project-dir>")
-		log.Printf("WARNING:     wrongtrace start")
-		log.Printf("WARNING: or pass the directory explicitly: wrongtrace start --watch <project-dir>")
+	if repoName != "" {
+		log.Printf("  repo   : %s", repoName)
+	} else {
+		log.Printf("  repo   : (active project)")
 	}
 
 	// Storage layer.
@@ -311,6 +316,41 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 	}
 	defer w.Close()
 	engine.SetWatcher(w)
+
+	// Started from home: watch the restored active project instead. Its
+	// AST priming runs in the background so the HTTP server is not held up;
+	// shutdown cancels it and waits for it before the store and AST engine
+	// close underneath it.
+	activeDir := ""
+	if homeStart {
+		activeDir = homeStartProjectDir(engine.GetActiveProject())
+		logHomeStartWarning(abs, engine.GetActiveProject(), activeDir)
+	}
+	if activeDir != "" {
+		if err := w.AddWatchDir(activeDir); err != nil {
+			log.Printf("watcher: cannot watch active project %s: %v", activeDir, err)
+		}
+		primeDone := make(chan struct{})
+		go func() {
+			defer close(primeDone)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("PANIC priming active project: %v\n%s", r, debug.Stack())
+				}
+			}()
+			engine.PrimeDirectory(activeDir)
+		}()
+		// Registered after `defer engine.Close()`, so it runs first. Close is
+		// idempotent; calling it here cancels the walk before waiting on it.
+		defer func() {
+			engine.Close()
+			select {
+			case <-primeDone:
+			case <-time.After(supervisedShutdownGrace):
+				log.Printf("shutdown: active project indexing still running after %s; closing resources anyway", supervisedShutdownGrace)
+			}
+		}()
+	}
 
 	// IPC listener: Unix Domain Socket on POSIX, Named Pipe on Windows.
 	ipcServer := ipc.NewServer(ipc.Config{
@@ -413,6 +453,9 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 		log.Printf("ingest: offset checkpoint reset: %v", err)
 	}
 	sessionWatcher.DiscoverAgentDirs(abs)
+	if activeDir != "" {
+		sessionWatcher.DiscoverAgentDirs(activeDir)
+	}
 	sessionWatcher.DiscoverGlobalAgentDirs()
 	pollerDone := sessionWatcher.StartPolling(ctx, 25*time.Second)
 
