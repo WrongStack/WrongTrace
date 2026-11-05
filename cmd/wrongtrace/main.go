@@ -244,12 +244,30 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 		return fmt.Errorf("resolve watch dir: %w", err)
 	}
 
+	// scanDir is the tree the daemon walks, parses and watches. The home
+	// directory is never scanned: see isUserHome. Started from home, the
+	// --repo default (the cwd's base name, i.e. the user name) names no
+	// project, so it is dropped and the engine restores the persisted active
+	// project instead; that project is watched in place of the home tree.
+	homeStart := isUserHome(abs)
+	scanDir := abs
+	if homeStart {
+		scanDir = ""
+		if !cmd.Flags().Changed("repo") {
+			repoName = ""
+		}
+	}
+
 	log.Printf("wrongtrace %s starting (resilient daemon mode)", version)
 	log.Printf("  watch  : %s", abs)
 	log.Printf("  port   : %d", port)
 	log.Printf("  db     : %s", dbPath)
 	log.Printf("  socket : %s", socketPath)
-	log.Printf("  repo   : %s", repoName)
+	if repoName != "" {
+		log.Printf("  repo   : %s", repoName)
+	} else {
+		log.Printf("  repo   : (active project)")
+	}
 
 	// Storage layer.
 	store, err := db.Open(dbPath)
@@ -275,18 +293,21 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 		RepoName: repoName,
 		Store:    store,
 		AST:      astEngine,
-		WatchDir: abs,
+		WatchDir: scanDir,
 	})
 	// Registered after the store/AST defers so it runs BEFORE them: it stops
 	// the engine's sampler and background indexing, which still use both.
 	// Deferred calls run after the supervised-goroutine wait below.
 	defer engine.Close()
-	engine.PrimeDirectory(abs)
+	if scanDir != "" {
+		engine.PrimeDirectory(scanDir)
+	}
 
-	// Filesystem watcher with debouncing + ignore rules.
+	// Filesystem watcher with debouncing + ignore rules. An empty Dir watches
+	// nothing until a project is added.
 	debugFS, _ := cmd.Flags().GetBool("debug-fs")
 	w, err := watcher.New(watcher.Config{
-		Dir:           abs,
+		Dir:           scanDir,
 		Engine:        engine,
 		DebugFSEvents: debugFS,
 	})
@@ -295,6 +316,41 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 	}
 	defer w.Close()
 	engine.SetWatcher(w)
+
+	// Started from home: watch the restored active project instead. Its
+	// AST priming runs in the background so the HTTP server is not held up;
+	// shutdown cancels it and waits for it before the store and AST engine
+	// close underneath it.
+	activeDir := ""
+	if homeStart {
+		activeDir = homeStartProjectDir(engine.GetActiveProject())
+		logHomeStartWarning(abs, engine.GetActiveProject(), activeDir)
+	}
+	if activeDir != "" {
+		if err := w.AddWatchDir(activeDir); err != nil {
+			log.Printf("watcher: cannot watch active project %s: %v", activeDir, err)
+		}
+		primeDone := make(chan struct{})
+		go func() {
+			defer close(primeDone)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("PANIC priming active project: %v\n%s", r, debug.Stack())
+				}
+			}()
+			engine.PrimeDirectory(activeDir)
+		}()
+		// Registered after `defer engine.Close()`, so it runs first. Close is
+		// idempotent; calling it here cancels the walk before waiting on it.
+		defer func() {
+			engine.Close()
+			select {
+			case <-primeDone:
+			case <-time.After(supervisedShutdownGrace):
+				log.Printf("shutdown: active project indexing still running after %s; closing resources anyway", supervisedShutdownGrace)
+			}
+		}()
+	}
 
 	// IPC listener: Unix Domain Socket on POSIX, Named Pipe on Windows.
 	ipcServer := ipc.NewServer(ipc.Config{
@@ -397,6 +453,9 @@ func runStart(cmd *cobra.Command, _ []string) (err error) {
 		log.Printf("ingest: offset checkpoint reset: %v", err)
 	}
 	sessionWatcher.DiscoverAgentDirs(abs)
+	if activeDir != "" {
+		sessionWatcher.DiscoverAgentDirs(activeDir)
+	}
 	sessionWatcher.DiscoverGlobalAgentDirs()
 	pollerDone := sessionWatcher.StartPolling(ctx, 25*time.Second)
 
