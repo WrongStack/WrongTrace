@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Building from source now requires **Go 1.26** or newer (was 1.25, which is out of upstream support). `golang.org/x/sys` 0.49, `github.com/Microsoft/go-winio` 0.6.4 and `modernc.org/sqlite` 1.61 require it.
+- Dependency updates: `modernc.org/sqlite` 1.61.1, `github.com/go-chi/chi/v5` 5.5.0, `github.com/Microsoft/go-winio` 0.6.4, `golang.org/x/sys` 0.49.0; dashboard: React and React DOM 19.3, `@tanstack/react-query` 5.106, `@xyflow/react` 12.12, `lucide-react` 1.70, `@vitejs/plugin-react` 6.2.
+- CI and release workflows use `actions/checkout@v7` and `actions/setup-go@v7`.
+
 ### Security
 - Update `github.com/go-chi/chi/v5` to 5.4.0 for [GHSA-j6qf-3m9c-vwj3](https://github.com/advisories/GHSA-j6qf-3m9c-vwj3) (client IP spoofing in `ClientIPFromXFF`). WrongTrace does not call the affected function, so it was not exploitable here; the update clears the advisory.
 
