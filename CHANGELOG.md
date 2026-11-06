@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Update `github.com/go-chi/chi/v5` to 5.4.0 for [GHSA-j6qf-3m9c-vwj3](https://github.com/advisories/GHSA-j6qf-3m9c-vwj3) (client IP spoofing in `ClientIPFromXFF`). WrongTrace does not call the affected function, so it was not exploitable here; the update clears the advisory.
+
 ---
 
 ## [0.3.19] - 2026-11-06
