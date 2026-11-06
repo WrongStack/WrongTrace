@@ -48,7 +48,7 @@ jobs:
             goarch: arm64
             runner: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # mingw cross-compiler for the windows leg (built on ubuntu). Debian
       # package name is hyphenated (gcc-mingw-w64-x86-64); the compiler
@@ -59,7 +59,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-mingw-w64-x86-64
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -111,7 +111,7 @@ jobs:
     steps:
       # Full history so the annotated tag object (and its message) is
       # available for release notes.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
