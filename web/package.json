@@ -11,7 +11,7 @@
     "restore:placeholder": "node -e \"const fs=require('fs'); fs.copyFileSync('placeholder.html', 'dist/index.html');\""
   },
   "dependencies": {
-    "@tanstack/react-query": "^5.106.1",
+    "@tanstack/react-query": "^5.108.0",
     "@xyflow/react": "^12.12.1",
     "lucide-react": "^1.70.0",
     "react": "^19.3.1",
